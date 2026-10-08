@@ -16,8 +16,11 @@ mod interrupts;
 mod ipc;
 mod keyboard;
 mod memory;
+mod mouse;
 mod paging;
 mod pci;
+mod pointer;
+mod ps2;
 mod serial;
 mod timer;
 mod userspace;
@@ -152,6 +155,9 @@ pub extern "C" fn _start() -> ! {
         unsafe { dma::self_test(&mut frames, boot.direct_map_offset) };
         block::self_test();
         keyboard::self_test();
+        mouse::self_test();
+        ps2::self_test();
+        pointer::self_test();
         console::self_test();
         assert!(devices.functions > 0, "no PCI devices discovered");
         assert!(
@@ -185,7 +191,8 @@ pub extern "C" fn _start() -> ! {
         inject_block_error,
     );
 
-    let keyboard_ready = match keyboard::init() {
+    let input_devices = ps2::init();
+    let keyboard_ready = match input_devices.keyboard {
         Ok(()) => {
             serial::println!("MIRROR_KEYBOARD_READY transport=i8042 set=2 irq=1");
             true
@@ -197,6 +204,19 @@ pub extern "C" fn _start() -> ! {
     };
     if keyboard_ready {
         timer::enable_keyboard_irq();
+    }
+    let mouse_ready = match input_devices.mouse {
+        Ok(()) => {
+            serial::println!("MIRROR_MOUSE_READY transport=i8042 packet=3 irq=12");
+            true
+        }
+        Err(error) => {
+            serial::println!("MIRROR_MOUSE_SKIPPED reason={:?}", error);
+            false
+        }
+    };
+    if mouse_ready {
+        timer::enable_mouse_irq();
     }
 
     let scenario = {
@@ -255,8 +275,8 @@ pub extern "C" fn _start() -> ! {
     {
         serial::println!("MIRROR_BOOT_OK");
         serial::println!("Mirror idle: timer ticks={}", timer::ticks());
-        if keyboard_ready {
-            run_console(&mut display);
+        if keyboard_ready || mouse_ready {
+            run_console(&mut display, mouse_ready);
         }
         // SAFETY: Only initialized IRQ sources are unmasked; the heap and
         // descriptors are ready. Keep allocator/table state alive here.
@@ -265,21 +285,39 @@ pub extern "C" fn _start() -> ! {
 }
 
 #[cfg(not(feature = "boot-smoke"))]
-fn run_console(display: &mut Option<framebuffer::Driver<'_>>) -> ! {
+fn run_console(display: &mut Option<framebuffer::Driver<'_>>, mouse_ready: bool) -> ! {
     assert!(!arch::interrupts_enabled());
     // Discard the bounded queue left by boot. Limit work even if new bytes keep
     // arriving through the controller's deferred-drain path.
     for _ in 0..128 {
-        let discarded = keyboard::pop_event().is_some();
-        let lost = keyboard::take_overflow();
-        if !discarded && !lost {
+        if ps2::next_event().is_none() {
             break;
         }
     }
-    let _ = keyboard::take_overflow();
     let mut console = console::Console::new();
+    let (width, height) = display.as_ref().map_or((1, 1), |display| {
+        let info = display.info();
+        (info.width, info.height)
+    });
+    let mut pointer = pointer::Pointer::new(width, height);
+    let mut drawn_cursor = None;
     if let Some(display) = display {
         display.render_console(&console);
+        if mouse_ready {
+            let (x, y) = pointer.position();
+            display.draw_cursor(x, y);
+            drawn_cursor = Some((x, y));
+        }
+    }
+    if mouse_ready {
+        let (x, y) = pointer.position();
+        serial::println!(
+            "MIRROR_POINTER_READY x={} y={} width={} height={}",
+            x,
+            y,
+            width,
+            height
+        );
     }
     serial::println!(
         "MIRROR_CONSOLE_READY input=ps2 display={}",
@@ -289,43 +327,72 @@ fn run_console(display: &mut Option<framebuffer::Driver<'_>>) -> ! {
     loop {
         let mut dirty = false;
         let mut redraw_content = false;
+        let mut pointer_changed = false;
+        let mut pointer_buttons = None;
         let mut full_batch = true;
         // Keep work per pass bounded. IRQs may append while an event is handled,
         // but only this loop owns console state and the framebuffer writer.
         for _ in 0..32 {
-            let mut event = keyboard::pop_event();
-            // pop_event can perform a bounded deferred controller drain and
-            // discover loss. Clear the edit line before using any returned key.
-            if keyboard::take_overflow() {
-                console.input_lost();
-                event = None;
-                dirty = true;
-                redraw_content = true;
-                serial::println!("MIRROR_CONSOLE_INPUT_LOST");
-            }
-            let Some(event) = event else {
+            // One controller consumer preserves keyboard/mouse event order and
+            // places a loss barrier before any input after a discarded queue.
+            let Some(event) = ps2::next_event() else {
                 full_batch = false;
                 break;
             };
             // SAFETY: IRQ handlers only update independent timer/input state;
             // the console/display are never borrowed or accessed by an IRQ.
             unsafe { arch::restore_interrupts(true) };
-            if let Some(action) = console.process(event) {
-                redraw_content |= matches!(action, console::Action::Submitted { .. });
-                action.log();
-                dirty = true;
+            match event {
+                ps2::InputEvent::Lost => {
+                    console.input_lost();
+                    pointer.input_lost();
+                    dirty = true;
+                    redraw_content = true;
+                    serial::println!("MIRROR_CONSOLE_INPUT_LOST");
+                }
+                ps2::InputEvent::Key(event) => {
+                    if let Some(action) = console.process(event) {
+                        redraw_content |= matches!(action, console::Action::Submitted { .. });
+                        action.log();
+                        dirty = true;
+                    }
+                }
+                ps2::InputEvent::Mouse(event) => {
+                    let update = pointer.apply(event);
+                    pointer_changed |= update.moved;
+                    pointer_buttons = Some(event.buttons);
+                    let (x, y) = pointer.position();
+                    if update.left_pressed
+                        && let Some(display) = display
+                        && let Some(caret) = display.console_caret_at(&console, x, y)
+                    {
+                        dirty |= console.place_cursor(caret);
+                        serial::println!("MIRROR_POINTER_CLICK x={} y={} caret={}", x, y, caret);
+                    }
+                }
             }
             arch::disable_interrupts();
         }
-        if dirty {
+        if dirty || pointer_changed {
             // Rendering must not hold off IRQ delivery for a whole frame.
             // SAFETY: Same initialized sources and exclusive display ownership.
             unsafe { arch::restore_interrupts(true) };
             if let Some(display) = display {
-                if redraw_content {
-                    display.update_console_content(&console);
-                } else {
-                    display.update_console_input(&console);
+                if let Some((x, y)) = drawn_cursor {
+                    // Restore from current scene state rather than reading VRAM.
+                    display.restore_cursor(&console, x, y);
+                }
+                if dirty {
+                    if redraw_content {
+                        display.update_console_content(&console);
+                    } else {
+                        display.update_console_input(&console);
+                    }
+                }
+                if mouse_ready {
+                    let (x, y) = pointer.position();
+                    display.draw_cursor(x, y);
+                    drawn_cursor = Some((x, y));
                 }
             }
             revision = revision.wrapping_add(1);
@@ -336,9 +403,18 @@ fn run_console(display: &mut Option<framebuffer::Driver<'_>>) -> ! {
                 keyboard::irq_count()
             );
             arch::disable_interrupts();
-            continue;
         }
-        if full_batch {
+        if let Some(buttons) = pointer_buttons {
+            let (x, y) = pointer.position();
+            serial::println!(
+                "MIRROR_POINTER_UPDATED x={} y={} buttons={} irq={}",
+                x,
+                y,
+                buttons,
+                mouse::irq_count()
+            );
+        }
+        if dirty || pointer_changed || full_batch {
             continue;
         }
         // SAFETY: Installed IRQ handlers are ready; IF stayed clear since the

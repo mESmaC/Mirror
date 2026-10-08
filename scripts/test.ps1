@@ -43,11 +43,14 @@ try {
             Copy-Item -LiteralPath (Join-Path $repositoryRoot "build/normal-boot.$artifact") -Destination (Join-Path $logDirectory "$profile-console.$artifact") -Force
         }
         Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/normal-console.png') -Destination (Join-Path $logDirectory "$profile-console-input.png") -Force
+        foreach ($artifact in @('normal-pointer.png', 'cursor-away.png', 'cursor-restored.png')) {
+            Copy-Item -LiteralPath (Join-Path $repositoryRoot "build/$artifact") -Destination (Join-Path $logDirectory "$profile-$artifact") -Force
+        }
     }
 
     # Leave the boot tree ready for a normal run after the test cases finish.
     & (Join-Path $PSScriptRoot 'build.ps1')
-    Write-Host "All 32 kernel/userspace/device smoke cases and debug/release keyboard input captures passed. Logs: $logDirectory"
+    Write-Host "All 32 kernel/userspace/device smoke cases and debug/release keyboard/mouse captures passed. Logs: $logDirectory"
 }
 finally {
     Pop-Location

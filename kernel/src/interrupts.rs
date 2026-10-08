@@ -447,9 +447,10 @@ fn dispatch(frame: &mut TrapFrame) {
     // IRQs must never consume an armed synchronous-exception expectation.
     // Device handlers do not allocate, print or take a lock.
     if (32..48).contains(&frame.vector) {
-        if frame.vector == 33 {
-            // Drain device output before the PIC owner acknowledges IRQ1.
-            crate::keyboard::handle_irq();
+        if matches!(frame.vector, 33 | 44) {
+            // The controller routes bytes by source, independent of which PS/2
+            // IRQ fired. Drain before the PIC owner acknowledges IRQ1 or IRQ12.
+            crate::ps2::handle_irq(frame.vector as u8);
         }
         timer::handle_irq(frame.vector as u8);
         if frame.vector == 32 && frame.cs & 3 == 3 {

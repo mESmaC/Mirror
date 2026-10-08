@@ -148,16 +148,17 @@ try {
     $markers += @('MIRROR_PCI_TESTS_OK', 'MIRROR_PCI_READY', 'MIRROR_FRAMEBUFFER_TESTS_OK')
     $markers += @('MIRROR_CONTIGUOUS_TESTS_OK', 'MIRROR_DMA_TESTS_OK', 'MIRROR_BLOCK_TESTS_OK')
     $markers += @('MIRROR_KEYBOARD_TESTS_OK', 'MIRROR_CONSOLE_TESTS_OK')
+    $markers += @('MIRROR_PS2_TESTS_OK', 'MIRROR_MOUSE_TESTS_OK', 'MIRROR_POINTER_TESTS_OK')
     if ($NoKeyboard) {
-        $markers += 'MIRROR_KEYBOARD_SKIPPED'
-        if ($serial -match '(?m)^MIRROR_KEYBOARD_READY(?:\s|$)') {
-            throw "Mirror unexpectedly initialized an absent keyboard controller. See $serialLog."
+        $markers += @('MIRROR_KEYBOARD_SKIPPED', 'MIRROR_MOUSE_SKIPPED')
+        if ($serial -match '(?m)^MIRROR_(?:KEYBOARD|MOUSE)_READY(?:\s|$)') {
+            throw "Mirror unexpectedly initialized the absent PS/2 controller. See $serialLog."
         }
     }
     else {
-        $markers += 'MIRROR_KEYBOARD_READY'
-        if ($serial -match '(?m)^MIRROR_KEYBOARD_SKIPPED(?:\s|$)') {
-            throw "Mirror skipped its PS/2 keyboard. See $serialLog."
+        $markers += @('MIRROR_KEYBOARD_READY', 'MIRROR_MOUSE_READY')
+        if ($serial -match '(?m)^MIRROR_(?:KEYBOARD|MOUSE)_SKIPPED(?:\s|$)') {
+            throw "Mirror skipped a PS/2 device. See $serialLog."
         }
     }
     if ($serial -match '(?m)^MIRROR_BLOCK_FAILED(?:\s|$)') {

@@ -155,6 +155,54 @@ const TEXT: Color = Color::rgb(230, 239, 245);
 const MUTED: Color = Color::rgb(141, 161, 177);
 const ACCENT: Color = Color::rgb(89, 221, 202);
 
+const CURSOR_WIDTH: usize = 12;
+const CURSOR_HEIGHT: usize = 18;
+// Original arrow with an opaque dark outline and light interior; dots leave
+// the scene untouched. Its hot spot is the top-left pixel.
+const CURSOR: [&[u8; CURSOR_WIDTH]; CURSOR_HEIGHT] = [
+    b"X...........",
+    b"XX..........",
+    b"XOX.........",
+    b"XOOX........",
+    b"XOOOX.......",
+    b"XOOOOX......",
+    b"XOOOOOX.....",
+    b"XOOOOOOX....",
+    b"XOOOOOOOX...",
+    b"XOOOOOOOOX..",
+    b"XOOOOOOOOOX.",
+    b"XOOOOOXXXXXX",
+    b"XOOXOOX.....",
+    b"XOX.XOOX....",
+    b"XX..XOOX....",
+    b"X....XOOX...",
+    b".....XOOX...",
+    b"......XX....",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Clip {
+    left: usize,
+    top: usize,
+    right: usize,
+    bottom: usize,
+}
+
+impl Clip {
+    fn intersect(self, other: Self) -> Self {
+        Self {
+            left: self.left.max(other.left),
+            top: self.top.max(other.top),
+            right: self.right.min(other.right),
+            bottom: self.bottom.min(other.bottom),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.left >= self.right || self.top >= self.bottom
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ConsoleGeometry {
     large: bool,
@@ -203,12 +251,19 @@ impl ConsoleGeometry {
             history_rows: prompt_y.saturating_sub(history_y + row_height) / row_height,
         }
     }
+
+    fn input_start(self, console: &crate::console::Console) -> usize {
+        console
+            .cursor()
+            .saturating_sub(self.columns.saturating_sub(3))
+    }
 }
 
 /// A sole-writer handle. It is intentionally neither Clone nor Send/Sync.
 pub struct Driver<'a> {
     address: NonNull<u8>,
     layout: Layout,
+    clip: Option<Clip>,
     _exclusive: PhantomData<&'a mut ()>,
 }
 
@@ -249,12 +304,84 @@ impl<'a> Driver<'a> {
         Ok(Self {
             address: NonNull::new(framebuffer.addr()).ok_or(FramebufferError::NullAddress)?,
             layout,
+            clip: None,
             _exclusive: PhantomData,
         })
     }
 
     pub fn info(&self) -> Info {
         self.layout.info
+    }
+
+    /// Restore the scene beneath an old software cursor without reading VRAM
+    /// or scanning out a full frame. The previous damage clip is restored before
+    /// returning; the driver remains exclusively owned by normal kernel context.
+    pub fn restore_cursor(&mut self, console: &crate::console::Console, x: usize, y: usize) {
+        let info = self.info();
+        let damage = Clip {
+            left: x.min(info.width),
+            top: y.min(info.height),
+            right: x.saturating_add(CURSOR_WIDTH).min(info.width),
+            bottom: y.saturating_add(CURSOR_HEIGHT).min(info.height),
+        };
+        let previous = self.clip;
+        let damage = previous.map_or(damage, |clip| clip.intersect(damage));
+        if damage.is_empty() {
+            return;
+        }
+        self.clip = Some(damage);
+        self.render_console(console);
+        self.clip = previous;
+    }
+
+    /// Draw an opaque arrow over the current scene. Positions outside the
+    /// framebuffer are ignored; arrows at its right/bottom edges are clipped.
+    pub fn draw_cursor(&mut self, x: usize, y: usize) {
+        if x >= self.layout.info.width || y >= self.layout.info.height {
+            return;
+        }
+        for (row, pixels) in CURSOR.iter().enumerate() {
+            for (column, &pixel) in pixels.iter().enumerate() {
+                let color = match pixel {
+                    b'X' => Color::rgb(3, 6, 10),
+                    b'O' => TEXT,
+                    _ => continue,
+                };
+                self.fill_rect((x + column) as i64, (y + row) as i64, 1, 1, color);
+            }
+        }
+    }
+
+    /// Map a hit in the visible input row to its bounded insertion index.
+    /// The prompt symbol, history, notices, and tiny overlapping layouts do not
+    /// accept clicks. The scroll origin is shared with the actual renderer.
+    pub fn console_caret_at(
+        &self,
+        console: &crate::console::Console,
+        x: usize,
+        y: usize,
+    ) -> Option<usize> {
+        let info = self.info();
+        let geometry = ConsoleGeometry::new(info);
+        if x >= info.width
+            || y >= info.height
+            || geometry.columns < 3
+            || geometry.prompt_y < geometry.history_y
+        {
+            return None;
+        }
+        let left = geometry.x as usize + 2 * geometry.cell;
+        let right = geometry.x as usize + geometry.content_width;
+        if x < left
+            || x >= right
+            || y < geometry.prompt_y
+            || y >= geometry.prompt_y + geometry.row_height
+        {
+            return None;
+        }
+        let visible = geometry.columns.saturating_sub(3);
+        let column = ((x - left) / geometry.cell).min(visible);
+        Some((geometry.input_start(console) + column).min(console.input().len()))
     }
 
     #[cfg(feature = "boot-smoke")]
@@ -280,15 +407,31 @@ impl<'a> Driver<'a> {
         true
     }
 
-    fn fill_rect(&mut self, x: i64, y: i64, width: u64, height: u64, color: Color) {
+    fn clipped_rectangle(&self, x: i64, y: i64, width: u64, height: u64) -> Clip {
         // i128 accommodates every i64 coordinate plus every u64 extent, so even
         // deliberately enormous/offscreen rectangles clip without wrapping.
         let horizontal = clipped_span(x, width, self.layout.info.width);
         let vertical = clipped_span(y, height, self.layout.info.height);
-        let pixels = horizontal.1 - horizontal.0;
-        if pixels == 0 || vertical.0 == vertical.1 {
+        let rectangle = Clip {
+            left: horizontal.0,
+            right: horizontal.1,
+            top: vertical.0,
+            bottom: vertical.1,
+        };
+        match self.clip {
+            Some(clip) => rectangle.intersect(clip),
+            None => rectangle,
+        }
+    }
+
+    fn fill_rect(&mut self, x: i64, y: i64, width: u64, height: u64, color: Color) {
+        let rectangle = self.clipped_rectangle(x, y, width, height);
+        if rectangle.is_empty() {
             return;
         }
+        let horizontal = (rectangle.left, rectangle.right);
+        let vertical = (rectangle.top, rectangle.bottom);
+        let pixels = horizontal.1 - horizontal.0;
         let bytes = self.layout.encode(color);
         let pitch = self.layout.info.pitch;
         let pixel_bytes = self.layout.bytes_per_pixel;
@@ -331,6 +474,14 @@ impl<'a> Driver<'a> {
 
     fn text(&mut self, x: i64, y: i64, text: &str, scale: u8, color: Color) {
         let scale = u64::from(scale.clamp(1, 8));
+        // Cursor damage normally intersects at most one text row. Skip whole
+        // strings outside the clip rather than visiting every glyph bit.
+        if self
+            .clipped_rectangle(x, y, text.len().min(128) as u64 * 6 * scale, 7 * scale)
+            .is_empty()
+        {
+            return;
+        }
         // Bound work even if a future boot-status caller supplies a long string.
         for (index, byte) in text.bytes().take(128).enumerate() {
             let origin = x.saturating_add(index as i64 * 6 * scale as i64);
@@ -487,7 +638,7 @@ impl<'a> Driver<'a> {
             self.text(
                 x,
                 (margin + 88) as i64,
-                "Native keyboard input / help / status / echo / clear",
+                "Native keyboard and mouse / help / status / echo / clear",
                 1,
                 MUTED,
             );
@@ -603,7 +754,7 @@ impl<'a> Driver<'a> {
         // Reserve the prompt and one cursor cell. Scroll by ASCII byte cells so
         // a full line still exposes the caret on narrow framebuffer modes.
         let visible = columns.saturating_sub(3);
-        let start = console.cursor().saturating_sub(visible);
+        let start = geometry.input_start(console);
         let end = console.input().len().min(start + visible);
         self.text(
             x + (2 * cell) as i64,
@@ -754,6 +905,7 @@ pub fn self_test() {
         Ok(Driver {
             address: NonNull::new(bytes.as_mut_ptr()).expect("nonempty test storage"),
             layout,
+            clip: None,
             _exclusive: PhantomData,
         })
     }
@@ -949,6 +1101,25 @@ pub fn self_test() {
         let mut driver =
             surface(&mut console_canvas[8..38_808], console_description).expect("console surface");
         driver.render_console(&console);
+        // A full 96-byte line is scrolled by 85 bytes on this small mode.
+        assert_eq!(driver.console_caret_at(&console, 16, 72), Some(85));
+        assert_eq!(driver.console_caret_at(&console, 46, 83), Some(90));
+        assert_eq!(driver.console_caret_at(&console, 91, 72), Some(96));
+        for position in [
+            (15, 72),
+            (92, 72),
+            (16, 71),
+            (16, 84),
+            (usize::MAX, usize::MAX),
+        ] {
+            assert_eq!(
+                driver.console_caret_at(&console, position.0, position.1),
+                None
+            );
+        }
+        assert!(console.place_cursor(90));
+        assert_eq!(driver.console_caret_at(&console, 16, 72), Some(79));
+        assert!(console.place_cursor(96));
     }
     assert!(
         console_canvas[..8]
@@ -980,6 +1151,8 @@ pub fn self_test() {
             modifiers: crate::keyboard::Modifiers::default(),
         });
         driver.update_console_input(&console);
+        assert_eq!(driver.console_caret_at(&console, 16, 72), Some(0));
+        assert_eq!(driver.console_caret_at(&console, 91, 72), Some(0));
     }
     let header_marker = 8 + 4 * 388 + 4 * 4;
     let history_marker = 8 + 40 * 388 + 4 * 4;
@@ -1034,6 +1207,97 @@ pub fn self_test() {
             &console_canvas[8 + row * 388 + 384..8 + row * 388 + 388],
             &[0xa5; 4]
         );
+    }
+
+    // RGB24 and RGB32 cursor damage must reproduce the original scene exactly
+    // without reading VRAM. RAM-backed reference pixels also prove restoration
+    // leaves an unrelated marker outside the damage rectangle untouched.
+    let mut cursor_reference = [0xa5u8; 16_656];
+    let mut cursor_canvas = [0xa5u8; 16_656];
+    for format in [rgb24, bgr32] {
+        cursor_reference.fill(0xa5);
+        let pixel_bytes = usize::from(format.bpp / 8);
+        let pitch = 64 * pixel_bytes + 4;
+        let cursor_description = Description {
+            width: 64,
+            height: 64,
+            pitch: pitch as u64,
+            ..format
+        };
+        let end = 8 + pitch * 64;
+        {
+            let mut driver = surface(&mut cursor_reference[8..end], cursor_description)
+                .expect("cursor reference");
+            driver.render_console(&console);
+        }
+        cursor_canvas.copy_from_slice(&cursor_reference);
+        for position in [
+            (0, 0),
+            (4, 4),
+            (5, 23),
+            (18, 36),
+            (60, 62),
+            (usize::MAX, usize::MAX),
+        ] {
+            {
+                let mut driver =
+                    surface(&mut cursor_canvas[8..end], cursor_description).expect("cursor draw");
+                driver.draw_cursor(position.0, position.1);
+            }
+            if position.0 < 64 {
+                assert_ne!(cursor_canvas, cursor_reference);
+            } else {
+                assert_eq!(cursor_canvas, cursor_reference);
+            }
+            {
+                let mut driver = surface(&mut cursor_canvas[8..end], cursor_description)
+                    .expect("cursor restore");
+                assert!(driver.pixel(63, 0, Color::rgb(11, 22, 33)));
+                driver.restore_cursor(&console, position.0, position.1);
+                assert_eq!(driver.clip, None);
+            }
+            let marker = 8 + 63 * pixel_bytes;
+            let encoded = Layout::validate(0x1000, cursor_description)
+                .unwrap()
+                .encode(Color::rgb(11, 22, 33));
+            assert_eq!(
+                &cursor_canvas[marker..marker + pixel_bytes],
+                &encoded[..pixel_bytes]
+            );
+            cursor_canvas[marker..marker + pixel_bytes]
+                .copy_from_slice(&cursor_reference[marker..marker + pixel_bytes]);
+            assert_eq!(cursor_canvas, cursor_reference);
+        }
+        // A preexisting inner damage clip is intersected, then preserved.
+        {
+            let mut driver = surface(&mut cursor_canvas[8..end], cursor_description)
+                .expect("nested cursor clip");
+            let clip = Clip {
+                left: 3,
+                top: 3,
+                right: 8,
+                bottom: 8,
+            };
+            driver.clip = Some(clip);
+            driver.draw_cursor(2, 2);
+            driver.restore_cursor(&console, 2, 2);
+            assert_eq!(driver.clip, Some(clip));
+            driver.clip = None;
+            assert_eq!(driver.console_caret_at(&console, 16, 36), None);
+        }
+        assert_eq!(cursor_canvas, cursor_reference);
+        assert!(
+            cursor_canvas[..8]
+                .iter()
+                .chain(&cursor_canvas[end..])
+                .all(|&byte| byte == 0xa5)
+        );
+        for row in 0..64 {
+            assert_eq!(
+                &cursor_canvas[8 + row * pitch + 64 * pixel_bytes..8 + (row + 1) * pitch],
+                &[0xa5; 4]
+            );
+        }
     }
 
     rejected(

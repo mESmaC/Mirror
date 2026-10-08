@@ -9,7 +9,7 @@ use crate::keyboard::{Key, KeyEvent};
 pub const LINE_CAPACITY: usize = 96;
 const HISTORY_ROWS: usize = 12;
 const EDIT_NOTICE: &str =
-    "Enter runs a command. Escape clears input. Left/Right/Home/End move the caret.";
+    "Enter runs a command. Escape clears input. Click or arrow keys move the caret.";
 const LOST_NOTICE: &str = "Input lost. Current line discarded; type the command again.";
 
 /// Owned, bounded printable ASCII. Construction rejects controls and truncation.
@@ -130,6 +130,15 @@ impl Console {
     }
     pub fn cursor(&self) -> usize {
         self.cursor
+    }
+    /// Place the insertion point through the same bounded editor state used by
+    /// keyboard navigation. Return true only if a valid index actually moves it.
+    pub fn place_cursor(&mut self, index: usize) -> bool {
+        if index > self.input.length || index == self.cursor {
+            return false;
+        }
+        self.cursor = index;
+        true
     }
     pub fn history(&self) -> &[HistoryLine] {
         &self.history[..self.history_length]
@@ -363,6 +372,12 @@ pub fn self_test() {
     console.process(key(Key::Backspace));
     type_text(&mut console, "r");
     assert_eq!(console.input(), "echo Mirror");
+    assert!(!console.place_cursor(usize::MAX));
+    assert!(!console.place_cursor(console.input().len() + 1));
+    assert_eq!(console.cursor(), console.input().len());
+    assert!(console.place_cursor(0));
+    assert!(!console.place_cursor(0));
+    assert!(console.place_cursor(console.input().len()));
     console.process(key(Key::Left));
     assert_eq!(console.cursor(), 10);
     console.process(key(Key::Right));

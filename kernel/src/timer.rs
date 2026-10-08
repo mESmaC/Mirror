@@ -108,6 +108,24 @@ pub fn enable_keyboard_irq() {
     }
 }
 
+/// Unmask mouse IRQ12 and the slave cascade only after the shared PS/2 driver
+/// has published initialized input state. Preserve every other PIC mask bit.
+pub fn enable_mouse_irq() {
+    assert!(INITIALIZED.load(Ordering::SeqCst), "PIC not initialized");
+    assert!(!arch::interrupts_enabled(), "IRQ12 setup requires IF clear");
+    // SAFETY: Sole BSP ownership and IF exclusion serialize both PICs. IRQ12's
+    // gate/controller handler are ready; enabling the cascade exposes only the
+    // explicitly unmasked slave line. The existing IRQ1/IRQ0 masks are retained.
+    unsafe {
+        let slave_mask = arch::in8(SLAVE_DATA) & !(1 << 4);
+        arch::out8(SLAVE_DATA, slave_mask);
+        let master_mask = arch::in8(MASTER_DATA) & !(1 << 2);
+        arch::out8(MASTER_DATA, master_mask);
+        assert_eq!(arch::in8(SLAVE_DATA), slave_mask);
+        assert_eq!(arch::in8(MASTER_DATA), master_mask);
+    }
+}
+
 /// Called only by installed IRQ gates for vectors 32..47, with IF clear.
 /// No allocation, locks, printing, scheduling or interrupt nesting here.
 pub(crate) fn handle_irq(vector: u8) {

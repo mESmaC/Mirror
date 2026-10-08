@@ -1,8 +1,8 @@
-//! Bounded i8042 / PS/2 Set 2 input for Mirror's single-CPU q35 platform.
+//! Bounded PS/2 Set 2 keyboard decoding and typed events.
 //!
 //! This is an explicitly selected platform driver, not physical-PC discovery.
-//! IRQ1 only moves bytes into a fixed event queue. Main-context consumers own
-//! printing and rendering; the periodic PIT also services deferred drain work.
+//! The shared ps2 controller owns all port I/O and routes keyboard bytes here.
+//! IRQ handlers only decode into a fixed queue; main owns printing/rendering.
 //!
 //! Register/command references (no source code copied):
 //! - Intel EC keyboard-controller host documentation:
@@ -12,21 +12,14 @@
 //!   https://github.com/qemu/qemu/blob/v10.1.0/hw/input/ps2.c
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arch;
+use crate::{arch, ps2};
 
-const DATA: u16 = 0x60;
-const STATUS_COMMAND: u16 = 0x64;
+#[cfg(feature = "boot-smoke")]
 const OUTPUT_FULL: u8 = 1;
-const INPUT_FULL: u8 = 2;
 const AUXILIARY: u8 = 0x20;
 const RECEIVE_ERROR: u8 = 0xc0;
-const POLL_LIMIT: usize = 100_000;
-const INIT_DRAIN_LIMIT: usize = 256;
-const DRAIN_LIMIT: usize = 32;
 const QUEUE_CAPACITY: usize = 64;
-const RESEND_LIMIT: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
@@ -104,23 +97,6 @@ impl KeyEvent {
         }
         (b' '..=b'~').contains(&byte).then_some(byte)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KeyboardError {
-    InterruptsEnabled,
-    AlreadyInitialized,
-    ControllerMissing,
-    InputTimeout,
-    OutputTimeout,
-    OutputStuck,
-    ControllerData,
-    ControllerTest,
-    KeyboardPortTest,
-    Configuration,
-    DeviceRejected,
-    ResendLimit,
-    WrongScanSet,
 }
 
 struct Decoder {
@@ -328,11 +304,10 @@ fn decode_key(byte: u8, extended: bool) -> Option<Key> {
 struct State {
     initialized: bool,
     decoder: Decoder,
-    queue: [Option<KeyEvent>; QUEUE_CAPACITY],
+    queue: [Option<(u64, KeyEvent)>; QUEUE_CAPACITY],
     head: usize,
     len: usize,
     overflow: bool,
-    pending_drain: bool,
 }
 
 impl State {
@@ -344,7 +319,6 @@ impl State {
             head: 0,
             len: 0,
             overflow: false,
-            pending_drain: false,
         }
     }
 
@@ -373,7 +347,7 @@ impl State {
                     self.lose_input();
                 } else {
                     let tail = (self.head + self.len) % QUEUE_CAPACITY;
-                    self.queue[tail] = Some(event);
+                    self.queue[tail] = Some((ps2::next_sequence(), event));
                     self.len += 1;
                 }
             }
@@ -385,10 +359,25 @@ impl State {
         if self.overflow || self.len == 0 {
             return None;
         }
-        let event = self.queue[self.head].take();
+        let event = self.queue[self.head].take().map(|(_, event)| event);
         self.head = (self.head + 1) % QUEUE_CAPACITY;
         self.len -= 1;
         event
+    }
+
+    fn peek_sequence(&self) -> Option<u64> {
+        if self.overflow || self.len == 0 {
+            None
+        } else {
+            self.queue[self.head].map(|(sequence, _)| sequence)
+        }
+    }
+
+    fn discard_input(&mut self) {
+        self.lose_input();
+        self.decoder.extended = false;
+        self.decoder.released = false;
+        self.overflow = false;
     }
 }
 
@@ -399,7 +388,6 @@ struct SharedState(UnsafeCell<State>);
 unsafe impl Sync for SharedState {}
 
 static STATE: SharedState = SharedState(UnsafeCell::new(State::new()));
-static IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn with_state<R>(operation: impl FnOnce(&mut State) -> R) -> R {
     let enabled = arch::save_and_disable_interrupts();
@@ -410,240 +398,66 @@ fn with_state<R>(operation: impl FnOnce(&mut State) -> R) -> R {
     result
 }
 
-/// Initialize the selected q35 controller with IF clear and PIC IRQ1 masked.
-/// Call after timer initialization; only the caller unmasks IRQ1 after success.
-/// No controller output-port, A20, CPU-reset, or auxiliary-device command is used.
-pub fn init() -> Result<(), KeyboardError> {
-    if arch::interrupts_enabled() {
-        return Err(KeyboardError::InterruptsEnabled);
-    }
+/// Publish a fresh decoder after the controller consumed the final enable ACK.
+/// The shared controller calls this once with IF clear, before PIC unmasking.
+pub(crate) fn activate() {
+    assert!(!arch::interrupts_enabled());
     with_state(|state| {
-        if state.initialized {
-            return Err(KeyboardError::AlreadyInitialized);
-        }
-        let mut quiet_config = None;
-        let result = initialize_controller(&mut quiet_config);
-        if result.is_ok() {
-            *state = State::new();
-            state.initialized = true;
-            IRQ_COUNT.store(0, Ordering::Relaxed);
-        } else {
-            // Best-effort bounded quieting. IRQ1 stays masked at the PIC on
-            // every failed init, even if an absent/broken controller ignores us.
-            let _ = command(0xad);
-            let _ = command(0xa7);
-            if let Some(config) = quiet_config {
-                let _ = write_config(config);
-            }
-        }
-        result
-    })
+        assert!(!state.initialized, "keyboard already active");
+        *state = State::new();
+        state.initialized = true;
+    });
 }
 
-fn initialize_controller(quiet_config: &mut Option<u8>) -> Result<(), KeyboardError> {
-    command(0xad)?;
-    command(0xa7)?;
-    drain_initial_output()?;
-    let original = read_config()?;
-    // Preserve the platform's system/keylock bits, but clear reserved bits,
-    // translation, and both IRQ enables, while disabling both interfaces.
-    let quiet = (original & 0x0c) | 0x30;
-    *quiet_config = Some(quiet);
-    write_config(quiet)?;
-    command(0xaa)?;
-    if read_response()? != 0x55 {
-        return Err(KeyboardError::ControllerTest);
-    }
-    // A controller self-test may reset its configuration. Reapply all policy.
-    command(0xad)?;
-    command(0xa7)?;
-    write_config(quiet)?;
-    drain_initial_output()?;
-    command(0xab)?;
-    if read_response()? != 0 {
-        return Err(KeyboardError::KeyboardPortTest);
-    }
-    command(0xae)?;
-    write_config(quiet & !0x10)?;
-    verify_config(quiet & !0x10)?;
-    keyboard_command(0xf5)?;
-    keyboard_command(0xf0)?;
-    keyboard_command(0x02)?;
-    keyboard_command(0xf0)?;
-    keyboard_command(0x00)?;
-    if read_response()? != 2 {
-        return Err(KeyboardError::WrongScanSet);
-    }
-    // Configure and verify IRQ routing while scanning is still disabled. IF
-    // and the PIC mask exclude IRQ1 throughout these command transactions.
-    let active = (quiet & !0x10) | 1;
-    write_config(active)?;
-    verify_config(active)?;
-    keyboard_command(0xf4)?;
-    // The enable ACK has been consumed. No further polling before IRQ handoff.
-    Ok(())
-}
-
-fn status() -> u8 {
-    // SAFETY: This BSP platform driver owns the i8042 status/data ports.
-    unsafe { arch::in8(STATUS_COMMAND) }
-}
-
-fn data() -> u8 {
-    // SAFETY: The caller observed OBF and this driver owns port 0x60.
-    unsafe { arch::in8(DATA) }
-}
-
-fn wait_input_empty() -> Result<(), KeyboardError> {
-    for _ in 0..POLL_LIMIT {
-        let current = status();
-        if current == 0xff {
-            return Err(KeyboardError::ControllerMissing);
-        }
-        if current & INPUT_FULL == 0 {
-            return Ok(());
-        }
-        core::hint::spin_loop();
-    }
-    Err(KeyboardError::InputTimeout)
-}
-
-fn command(value: u8) -> Result<(), KeyboardError> {
-    wait_input_empty()?;
-    // SAFETY: Owned controller command port with an empty input buffer.
-    unsafe { arch::out8(STATUS_COMMAND, value) };
-    Ok(())
-}
-
-fn write_data(value: u8) -> Result<(), KeyboardError> {
-    wait_input_empty()?;
-    // SAFETY: Owned controller data port with an empty input buffer.
-    unsafe { arch::out8(DATA, value) };
-    Ok(())
-}
-
-fn read_response() -> Result<u8, KeyboardError> {
-    for _ in 0..POLL_LIMIT {
-        let current = status();
-        if current == 0xff {
-            return Err(KeyboardError::ControllerMissing);
-        }
-        if current & OUTPUT_FULL != 0 {
-            let byte = data();
-            if current & AUXILIARY != 0 {
-                continue;
-            }
-            if current & RECEIVE_ERROR != 0 {
-                return Err(KeyboardError::ControllerData);
-            }
-            return Ok(byte);
-        }
-        core::hint::spin_loop();
-    }
-    Err(KeyboardError::OutputTimeout)
-}
-
-fn drain_initial_output() -> Result<(), KeyboardError> {
-    for _ in 0..INIT_DRAIN_LIMIT {
-        if status() & OUTPUT_FULL == 0 {
-            return Ok(());
-        }
-        let _ = data();
-    }
-    if status() & OUTPUT_FULL == 0 {
-        Ok(())
-    } else {
-        Err(KeyboardError::OutputStuck)
+/// The controller owns the status/data transaction and calls this with IF clear.
+/// Never call back into ps2 while the keyboard state is borrowed.
+pub(crate) fn accept_byte(status: u8, byte: u8) {
+    debug_assert!(!arch::interrupts_enabled());
+    // SAFETY: The single-BSP controller excludes interrupts and every consumer
+    // ends its device-state borrow before calling into the controller again.
+    let state = unsafe { &mut *STATE.0.get() };
+    if state.initialized {
+        state.accept(status, byte);
     }
 }
 
-fn read_config() -> Result<u8, KeyboardError> {
-    command(0x20)?;
-    read_response()
+/// Consume one typed event without touching controller ports, preserving IF.
+/// The shared consumer handles deferred polling before borrowing device state.
+pub(crate) fn pop_event() -> Option<KeyEvent> {
+    with_state(State::pop)
 }
 
-fn write_config(config: u8) -> Result<(), KeyboardError> {
-    command(0x60)?;
-    write_data(config)
+pub(crate) fn peek_sequence() -> Option<u64> {
+    with_state(|state| state.peek_sequence())
 }
 
-fn verify_config(expected: u8) -> Result<(), KeyboardError> {
-    if read_config()? & 0x73 != expected & 0x73 {
-        return Err(KeyboardError::Configuration);
-    }
-    Ok(())
-}
-
-fn keyboard_command(value: u8) -> Result<(), KeyboardError> {
-    for _ in 0..=RESEND_LIMIT {
-        write_data(value)?;
-        // A last scan byte can race F5. Discard a bounded number of such bytes;
-        // FA/FE alone control this transaction. No command responses are queued.
-        let mut resend = false;
-        for _ in 0..DRAIN_LIMIT {
-            match read_response()? {
-                0xfa => return Ok(()),
-                0xfe => {
-                    resend = true;
-                    break;
-                }
-                0xfc | 0xfd | 0xff => return Err(KeyboardError::DeviceRejected),
-                _ => {}
-            }
-        }
-        if !resend {
-            return Err(KeyboardError::DeviceRejected);
-        }
-    }
-    Err(KeyboardError::ResendLimit)
-}
-
-fn drain_controller(state: &mut State) {
-    for _ in 0..DRAIN_LIMIT {
-        let current = status();
-        if current & OUTPUT_FULL == 0 {
-            state.pending_drain = false;
-            return;
-        }
-        let byte = data();
-        if state.initialized {
-            state.accept(current, byte);
-        }
-    }
-    // Do not depend on another edge while OBF remains asserted. pop_event
-    // continues bounded work on each PIT wake of the normal main loop.
-    state.pending_drain = status() & OUTPUT_FULL != 0;
-}
-
-/// Called by the IRQ1 interrupt gate with IF clear, before the PIC EOI.
-pub(crate) fn handle_irq() {
-    IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
-    // SAFETY: The interrupt gate cleared IF on the sole BSP, so no other access
-    // to STATE can run until this bounded handler returns.
-    drain_controller(unsafe { &mut *STATE.0.get() });
-}
-
-/// Consume one typed event, preserving IF. A pending hardware drain processes
-/// at most 32 more bytes. The PIT must keep waking main even when no event exists.
-pub fn pop_event() -> Option<KeyEvent> {
-    with_state(|state| {
-        if state.initialized && state.pending_drain {
-            drain_controller(state);
-        }
-        state.pop()
-    })
+/// A shared loss barrier invalidates both input streams. Preserve an opaque
+/// Pause tail, but discard prefixes/held keys and require a new release boundary.
+pub(crate) fn discard_input() {
+    with_state(State::discard_input);
 }
 
 /// Report and acknowledge queue overflow or damaged input. The consumer must
 /// discard its unfinished input line. pop_event withholds events until this ack.
-pub fn take_overflow() -> bool {
+pub(crate) fn take_overflow() -> bool {
     with_state(|state| core::mem::take(&mut state.overflow))
 }
 
 /// Delivered IRQ1 handlers, including empty or command-ACK deliveries; this is
 /// not a key count. Real input evidence also requires decoded key events.
 pub fn irq_count() -> u64 {
-    IRQ_COUNT.load(Ordering::Relaxed)
+    ps2::keyboard_irq_count()
+}
+
+/// Exercise the real merged consumer before controller initialization. No
+/// device-state borrow spans the callback, which may use all consumer paths.
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn with_test_input(operation: impl FnOnce()) {
+    assert!(!arch::interrupts_enabled());
+    activate(); // Also asserts the real device has not already been activated.
+    operation();
+    assert!(!arch::interrupts_enabled());
+    with_state(|state| *state = State::new());
 }
 
 #[cfg(feature = "boot-smoke")]
@@ -662,7 +476,7 @@ pub fn self_test() {
 
     // Boot calls this before hardware initialization, so these public consumer
     // paths must leave an empty queue and the caller's IF unchanged, without
-    // touching controller ports. Deferred polling requires initialized state.
+    // touching controller ports. Only ps2::next_event performs deferred polling.
     let original_if = arch::interrupts_enabled();
     assert!(pop_event().is_none());
     assert_eq!(arch::interrupts_enabled(), original_if);
@@ -774,5 +588,33 @@ pub fn self_test() {
         feed(&mut state, &[0xf0, 0x1c]);
         state.overflow = false;
     }
+
+    // A mouse loss barrier may interrupt any keyboard prefix. It clears old
+    // modifiers/queued text and withholds makes until an ordinary release.
+    state = State::new();
+    feed(&mut state, &[0x12, 0x1c, 0xe0, 0xf0]);
+    assert!(state.peek_sequence().is_some());
+    state.discard_input();
+    assert!(state.peek_sequence().is_none());
+    assert!(!state.overflow);
+    assert_eq!(state.decoder.modifiers(), Modifiers::default());
+    feed(&mut state, &[0x14, 0x1c]);
+    assert!(state.pop().is_none());
+    feed(&mut state, &[0xf0, 0x1c, 0x1c]);
+    assert_eq!(event(&mut state).ascii(), Some(b'a'));
+
+    // Preserve the complete remaining Pause tail through a shared barrier:
+    // its embedded break must not prematurely release the recovery gate.
+    feed(&mut state, &[0xe1, 0x14]);
+    assert_eq!(state.decoder.pause_remaining, 6);
+    state.discard_input();
+    feed(
+        &mut state,
+        &[0x77, 0xe1, 0xf0, 0x14, 0xf0, 0x77, 0x12, 0x1c],
+    );
+    assert!(state.pop().is_none());
+    assert_eq!(state.decoder.modifiers(), Modifiers::default());
+    feed(&mut state, &[0xf0, 0x1c, 0x1c]);
+    assert_eq!(event(&mut state).ascii(), Some(b'a'));
     crate::serial::println!("MIRROR_KEYBOARD_TESTS_OK");
 }

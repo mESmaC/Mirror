@@ -28,6 +28,9 @@ Copy-Item -LiteralPath $varsTemplate -Destination $varsPath -Force
 $serialLog = Join-Path $buildDirectory 'normal-boot.serial.log'
 $screenshot = Join-Path $buildDirectory 'normal-boot.png'
 $consoleScreenshot = Join-Path $buildDirectory 'normal-console.png'
+$pointerScreenshot = Join-Path $buildDirectory 'normal-pointer.png'
+$cursorAwayScreenshot = Join-Path $buildDirectory 'cursor-away.png'
+$cursorRestoredScreenshot = Join-Path $buildDirectory 'cursor-restored.png'
 [System.IO.File]::WriteAllText($serialLog, '')
 
 function Read-MirrorSerial {
@@ -121,6 +124,47 @@ function Save-MirrorScreenshot {
     }
 }
 
+function Send-MirrorPointerMotion {
+    param([System.Diagnostics.Process]$Process, [int]$Dx, [int]$Dy)
+    # Keep each delta below a standard PS/2 packet's range, while allowing the
+    # guest to clamp a sequence beyond the screen boundaries.
+    while ($Dx -ne 0 -or $Dy -ne 0) {
+        $stepX = [Math]::Max(-100, [Math]::Min($Dx, 100))
+        $stepY = [Math]::Max(-100, [Math]::Min($Dy, 100))
+        $events = @()
+        if ($stepX -ne 0) { $events += @{ type = 'rel'; data = @{ axis = 'x'; value = $stepX } } }
+        if ($stepY -ne 0) { $events += @{ type = 'rel'; data = @{ axis = 'y'; value = $stepY } } }
+        Invoke-MirrorQmp $Process 'input-send-event' @{ events = $events }
+        $Dx -= $stepX
+        $Dy -= $stepY
+        Start-Sleep -Milliseconds 40
+    }
+}
+
+function Send-MirrorPointerButton {
+    param([System.Diagnostics.Process]$Process, [string]$Button, [bool]$Down)
+    # Mouse state is synchronized at the end of a QMP command. Separate calls
+    # preserve both button edges instead of collapsing a click into no change.
+    Invoke-MirrorQmp $Process 'input-send-event' @{ events = @(@{ type = 'btn'; data = @{ button = $Button; down = $Down } }) }
+}
+
+function Wait-MirrorPointer {
+    param([System.Diagnostics.Process]$Process, [int]$X, [int]$Y, [int]$Buttons, [int]$AfterOffset)
+    $deadline = [System.Diagnostics.Stopwatch]::StartNew()
+    do {
+        if ($Process.HasExited) { throw 'Kernel exited during mouse input.' }
+        $serial = Read-MirrorSerial
+        if ($serial -match '(?m)^(?:MIRROR_PANIC|MIRROR_EXCEPTION|MIRROR_CONSOLE_INPUT_LOST)(?:\s|:|$)') {
+            throw "Kernel failed or lost PS/2 input. See $serialLog."
+        }
+        if ($serial.Length -lt $AfterOffset) { throw 'Serial log unexpectedly shrank.' }
+        $fresh = $serial.Substring($AfterOffset)
+        if ($fresh -match "(?m)^MIRROR_POINTER_UPDATED x=$X y=$Y buttons=$Buttons irq=[1-9][0-9]*\r?`$") { return }
+        if ($deadline.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw "Pointer did not reach ($X,$Y) with buttons=$Buttons. See $serialLog." }
+        Start-Sleep -Milliseconds 50
+    } while ($true)
+}
+
 $qemuArguments = @(
     '-machine', 'q35,accel=tcg', '-cpu', 'qemu64', '-m', '256', '-smp', '1',
     '-display', 'none', '-vga', 'std', '-monitor', 'none', '-qmp', 'stdio',
@@ -170,7 +214,7 @@ try {
         if ($elapsed.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw "Normal boot timed out. See $serialLog." }
         Start-Sleep -Milliseconds 100
     } while ($true)
-    foreach ($marker in @('MIRROR_BOOT_OK', 'MIRROR_USERSPACE_OK scenario=0', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_SCHEDULER_OK processes=2', 'MIRROR_IPC_OK messages=3', 'MIRROR_PCI_READY', 'MIRROR_FRAMEBUFFER_READY', 'MIRROR_FRAMEBUFFER_PRESENTED', 'MIRROR_BLOCK_READY', 'MIRROR_BLOCK_READ_OK', 'MIRROR_BLOCK_CLEANUP_OK', 'MIRROR_KEYBOARD_READY')) {
+    foreach ($marker in @('MIRROR_BOOT_OK', 'MIRROR_USERSPACE_OK scenario=0', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_SCHEDULER_OK processes=2', 'MIRROR_IPC_OK messages=3', 'MIRROR_PCI_READY', 'MIRROR_FRAMEBUFFER_READY', 'MIRROR_FRAMEBUFFER_PRESENTED', 'MIRROR_BLOCK_READY', 'MIRROR_BLOCK_READ_OK', 'MIRROR_BLOCK_CLEANUP_OK', 'MIRROR_KEYBOARD_READY', 'MIRROR_MOUSE_READY', 'MIRROR_POINTER_READY')) {
         if ($serial -notmatch "(?m)^$marker(?:\s|$)") { throw "Normal boot missing $marker. See $serialLog." }
     }
     if ($serial -match '(?m)^MIRROR_FRAMEBUFFER_SKIPPED(?:\s|$)') { throw 'Normal boot skipped framebuffer output.' }
@@ -205,6 +249,57 @@ try {
     if ((Get-FileHash -LiteralPath $screenshot).Hash -eq (Get-FileHash -LiteralPath $consoleScreenshot).Hash) {
         throw 'Framebuffer did not change after keyboard commands.'
     }
+
+    $pointerReady = [regex]::Match($serial, '(?m)^MIRROR_POINTER_READY x=(\d+) y=(\d+) width=(\d+) height=(\d+)\r?$')
+    if (-not $pointerReady.Success) { throw 'Pointer geometry is missing.' }
+    $startX = [int]$pointerReady.Groups[1].Value
+    $startY = [int]$pointerReady.Groups[2].Value
+    $width = [int]$pointerReady.Groups[3].Value
+    $height = [int]$pointerReady.Groups[4].Value
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorPointerMotion $process (-2 * $width) (-2 * $height)
+    Wait-MirrorPointer $process 0 0 0 $offset
+    Save-MirrorScreenshot $process $cursorAwayScreenshot
+    if ((Get-FileHash -LiteralPath $consoleScreenshot).Hash -eq (Get-FileHash -LiteralPath $cursorAwayScreenshot).Hash) {
+        throw 'Cursor motion did not change the framebuffer.'
+    }
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorPointerMotion $process (2 * $width) (2 * $height)
+    Wait-MirrorPointer $process ($width - 1) ($height - 1) 0 $offset
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorPointerMotion $process ($startX - $width + 1) ($startY - $height + 1)
+    Wait-MirrorPointer $process $startX $startY 0 $offset
+    Save-MirrorScreenshot $process $cursorRestoredScreenshot
+    if ((Get-FileHash -LiteralPath $consoleScreenshot).Hash -ne (Get-FileHash -LiteralPath $cursorRestoredScreenshot).Hash) {
+        throw 'Moving the cursor left stale pixels after returning to its starting position.'
+    }
+
+    # Place the caret before c in "echo abcd", then insert x through the
+    # keyboard. Exact output verifies that pointer and keyboard input cooperate.
+    Send-MirrorText $process 'echo abcd'
+    $large = $width -ge 640 -and $height -ge 400
+    $scale = if ($large) { 2 } else { 1 }
+    $margin = if ($large) { 24 } else { 0 }
+    $inset = if ($large) { 24 } else { 4 }
+    $footer = if ($large) { 80 } else { 28 }
+    $clickX = $margin + $inset + (2 + 7) * 6 * $scale + 1
+    $clickY = $margin + [Math]::Max(0, $height - 2 * $margin - $footer) + 3 * $scale
+    if ($clickX -ge $width -or $clickY -ge $height) { throw 'Display is too small for the pointer editing probe.' }
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorPointerMotion $process ($clickX - $startX) ($clickY - $startY)
+    Wait-MirrorPointer $process $clickX $clickY 0 $offset
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorPointerButton $process 'left' $true
+    Wait-MirrorPointer $process $clickX $clickY 1 $offset
+    if ((Read-MirrorSerial).Substring($offset) -notmatch "(?m)^MIRROR_POINTER_CLICK x=$clickX y=$clickY caret=7\r?`$") {
+        throw 'Left click did not place the editor caret at the intended character.'
+    }
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorPointerButton $process 'left' $false
+    Wait-MirrorPointer $process $clickX $clickY 0 $offset
+    foreach ($key in @('x', 'end', 'ret')) { Send-MirrorKey $process $key }
+    Wait-MirrorConsoleCommand $process 'operation=echo text=abxcd'
+    Save-MirrorScreenshot $process $pointerScreenshot
     # QMP permits quit to terminate before returning a response. Require clean
     # process exit below rather than interpreting that allowed EOF as failure.
     $process.StandardInput.WriteLine('{"execute":"quit"}')
@@ -215,7 +310,7 @@ try {
     if ((Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash -ne $testDiskHash) {
         throw 'The read-only block fixture was modified during the capture.'
     }
-    Write-Host "Normal boot, PS/2 input, console editing, and framebuffer captures passed. Image: $consoleScreenshot"
+    Write-Host "Normal boot, keyboard/mouse input, cursor restoration, and click editing passed. Image: $pointerScreenshot"
 }
 finally {
     if ($started) {
