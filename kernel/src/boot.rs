@@ -4,8 +4,8 @@
 use limine::{
     BaseRevision,
     request::{
-        HhdmRequest, MemoryMapRequest, ModuleRequest, RequestsEndMarker, RequestsStartMarker,
-        StackSizeRequest,
+        FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest, RequestsEndMarker,
+        RequestsStartMarker, StackSizeRequest,
     },
     response::MemoryMapResponse,
 };
@@ -30,6 +30,10 @@ static HHDM: HhdmRequest = HhdmRequest::new();
 #[unsafe(link_section = ".limine_requests")]
 static MODULES: ModuleRequest = ModuleRequest::new();
 
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static FRAMEBUFFER: FramebufferRequest = FramebufferRequest::new();
+
 #[cfg(feature = "boot-smoke")]
 #[used]
 #[unsafe(link_section = ".limine_requests")]
@@ -48,6 +52,7 @@ pub struct BootInfo {
     pub memory_map: &'static MemoryMapResponse,
     pub direct_map_offset: u64,
     pub init: &'static [u8],
+    pub framebuffer: Option<limine::framebuffer::Framebuffer<'static>>,
 }
 
 pub fn info() -> BootInfo {
@@ -80,6 +85,9 @@ pub fn info() -> BootInfo {
         memory_map: MEMORY_MAP.get_response().expect("missing memory map"),
         direct_map_offset: HHDM.get_response().expect("missing direct map").offset(),
         init,
+        framebuffer: FRAMEBUFFER
+            .get_response()
+            .and_then(|response| response.framebuffers().next()),
     }
 }
 

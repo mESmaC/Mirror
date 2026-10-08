@@ -3,6 +3,8 @@ param(
     [switch]$Release,
     [switch]$Smoke,
     [switch]$NoBuild,
+    [switch]$Graphical,
+    [switch]$NoDisplayDevice,
     [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
@@ -15,6 +17,9 @@ param(
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 if ($Fault -ne 'None' -and -not $Smoke) {
     throw '-Fault requires -Smoke; intentional faults are excluded from normal kernels.'
+}
+if ($Graphical -and ($Smoke -or $NoDisplayDevice)) {
+    throw '-Graphical requires a normal boot with a display device.'
 }
 $qemu = Get-MirrorQemu -RequestedPath $QemuPath -RepositoryRoot $repositoryRoot
 $qemuDirectory = Split-Path -Parent $qemu
@@ -66,7 +71,7 @@ $qemuArguments = @(
     '-cpu', 'qemu64',
     '-m', "$MemoryMiB",
     '-smp', '1',
-    '-display', 'none',
+    '-vga', $(if ($NoDisplayDevice) { 'none' } else { 'std' }),
     '-monitor', 'none',
     '-nic', 'none',
     '-no-reboot',
@@ -75,6 +80,7 @@ $qemuArguments = @(
     '-drive', "if=none,id=mirror-esp,format=raw,readonly=on,file=fat:$(ConvertTo-QemuOptionValue $espDirectory)",
     '-device', 'virtio-blk-pci,drive=mirror-esp,bootindex=0'
 )
+if (-not $Graphical) { $qemuArguments += @('-display', 'none') }
 if (Test-Path -LiteralPath (Join-Path $qemuDirectory 'share') -PathType Container) {
     $qemuArguments += @('-L', (Join-Path $qemuDirectory 'share'))
 }
@@ -109,6 +115,24 @@ try {
         throw "Mirror smoke test expected QEMU exit $expectedExitCode; got $qemuExitCode. $qemuError See $serialLog."
     }
     $markers = @('MIRROR_FRAMES_OK', 'MIRROR_ALLOCATOR_TESTS_OK', 'MIRROR_FRAME_REUSE_OK', 'MIRROR_EXCEPTIONS_OK', 'MIRROR_PAGING_OK', 'MIRROR_HEAP_OK', 'MIRROR_TIMER_OK', 'MIRROR_HEAP_IRQ_OK', 'MIRROR_USER_PAGING_OK', 'MIRROR_ELF_TESTS_OK', 'MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_USER_LOAD_ROLLBACK_OK', 'MIRROR_SCHEDULER_OK', 'MIRROR_CAPABILITY_TESTS_OK', 'MIRROR_IPC_TESTS_OK', 'MIRROR_IPC_OK')
+    $markers += @('MIRROR_PCI_TESTS_OK', 'MIRROR_PCI_READY', 'MIRROR_FRAMEBUFFER_TESTS_OK')
+    if ($serial -notmatch '(?m)^MIRROR_PCI_READY .*virtio_block=[1-9][0-9]*(?:\s|$)') {
+        throw "Mirror did not discover its VirtIO boot disk. See $serialLog."
+    }
+    if ($NoDisplayDevice) {
+        if ($serial -notmatch '(?m)^MIRROR_FRAMEBUFFER_SKIPPED reason=missing(?:\s|$)' -or
+            $serial -notmatch '(?m)^MIRROR_PCI_READY .*display=0(?:\s|$)' -or
+            $serial -match '(?m)^MIRROR_FRAMEBUFFER_(?:READY|PRESENTED)(?:\s|$)') {
+            throw "Mirror did not complete the no-display fallback. See $serialLog."
+        }
+    }
+    else {
+        $markers += @('MIRROR_FRAMEBUFFER_READY', 'MIRROR_FRAMEBUFFER_PRESENTED')
+        if ($serial -match '(?m)^MIRROR_FRAMEBUFFER_SKIPPED(?:\s|$)' -or
+            $serial -notmatch '(?m)^MIRROR_PCI_READY .*display=[1-9][0-9]*(?:\s|$)') {
+            throw "Mirror did not use its display device. See $serialLog."
+        }
+    }
     $scenario = switch ($Fault) {
         'UserKernelRead' { 1 }
         'UserCodeWrite' { 2 }
@@ -193,7 +217,7 @@ try {
             throw "Mirror smoke test did not report $marker. See $serialLog."
         }
     }
-    Write-Host "Mirror boot smoke test passed (fault=$Fault, QEMU exit $expectedExitCode). Serial log: $serialLog"
+    Write-Host "Mirror boot smoke test passed (fault=$Fault, no-display=$NoDisplayDevice, QEMU exit $expectedExitCode). Serial log: $serialLog"
     # Keep firmware's terminal control sequences in the raw log, not tool output.
     Write-Output (($serial -split '\r?\n' | Where-Object { $_ -match '^(MIRROR_|Memory map:|Direct map offset:|Page tables:)' }) -join [Environment]::NewLine)
 }

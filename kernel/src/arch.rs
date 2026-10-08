@@ -78,6 +78,28 @@ pub unsafe fn in8(port: u16) -> u8 {
     value
 }
 
+/// # Safety
+/// The caller must own all four I/O byte lanes beginning at `port`, run with
+/// I/O privileges, and ensure the device supports a 32-bit write at that port.
+pub unsafe fn out32(port: u16, value: u32) {
+    // SAFETY: The caller provides port ownership, width, and I/O privileges.
+    unsafe {
+        asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack, preserves_flags))
+    };
+}
+
+/// # Safety
+/// The caller must own all four I/O byte lanes beginning at `port`, run with
+/// I/O privileges, and ensure the device supports a 32-bit read at that port.
+pub unsafe fn in32(port: u16) -> u32 {
+    let value: u32;
+    // SAFETY: The caller provides port ownership, width, and I/O privileges.
+    unsafe {
+        asm!("in eax, dx", in("dx") port, out("eax") value, options(nomem, nostack, preserves_flags))
+    };
+    value
+}
+
 #[cfg(feature = "boot-smoke")]
 pub fn exit_qemu(success: bool) -> ! {
     let code: u32 = if success { 0x10 } else { 0x11 };

@@ -7,11 +7,13 @@ mod arch;
 mod boot;
 mod capability;
 mod elf;
+mod framebuffer;
 mod heap;
 mod interrupts;
 mod ipc;
 mod memory;
 mod paging;
+mod pci;
 mod serial;
 mod timer;
 mod userspace;
@@ -103,8 +105,49 @@ pub extern "C" fn _start() -> ! {
     );
     timer::init();
 
+    let devices = pci::probe();
+    if devices.functions == 0 {
+        serial::println!("PCI: no functions discovered through configuration mechanism 1");
+    }
+    let mut display = boot.framebuffer.as_ref().and_then(|framebuffer| {
+        // SAFETY: Limine provides a writable reserved framebuffer. The owned
+        // hierarchy preserves its mapping and cache attributes; its memory is
+        // never allocated as RAM. This local driver is the sole writer on the
+        // BSP, and no interrupt handler or user mapping exposes its bytes.
+        match unsafe { framebuffer::Driver::from_limine(framebuffer) } {
+            Ok(mut driver) => {
+                let info = driver.info();
+                driver.render_boot(usable_bytes);
+                driver.update_status("NATIVE USERSPACE STARTING", 70);
+                serial::println!(
+                    "MIRROR_FRAMEBUFFER_READY width={} height={} pitch={} bpp={} bytes={}",
+                    info.width,
+                    info.height,
+                    info.pitch,
+                    info.bpp,
+                    info.byte_len
+                );
+                Some(driver)
+            }
+            Err(error) => {
+                serial::println!("MIRROR_FRAMEBUFFER_SKIPPED reason={:?}", error);
+                None
+            }
+        }
+    });
+    if boot.framebuffer.is_none() {
+        serial::println!("MIRROR_FRAMEBUFFER_SKIPPED reason=missing");
+    }
+
     #[cfg(feature = "boot-smoke")]
     {
+        pci::self_test();
+        framebuffer::self_test();
+        assert!(devices.functions > 0, "no PCI devices discovered");
+        assert!(
+            devices.virtio_block_devices > 0,
+            "runner's VirtIO boot disk was not discovered"
+        );
         memory::self_test_recycling(&mut frames);
         interrupts::self_test();
         // SAFETY: This is the active, exclusively owned hierarchy and allocator.
@@ -136,6 +179,10 @@ pub extern "C" fn _start() -> ! {
         boot.direct_map_offset,
         scenario,
     );
+    if let Some(display) = &mut display {
+        display.update_status("KERNEL READY - NATIVE TASKS COMPLETE", 100);
+        serial::println!("MIRROR_FRAMEBUFFER_PRESENTED");
+    }
 
     #[cfg(feature = "boot-smoke")]
     {

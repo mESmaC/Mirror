@@ -2,7 +2,9 @@
 
 Mirror is an independent operating system being built around a new Rust kernel and native userspace, designed for people and AI agents to use the same computer efficiently. Mirror owns the system interfaces for processes, memory, scheduling, devices, and native services. Windows and Linux are application compatibility targets: separate compatibility implementations will translate their application interfaces onto Mirror. Other goals are fast and controllable automation and coordination of local inference with the rest of the system.
 
-**Status:** the freestanding Rust kernel boots through UEFI/Limine in QEMU with its own exception descriptors and page tables, reusable physical pages, a 1 MiB kernel heap, and timer interrupts. It preemptively schedules two isolated native Rust processes, with twelve native syscalls, process-local capability handles, bounded message channels, sleeping, yielding, and a coarse per-process timer-interrupt budget. Receive operations can block until a message, endpoint closure, or a timeout; checked user copies preserve permissions and message ownership. Process termination releases handles and private memory. Formatting, Clippy, and all 24 debug/release boot cases pass; a separate normal boot also completes both processes, IPC, cleanup, and idle entry. Broader driver ports, application compatibility, unified resource management, and inference services remain future work. The broader designs below are proposals; performance improvements must be demonstrated with measurements.
+**Status:** the freestanding Rust kernel boots through UEFI/Limine in QEMU with its own exception descriptors and page tables, reusable physical pages, a 1 MiB kernel heap, and timer interrupts. It preemptively schedules two isolated native Rust processes, with twelve native syscalls, process-local capability handles, bounded message channels, sleeping, yielding, and a coarse per-process timer-interrupt budget. Receive operations can block until a message, endpoint closure, or a timeout; checked user copies preserve permissions and message ownership. Process termination releases handles and private memory. The kernel now inventories PCI functions without changing device configuration and draws a native boot panel through an optional framebuffer. A complete desktop, broader driver ports, application compatibility, unified resource management, and inference services remain future work. The broader designs below are proposals; performance improvements must be demonstrated with measurements.
+
+**Validation:** formatting and Clippy pass in normal and smoke configurations. All 26 debug/release smoke boots pass, including operation without a display. A separate normal boot completes both processes, IPC, cleanup, and idle entry, and its QMP PNG capture passes with the boot panel visually inspected.
 
 ## Build and boot the kernel
 
@@ -16,7 +18,7 @@ From the repository root in PowerShell:
 # Compile the kernel and native init, then stage their UEFI boot files.
 .\scripts\build.ps1
 
-# Run formatting, Clippy, and all 24 debug/release boot cases.
+# Run formatting, Clippy, 26 debug/release smoke cases, and a normal PNG capture.
 .\scripts\test.ps1
 
 # Build the smoke-test kernel, boot it, and verify its serial results and exit code.
@@ -46,11 +48,22 @@ From the repository root in PowerShell:
 # Verify receive timeout while the peer keeps the endpoint open, then recovery.
 .\scripts\run.ps1 -Smoke -Fault IpcTimeout
 
+# Verify successful serial-only boot with no display device attached.
+.\scripts\run.ps1 -Smoke -NoDisplayDevice
+
 # Boot normally; both native processes exit before the idle loop. Ctrl+C stops QEMU.
 .\scripts\run.ps1
+
+# Show the current native boot panel in a QEMU window, with serial diagnostics.
+.\scripts\run.ps1 -Graphical
+
+# Validate a normal boot, capture its framebuffer to PNG, and close QEMU.
+.\scripts\capture.ps1
 ```
 
 Running requires `qemu-system-x86_64.exe` and a matching pair of EDK II/OVMF firmware files. The runner checks `.tools/qemu/`, then PATH; alternatively pass `-QemuPath`, `-FirmwareCode`, and `-FirmwareVars`, or set `QEMU_PATH`, `OVMF_CODE`, and `OVMF_VARS`. QEMU's bundled `edk2-x86_64-code.fd` pairs with `edk2-i386-vars.fd`. Obtain Windows builds through the [official QEMU download page](https://www.qemu.org/download/#windows); QEMU is a local development prerequisite, not a checked-in dependency.
+
+The PNG capture test requires QEMU 7.1 or newer with PNG screendump support; development uses QEMU 11.1. The capture script uses [QEMU's QMP screendump command](https://www.qemu.org/docs/master/interop/qemu-qmp-ref.html#command-screendump), waits for the native processes and kernel idle marker, checks the image signature, then requests a clean QEMU exit. It retains `build/normal-boot.png`, `build/normal-boot.serial.log`, and `build/normal-boot.stderr.log`. Capture runs without a visible window. `-Graphical` opens a window for a normal run; it cannot be combined with `-Smoke` or `-NoDisplayDevice`.
 
 `build/esp/` contains `EFI/BOOT/BOOTX64.EFI`, `limine.conf`, `kernel.elf`, and `init.elf`. Limine supplies `init.elf` as a boot module for Mirror's ELF loader. QEMU exposes this directory as a virtual FAT boot disk; the scripts do not format physical disks. Firmware variables are copied into `build/` before use. `.tools/`, `build/`, and `target/` are ignored by Git. This produces an EFI boot tree, not an installer or standalone disk image.
 
@@ -60,7 +73,11 @@ Userspace checks cover private page-table permissions and reclamation, bounded E
 
 Capability checks cover missing, stale, and foreign handles; denied operations; restricted duplicates; zero-rights handles; table exhaustion; and token exhaustion without reuse. Queue checks cover capacity, FIFO wraparound, message preservation, endpoint reference counts, and scrubbing after the last receiver closes. The native processes exchange three messages, verify that learning a peer's token grants no authority, and recover from short or read-only receive buffers without losing the queued message. Each smoke boot tears down its first pair and launches a fresh normal pair, checking fresh BSS, frame reuse, and complete handle/message cleanup after exit or a contained failure.
 
+Device checks cover PCI address bounds, multifunction enumeration with absent functions, the final bus/slot/function, bridge decoding, missing devices, and bounded inventory overflow. Framebuffer checks use guarded RAM surfaces to exercise the same pixel writer: RGB24/BGR32 encoding, padded rows, clipped and extreme rectangles, text and progress rendering, tiny displays, invalid dimensions/masks/pitch, null and noncanonical addresses, and arithmetic overflow. Guard bytes and row padding must stay unchanged.
+
 The runner requires `MIRROR_USER_PAGING_OK`, `MIRROR_ELF_TESTS_OK`, `MIRROR_USER_LOAD_ROLLBACK_OK`, `MIRROR_USERSPACE_OK`, `MIRROR_USER_CLEANUP_OK`, `MIRROR_SCHEDULER_OK`, `MIRROR_CAPABILITY_TESTS_OK`, `MIRROR_IPC_TESTS_OK`, and `MIRROR_IPC_OK` along with the earlier subsystem markers. The scheduler marker reports process, switch, yield, sleep, preemption, and idle-tick counts; the IPC marker reports messages, waits, timeouts, and handle reclamation. Nonfatal cases finish with the expected kernel page-fault probe, `MIRROR_PAGE_FAULT_OK`, `MIRROR_BOOT_OK`, and QEMU exit status 33.
+
+Every smoke case also requires `MIRROR_PCI_TESTS_OK`, `MIRROR_PCI_READY`, and `MIRROR_FRAMEBUFFER_TESTS_OK`, including detection of the runner's VirtIO boot disk. Display cases require a PCI display function plus `MIRROR_FRAMEBUFFER_READY` and `MIRROR_FRAMEBUFFER_PRESENTED`. `-NoDisplayDevice` removes the emulated display and instead requires zero PCI display functions and `MIRROR_FRAMEBUFFER_SKIPPED reason=missing`, while completing the ordinary userspace and cleanup checks.
 
 `-Fault PageFault` and `-Fault InvalidOpcode` select intentional unexpected exceptions through the smoke kernel's boot command line. These cases require the matching exception vector, error code, page-fault address where applicable, and QEMU exit status 35. A panic, timeout, or ordinary successful boot cannot satisfy them. The normal kernel excludes these fault triggers and QEMU exit-port writes.
 
@@ -72,15 +89,31 @@ The five user-fault modes attempt to read supervisor kernel memory, write an RX 
 
 `-Fault IpcPeerExit` leaves a duplicate sender open until its owning process exits. Teardown must release that final endpoint reference and wake the peer's blocked receive with the closed-channel result, reported by `MIRROR_IPC_PEER_CLOSED_OK`. `-Fault IpcTimeout` keeps the sender open while its owner sleeps for 110 ticks; the peer must observe exactly one 100-tick receive timeout and then recover when the sender closes, reported by `MIRROR_IPC_TIMEOUT_OK`. Both cases require ordinary process completion, cleanup and relaunch, and QEMU exit status 33. Hardware faults or a scenario marker in the wrong test fail validation.
 
-Serial and QEMU diagnostic logs are saved under `build/`. `scripts/test.ps1` runs all twelve cases in debug with 128 MiB and release with 256 MiB, retains their logs under `build/test-logs/`, and leaves a normal kernel and init staged afterward. Build and boot commands should run one at a time because they share the staged files.
+Serial and QEMU diagnostic logs are saved under `build/`. `scripts/test.ps1` runs the twelve fault/normal cases plus a no-display case in debug with 128 MiB and release with 256 MiB, for 26 smoke boots. It retains their logs under `build/test-logs/`, rebuilds a normal kernel and init, and runs `scripts/capture.ps1 -NoBuild` against that normal image. Build, run, test, and capture commands should run one at a time because they share the staged files.
 
-The current kernel runs one CPU. Its GDT, TSS, 32 exception gates, 16 legacy IRQ gates, a user-callable `INT 0x80` gate, and dedicated double-fault stack are installed before interrupts are enabled. Ring-3 entries use a dedicated kernel stack through TSS.RSP0. The QEMU q35 timer uses the legacy PIC/PIT at approximately 100 Hz. Only IRQ0 is unmasked; its handler increments a counter and acknowledges the interrupt without allocation, logging, or locking. IRQs delivered during user execution also charge that process's budget and can save its context for another process to run. The scheduler idles with interrupts enabled when all unfinished processes are sleeping or waiting to receive. After both processes exit, the kernel's idle loop continues waking on IRQs. Ticks measure delivered interrupts, not calibrated elapsed time; long critical sections can lose ticks. APIC/IOAPIC support and hardware discovery remain future work.
+The current kernel runs one CPU. Its GDT, TSS, 32 exception gates, 16 legacy IRQ gates, a user-callable `INT 0x80` gate, and dedicated double-fault stack are installed before interrupts are enabled. Ring-3 entries use a dedicated kernel stack through TSS.RSP0. The QEMU q35 timer uses the legacy PIC/PIT at approximately 100 Hz. Only IRQ0 is unmasked; its handler increments a counter and acknowledges the interrupt without allocation, logging, or locking. IRQs delivered during user execution also charge that process's budget and can save its context for another process to run. The scheduler idles with interrupts enabled when all unfinished processes are sleeping or waiting to receive. After both processes exit, the kernel's idle loop continues waking on IRQs. Ticks measure delivered interrupts, not calibrated elapsed time; long critical sections can lose ticks. APIC/IOAPIC support and broader hardware discovery remain future work.
 
 Paging ownership is established by deep-copying Limine's four-level hierarchy, retaining existing mappings and huge-page leaves, and switching CR3. New heap and scratch mappings are supervisor-only, writable, and non-executable; unmapping invalidates the local TLB. NX and supervisor write protection are enabled. Each user address space owns its lower-half mappings and page tables while sharing supervisor-only upper-half kernel mappings. User text is RX, constants are read-only/NX, and data and stack pages are writable/NX; writable/executable user mappings are rejected. The user-fault suite exercises these restrictions. Existing kernel aliases remain, so user W^X does not establish complete kernel memory protection. Double-fault stack installation is still untested with an induced double fault. Five-level paging is explicitly rejected for now.
 
 Physical allocation begins with a bump allocator, then tracks usable pages with a dynamically sized two-bit bitmap. Previously allocated page tables remain tracked, bitmap pages stay reserved, and released pages can be reused. Metadata currently needs one contiguous usable span. Freeing a page requires ending its uses and withdrawing non-direct-map aliases first; checks reject reserved, misaligned, never-allocated, metadata, and already-free pages. They cannot detect a stale ownership claim after a page has been reallocated. The bootstrap stack and boot responses still belong to Limine, so bootloader memory remains reserved.
 
 The fixed 1 MiB heap has unmapped guard pages and uses `linked_list_allocator` 0.10.6 with an interrupt-state-preserving lock. Blocks are reused and coalesced; heap backing pages stay mapped. Unsupported sizes/alignments return allocation failure before entering the dependency. Interrupt, exception, and syscall handlers must not allocate. The scheduler restores the kernel root before closing a finished process's remaining handles and checking peer wakeups. After both processes finish, it releases their private user trees, including mapped frames and page-table frames, and checks that channel references and messages are gone. Kernel page-table reclamation, heap growth, bounded allocation latency, and a general device framework remain future work.
+
+### PCI inventory and boot framebuffer
+
+The PCI inventory in [kernel/src/pci.rs](kernel/src/pci.rs) reads firmware-configured segment 0 through x86 configuration mechanism 1. Each CF8/CFC address/read transaction preserves the caller's interrupt state on the single boot CPU. Scanning is bounded by 65,536 function addresses and 262,144 configuration reads; the first 32 functions are retained and logged, with full counts and an omitted count. The inventory records identifiers, class, revision, header type, and type-1 bridge bus numbers. It recognizes VirtIO block and GPU identifiers defined by the [Virtio 1.2 specification](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html).
+
+Discovery writes only the host's configuration-address selector; it does not write device configuration, size or assign BARs, enable bus mastering, or start DMA or device IRQs. ECAM, extended configuration, additional PCI segments, capability walking, hotplug synchronization, and general driver binding are future work. Discovering the VirtIO boot disk does not provide a disk driver: firmware and Limine load the kernel and init, and Mirror cannot yet issue storage requests itself.
+
+The boot display in [kernel/src/framebuffer.rs](kernel/src/framebuffer.rs) accepts the first Limine framebuffer when it supplies RGB24 or RGB32 pixels with three disjoint eight-bit color masks. It validates dimensions, pitch, masks, address arithmetic, and canonical addresses before drawing; dimensions are capped at 8192 each and the surface at 128 MiB. Missing or unsupported framebuffers produce a serial diagnostic and boot continues. The renderer respects row padding, clips drawing to the surface, and writes volatile bytes without allocating a backbuffer or reading uninitialized video memory.
+
+Limine supplies the virtual address with the direct-map offset already applied. Mirror preserves its mapping and cache attributes when taking ownership of paging, reserves the framebuffer and boot-response memory, and keeps the mapping supervisor-only in user address spaces. One local driver exclusively owns drawing; interrupt handlers and user processes do not access the surface. These assumptions follow the [Limine protocol's handoff and framebuffer contracts](https://github.com/limine-bootloader/limine-protocol/blob/trunk/PROTOCOL.md#framebuffer-feature).
+
+The panel shows Mirror's identity, usable memory reported at boot, and status updated after the native tasks complete. It preserves the boot-selected display mode and has no GPU acceleration, mode switching, input, application surfaces, compositor, or window manager yet. The full native desktop acceptance criteria appear below.
+
+![Mirror's native boot panel captured from QEMU](docs/images/boot-framebuffer.png)
+
+QEMU capture of the current native boot panel. This is display bring-up evidence; the planned desktop environment remains to be implemented.
 
 ### Native userspace and syscall ABI
 
@@ -143,7 +176,7 @@ Kernel entry is in [kernel/src/main.rs](kernel/src/main.rs), boot requests in [k
 
 ## Goals
 
-- A responsive desktop with a small baseline resource footprint and optional background services.
+- A complete native desktop environment with responsive manual controls, typed agent interfaces, a small baseline resource footprint, and optional background services.
 - Independent Windows and Linux application compatibility implementations over Mirror's native kernel and services, expanded through a published, tested application matrix.
 - Structured application operations that agents can discover and invoke without repeatedly interpreting screenshots.
 - OS-enforced limits on agent access to files, processes, networks, devices, credentials, and compute.
@@ -163,6 +196,7 @@ Two separate application compatibility personalities are planned. A personality 
 | --- | --- |
 | Mirror kernel | New Rust implementations of address spaces, threads, scheduling mechanisms, interrupts, memory mappings, IPC, capability enforcement, and device isolation where hardware supports it. |
 | Native system services | Mirror filesystems, networking, device management, application lifecycle, and desktop services using native Mirror interfaces. Place services outside the kernel where practical. |
+| Native desktop | Mirror's compositor, window management, input routing, application launcher, taskbar, settings, file manager, and notifications, with complete human controls and capability-checked agent operations. |
 | Agent broker | Discover typed operations, validate arguments and authority, apply quotas, dispatch actions, and record results. |
 | Capacity manager | Account for resources, choose object placement, reserve transfers, and coordinate reclamation and prefetching. |
 | Inference services | Execute models through replaceable backends and supply workload hints to the capacity manager and scheduler. |
@@ -173,6 +207,24 @@ Two separate application compatibility personalities are planned. A personality 
 The kernel supplies bounded mechanisms and enforces authority. Higher-level resource policy and model execution belong in restartable services. A model crash or unavailable cloud provider must not stop the machine from booting or being used manually.
 
 Initial development target: **x86-64, UEFI, and QEMU**, using Limine for the boot handoff, followed by a deliberately small hardware support list. QEMU provides a repeatable machine to boot the actual Mirror kernel. GPU and target-application requirements will guide the first physical hardware targets.
+
+## Native desktop environment
+
+Mirror will have a complete native desktop environment built on its own kernel, drivers, and userspace services. The desktop must be usable manually with a keyboard and pointer, including when no model is loaded or cloud account is available. Every desktop feature must also be designed for typed, capability-checked agent access through the same underlying operations and state changes used by the human interface.
+
+The planned scope and completion criteria are:
+
+| Area | Native implementation and acceptance evidence |
+| --- | --- |
+| Compositor and windows | Compose surfaces from real native applications; open multiple independent windows, move and resize them, change focus, minimize, maximize, and close them. Rendering and repainting must reflect live application state. |
+| Input | Route keyboard and pointer events through Mirror's device and input services to the focused surface; verify text entry, selection, pointer actions, and desktop shortcuts across application switches. |
+| Application launcher and taskbar | Launch installed native applications, display running applications and their windows, switch or restore them, and reflect their actual exit state. |
+| Settings | Provide working display, input, appearance, resource, and permission controls backed by the corresponding services; persist supported settings and verify them after reboot. |
+| Files | Browse the real filesystem, open files in applications, and create, rename, move, copy, and delete permitted objects; verify durable results and reject operations outside the caller's authority. |
+| Notifications | Deliver notifications from applications and services, show their source and actions, and support dismissal and notification preferences through both interfaces. |
+| Human and agent operation | Complete the same representative desktop workflows manually and through typed operations; verify consistent results, change events, permission denials, and continued manual use when inference is unavailable. |
+
+Desktop acceptance requires these features to work together on a documented supported machine with Mirror's actual rendering, input, application, and storage paths. Record responsiveness under application and inference load once those backends exist. Boot framebuffer output establishes early display access; it does not demonstrate a compositor, working controls, or a completed desktop. The full desktop remains planned, and the verified kernel/userspace milestone above does not claim these features are implemented.
 
 ## AI as a first-class system interface
 
@@ -308,10 +360,10 @@ Milestones are acceptance gates, not delivery-date promises. Work proceeds from 
 | 1. Kernel boot | Freestanding Rust x86-64 kernel, Limine boot handoff, serial diagnostics, and memory-map inspection. | Buildable EFI boot tree and repeatable QEMU boots; expected serial output; validated handoff data; diagnostic panic and halt paths. |
 | 2. Memory and exceptions | Physical frame allocation, virtual memory ownership, kernel allocation, exception handling, interrupts, and timers. | Reserved memory is never allocated; mapping operations preserve ownership; faults produce useful diagnostics; timer interrupts work. |
 | 3. Native userspace and syscalls | User address spaces, executable loading, syscall entry, threads, scheduling, IPC, capability handles, and a minimal native init process. | A native user program runs; process faults remain contained; invalid pointers and unauthorized handles are rejected; tasks yield and resume. |
-| 4. Device framework and driver ports | Platform adaptation layer, device discovery, DMA and interrupt support, VirtIO storage/network drivers, and selected physical-device ports. | Named devices work through Mirror's interfaces; DMA ownership and interrupt handling are checked; failure and device recovery paths are exercised. |
-| 5. Native services, application personalities, and AI | Mirror filesystem and shell; initial, separately scoped Windows PE/API/NT and Linux ELF/syscall personalities over Mirror interfaces; typed-operation broker, CPU inference, and capacity-manager integration. | Native services run on Mirror; selected Windows and Linux workflows pass their personality-specific tests as support arrives; agent permissions are enforced; inference preserves interactive headroom. |
+| 4. Device framework and driver ports | Platform adaptation layer, device discovery, display and input foundations, DMA and interrupt support, VirtIO storage/network drivers, and selected physical-device ports. | Named devices work through Mirror's interfaces; display output and input delivery use real device paths; DMA ownership and interrupt handling are checked; failure and device recovery paths are exercised. |
+| 5. Native services, application personalities, and AI | Mirror filesystem, shell, and desktop service foundations; initial, separately scoped Windows PE/API/NT and Linux ELF/syscall personalities over Mirror interfaces; typed-operation broker, CPU inference, and capacity-manager integration. | Native services run on Mirror; selected Windows and Linux workflows pass their personality-specific tests as support arrives; agent permissions are enforced; inference preserves interactive headroom. |
 | 6. GPU ports and accelerated inference | Selected GPU driver port, userspace graphics/compute integration, real RAM/VRAM placement, and responsiveness controls. | Correct rendering and model outputs on named hardware; reproducible mixed-load measurements; migration and resource-pressure recovery. Assess the port's dependencies during earlier stages. |
-| 7. Usable desktop and durable pool | Human/agent desktop, installer/update recovery, storage pooling and recovery, expanded compatibility, and broader device testing. | Recovery after interrupted writes/updates and device failures, usable manual controls, application-specific workflow tests, and repeatable agent permission tests. |
+| 7. Complete native desktop and durable pool | Native compositor and windows, keyboard/pointer input, application launcher and taskbar, settings, files, and notifications with full human controls and typed agent interfaces; installer/update recovery, storage pooling, expanded compatibility, and broader device testing. | All native desktop acceptance workflows above pass on supported hardware, manually and through authorized agent operations; settings and files survive reboot; recovery after interrupted writes/updates and device failures; application-specific workflows and repeatable permission tests. |
 
 Full guest-OS integration remains a separate later compatibility option. Universal Windows/Linux compatibility, arbitrary hardware support, and a fully optimized inference stack are outside the first milestone.
 
@@ -327,7 +379,7 @@ The first boot slice's acceptance criteria are:
 4. Memory-map accounting and frame allocation distinguish usable memory from reserved regions. Frame recycling, page-table ownership, and the initial heap are implemented; private user trees are reclaimed on process teardown. Bootloader and kernel page-table reclamation remain later work.
 5. Panic and normal idle paths remain within Mirror. Fatal paths disable maskable interrupts and halt; normal idle enables them and wakes for timer IRQs.
 
-This original slice establishes boot and handoff behavior. Work has now reached stage 3 with isolated native user processes, syscalls, teardown, preemptive scheduling, console/channel capabilities, and bounded IPC. Broader thread and process lifecycle support, capability delegation, and additional IPC mechanisms remain work for this stage. Driver compatibility, general application compatibility, and inference capability remain later milestones.
+This original slice establishes boot and handoff behavior. Stage 3 now has isolated native user processes, syscalls, teardown, preemptive scheduling, console/channel capabilities, and bounded IPC. Broader thread and process lifecycle support, capability delegation, and additional IPC mechanisms remain work for that stage. Early stage-4 work adds read-only PCI inventory and optional boot framebuffer output; a device framework, storage/input drivers, and the full native desktop remain ahead. General application compatibility and inference capability remain later milestones.
 
 ### Performance evidence
 
