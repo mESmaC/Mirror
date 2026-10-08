@@ -5,7 +5,8 @@ param(
     [switch]$NoBuild,
     [switch]$Graphical,
     [switch]$NoDisplayDevice,
-    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout')][string]$Fault = 'None',
+    [switch]$NoTestDisk,
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -20,6 +21,9 @@ if ($Fault -ne 'None' -and -not $Smoke) {
 }
 if ($Graphical -and ($Smoke -or $NoDisplayDevice)) {
     throw '-Graphical requires a normal boot with a display device.'
+}
+if ($NoTestDisk -and $Fault -eq 'BlockIoError') {
+    throw '-Fault BlockIoError requires the test disk.'
 }
 $qemu = Get-MirrorQemu -RequestedPath $QemuPath -RepositoryRoot $repositoryRoot
 $qemuDirectory = Split-Path -Parent $qemu
@@ -53,6 +57,7 @@ $testMode = switch ($Fault) {
     'UserBudget' { 'user-budget' }
     'IpcPeerExit' { 'ipc-peer-exit' }
     'IpcTimeout' { 'ipc-timeout' }
+    'BlockIoError' { 'block-io-error' }
     default { $null }
 }
 if ($null -ne $testMode) { $bootConfig += "`n    cmdline: mirror.test=$testMode`n" }
@@ -78,8 +83,29 @@ $qemuArguments = @(
     '-drive', "if=pflash,unit=0,format=raw,readonly=on,file=$(ConvertTo-QemuOptionValue $codePath)",
     '-drive', "if=pflash,unit=1,format=raw,file=$(ConvertTo-QemuOptionValue $varsPath)",
     '-drive', "if=none,id=mirror-esp,format=raw,readonly=on,file=fat:$(ConvertTo-QemuOptionValue $espDirectory)",
-    '-device', 'virtio-blk-pci,drive=mirror-esp,bootindex=0'
+    '-device', 'virtio-blk-pci,drive=mirror-esp,disable-legacy=on,bootindex=0'
 )
+if (-not $NoTestDisk) {
+    $testDisk = Get-MirrorTestDisk -RepositoryRoot $repositoryRoot
+    $testDiskHash = (Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash
+    if ($Fault -eq 'BlockIoError') {
+        # Inject into a data sector used by the kernel probe, away from firmware
+        # partition discovery. JSON preserves paths without blkdebug URL colons.
+        $testNode = @{
+            driver = 'raw'; 'node-name' = 'mirror-test'; 'read-only' = $true
+            file = @{
+                driver = 'blkdebug'
+                image = @{ driver = 'file'; filename = $testDisk }
+                'inject-error' = @(@{ event = 'read_aio'; errno = 5; sector = 1234; once = $true })
+            }
+        } | ConvertTo-Json -Compress -Depth 6
+        $qemuArguments += @('-blockdev', $testNode)
+    }
+    else {
+        $qemuArguments += @('-drive', "if=none,id=mirror-test,format=raw,readonly=on,file=$(ConvertTo-QemuOptionValue $testDisk)")
+    }
+    $qemuArguments += @('-device', 'virtio-blk-pci,drive=mirror-test,disable-modern=on,disable-legacy=off')
+}
 if (-not $Graphical) { $qemuArguments += @('-display', 'none') }
 if (Test-Path -LiteralPath (Join-Path $qemuDirectory 'share') -PathType Container) {
     $qemuArguments += @('-L', (Join-Path $qemuDirectory 'share'))
@@ -105,6 +131,9 @@ try {
     $process.Refresh()
     $qemuExitCode = $process.ExitCode
     $serial = [System.IO.File]::ReadAllText($serialLog)
+    if (-not $NoTestDisk -and (Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash -ne $testDiskHash) {
+        throw 'The read-only block fixture was modified during the boot.'
+    }
     if ($serial -match '(?im)^(?:MIRROR_PANIC|PANIC|\[panic\])') {
         throw "Mirror reported a panic. See $serialLog."
     }
@@ -116,6 +145,26 @@ try {
     }
     $markers = @('MIRROR_FRAMES_OK', 'MIRROR_ALLOCATOR_TESTS_OK', 'MIRROR_FRAME_REUSE_OK', 'MIRROR_EXCEPTIONS_OK', 'MIRROR_PAGING_OK', 'MIRROR_HEAP_OK', 'MIRROR_TIMER_OK', 'MIRROR_HEAP_IRQ_OK', 'MIRROR_USER_PAGING_OK', 'MIRROR_ELF_TESTS_OK', 'MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_USER_LOAD_ROLLBACK_OK', 'MIRROR_SCHEDULER_OK', 'MIRROR_CAPABILITY_TESTS_OK', 'MIRROR_IPC_TESTS_OK', 'MIRROR_IPC_OK')
     $markers += @('MIRROR_PCI_TESTS_OK', 'MIRROR_PCI_READY', 'MIRROR_FRAMEBUFFER_TESTS_OK')
+    $markers += @('MIRROR_CONTIGUOUS_TESTS_OK', 'MIRROR_DMA_TESTS_OK', 'MIRROR_BLOCK_TESTS_OK')
+    if ($serial -match '(?m)^MIRROR_BLOCK_FAILED(?:\s|$)') {
+        throw "Mirror block driver failed. See $serialLog."
+    }
+    if ($NoTestDisk) {
+        $markers += 'MIRROR_BLOCK_SKIPPED'
+        if ($serial -match '(?m)^MIRROR_BLOCK_(?:READY|READ_OK|IO_ERROR_OK)(?:\s|$)') {
+            throw "Mirror unexpectedly bound a block device. See $serialLog."
+        }
+    }
+    else {
+        $markers += @('MIRROR_BLOCK_READY', 'MIRROR_BLOCK_READ_OK', 'MIRROR_BLOCK_CLEANUP_OK')
+        if ($serial -match '(?m)^MIRROR_BLOCK_SKIPPED(?:\s|$)') {
+            throw "Mirror skipped the attached block fixture. See $serialLog."
+        }
+    }
+    if ($Fault -eq 'BlockIoError') { $markers += 'MIRROR_BLOCK_IO_ERROR_OK' }
+    elseif ($serial -match '(?m)^MIRROR_BLOCK_IO_ERROR_OK(?:\s|$)') {
+        throw "Mirror unexpectedly reported a block I/O error probe. See $serialLog."
+    }
     if ($serial -notmatch '(?m)^MIRROR_PCI_READY .*virtio_block=[1-9][0-9]*(?:\s|$)') {
         throw "Mirror did not discover its VirtIO boot disk. See $serialLog."
     }

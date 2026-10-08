@@ -96,6 +96,7 @@ pub enum SmokeMode {
     Normal,
     PageFault,
     InvalidOpcode,
+    BlockIoError,
     User(u64),
 }
 
@@ -118,6 +119,7 @@ pub fn smoke_mode() -> SmokeMode {
         b"mirror.test=user-budget" => SmokeMode::User(7),
         b"mirror.test=ipc-peer-exit" => SmokeMode::User(8),
         b"mirror.test=ipc-timeout" => SmokeMode::User(9),
+        b"mirror.test=block-io-error" => SmokeMode::BlockIoError,
         _ => panic!("unknown smoke-test command line"),
     }
 }

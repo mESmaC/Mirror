@@ -79,6 +79,28 @@ pub unsafe fn in8(port: u16) -> u8 {
 }
 
 /// # Safety
+/// The caller must own both I/O byte lanes beginning at `port`, run with I/O
+/// privileges, and ensure the device supports a 16-bit write at that port.
+pub unsafe fn out16(port: u16, value: u16) {
+    // SAFETY: The caller provides port ownership, width, and I/O privileges.
+    unsafe {
+        asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags))
+    };
+}
+
+/// # Safety
+/// The caller must own both I/O byte lanes beginning at `port`, run with I/O
+/// privileges, and ensure the device supports a 16-bit read at that port.
+pub unsafe fn in16(port: u16) -> u16 {
+    let value: u16;
+    // SAFETY: The caller provides port ownership, width, and I/O privileges.
+    unsafe {
+        asm!("in ax, dx", in("dx") port, out("ax") value, options(nomem, nostack, preserves_flags))
+    };
+    value
+}
+
+/// # Safety
 /// The caller must own all four I/O byte lanes beginning at `port`, run with
 /// I/O privileges, and ensure the device supports a 32-bit write at that port.
 pub unsafe fn out32(port: u16, value: u32) {

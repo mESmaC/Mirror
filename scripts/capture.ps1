@@ -74,7 +74,13 @@ $qemuArguments = @(
     '-drive', "if=pflash,unit=0,format=raw,readonly=on,file=$(ConvertTo-QemuOptionValue $codePath)",
     '-drive', "if=pflash,unit=1,format=raw,file=$(ConvertTo-QemuOptionValue $varsPath)",
     '-drive', "if=none,id=mirror-esp,format=raw,readonly=on,file=fat:$(ConvertTo-QemuOptionValue $espDirectory)",
-    '-device', 'virtio-blk-pci,drive=mirror-esp,bootindex=0', '-serial', "file:$serialLog"
+    '-device', 'virtio-blk-pci,drive=mirror-esp,disable-legacy=on,bootindex=0', '-serial', "file:$serialLog"
+)
+$testDisk = Get-MirrorTestDisk -RepositoryRoot $repositoryRoot
+$testDiskHash = (Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash
+$qemuArguments += @(
+    '-drive', "if=none,id=mirror-test,format=raw,readonly=on,file=$(ConvertTo-QemuOptionValue $testDisk)",
+    '-device', 'virtio-blk-pci,drive=mirror-test,disable-modern=on,disable-legacy=off'
 )
 if (Test-Path -LiteralPath (Join-Path $qemuDirectory 'share') -PathType Container) {
     $qemuArguments += @('-L', (Join-Path $qemuDirectory 'share'))
@@ -110,7 +116,7 @@ try {
         if ($elapsed.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw "Normal boot timed out. See $serialLog." }
         Start-Sleep -Milliseconds 100
     } while ($true)
-    foreach ($marker in @('MIRROR_BOOT_OK', 'MIRROR_USERSPACE_OK scenario=0', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_SCHEDULER_OK processes=2', 'MIRROR_IPC_OK messages=3', 'MIRROR_PCI_READY', 'MIRROR_FRAMEBUFFER_READY', 'MIRROR_FRAMEBUFFER_PRESENTED')) {
+    foreach ($marker in @('MIRROR_BOOT_OK', 'MIRROR_USERSPACE_OK scenario=0', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_SCHEDULER_OK processes=2', 'MIRROR_IPC_OK messages=3', 'MIRROR_PCI_READY', 'MIRROR_FRAMEBUFFER_READY', 'MIRROR_FRAMEBUFFER_PRESENTED', 'MIRROR_BLOCK_READY', 'MIRROR_BLOCK_READ_OK', 'MIRROR_BLOCK_CLEANUP_OK')) {
         if ($serial -notmatch "(?m)^$marker(?:\s|$)") { throw "Normal boot missing $marker. See $serialLog." }
     }
     if ($serial -match '(?m)^MIRROR_FRAMEBUFFER_SKIPPED(?:\s|$)') { throw 'Normal boot skipped framebuffer output.' }
@@ -126,6 +132,9 @@ try {
     if (-not $process.WaitForExit(5000)) { throw 'QEMU did not exit after the capture.' }
     $process.WaitForExit()
     if ($process.ExitCode -ne 0) { throw "QEMU capture exited with code $($process.ExitCode)." }
+    if ((Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash -ne $testDiskHash) {
+        throw 'The read-only block fixture was modified during the capture.'
+    }
     Write-Host "Normal boot and framebuffer capture passed. Image: $screenshot"
 }
 finally {

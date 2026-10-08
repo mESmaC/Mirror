@@ -1,14 +1,20 @@
-//! Bounded, read-only PCI discovery through x86 configuration mechanism 1.
+//! Bounded PCI discovery and a legacy Virtio block claim through mechanism 1.
 //!
 //! One BSP owns CF8/CFC; each address/data transaction preserves the caller's
 //! interrupt state. Only firmware-configured segment 0 is visible. No ECAM,
 //! extended configuration, ARI, hotplug synchronization, BAR sizing, resource
-//! assignment, capability walking, DMA, bus-master, or IRQ enablement yet.
+//! assignment, or IRQ routing. Discovery never writes device configuration.
+//! A claimed legacy block function permits only 16-bit command changes; its
+//! transport driver owns device reset and DMA lifetime. No MSI/MSI-X enablement.
 //!
 //! PCI Local Bus Specification 2.1, sections 3.7.4.1 and 6.2 (PCI-SIG document):
 //! https://www.bitsavers.org/pdf/pciSIG/PCI_Local_Bus_Specification_2.1_199506.pdf
-//! Virtio 1.2, sections 4.1.2, 5.2.1, and 5.7.1 (device identifiers):
+//! Virtio 1.2, sections 4.1.2, 4.1.4.10, 4.1.5.1.1.1, 5.2.1, and 5.7.1:
 //! https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html
+//! PCI capability IDs, command/status masks, and MSI/MSI-X control masks:
+//! https://github.com/torvalds/linux/blob/master/include/uapi/linux/pci_regs.h
+
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{arch, serial};
 
@@ -22,6 +28,15 @@ const MAX_FUNCTIONS: u32 = BUS_COUNT as u32 * SLOT_COUNT as u32 * FUNCTION_COUNT
 const MAX_CONFIG_READS: u32 = MAX_FUNCTIONS * 4;
 const MAX_RETAINED: usize = 32;
 const VIRTIO_VENDOR: u16 = 0x1af4;
+const COMMAND_IO: u16 = 1;
+const COMMAND_MASTER: u16 = 1 << 2;
+const COMMAND_INTX_DISABLE: u16 = 1 << 10;
+const STATUS_CAPABILITIES: u32 = 1 << 20;
+const MAX_CAPABILITIES: usize = (0x100 - 0x40) / 4;
+// General legacy header (20 bytes without MSI-X) plus block capacity (8).
+// Optional device-specific fields outside this window are not supported.
+const LEGACY_PORT_BYTES: u32 = 28;
+static LEGACY_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Bdf {
@@ -150,6 +165,221 @@ fn configuration_address(
         | u32::from(register))
 }
 
+/// One aligned DWORD from conventional segment-0 configuration space.
+/// Invalid slot, function, offset, or alignment fails before any port access.
+pub(crate) fn read_config_u32(bdf: Bdf, register: u16) -> Result<u32, LegacyError> {
+    let address = configuration_address(u16::from(bdf.bus), bdf.slot, bdf.function, register)
+        .map_err(|_| LegacyError::ConfigurationAddress)?;
+    Ok(read_configuration_address(address))
+}
+
+fn read_configuration_address(address: u32) -> u32 {
+    let was_enabled = arch::save_and_disable_interrupts();
+    // SAFETY: This module owns CF8/CFC on the sole BSP. Every caller has
+    // validated the address, and no fallible code runs while IF is disabled.
+    unsafe {
+        arch::out32(CONFIG_ADDRESS, address);
+        let value = arch::in32(CONFIG_DATA);
+        arch::restore_interrupts(was_enabled);
+        value
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LegacyError {
+    ConfigurationAddress,
+    DeviceChanged,
+    IoBar,
+    CapabilityList,
+    MsiEnabled,
+    MsixEnabled,
+    AlreadyClaimed,
+    IoNotPrepared,
+    CommandRejected,
+}
+
+/// Exclusive claim to the first retained legacy block function. It is neither
+/// Clone nor Copy. Dropping it does not release the claim: an unreset device
+/// must never silently become available to another DMA owner.
+pub(crate) struct LegacyBlock {
+    pub io_base: u16,
+    pub bdf: Bdf,
+    original_command: u16,
+    // Keep the validated target private: public diagnostic BDF changes cannot
+    // redirect command writes to another function.
+    command_address: u32,
+    io_prepared: bool,
+}
+
+impl LegacyBlock {
+    /// Claim a firmware-assigned 1af4:1001, type-0 function. Only the retained
+    /// inventory (at most 32 devices) is considered. An absent fixture is None;
+    /// the first candidate with invalid configuration returns an error instead
+    /// of quietly selecting a different disk. No configuration is written.
+    pub(crate) fn discover(inventory: &Inventory) -> Result<Option<Self>, LegacyError> {
+        let Some(device) = inventory.devices.iter().flatten().find(|device| {
+            device.vendor == VIRTIO_VENDOR && device.device == 0x1001 && device.header & 0x7f == 0
+        }) else {
+            return Ok(None);
+        };
+        let bdf = device.bdf;
+        // Identity/header/command/BAR/pointer plus at most 48 capability reads.
+        let (io_base, original_command) =
+            legacy_configuration(|register| read_config_u32(bdf, register))?;
+        let command_address = configuration_address(u16::from(bdf.bus), bdf.slot, bdf.function, 4)
+            .map_err(|_| LegacyError::ConfigurationAddress)?;
+        LEGACY_CLAIMED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| LegacyError::AlreadyClaimed)?;
+        Ok(Some(Self {
+            io_base,
+            bdf,
+            original_command,
+            command_address,
+            io_prepared: false,
+        }))
+    }
+
+    /// Enable the PIO registers, suppress INTx, and inhibit bus mastering so
+    /// the transport can reset before providing its own DMA queue addresses.
+    ///
+    /// # Safety
+    /// The caller must run on the BSP and own this function's transport. Any
+    /// previous DMA buffers must remain allocated until reset is acknowledged.
+    pub(crate) unsafe fn enable_io_only(&mut self) -> Result<(), LegacyError> {
+        let command = io_only_command(self.original_command);
+        self.io_prepared = false;
+        // SAFETY: The claim and caller establish sole device/config ownership.
+        unsafe { self.write_command(command)? };
+        self.io_prepared = true;
+        Ok(())
+    }
+
+    /// Enable bus mastering without enabling any interrupt delivery mode.
+    ///
+    /// # Safety
+    /// The caller must have acknowledged a transport reset and established a
+    /// valid DMA ownership protocol. All published buffers must remain pinned
+    /// until completion or a subsequently acknowledged device reset.
+    pub(crate) unsafe fn enable(&mut self) -> Result<(), LegacyError> {
+        if !self.io_prepared {
+            return Err(LegacyError::IoNotPrepared);
+        }
+        // SAFETY: The caller owns the transport and its DMA lifetime.
+        unsafe { self.write_command(master_command(self.original_command)) }
+    }
+
+    /// Inhibit future bus mastering after a failed reset. This does not prove
+    /// that previous DMA completed, so it does not authorize freeing buffers.
+    ///
+    /// # Safety
+    /// The caller must retain all possibly device-owned buffers and this claim
+    /// until a later reset is acknowledged, or quarantine them permanently.
+    pub(crate) unsafe fn disable_bus_master(&mut self) -> Result<(), LegacyError> {
+        let command = read_configuration_address(self.command_address) as u16;
+        self.io_prepared = false;
+        // SAFETY: Command is from the privately retained claimed function.
+        unsafe { self.write_command(command & !COMMAND_MASTER) }
+    }
+
+    /// Restore exactly the original command and release the claim on verified
+    /// success. A failure leaves the global claim held, even though self is
+    /// consumed; a device of uncertain state cannot be claimed again.
+    ///
+    /// # Safety
+    /// The caller must have acknowledged device status zero after all queue
+    /// activity, and stopped all transport accesses. No pending DMA may remain.
+    pub(crate) unsafe fn restore(self) -> Result<(), LegacyError> {
+        // SAFETY: The caller has reset the device before restoring its command.
+        unsafe { self.write_command(self.original_command)? };
+        LEGACY_CLAIMED.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    unsafe fn write_command(&self, command: u16) -> Result<(), LegacyError> {
+        let was_enabled = arch::save_and_disable_interrupts();
+        // SAFETY: The private address is the claimed function's aligned
+        // command register at offset 4. A WORD write touches no Status bits
+        // (offset 6 contains write-one-to-clear fields). Readback is also WORD.
+        let observed = unsafe {
+            arch::out32(CONFIG_ADDRESS, self.command_address);
+            arch::out16(CONFIG_DATA, command);
+            let observed = arch::in16(CONFIG_DATA);
+            arch::restore_interrupts(was_enabled);
+            observed
+        };
+        if observed == command {
+            Ok(())
+        } else {
+            Err(LegacyError::CommandRejected)
+        }
+    }
+}
+
+fn io_only_command(original: u16) -> u16 {
+    (original | COMMAND_IO | COMMAND_INTX_DISABLE) & !COMMAND_MASTER
+}
+
+fn master_command(original: u16) -> u16 {
+    original | COMMAND_IO | COMMAND_MASTER | COMMAND_INTX_DISABLE
+}
+
+fn legacy_io_base(bar: u32) -> Result<u16, LegacyError> {
+    // I/O BAR bit 0 must be set, reserved bit 1 clear. No sizing writes are
+    // performed; firmware and the Virtio device contract supply the resource.
+    let base = bar & !3;
+    if bar & 3 != 1 || base == 0 || base > 0x1_0000 - LEGACY_PORT_BYTES {
+        return Err(LegacyError::IoBar);
+    }
+    Ok(base as u16)
+}
+
+fn legacy_configuration(
+    mut read: impl FnMut(u16) -> Result<u32, LegacyError>,
+) -> Result<(u16, u16), LegacyError> {
+    if read(0)? != 0x1001_1af4 || (read(0x0c)? >> 16) & 0x7f != 0 {
+        return Err(LegacyError::DeviceChanged);
+    }
+    let command_status = read(4)?;
+    let base = legacy_io_base(read(0x10)?)?;
+    if command_status & STATUS_CAPABILITIES != 0 {
+        let mut next = read(0x34)? as u8;
+        let mut visited = 0_u64;
+        // Conventional capabilities occupy DWORD-aligned addresses 40..FC.
+        // A bitmap catches cycles; the loop also has an explicit read bound.
+        for _ in 0..MAX_CAPABILITIES {
+            if next == 0 {
+                return Ok((base, command_status as u16));
+            }
+            if next < 0x40 || !next.is_multiple_of(4) {
+                return Err(LegacyError::CapabilityList);
+            }
+            let bit = 1_u64 << (next / 4);
+            if visited & bit != 0 {
+                return Err(LegacyError::CapabilityList);
+            }
+            visited |= bit;
+            let capability = read(u16::from(next))?;
+            let id = capability as u8;
+            let control = (capability >> 16) as u16;
+            // INTx Disable does not suppress message-signaled interrupts.
+            if id == 0x05 && control & 1 != 0 {
+                return Err(LegacyError::MsiEnabled);
+            }
+            // With MSI-X enabled, legacy device config starts at 24 rather
+            // than 20. Refuse it instead of changing routing or port layouts.
+            if id == 0x11 && control & 0x8000 != 0 {
+                return Err(LegacyError::MsixEnabled);
+            }
+            next = (capability >> 8) as u8;
+        }
+        if next != 0 {
+            return Err(LegacyError::CapabilityList);
+        }
+    }
+    Ok((base, command_status as u16))
+}
+
 struct Reader<F> {
     read: F,
     count: u32,
@@ -234,19 +464,7 @@ fn scan(read: impl FnMut(u32) -> u32) -> Inventory {
 /// diagnostic lines. No device configuration register is written.
 pub(crate) fn probe() -> Inventory {
     let initial_if = arch::interrupts_enabled();
-    let inventory = scan(|address| {
-        let was_enabled = arch::save_and_disable_interrupts();
-        // SAFETY: Only this BSP/module owns the two DWORD configuration ports.
-        // Reader validated the address before disabling IF. The fixed sequence
-        // has no fallible operations between saving and restoring IF. CF8 is
-        // only the host's address latch; the selected device is read at CFC.
-        unsafe {
-            arch::out32(CONFIG_ADDRESS, address);
-            let value = arch::in32(CONFIG_DATA);
-            arch::restore_interrupts(was_enabled);
-            value
-        }
-    });
+    let inventory = scan(read_configuration_address);
     assert_eq!(arch::interrupts_enabled(), initial_if, "PCI changed IF");
     for device in inventory.devices.iter().flatten() {
         if let Some(bridge) = device.bridge {
@@ -401,5 +619,86 @@ pub(crate) fn self_test() {
     assert_eq!(crowded.retained, MAX_RETAINED);
     assert_eq!(crowded.omitted, 8192 - MAX_RETAINED as u32);
     assert_eq!(crowded.config_reads, 8192 * 3);
+    legacy_self_test();
     serial::println!("MIRROR_PCI_TESTS_OK");
+}
+
+#[cfg(feature = "boot-smoke")]
+fn legacy_self_test() {
+    // Configuration snapshots exercise only parsing. No claim is created, no
+    // global state is changed, and no hardware port is read or written.
+    fn inspect(snapshot: &[u32; 64]) -> (Result<(u16, u16), LegacyError>, usize) {
+        let mut reads = 0;
+        let result = legacy_configuration(|register| {
+            assert!(register <= 0xfc && register.is_multiple_of(4));
+            reads += 1;
+            assert!(reads <= 5 + MAX_CAPABILITIES);
+            Ok(snapshot[usize::from(register / 4)])
+        });
+        (result, reads)
+    }
+
+    let mut snapshot = [0_u32; 64];
+    snapshot[0] = 0x1001_1af4;
+    snapshot[1] = 0xa000_0006; // Keep PCI Status distinct from Command.
+    snapshot[4] = 0xc001;
+    snapshot[0x34 / 4] = 0xff; // Ignored without Status.CapabilitiesList.
+    assert_eq!(inspect(&snapshot), (Ok((0xc000, 6)), 4));
+    assert_eq!(io_only_command(6), 0x0403);
+    assert_eq!(master_command(6), 0x0407);
+    assert_eq!(io_only_command(0xffff), 0xfffb);
+    assert_eq!(master_command(0xffff), 0xffff);
+    assert_eq!(legacy_io_base(0xffe5), Ok(0xffe4)); // Last valid 28-byte range.
+    for bar in [0, 1, 2, 0xc000, 0xc003, 0xffe9, 0x1_0001, 0xffff_ffff] {
+        assert_eq!(legacy_io_base(bar), Err(LegacyError::IoBar));
+    }
+
+    snapshot[0] = 0x1042_1af4; // A modern-only block is never a legacy target.
+    assert_eq!(inspect(&snapshot).0, Err(LegacyError::DeviceChanged));
+    snapshot[0] = 0x1001_1234;
+    assert_eq!(inspect(&snapshot).0, Err(LegacyError::DeviceChanged));
+    snapshot[0] = 0x1001_1af4;
+    snapshot[3] = 0x0001_0000; // A type-1 bridge has different BAR/pointer rules.
+    assert_eq!(inspect(&snapshot).0, Err(LegacyError::DeviceChanged));
+    snapshot[3] = 0x0080_0000; // Multifunction bit is legal on a type-0 header.
+    assert_eq!(inspect(&snapshot).0, Ok((0xc000, 6)));
+
+    snapshot[1] |= STATUS_CAPABILITIES;
+    snapshot[0x34 / 4] = 0;
+    assert_eq!(inspect(&snapshot), (Ok((0xc000, 6)), 5));
+    for pointer in [0x3c, 0x42, 0xfe, 0xff] {
+        snapshot[0x34 / 4] = pointer;
+        assert_eq!(inspect(&snapshot).0, Err(LegacyError::CapabilityList));
+    }
+    snapshot[0x34 / 4] = 0x40;
+    snapshot[0x40 / 4] = 0x4401; // Unknown/irrelevant cap -> disabled MSI.
+    snapshot[0x44 / 4] = 0x4805;
+    snapshot[0x48 / 4] = 0x4000_0011; // MSI-X masked, but disabled.
+    assert_eq!(inspect(&snapshot), (Ok((0xc000, 6)), 8));
+    snapshot[0x48 / 4] |= 0x8000_0000;
+    assert_eq!(inspect(&snapshot).0, Err(LegacyError::MsixEnabled));
+    snapshot[0x48 / 4] &= !0x8000_0000;
+    snapshot[0x44 / 4] |= 0x0001_0000;
+    assert_eq!(inspect(&snapshot).0, Err(LegacyError::MsiEnabled));
+    snapshot[0x44 / 4] = 0x4005; // Two-entry cycle.
+    assert_eq!(inspect(&snapshot).0, Err(LegacyError::CapabilityList));
+    snapshot[0x40 / 4] = 0x4001; // Self-cycle.
+    assert_eq!(inspect(&snapshot).0, Err(LegacyError::CapabilityList));
+    snapshot[0x40 / 4] = 0x4301; // Malformed next pointer.
+    assert_eq!(inspect(&snapshot).0, Err(LegacyError::CapabilityList));
+
+    for register in (0x40..=0xfc).step_by(4) {
+        let next = if register == 0xfc { 0 } else { register + 4 };
+        snapshot[register / 4] = (next as u32) << 8 | 1;
+    }
+    assert_eq!(inspect(&snapshot), (Ok((0xc000, 6)), 5 + MAX_CAPABILITIES));
+    snapshot[0xfc / 4] = 0x4001; // Full-length cycle still stops at 48 reads.
+    assert_eq!(
+        inspect(&snapshot),
+        (Err(LegacyError::CapabilityList), 5 + MAX_CAPABILITIES)
+    );
+    assert_eq!(
+        legacy_configuration(|_| Err(LegacyError::ConfigurationAddress)),
+        Err(LegacyError::ConfigurationAddress)
+    );
 }

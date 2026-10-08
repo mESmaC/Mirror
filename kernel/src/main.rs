@@ -4,8 +4,10 @@
 extern crate alloc;
 
 mod arch;
+mod block;
 mod boot;
 mod capability;
+mod dma;
 mod elf;
 mod framebuffer;
 mod heap;
@@ -143,6 +145,10 @@ pub extern "C" fn _start() -> ! {
     {
         pci::self_test();
         framebuffer::self_test();
+        // SAFETY: IF is clear; the sole allocator and preserved writable HHDM
+        // exclusively own these test pages, which are never sent to a device.
+        unsafe { dma::self_test(&mut frames, boot.direct_map_offset) };
+        block::self_test();
         assert!(devices.functions > 0, "no PCI devices discovered");
         assert!(
             devices.virtio_block_devices > 0,
@@ -157,6 +163,23 @@ pub extern "C" fn _start() -> ! {
         test_heap_with_interrupts();
         elf::self_test();
     }
+
+    let inject_block_error = {
+        #[cfg(feature = "boot-smoke")]
+        {
+            matches!(boot::smoke_mode(), boot::SmokeMode::BlockIoError)
+        }
+        #[cfg(not(feature = "boot-smoke"))]
+        {
+            false
+        }
+    };
+    probe_block_device(
+        &devices,
+        &mut frames,
+        boot.direct_map_offset,
+        inject_block_error,
+    );
 
     let scenario = {
         #[cfg(feature = "boot-smoke")]
@@ -187,7 +210,7 @@ pub extern "C" fn _start() -> ! {
     #[cfg(feature = "boot-smoke")]
     {
         match boot::smoke_mode() {
-            boot::SmokeMode::Normal | boot::SmokeMode::User(_) => {
+            boot::SmokeMode::Normal | boot::SmokeMode::User(_) | boot::SmokeMode::BlockIoError => {
                 interrupts::arm_expected_page_fault(paging::TEST_ADDRESS)
             }
             boot::SmokeMode::PageFault => {
@@ -217,6 +240,122 @@ pub extern "C" fn _start() -> ! {
         // SAFETY: The PIC unmasks only the installed timer IRQ; the heap and
         // descriptors are initialized. Keep allocator/table state alive here.
         unsafe { arch::idle() }
+    }
+}
+
+fn probe_block_device(
+    devices: &pci::Inventory,
+    frames: &mut memory::FrameAllocator<'_>,
+    direct_map: u64,
+    inject_error: bool,
+) {
+    let baseline = frames.stats().expect("frame accounting").allocated_frames;
+    // SAFETY: IF is clear; this boot path alone claims the device. Firmware has
+    // exited; the sole allocator owns DMA pages and its HHDM remains mapped.
+    // No other driver or interrupt handler accesses this transport or buffers.
+    let mut driver = match unsafe { block::Driver::open(devices, frames, direct_map) } {
+        Ok(Some(driver)) => driver,
+        Ok(None) => {
+            assert!(!inject_error, "block error probe requires its test disk");
+            assert_eq!(frames.stats().unwrap().allocated_frames, baseline);
+            serial::println!("MIRROR_BLOCK_SKIPPED reason=no_supported_device");
+            return;
+        }
+        Err(error) => {
+            serial::println!("MIRROR_BLOCK_FAILED phase=open error={}", error);
+            return;
+        }
+    };
+    let capacity = driver.capacity_sectors();
+    let queue_size = driver.queue_size();
+    serial::println!(
+        "MIRROR_BLOCK_READY sectors={} queue={} readonly={}",
+        capacity,
+        queue_size,
+        u8::from(driver.is_read_only())
+    );
+    let result = check_block_data(&mut driver, inject_error);
+    // SAFETY: IF is clear; no users or handlers retain this device/buffers.
+    // Shutdown must observe reset completion before releasing its DMA pages;
+    // an unconfirmed reset deliberately quarantines the allocations instead.
+    let cleanup = unsafe { driver.shutdown(frames) };
+    if let Err(error) = cleanup {
+        serial::println!("MIRROR_BLOCK_FAILED phase=shutdown error={}", error);
+        return;
+    }
+    assert_eq!(
+        frames.stats().expect("frame accounting").allocated_frames,
+        baseline,
+        "quiesced block driver leaked DMA pages"
+    );
+    serial::println!("MIRROR_BLOCK_CLEANUP_OK dma_reclaimed=1");
+    match result {
+        Ok(Some(reads)) => serial::println!(
+            "MIRROR_BLOCK_READ_OK sectors={} reads={} queue={} bounds_rejected=2",
+            capacity,
+            reads,
+            queue_size
+        ),
+        Ok(None) => serial::println!("MIRROR_BLOCK_PROBE_OK fixture=0 reads=1"),
+        Err(error) => serial::println!("MIRROR_BLOCK_FAILED phase=read error={}", error),
+    }
+}
+
+/// Read arbitrary disks only for identification; extensive data checks run only
+/// on the dedicated fixture produced by scripts/common.ps1, never on a filesystem.
+fn check_block_data(
+    driver: &mut block::Driver,
+    inject_error: bool,
+) -> Result<Option<usize>, block::BlockError> {
+    let mut bytes = [0_u8; 512];
+    driver.read_sector(0, &mut bytes)?;
+    if driver.capacity_sectors() != 2048 || &bytes[8..16] != b"MIRROR\0\x01" {
+        assert!(!inject_error, "unexpected block error fixture");
+        return Ok(None);
+    }
+    assert!(driver.is_read_only(), "fixture must be read-only");
+    check_fixture_sector(0, &bytes);
+    if inject_error {
+        bytes.fill(0xcc);
+        let result = driver.read_sector(1234, &mut bytes);
+        assert!(
+            matches!(&result, Err(block::BlockError::IoError)),
+            "backend error injection was not observed: {:?}",
+            result
+        );
+        assert_eq!(bytes, [0xcc; 512], "failed read modified caller buffer");
+        driver.read_sector(1234, &mut bytes)?;
+        check_fixture_sector(1234, &bytes);
+        serial::println!("MIRROR_BLOCK_IO_ERROR_OK retry=1 output_preserved=1");
+    }
+    for sector in [driver.capacity_sectors(), u64::MAX] {
+        bytes.fill(0x5a);
+        assert!(driver.read_sector(sector, &mut bytes).is_err());
+        assert_eq!(bytes, [0x5a; 512], "invalid sector modified caller buffer");
+    }
+    let mut reads = 1 + usize::from(inject_error);
+    for sector in [1, 127, 255, 256, 1023, 2047] {
+        driver.read_sector(sector, &mut bytes)?;
+        check_fixture_sector(sector, &bytes);
+        reads += 1;
+    }
+    // Cross the ring's slot boundary twice while reusing the same descriptor
+    // chain and bounce page. Distinct LBAs reveal stale or misordered data.
+    for index in 0..u64::from(driver.queue_size()) * 2 + 3 {
+        let sector = (index * 37 + 11) % 2048;
+        driver.read_sector(sector, &mut bytes)?;
+        check_fixture_sector(sector, &bytes);
+        reads += 1;
+    }
+    Ok(Some(reads))
+}
+
+fn check_fixture_sector(sector: u64, bytes: &[u8; 512]) {
+    assert_eq!(&bytes[..8], &sector.to_le_bytes(), "wrong sector returned");
+    assert_eq!(&bytes[8..16], b"MIRROR\0\x01", "fixture signature mismatch");
+    for (offset, &value) in bytes.iter().enumerate().skip(16) {
+        let expected = ((sector * 73) ^ (sector >> 8) ^ (offset as u64 * 29) ^ 0xa5) as u8;
+        assert_eq!(value, expected, "fixture data mismatch");
     }
 }
 

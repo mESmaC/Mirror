@@ -8,6 +8,8 @@
 use limine::memory_map::{Entry, EntryType};
 
 pub const PAGE_SIZE: u64 = 4096;
+pub const MAX_DMA_PAGES: usize = 4;
+pub const DMA32_LIMIT: u64 = 1 << 32;
 
 const NEVER_ALLOCATED: u8 = 0;
 const ALLOCATED: u8 = 1;
@@ -35,11 +37,19 @@ pub enum RecyclingError {
 #[derive(Debug, PartialEq, Eq)]
 pub enum FrameError {
     RecyclingDisabled,
+    InvalidPageCount,
     UnalignedAddress,
     NotUsable,
     NeverAllocated,
     AlreadyFree,
     MetadataReserved,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ContiguousError {
+    InvalidPageCount,
+    RecyclingDisabled,
+    OutOfFrames,
 }
 
 struct Recycling {
@@ -117,7 +127,9 @@ impl<'a> FrameAllocator<'a> {
                     let index = self.index_of(start);
                     if let Some(recycling) = &mut self.recycling {
                         let index = index.expect("invalid bump frame");
-                        if recycling.state(index) == METADATA {
+                        // Contiguous allocations may reserve never-used pages
+                        // ahead of this cursor, as may the metadata itself.
+                        if matches!(recycling.state(index), METADATA | ALLOCATED) {
                             continue;
                         }
                         assert_eq!(recycling.state(index), NEVER_ALLOCATED);
@@ -132,6 +144,63 @@ impl<'a> FrameAllocator<'a> {
             self.next = 0;
         }
         None
+    }
+
+    /// Allocate 1..=MAX_DMA_PAGES consecutive pages in one USABLE range, with
+    /// the entire run below 4 GiB. Recycling must already be enabled. The scan
+    /// examines at most the usable frames below that address ceiling and never
+    /// changes allocation state until a complete free run has been found.
+    pub fn allocate_contiguous_dma32(&mut self, pages: usize) -> Result<u64, ContiguousError> {
+        if !(1..=MAX_DMA_PAGES).contains(&pages) {
+            return Err(ContiguousError::InvalidPageCount);
+        }
+        let recycling = self
+            .recycling
+            .as_ref()
+            .ok_or(ContiguousError::RecyclingDisabled)?;
+        let mut index_base = 0usize;
+        let mut selected = None;
+        for entry in self.entries {
+            let Some((base, end)) = usable_bounds(entry) else {
+                continue;
+            };
+            let count = ((end - base) / PAGE_SIZE) as usize;
+            let eligible = (end.min(DMA32_LIMIT).saturating_sub(base) / PAGE_SIZE) as usize;
+            let mut run = 0usize;
+            for offset in 0..eligible {
+                if matches!(
+                    recycling.state(index_base + offset),
+                    NEVER_ALLOCATED | RECYCLED
+                ) {
+                    run += 1;
+                    if run == pages {
+                        let first = offset + 1 - pages;
+                        selected = Some((base + first as u64 * PAGE_SIZE, index_base + first));
+                        break;
+                    }
+                } else {
+                    run = 0;
+                }
+            }
+            if selected.is_some() {
+                break;
+            }
+            index_base += count;
+        }
+        let (physical, first) = selected.ok_or(ContiguousError::OutOfFrames)?;
+        let recycling = self.recycling.as_mut().expect("bitmap initialized");
+        for index in first..first + pages {
+            match recycling.state(index) {
+                NEVER_ALLOCATED => recycling.stats.never_allocated_frames -= 1,
+                RECYCLED => recycling.stats.recycled_frames -= 1,
+                _ => unreachable!("complete free run was preflighted"),
+            }
+            recycling.set_state(index, ALLOCATED);
+        }
+        recycling.stats.allocated_frames += pages;
+        // The recycled hint remains a valid lower bound even if this run
+        // consumed its target: ordinary allocation skips non-recycled entries.
+        Ok(physical)
     }
 
     /// Reserve state metadata from one remaining contiguous USABLE range.
@@ -268,6 +337,52 @@ impl<'a> FrameAllocator<'a> {
         }
     }
 
+    /// Release a bounded run atomically: every frame is validated before any
+    /// bitmap state changes. A failed release retains the entire allocation.
+    ///
+    /// # Safety
+    /// The caller must satisfy deallocate's ownership, quiescence, mapping and
+    /// single-CPU requirements for every page. Use the same allocator that
+    /// allocated the run. Invalid ranges may be submitted as validation probes.
+    pub unsafe fn deallocate_contiguous(
+        &mut self,
+        physical: u64,
+        pages: usize,
+    ) -> Result<(), FrameError> {
+        if !(1..=MAX_DMA_PAGES).contains(&pages) {
+            return Err(FrameError::InvalidPageCount);
+        }
+        let recycling = self
+            .recycling
+            .as_ref()
+            .ok_or(FrameError::RecyclingDisabled)?;
+        if !physical.is_multiple_of(PAGE_SIZE) {
+            return Err(FrameError::UnalignedAddress);
+        }
+        let mut indices = [0usize; MAX_DMA_PAGES];
+        for (offset, index) in indices.iter_mut().take(pages).enumerate() {
+            let frame = physical
+                .checked_add(offset as u64 * PAGE_SIZE)
+                .ok_or(FrameError::NotUsable)?;
+            *index = self.index_of(frame).ok_or(FrameError::NotUsable)?;
+            match recycling.state(*index) {
+                NEVER_ALLOCATED => return Err(FrameError::NeverAllocated),
+                RECYCLED => return Err(FrameError::AlreadyFree),
+                METADATA => return Err(FrameError::MetadataReserved),
+                ALLOCATED => {}
+                _ => unreachable!("two-bit frame state"),
+            }
+        }
+        let recycling = self.recycling.as_mut().expect("bitmap initialized");
+        for &index in indices.iter().take(pages) {
+            recycling.set_state(index, RECYCLED);
+            recycling.recycled_hint = recycling.recycled_hint.min(index);
+        }
+        recycling.stats.allocated_frames -= pages;
+        recycling.stats.recycled_frames += pages;
+        Ok(())
+    }
+
     pub fn stats(&self) -> Option<FrameStats> {
         self.recycling.as_ref().map(|recycling| recycling.stats)
     }
@@ -400,7 +515,211 @@ pub fn self_test() {
     }
     assert_eq!(FrameAllocator::new(&[]).allocate(), None);
     assert_eq!(align_up(u64::MAX), None);
+    self_test_contiguous();
     crate::serial::println!("MIRROR_ALLOCATOR_TESTS_OK");
+}
+
+/// Exercise fragmentation and address ceilings using a private state bitmap.
+/// Synthetic physical numbers are never dereferenced or given to a device.
+#[cfg(feature = "boot-smoke")]
+fn self_test_contiguous() {
+    const COUNT: usize = 18;
+    fn snapshot(frames: &FrameAllocator<'_>) -> [u8; COUNT] {
+        core::array::from_fn(|index| frames.recycling.as_ref().unwrap().state(index))
+    }
+    let entries = [
+        Entry {
+            base: 0x1000,
+            length: 6 * PAGE_SIZE,
+            entry_type: EntryType::USABLE,
+        },
+        Entry {
+            base: 0x7000,
+            length: PAGE_SIZE,
+            entry_type: EntryType::RESERVED,
+        },
+        Entry {
+            base: 0x8000,
+            length: 4 * PAGE_SIZE,
+            entry_type: EntryType::USABLE,
+        },
+        Entry {
+            base: DMA32_LIMIT - 2 * PAGE_SIZE,
+            length: 4 * PAGE_SIZE,
+            entry_type: EntryType::USABLE,
+        },
+        Entry {
+            base: DMA32_LIMIT + 3 * PAGE_SIZE,
+            length: 4 * PAGE_SIZE,
+            entry_type: EntryType::USABLE,
+        },
+    ];
+    let refs = entries.each_ref();
+    let mut frames = FrameAllocator::new(&refs);
+    assert_eq!(
+        frames.allocate_contiguous_dma32(1),
+        Err(ContiguousError::RecyclingDisabled)
+    );
+    let mut bitmap = [0u8; COUNT.div_ceil(4)];
+    let mut recycling = Recycling {
+        bitmap: bitmap.as_mut_ptr(),
+        physical: 0x1000,
+        direct_map_offset: 0,
+        stats: FrameStats {
+            total_frames: COUNT,
+            allocated_frames: 2,
+            recycled_frames: 4,
+            metadata_frames: 1,
+            never_allocated_frames: 11,
+        },
+        recycled_hint: 2,
+    };
+    let initial = [
+        METADATA,
+        ALLOCATED,
+        RECYCLED,
+        ALLOCATED,
+        NEVER_ALLOCATED,
+        RECYCLED,
+        NEVER_ALLOCATED,
+        RECYCLED,
+        NEVER_ALLOCATED,
+        NEVER_ALLOCATED,
+        RECYCLED,
+        NEVER_ALLOCATED,
+        NEVER_ALLOCATED,
+        NEVER_ALLOCATED,
+        NEVER_ALLOCATED,
+        NEVER_ALLOCATED,
+        NEVER_ALLOCATED,
+        NEVER_ALLOCATED,
+    ];
+    for (index, state) in initial.into_iter().enumerate() {
+        recycling.set_state(index, state);
+    }
+    // This private bitmap, rather than a mapped synthetic physical address,
+    // remains writable and exclusively owned until the allocator is dropped.
+    frames.recycling = Some(recycling);
+    let before = frames.stats();
+    for pages in [0, MAX_DMA_PAGES + 1, usize::MAX] {
+        assert_eq!(
+            frames.allocate_contiguous_dma32(pages),
+            Err(ContiguousError::InvalidPageCount)
+        );
+    }
+    assert_eq!(frames.stats(), before);
+    assert_eq!(snapshot(&frames), initial);
+
+    // No run crosses the reserved hole. The first qualifying run mixes recycled
+    // and never-used pages, after a fragmented earlier region.
+    let three = frames
+        .allocate_contiguous_dma32(3)
+        .expect("mixed contiguous run");
+    assert_eq!(three, 0x8000);
+    let before = frames.stats();
+    let states = snapshot(&frames);
+    let cursor = (frames.region, frames.next);
+    assert_eq!(
+        frames.allocate_contiguous_dma32(4),
+        Err(ContiguousError::OutOfFrames)
+    );
+    assert_eq!(frames.stats(), before);
+    assert_eq!(snapshot(&frames), states);
+    assert_eq!((frames.region, frames.next), cursor);
+    // SAFETY: This test owns the private bitmap and all synthetic allocations;
+    // there are no real frame accesses, DMA operations, or secondary aliases.
+    unsafe { frames.deallocate_contiguous(three, 3) }.expect("release synthetic run");
+    let four = frames
+        .allocate_contiguous_dma32(4)
+        .expect("maximum contiguous run");
+    assert_eq!(four, 0x8000);
+    let two = frames
+        .allocate_contiguous_dma32(2)
+        .expect("earlier two-page run");
+    assert_eq!(two, 0x5000);
+    let before = frames.stats();
+    let states = snapshot(&frames);
+    // SAFETY: The third page is reserved; atomic validation must leave both
+    // owned pages live. This changes only the test's private allocator bitmap.
+    unsafe {
+        assert_eq!(
+            frames.deallocate_contiguous(two, 3),
+            Err(FrameError::NotUsable)
+        );
+    }
+    assert_eq!(frames.stats(), before);
+    assert_eq!(snapshot(&frames), states);
+
+    let edge = frames
+        .allocate_contiguous_dma32(2)
+        .expect("DMA32 ceiling run");
+    assert_eq!(edge + 2 * PAGE_SIZE, DMA32_LIMIT);
+    let before = frames.stats();
+    let states = snapshot(&frames);
+    assert_eq!(
+        frames.allocate_contiguous_dma32(3),
+        Err(ContiguousError::OutOfFrames)
+    );
+    // SAFETY: The third page exists above the DMA ceiling but was never
+    // allocated. Rejecting it must retain the first two pages atomically.
+    unsafe {
+        assert_eq!(
+            frames.deallocate_contiguous(edge, 3),
+            Err(FrameError::NeverAllocated)
+        );
+    }
+    assert_eq!(frames.stats(), before);
+    assert_eq!(snapshot(&frames), states);
+    // SAFETY: The test owns these synthetic pages; no access uses their contents.
+    unsafe { frames.deallocate_contiguous(edge, 2) }.expect("release ceiling run");
+
+    // Drain ordinary allocation while the out-of-order contiguous reservations
+    // stay live. This proves the bump cursor skips them rather than returning
+    // aliases or asserting when it eventually reaches their bitmap positions.
+    let mut live = [0u64; COUNT - 1];
+    live[..8].copy_from_slice(&[
+        0x2000,
+        0x4000,
+        two,
+        two + PAGE_SIZE,
+        four,
+        four + PAGE_SIZE,
+        four + 2 * PAGE_SIZE,
+        four + 3 * PAGE_SIZE,
+    ]);
+    let mut count = 8;
+    while let Some(physical) = frames.allocate() {
+        assert_ne!(physical, 0x1000, "metadata was allocated");
+        assert!(!live[..count].contains(&physical), "live frame was aliased");
+        live[count] = physical;
+        count += 1;
+    }
+    assert_eq!(count, COUNT - 1);
+    assert!(live.iter().any(|&physical| physical >= DMA32_LIMIT));
+    let before = frames.stats();
+    let states = snapshot(&frames);
+    assert_eq!(
+        frames.allocate_contiguous_dma32(1),
+        Err(ContiguousError::OutOfFrames)
+    );
+    assert_eq!(frames.stats(), before);
+    assert_eq!(snapshot(&frames), states);
+    for physical in live {
+        // SAFETY: Every synthetic allocation is unique and test-owned, and this
+        // private bitmap is the only memory accessed by the release operation.
+        unsafe { frames.deallocate(physical) }.expect("reclaim synthetic frame");
+    }
+    assert_eq!(
+        frames.stats(),
+        Some(FrameStats {
+            total_frames: COUNT,
+            allocated_frames: 0,
+            recycled_frames: COUNT - 1,
+            metadata_frames: 1,
+            never_allocated_frames: 0,
+        })
+    );
+    crate::serial::println!("MIRROR_CONTIGUOUS_TESTS_OK");
 }
 
 /// Exercise recycling on actual RAM with the initialized direct-map contract.
