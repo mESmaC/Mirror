@@ -1,4 +1,4 @@
-//! BSP exception delivery. Maskable interrupts remain disabled; no userspace yet.
+//! BSP exception and legacy PIC IRQ delivery; no userspace yet.
 //!
 //! Descriptor and frame layouts follow Intel SDM vol. 3A, sections 6.14 and 7.7:
 //! https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "boot-smoke")]
 use core::sync::atomic::{AtomicU64, AtomicUsize};
 
-use crate::{arch, serial};
+use crate::{arch, serial, timer};
 
 global_asm!(include_str!("interrupts.S"));
 
@@ -148,10 +148,14 @@ static EXPECTED_PAGE_FAULT: AtomicU64 = AtomicU64::new(0);
 static PAGE_FAULT_ARMED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" {
-    static mirror_exception_entries: [u64; 32];
+    static mirror_exception_entries: [u64; 48];
 }
 
-/// Install the boot CPU's GDT, TSS and exception IDT exactly once at CPL0.
+pub(crate) fn is_initialized() -> bool {
+    INITIALIZED.load(Ordering::SeqCst)
+}
+
+/// Install the boot CPU's GDT, TSS and exception/IRQ IDT once at CPL0.
 /// All descriptor storage and the double-fault stack must remain mapped.
 /// This bring-up kernel has one CPU; later SMP needs per-CPU TSS/IST storage.
 pub fn init() {
@@ -186,7 +190,7 @@ pub fn init() {
         ]);
         let handlers = addr_of!(mirror_exception_entries).cast::<u64>();
         let entries = addr_of_mut!(IDT).cast::<IdtEntry>();
-        for vector in 0..32 {
+        for vector in 0..48 {
             let ist = if vector == 8 { DOUBLE_FAULT_IST } else { 0 };
             entries
                 .add(vector)
@@ -206,7 +210,8 @@ pub fn init() {
     // SAFETY: CPL0, interrupts disabled, persistent valid descriptors. The far
     // return reloads CS with balanced stack use; data selectors are replaced
     // before LTR. FS/GS have no TLS users in this single-CPU kernel. LTR marks
-    // our writable TSS descriptor busy. No ring3 transitions or IRQs are enabled.
+    // our writable TSS descriptor busy. No ring3 transitions or IRQs are enabled
+    // here; timer::init configures the PIC/PIT before the caller may set IF.
     unsafe {
         asm!(
             "lgdt [{gdt}]",
@@ -233,7 +238,7 @@ pub fn init() {
             out("rax") _,
         );
     }
-    serial::println!("MIRROR_IDT_READY exceptions=32 double_fault_ist=1");
+    serial::println!("MIRROR_IDT_READY exceptions=32 double_fault_ist=1 irqs=16");
 }
 
 #[cfg(feature = "boot-smoke")]
@@ -279,6 +284,13 @@ pub fn arm_expected_page_fault(address: u64) {
 
 #[unsafe(no_mangle)]
 extern "C" fn mirror_exception_dispatch(frame: &ExceptionFrame) {
+    // IRQs must never consume an armed synchronous-exception expectation.
+    // The IRQ path does not allocate, print or take a lock.
+    if (32..48).contains(&frame.vector) {
+        timer::handle_irq(frame.vector as u8);
+        return;
+    }
+
     let cr2: u64;
     // SAFETY: Every gate targets this CPL0 handler. Capture CR2 before printing
     // diagnostics, so a secondary fault cannot silently replace its value.

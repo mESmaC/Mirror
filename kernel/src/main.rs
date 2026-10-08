@@ -1,12 +1,16 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod arch;
 mod boot;
+mod heap;
 mod interrupts;
 mod memory;
 mod paging;
 mod serial;
+mod timer;
 
 use core::panic::PanicInfo;
 use limine::memory_map::EntryType;
@@ -58,11 +62,52 @@ pub extern "C" fn _start() -> ! {
         tables.owned_table_count()
     );
 
+    // SAFETY: The sole allocator and the copied direct map still own all usable
+    // RAM. Bitmap metadata excludes every already-allocated page-table frame.
+    unsafe { frames.enable_recycling(boot.direct_map_offset) }
+        .expect("could not initialize physical-frame recycling");
+    // SAFETY: These two bootstrap test pages have no live references, DMA, or
+    // mappings beyond the dormant direct map. Their content checks are finished.
+    unsafe {
+        frames.deallocate(first).expect("release first boot frame");
+        frames
+            .deallocate(second)
+            .expect("release second boot frame");
+    }
+    assert_eq!(
+        frames.stats().expect("frame accounting").allocated_frames,
+        tables.owned_table_count(),
+        "boot allocations must remain tracked during the allocator transition"
+    );
+
+    // SAFETY: IRQs are still disabled. This allocator and active hierarchy own
+    // the heap range exclusively, and frame recycling is now available.
+    unsafe { heap::init(&mut tables, &mut frames) }.expect("could not initialize kernel heap");
+    let heap_stats = heap::stats();
+    serial::println!(
+        "MIRROR_HEAP_READY size={} free={}",
+        heap_stats.size,
+        heap_stats.free
+    );
+    let frame_stats = frames.stats().expect("frame accounting");
+    serial::println!(
+        "MIRROR_FRAME_POOL total={} allocated={} metadata={} free={}",
+        frame_stats.total_frames,
+        frame_stats.allocated_frames,
+        frame_stats.metadata_frames,
+        frame_stats.recycled_frames + frame_stats.never_allocated_frames
+    );
+    timer::init();
+
     #[cfg(feature = "boot-smoke")]
     {
+        memory::self_test_recycling(&mut frames);
         interrupts::self_test();
         // SAFETY: This is the active, exclusively owned hierarchy and allocator.
         unsafe { paging::self_test(&mut tables, &mut frames) };
+        heap::self_test();
+        timer::self_test();
+        test_heap_with_interrupts();
         match boot::smoke_mode() {
             boot::SmokeMode::Normal => interrupts::arm_expected_page_fault(paging::TEST_ADDRESS),
             boot::SmokeMode::PageFault => {
@@ -87,12 +132,43 @@ pub extern "C" fn _start() -> ! {
 
     #[cfg(not(feature = "boot-smoke"))]
     {
-        // Keep the ownership object in this boot scope until the scheduler can
-        // take over. No page-table frames or bootloader memory are reclaimed.
-        let _ = &mut tables;
         serial::println!("MIRROR_BOOT_OK");
-        arch::halt()
+        serial::println!("Mirror idle: timer ticks={}", timer::ticks());
+        // SAFETY: The PIC unmasks only the installed timer IRQ; the heap and
+        // descriptors are initialized. Keep allocator/table state alive here.
+        unsafe { arch::idle() }
     }
+}
+
+#[cfg(feature = "boot-smoke")]
+fn test_heap_with_interrupts() {
+    use alloc::vec::Vec;
+
+    assert!(!arch::interrupts_enabled());
+    let baseline = heap::stats();
+    let before = timer::ticks();
+    // SAFETY: Timer setup and its first hardware-delivery test have completed;
+    // the only unmasked handler neither allocates nor takes the heap lock.
+    unsafe { arch::restore_interrupts(true) };
+    while timer::ticks().wrapping_sub(before) < 3 {
+        let mut values = Vec::with_capacity(64);
+        for index in 0..64_u64 {
+            values.push(index ^ 0x4d49_5252);
+        }
+        core::hint::black_box(&values);
+        assert_eq!(values[63], 63 ^ 0x4d49_5252);
+        drop(values);
+        assert!(
+            arch::interrupts_enabled(),
+            "allocator left interrupts disabled"
+        );
+    }
+    arch::disable_interrupts();
+    assert_eq!(heap::stats(), baseline, "IRQ-enabled allocations leaked");
+    serial::println!(
+        "MIRROR_HEAP_IRQ_OK ticks={}",
+        timer::ticks().wrapping_sub(before)
+    );
 }
 
 #[panic_handler]

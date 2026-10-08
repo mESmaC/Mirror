@@ -1,9 +1,9 @@
-//! Polling 16550 COM1 diagnostics for single-CPU, interrupt-disabled bring-up.
-//! Replace with synchronized console infrastructure before enabling SMP/IRQs.
+//! Polling 16550 COM1 diagnostics with boot-CPU interrupt exclusion.
+//! Normal IRQ handlers never print; SMP will need additional synchronization.
 
 use core::fmt::{self, Write};
 
-use crate::arch::{in8, out8};
+use crate::arch::{self, in8, out8};
 
 const COM1: u16 = 0x3f8;
 
@@ -48,7 +48,11 @@ impl Write for Console {
 }
 
 pub fn print(args: fmt::Arguments<'_>) {
+    let was_enabled = arch::save_and_disable_interrupts();
     let _ = Console.write_fmt(args);
+    // SAFETY: Restore this CPU's entry state after the whole message. No lock is
+    // held, so fatal exception diagnostics can print even during an allocation.
+    unsafe { arch::restore_interrupts(was_enabled) };
 }
 
 macro_rules! println {

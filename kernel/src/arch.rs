@@ -1,15 +1,59 @@
-//! Early x86-64 operations. Only the boot CPU runs; interrupts remain disabled.
+//! Boot-CPU operations, interrupt-state guards, and idle/fatal halt paths.
 
 use core::arch::asm;
 
 pub fn disable_interrupts() {
-    // SAFETY: The kernel runs at CPL0; boot keeps maskable interrupts disabled.
-    unsafe { asm!("cli", options(nomem, nostack)) };
+    // SAFETY: The kernel runs at CPL0. Keep a compiler memory barrier so memory
+    // operations in an interrupt-disabled critical section cannot move outside.
+    unsafe { asm!("cli", options(nostack)) };
+}
+
+pub fn interrupts_enabled() -> bool {
+    let flags: u64;
+    // SAFETY: PUSHFQ/POP are balanced, and the kernel stack is mapped writable.
+    unsafe { asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags)) };
+    flags & (1 << 9) != 0
+}
+
+/// Save the caller's IF state and disable maskable interrupts on the boot CPU.
+pub fn save_and_disable_interrupts() -> bool {
+    let flags: u64;
+    // SAFETY: CPL0, balanced stack use. Do not use `nomem`: this is also the
+    // compiler barrier at the beginning of an interrupt-safe critical section.
+    unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags) };
+    flags & (1 << 9) != 0
+}
+
+/// Restore a previously saved interrupt state after leaving a critical section.
+///
+/// # Safety
+/// Interrupts must currently be disabled. If `was_enabled` is true, all active
+/// interrupt sources must have installed handlers and consistent shared state.
+pub unsafe fn restore_interrupts(was_enabled: bool) {
+    if was_enabled {
+        // SAFETY: The caller guarantees handlers and shared state are ready.
+        // This compiler memory barrier publishes critical-section writes first.
+        unsafe { asm!("sti", options(nostack)) };
+    }
+}
+
+/// Wait for interrupts once boot has installed and initialized all IRQ sources.
+///
+/// # Safety
+/// Every unmasked interrupt must have a handler. All boot state must be ready
+/// for handlers to observe it. This is an idle loop, not a task scheduler.
+#[cfg(not(feature = "boot-smoke"))]
+pub unsafe fn idle() -> ! {
+    loop {
+        // SAFETY: The caller has initialized all unmasked sources. STI's
+        // interrupt shadow closes the race between enabling interrupts and HLT.
+        unsafe { asm!("sti", "hlt", options(nostack)) };
+    }
 }
 
 pub fn halt() -> ! {
     loop {
-        // SAFETY: CPL0; IRQ handling and scheduling are not enabled yet.
+        // SAFETY: CPL0; fatal halt must not resume ordinary IRQ processing.
         unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
     }
 }

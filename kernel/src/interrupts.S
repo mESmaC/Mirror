@@ -1,4 +1,4 @@
-# CPU exception entry, x86_64-unknown-none: SysV ABI, no red zone, soft float.
+# CPU exception/IRQ entry, x86_64-unknown-none: SysV ABI, no red zone, soft float.
 # Enabling SIMD in kernel Rust requires saving extended processor state here.
 .section .text.exceptions,"ax",@progbits
 
@@ -45,6 +45,11 @@ MIRROR_EXCEPTION 28
 MIRROR_EXCEPTION 29, 1
 MIRROR_EXCEPTION 30, 1
 MIRROR_EXCEPTION 31
+
+# Remapped legacy PIC IRQ0..15 never push a hardware error code.
+.irp vector,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47
+    MIRROR_EXCEPTION \vector
+.endr
 
 .type mirror_exception_common, @function
 mirror_exception_common:
@@ -97,7 +102,7 @@ mirror_exception_common:
 .global mirror_exception_entries
 .type mirror_exception_entries, @object
 mirror_exception_entries:
-.irp vector,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+.irp vector,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47
     .quad mirror_exception_\vector
 .endr
 .size mirror_exception_entries, .-mirror_exception_entries

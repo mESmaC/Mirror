@@ -3,8 +3,8 @@
 //! We copy Limine's tables, preserving every present leaf and its permissions.
 //! This keeps the kernel, bootstrap stack, and direct map available across CR3.
 //! Only the boot CPU may use this module, with interrupts disabled. There is no
-//! address-space isolation, huge-page splitting, SMP shootdown, or frame freeing
-//! yet. Bootloader-reclaimable memory must remain reserved for the stack and
+//! address-space isolation, huge-page splitting, SMP shootdown, or table-frame
+//! reclamation yet. Bootloader-reclaimable memory stays reserved for the stack and
 //! boot responses even after the page-table hierarchy has been copied.
 
 use core::{
@@ -104,8 +104,6 @@ impl PageTables {
     /// `physical` must be a full, valid RAM page the caller may map writable.
     /// The caller must account for aliases and Rust reference lifetimes. The
     /// allocator must remain the unique allocator used to create these tables.
-    // The production userspace/driver mapper will consume this API next.
-    #[cfg_attr(not(feature = "boot-smoke"), allow(dead_code))]
     pub unsafe fn map_page(
         &mut self,
         address: u64,
@@ -165,8 +163,6 @@ impl PageTables {
     /// No live reference or subsequent access may depend on the removed alias.
     /// In particular, keep the executing code, stack, and HHDM of all table
     /// frames mapped. The caller must handle any remaining physical aliases.
-    // The production userspace/driver mapper will consume this API next.
-    #[cfg_attr(not(feature = "boot-smoke"), allow(dead_code))]
     pub unsafe fn unmap_page(&mut self, address: u64) -> Result<u64, PagingError> {
         check_page_address(address)?;
         self.check_active()?;
@@ -271,8 +267,8 @@ impl PageTables {
 
 /// Deep-copy the active four-level hierarchy into USABLE frames and activate it.
 /// NX support is required; NXE and supervisor write protection are enabled.
-/// Allocation failures retain consumed frames because the bootstrap allocator
-/// has no free operation. The old root stays active if cloning fails.
+/// Allocation failures retain frames consumed by an incomplete copy. The old
+/// root stays active if cloning fails; this transition has no rollback yet.
 ///
 /// # Safety
 /// Call at CPL0 on the sole running CPU, with interrupts disabled and a valid
@@ -466,5 +462,8 @@ pub unsafe fn self_test(tables: &mut PageTables, frames: &mut FrameAllocator<'_>
         tables.translate(code).expect("kernel mapping after test"),
         before
     );
+    // SAFETY: Unmapping has invalidated the scratch translation and all raw
+    // accesses above have ended. Only the dormant direct-map alias remains.
+    unsafe { frames.deallocate(physical) }.expect("recycle unmapped scratch frame");
     crate::serial::println!("MIRROR_PAGING_OK");
 }
