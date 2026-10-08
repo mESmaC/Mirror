@@ -3,6 +3,7 @@ param(
     [switch]$Release,
     [switch]$Smoke,
     [switch]$NoBuild,
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -12,6 +13,9 @@ param(
 
 . (Join-Path $PSScriptRoot 'common.ps1')
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
+if ($Fault -ne 'None' -and -not $Smoke) {
+    throw '-Fault requires -Smoke; intentional faults are excluded from normal kernels.'
+}
 $qemu = Get-MirrorQemu -RequestedPath $QemuPath -RepositoryRoot $repositoryRoot
 $qemuDirectory = Split-Path -Parent $qemu
 $codePath = Get-MirrorFirmware -RequestedPath $FirmwareCode -QemuDirectory $qemuDirectory -Names @('edk2-x86_64-code.fd', 'OVMF_CODE.fd', 'OVMF_CODE.4m.fd') -ParameterName 'FirmwareCode'
@@ -28,6 +32,13 @@ foreach ($relativePath in @('EFI/BOOT/BOOTX64.EFI', 'kernel.elf', 'limine.conf')
         throw "The boot tree is incomplete: $relativePath. Run scripts/build.ps1 first."
     }
 }
+
+# All fault cases use the same smoke binary, selected by its boot command line.
+# Always start from the repository config so -NoBuild cannot retain a stale mode.
+$bootConfig = [System.IO.File]::ReadAllText((Join-Path $repositoryRoot 'boot/limine.conf'))
+if ($Fault -eq 'PageFault') { $bootConfig += "`n    cmdline: mirror.test=page-fault`n" }
+if ($Fault -eq 'InvalidOpcode') { $bootConfig += "`n    cmdline: mirror.test=invalid-opcode`n" }
+[System.IO.File]::WriteAllText((Join-Path $espDirectory 'limine.conf'), $bootConfig)
 
 # Never write to the QEMU installation's firmware template. A fresh local copy
 # also prevents stale firmware boot entries from changing the smoke-test path.
@@ -75,20 +86,41 @@ try {
     $process.Refresh()
     $qemuExitCode = $process.ExitCode
     $serial = [System.IO.File]::ReadAllText($serialLog)
-    if ($serial -match '(?im)^(?:MIRROR_PANIC|PANIC|\[panic\]|EXCEPTION|MIRROR_EXCEPTION)') {
-        throw "Mirror reported a panic or exception. See $serialLog."
+    if ($serial -match '(?im)^(?:MIRROR_PANIC|PANIC|\[panic\])') {
+        throw "Mirror reported a panic. See $serialLog."
     }
-    if ($qemuExitCode -ne 33) {
+    $expectedExitCode = if ($Fault -eq 'None') { 33 } else { 35 }
+    if ($qemuExitCode -ne $expectedExitCode) {
         $qemuError = [System.IO.File]::ReadAllText($stderrLog)
-        throw "Mirror smoke test expected QEMU exit 33; got $qemuExitCode. $qemuError See $serialLog."
+        throw "Mirror smoke test expected QEMU exit $expectedExitCode; got $qemuExitCode. $qemuError See $serialLog."
     }
-    foreach ($marker in @('MIRROR_FRAMES_OK', 'MIRROR_ALLOCATOR_TESTS_OK', 'MIRROR_BOOT_OK')) {
+    $markers = @('MIRROR_FRAMES_OK', 'MIRROR_ALLOCATOR_TESTS_OK', 'MIRROR_EXCEPTIONS_OK', 'MIRROR_PAGING_OK')
+    if ($Fault -eq 'None') {
+        $markers += @('MIRROR_PAGE_FAULT_OK', 'MIRROR_BOOT_OK')
+        if ($serial -match '(?im)^(?:EXCEPTION|MIRROR_EXCEPTION)(?:\s|:|$)') {
+            throw "Mirror reported an unexpected exception. See $serialLog."
+        }
+    }
+    else {
+        $vector = if ($Fault -eq 'PageFault') { 14 } else { 6 }
+        $diagnostic = "(?m)^MIRROR_EXCEPTION vector=$vector error=0x0 rip=0x[0-9a-f]+ cr2="
+        if ($Fault -eq 'PageFault') { $diagnostic += '0xffffc00000000000(?:\s|$)' }
+        else { $diagnostic += '0x[0-9a-f]+(?:\s|$)' }
+        if ($serial -notmatch $diagnostic -or $serial -notmatch "(?m)^MIRROR_TEST_EXPECT_FATAL vector=$vector(?:\s|$)") {
+            throw "Mirror did not report the intended $Fault diagnostic. See $serialLog."
+        }
+        if ($serial -match '(?m)^MIRROR_BOOT_OK(?:\s|$)') {
+            throw "Fatal-fault test incorrectly reached normal boot completion. See $serialLog."
+        }
+    }
+    foreach ($marker in $markers) {
         if ($serial -notmatch "(?m)^$marker(?:\s|$)") {
             throw "Mirror smoke test did not report $marker. See $serialLog."
         }
     }
-    Write-Host "Mirror boot smoke test passed (QEMU exit 33, frame and boot checks). Serial log: $serialLog"
-    Write-Output $serial
+    Write-Host "Mirror boot smoke test passed (fault=$Fault, QEMU exit $expectedExitCode). Serial log: $serialLog"
+    # Keep firmware's terminal control sequences in the raw log, not tool output.
+    Write-Output (($serial -split '\r?\n' | Where-Object { $_ -match '^(MIRROR_|Memory map:|Direct map offset:|Page tables:)' }) -join [Environment]::NewLine)
 }
 finally {
     if ($null -ne $process) {

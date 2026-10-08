@@ -3,13 +3,13 @@
 use core::arch::asm;
 
 pub fn disable_interrupts() {
-    // SAFETY: The kernel runs at CPL0. No interrupt handlers exist yet.
+    // SAFETY: The kernel runs at CPL0; boot keeps maskable interrupts disabled.
     unsafe { asm!("cli", options(nomem, nostack)) };
 }
 
 pub fn halt() -> ! {
     loop {
-        // SAFETY: CPL0; keep maskable interrupts disabled until we have an IDT.
+        // SAFETY: CPL0; IRQ handling and scheduling are not enabled yet.
         unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
     }
 }
