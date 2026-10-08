@@ -19,6 +19,8 @@ const SYS_RECV: u64 = 9;
 const SYS_RECV_WAIT: u64 = 10;
 const SYS_CLOSE: u64 = 11;
 const SYS_DUP: u64 = 12;
+const SYS_SURFACE_INFO: u64 = 13;
+const SYS_SURFACE_PRESENT: u64 = 14;
 const RIGHT_SEND: u64 = 1;
 const RIGHT_RECEIVE: u64 = 2;
 const RIGHT_WRITE: u64 = 4;
@@ -38,6 +40,14 @@ const STACK_GUARD: u64 = 0x7ffe_f000;
 const DATA_SENTINEL: u64 = 0xfedc_ba98_7654_3210;
 const BSS_SENTINEL: u64 = 0x1122_3344_5566_7788;
 const STACK_SENTINEL: u64 = 0xcafe_babe_0123_4567;
+const SURFACE_INFO_BYTES: usize = 24;
+const TILE_BYTES: usize = 16 + 4 * 16 * 16;
+
+// A valid 1x1 tile genuinely resides in the ELF's read-only segment. Its X byte
+// is deliberately nonzero: RGBX padding carries no authority or alpha blending.
+static READONLY_TILE: [u8; 20] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 37, 173, 231, 255,
+];
 
 // RDI packs the probe in its low byte and the process role in the next byte.
 // The entry trampoline establishes the System V alignment for the Rust call.
@@ -111,7 +121,286 @@ fn duplicate(handle: u64, rights: u64, status: u64) -> u64 {
     token as u64
 }
 
-fn check_capabilities(console: u64, outbound: u64, inbound: u64) -> u64 {
+fn surface_word(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+fn tile_header(bytes: &mut [u8; TILE_BYTES], x: u32, y: u32, width: u32, height: u32) {
+    for (index, value) in [x, y, width, height].into_iter().enumerate() {
+        bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn surface_pixel(x: u32, y: u32, width: u32, height: u32) -> [u8; 4] {
+    let u = x * 256 / width;
+    let v = y * 128 / height;
+    if !(3..253).contains(&u) || !(3..125).contains(&v) {
+        return [66, 211, 230, 255];
+    }
+    // Original five-by-seven glyphs for this userspace-authored MIRROR panel.
+    // The kernel only receives pixels; it does not supply text or decoration.
+    const TITLE: [[u8; 7]; 6] = [
+        [17, 27, 21, 21, 17, 17, 17], // M
+        [31, 4, 4, 4, 4, 4, 31],      // I
+        [30, 17, 17, 30, 20, 18, 17], // R
+        [30, 17, 17, 30, 20, 18, 17], // R
+        [14, 17, 17, 17, 17, 17, 14], // O
+        [30, 17, 17, 30, 20, 18, 17], // R
+    ];
+    if (74..182).contains(&u) && (30..51).contains(&v) {
+        let column = (u - 74) / 3;
+        let glyph = column / 6;
+        let bit = column % 6;
+        let row = (v - 30) / 3;
+        if bit < 5 && TITLE[glyph as usize][row as usize] & (1 << (4 - bit)) != 0 {
+            return [226, 239, 255, 17];
+        }
+    }
+    let distance = u.abs_diff(128);
+    if (68..106).contains(&v) && distance < (v - 56) * 2 && distance > 8 {
+        return if u < 128 {
+            [46, (140 + v) as u8, 222, 0]
+        } else {
+            [(u - 40) as u8, 104, 237, 99]
+        };
+    }
+    [
+        12 + (u / 24) as u8,
+        20 + (v / 8) as u8,
+        39 + (u / 16) as u8,
+        231,
+    ]
+}
+
+fn draw_surface(handle: u64, width: u32, height: u32) {
+    let mut packet = [0u8; TILE_BYTES];
+    let mut y = 0;
+    while y < height {
+        let tile_height = (height - y).min(16);
+        let mut x = 0;
+        while x < width {
+            let tile_width = (width - x).min(16);
+            tile_header(&mut packet, x, y, tile_width, tile_height);
+            for row in 0..tile_height {
+                for column in 0..tile_width {
+                    let offset = 16 + 4 * (row * tile_width + column) as usize;
+                    packet[offset..offset + 4].copy_from_slice(&surface_pixel(
+                        x + column,
+                        y + row,
+                        width,
+                        height,
+                    ));
+                }
+            }
+            let length = 16 + 4 * u64::from(tile_width * tile_height);
+            require(
+                syscall(SYS_SURFACE_PRESENT, handle, packet.as_ptr() as u64, length)
+                    == length as i64,
+                175,
+            );
+            x += tile_width;
+        }
+        y += tile_height;
+    }
+}
+
+fn check_surface(console: u64, role: u64) -> u64 {
+    let boot = syscall(SYS_BOOT_HANDLE, 3, 0, 0);
+    if role == 1 {
+        require(boot == EBADF, 120);
+        return 0;
+    }
+    // A headless boot has no surface authority and emits no display marker.
+    if boot == EBADF {
+        return 0;
+    }
+    require(boot > 0, 121);
+    let handle = boot as u64;
+    require(syscall(SYS_BOOT_HANDLE, 3, 0, 0) == boot, 122);
+    let mut info = [0u8; SURFACE_INFO_BYTES];
+    let info_pointer = info.as_mut_ptr() as u64;
+    require(
+        syscall(SYS_SURFACE_INFO, handle, info_pointer, 24) == 24,
+        123,
+    );
+    require(
+        surface_word(&info, 0) == 1
+            && surface_word(&info, 12) == 1
+            && surface_word(&info, 16) == 16
+            && surface_word(&info, 20) == 0,
+        124,
+    );
+    let width = surface_word(&info, 4);
+    let height = surface_word(&info, 8);
+    require(
+        (1..=256).contains(&width) && (1..=128).contains(&height),
+        125,
+    );
+    let expected_info = info;
+    let mut packet = [0u8; TILE_BYTES];
+    tile_header(&mut packet, width - 1, 0, 1, 1);
+    packet[16..20].copy_from_slice(&[203, 97, 242, 77]);
+    let packet_pointer = packet.as_ptr() as u64;
+
+    // Handle authority is checked before the length or any user memory access.
+    require(syscall(SYS_SURFACE_INFO, u64::MAX, 0, 0) == EBADF, 126);
+    require(syscall(SYS_SURFACE_PRESENT, u64::MAX, 0, 0) == EBADF, 127);
+    require(
+        syscall(SYS_SURFACE_INFO, console, info_pointer, 24) == EACCES,
+        128,
+    );
+    require(
+        syscall(SYS_SURFACE_PRESENT, console, packet_pointer, 20) == EACCES,
+        129,
+    );
+    let inert = duplicate(handle, 0, 130);
+    require(syscall(SYS_SURFACE_INFO, inert, 0, 0) == EACCES, 131);
+    require(syscall(SYS_SURFACE_PRESENT, inert, 0, 0) == EACCES, 132);
+    require(syscall(SYS_DUP, inert, RIGHT_WRITE, 0) == EACCES, 133);
+    require(syscall(SYS_CLOSE, inert, 0, 0) == 0, 134);
+    require(
+        syscall(SYS_SURFACE_INFO, inert, info_pointer, 24) == EBADF,
+        135,
+    );
+    require(
+        syscall(SYS_SURFACE_PRESENT, inert, packet_pointer, 20) == EBADF,
+        136,
+    );
+
+    let writer = duplicate(handle, RIGHT_WRITE, 137);
+    require(
+        syscall(SYS_SURFACE_INFO, writer, info_pointer, 24) == 24,
+        138,
+    );
+    require(info == expected_info, 139);
+    // Exactly three successful 1x1 probes precede the complete tiled image:
+    // duplicate authority/top-right, a read-only source/top-left, bottom-right.
+    require(
+        syscall(SYS_SURFACE_PRESENT, writer, packet_pointer, 20) == 20,
+        140,
+    );
+    require(syscall(SYS_CLOSE, writer, 0, 0) == 0, 141);
+    require(
+        syscall(SYS_SURFACE_INFO, writer, info_pointer, 24) == EBADF,
+        142,
+    );
+    require(
+        syscall(SYS_SURFACE_PRESENT, writer, packet_pointer, 20) == EBADF,
+        143,
+    );
+    require(
+        syscall(
+            SYS_SURFACE_PRESENT,
+            handle,
+            READONLY_TILE.as_ptr() as u64,
+            20,
+        ) == 20,
+        144,
+    );
+    tile_header(&mut packet, width - 1, height - 1, 1, 1);
+    require(
+        syscall(SYS_SURFACE_PRESENT, handle, packet_pointer, 20) == 20,
+        145,
+    );
+
+    info.fill(0xa5);
+    for (length, status) in [(0, 146), (23, 147), (25, 148), (u64::MAX, 149)] {
+        require(
+            syscall(SYS_SURFACE_INFO, handle, info_pointer, length) == EINVAL,
+            status,
+        );
+    }
+    for (pointer, status) in [
+        (0, 150),
+        (CODE_BASE, 151),
+        (u64::MAX - 12, 152),
+        (STACK_GUARD, 153),
+    ] {
+        require(
+            syscall(SYS_SURFACE_INFO, handle, pointer, 24) == EFAULT,
+            status,
+        );
+    }
+    require(info == [0xa5; SURFACE_INFO_BYTES], 154);
+
+    let readonly_end = (&raw const __readonly_end) as u64;
+    // The last source crosses the ELF's unmapped read-only-segment guard. Its
+    // complete packet must be checked/copied before parsing or touching pixels.
+    for (pointer, status) in [
+        (0, 155),
+        (KERNEL_BASE, 156),
+        (u64::MAX - 1, 157),
+        (readonly_end - 16, 158),
+    ] {
+        require(
+            syscall(SYS_SURFACE_PRESENT, handle, pointer, 20) == EFAULT,
+            status,
+        );
+    }
+    for (length, status) in [
+        (0, 159),
+        (15, 160),
+        (19, 161),
+        (21, 162),
+        (1041, 163),
+        (u64::MAX, 164),
+    ] {
+        require(
+            syscall(SYS_SURFACE_PRESENT, handle, packet_pointer, length) == EINVAL,
+            status,
+        );
+    }
+    for (x, y, tile_width, tile_height, status) in [
+        (width, 0, 1, 1, 165),
+        (0, height, 1, 1, 166),
+        (u32::MAX, 0, 1, 1, 167),
+        (0, u32::MAX, 1, 1, 168),
+        (0, 0, 0, 1, 169),
+        (0, 0, 1, 0, 170),
+        (0, 0, 17, 1, 171),
+        (0, 0, 1, 17, 172),
+        (0, 0, u32::MAX, 1, 173),
+        (0, 0, 1, u32::MAX, 174),
+    ] {
+        tile_header(&mut packet, x, y, tile_width, tile_height);
+        require(
+            syscall(SYS_SURFACE_PRESENT, handle, packet_pointer, 20) == EINVAL,
+            status,
+        );
+    }
+    draw_surface(handle, width, height);
+    require(syscall(SYS_BOOT_HANDLE, 3, 0, 0) == boot, 176);
+    require(
+        syscall(SYS_SURFACE_INFO, handle, info_pointer, 24) == 24,
+        177,
+    );
+    require(info == expected_info, 178);
+    write(console, b"Mirror init: surface checks passed\n");
+    // Retain the original live token through the peer's foreign-handle checks
+    // and process teardown; no surface duplicate survives this function.
+    handle
+}
+
+fn check_foreign_surface(console: u64, foreign: u64) {
+    require(foreign <= i64::MAX as u64, 182);
+    let mut info = [0u8; SURFACE_INFO_BYTES];
+    require(
+        syscall(SYS_SURFACE_INFO, foreign, info.as_mut_ptr() as u64, 24) == EBADF,
+        183,
+    );
+    require(
+        syscall(
+            SYS_SURFACE_PRESENT,
+            foreign,
+            READONLY_TILE.as_ptr() as u64,
+            20,
+        ) == EBADF,
+        184,
+    );
+    write(console, b"Mirror init: surface denied\n");
+}
+
+fn check_capabilities(console: u64, outbound: u64, inbound: u64, surface: u64) -> u64 {
     let mut buffer = [0u8; 64];
     let pointer = buffer.as_mut_ptr() as u64;
     require(syscall(SYS_SEND, u64::MAX, pointer, 64) == EBADF, 63);
@@ -129,9 +418,11 @@ fn check_capabilities(console: u64, outbound: u64, inbound: u64) -> u64 {
     require(syscall(SYS_DUP, inert, RIGHT_SEND, 0) == EACCES, 71);
     require(syscall(SYS_CLOSE, inert, 0, 0) == 0, 72);
 
-    // Three boot capabilities plus five duplicates exhaust the eight slots.
+    // A displayed primary has four boot capabilities; peers/headless processes
+    // have three. Surface probe duplicates have already been closed here.
     let mut clones = [0u64; 5];
-    for index in 0..clones.len() {
+    let clone_count = clones.len() - usize::from(surface != 0);
+    for index in 0..clone_count {
         let clone = duplicate(console, RIGHT_WRITE, 73);
         require(!clones[..index].contains(&clone), 74);
         clones[index] = clone;
@@ -144,7 +435,7 @@ fn check_capabilities(console: u64, outbound: u64, inbound: u64) -> u64 {
     clones[0] = replacement;
     require(syscall(SYS_WRITE, pointer, 1, stale) == EBADF, 79);
     write(replacement, b"Mirror init: console capability checked\n");
-    for clone in clones {
+    for &clone in &clones[..clone_count] {
         require(syscall(SYS_CLOSE, clone, 0, 0) == 0, 80);
     }
     require(syscall(SYS_WRITE, pointer, 1, replacement) == EBADF, 81);
@@ -160,7 +451,7 @@ fn check_capabilities(console: u64, outbound: u64, inbound: u64) -> u64 {
     sender
 }
 
-fn message(role: u64, tag: u8, sender: u64) -> [u8; 64] {
+fn message(role: u64, tag: u8, sender: u64, surface: u64) -> [u8; 64] {
     let mut bytes = [0u8; 64];
     for (index, byte) in bytes.iter_mut().enumerate() {
         *byte = (index as u8).wrapping_mul(17) ^ tag ^ (role as u8).wrapping_mul(0x5b);
@@ -168,29 +459,35 @@ fn message(role: u64, tag: u8, sender: u64) -> [u8; 64] {
     bytes[0] = tag;
     bytes[1] = role as u8;
     bytes[8..16].copy_from_slice(&sender.to_le_bytes());
+    bytes[16..24].copy_from_slice(&surface.to_le_bytes());
     bytes
 }
 
-fn send_message(sender: u64, role: u64, tag: u8) {
-    let bytes = message(role, tag, sender);
+fn send_message(sender: u64, role: u64, tag: u8, surface: u64) {
+    let bytes = message(role, tag, sender, surface);
     require(
         syscall(SYS_SEND, sender, bytes.as_ptr() as u64, 64) == 64,
         100,
     );
 }
 
-fn validate_message(bytes: &[u8; 64], role: u64, tag: u8) {
+fn validate_message(bytes: &[u8; 64], role: u64, tag: u8) -> u64 {
     let foreign_sender = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let foreign_surface = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
     require(foreign_sender > 0, 101);
-    require(*bytes == message(role, tag, foreign_sender), 102);
+    require(
+        *bytes == message(role, tag, foreign_sender, foreign_surface),
+        102,
+    );
     // Learning another process's integer token does not grant its authority.
     require(
         syscall(SYS_SEND, foreign_sender, bytes.as_ptr() as u64, 64) == EBADF,
         103,
     );
+    foreign_surface
 }
 
-fn receive_message(receiver: u64, role: u64, tag: u8, check_rejections: bool) {
+fn receive_message(receiver: u64, role: u64, tag: u8, check_rejections: bool) -> u64 {
     let mut bytes = [0u8; 64];
     let pointer = bytes.as_mut_ptr() as u64;
     if check_rejections {
@@ -202,20 +499,20 @@ fn receive_message(receiver: u64, role: u64, tag: u8, check_rejections: bool) {
     }
     // Both failed copies above must leave the full message at the FIFO head.
     require(syscall(SYS_RECV_WAIT, receiver, pointer, 64) == 64, 106);
-    validate_message(&bytes, role, tag);
+    validate_message(&bytes, role, tag)
 }
 
-fn check_ipc(console: u64, role: u64, probe: u64) {
+fn check_ipc(console: u64, role: u64, probe: u64, surface: u64) {
     let outbound = syscall(SYS_BOOT_HANDLE, 1, 0, 0);
     let inbound = syscall(SYS_BOOT_HANDLE, 2, 0, 0);
     require(outbound > 0, 61);
     require(inbound > 0, 62);
     let receiver = inbound as u64;
-    let sender = check_capabilities(console, outbound as u64, receiver);
+    let sender = check_capabilities(console, outbound as u64, receiver, surface);
     if role == 0 {
-        receive_message(receiver, 1, 1, true);
-        send_message(sender, 0, 2);
-        receive_message(receiver, 1, 3, false);
+        require(receive_message(receiver, 1, 1, true) == 0, 180);
+        send_message(sender, 0, 2, surface);
+        require(receive_message(receiver, 1, 3, false) == 0, 181);
         // Give the peer a deterministic opportunity to block waiting for EOF.
         require(syscall(SYS_YIELD, 0, 0, 0) == 0, 108);
         if probe == 9 {
@@ -234,9 +531,12 @@ fn check_ipc(console: u64, role: u64, probe: u64) {
             107,
         );
         require(syscall(SYS_SLEEP, 4, 0, 0) == 0, 111);
-        send_message(sender, 1, 1);
-        receive_message(receiver, 0, 2, true);
-        send_message(sender, 1, 3);
+        send_message(sender, 1, 1, 0);
+        let foreign_surface = receive_message(receiver, 0, 2, true);
+        if foreign_surface != 0 {
+            check_foreign_surface(console, foreign_surface);
+        }
+        send_message(sender, 1, 3, 0);
         let mut buffer = [0u8; 64];
         let mut saw_eof = false;
         for _ in 0..3 {
@@ -456,7 +756,8 @@ extern "C" fn init_main(launch: u64) -> ! {
         );
     }
 
-    check_ipc(console, role, probe);
+    let surface = check_surface(console, role);
+    check_ipc(console, role, probe, surface);
 
     require(syscall(SYS_WRITE, KERNEL_BASE, 1, console) == EFAULT, 20);
     require(syscall(SYS_WRITE, 0, 1, console) == EFAULT, 21);

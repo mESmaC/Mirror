@@ -37,6 +37,54 @@ pub struct Info {
     pub byte_len: usize,
 }
 
+pub const MAX_SURFACE_TILE: usize = 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlitError {
+    InvalidRegion,
+    InvalidDimensions,
+    InvalidLength,
+    OutOfBounds,
+}
+
+/// A display resource extent, independent of application layout or widgets.
+/// Coordinates supplied to a blit are relative to this owned rectangle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SurfaceRegion {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+impl SurfaceRegion {
+    pub fn new(
+        info: Info,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) -> Result<Self, BlitError> {
+        if width == 0
+            || height == 0
+            || x.checked_add(width).is_none_or(|end| end > info.width)
+            || y.checked_add(height).is_none_or(|end| end > info.height)
+        {
+            return Err(BlitError::InvalidRegion);
+        }
+        Ok(Self {
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    pub fn dimensions(self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Mask {
     size: u8,
@@ -313,6 +361,49 @@ impl<'a> Driver<'a> {
         self.layout.info
     }
 
+    /// Paint a fully checked, opaque RGBX tile without reading video memory.
+    /// RGBX is four source bytes R,G,B,X; X is ignored, not an alpha channel.
+    /// Invalid geometry or source length leaves the entire display unchanged.
+    #[allow(clippy::too_many_arguments)] // Keep resource, tile geometry, and source explicit.
+    pub fn blit_rgbx(
+        &mut self,
+        region: SurfaceRegion,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        pixels: &[u8],
+    ) -> Result<(), BlitError> {
+        // A region can have been created for a different display. Revalidate
+        // against this driver before trusting either its extent or origin.
+        SurfaceRegion::new(self.info(), region.x, region.y, region.width, region.height)?;
+        if !(1..=MAX_SURFACE_TILE).contains(&width) || !(1..=MAX_SURFACE_TILE).contains(&height) {
+            return Err(BlitError::InvalidDimensions);
+        }
+        if x.checked_add(width).is_none_or(|end| end > region.width)
+            || y.checked_add(height).is_none_or(|end| end > region.height)
+        {
+            return Err(BlitError::OutOfBounds);
+        }
+        // Width/height are bounded above, so this multiplication cannot wrap.
+        if pixels.len() != width * height * 4 {
+            return Err(BlitError::InvalidLength);
+        }
+        let origin_x = region.x + x;
+        let origin_y = region.y + y;
+        for (row, source) in pixels.chunks_exact(width * 4).enumerate() {
+            for (column, pixel) in source.chunks_exact(4).enumerate() {
+                let written = self.pixel(
+                    origin_x + column,
+                    origin_y + row,
+                    Color::rgb(pixel[0], pixel[1], pixel[2]),
+                );
+                debug_assert!(written, "validated surface pixel escaped framebuffer");
+            }
+        }
+        Ok(())
+    }
+
     /// Restore the scene beneath an old software cursor without reading VRAM
     /// or scanning out a full frame. The previous damage clip is restored before
     /// returning; the driver remains exclusively owned by normal kernel context.
@@ -384,7 +475,6 @@ impl<'a> Driver<'a> {
         Some((geometry.input_start(console) + column).min(console.input().len()))
     }
 
-    #[cfg(feature = "boot-smoke")]
     fn pixel(&mut self, x: usize, y: usize, color: Color) -> bool {
         if x >= self.layout.info.width || y >= self.layout.info.height {
             return false;
@@ -890,6 +980,261 @@ fn glyph(character: u8) -> [u8; 7] {
         b'~' => [0, 0, 9, 22, 0, 0, 0],
         b' ' => [0; 7],
         _ => [14, 17, 1, 2, 4, 0, 4],
+    }
+}
+
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn test_surface_upload() {
+    use crate::surface::{INFO_SIZE, MAX_PACKET, MAX_TILE, Session};
+
+    fn surface(bytes: &mut [u8], description: Description) -> Driver<'_> {
+        let layout = Layout::validate(bytes.as_mut_ptr() as usize, description).unwrap();
+        assert!(layout.info.byte_len <= bytes.len());
+        Driver {
+            address: NonNull::new(bytes.as_mut_ptr()).unwrap(),
+            layout,
+            clip: None,
+            _exclusive: PhantomData,
+        }
+    }
+    fn header(packet: &mut [u8], values: [u32; 4]) {
+        for (destination, value) in packet[..16].chunks_exact_mut(4).zip(values) {
+            destination.copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    fn info_fields(info: [u8; INFO_SIZE]) -> [u32; 6] {
+        let mut fields = [0; 6];
+        for (value, bytes) in fields.iter_mut().zip(info.chunks_exact(4)) {
+            *value = u32::from_le_bytes(bytes.try_into().unwrap());
+        }
+        fields
+    }
+    fn expected_byte(color: [u8; 3], byte: usize, bpp: u16) -> u8 {
+        if bpp == 24 {
+            color[byte]
+        } else {
+            [color[2], color[1], color[0], 0][byte]
+        }
+    }
+    fn check_pixels(
+        bytes: &[u8],
+        description: Description,
+        color_at: impl Fn(usize, usize) -> Option<[u8; 3]>,
+    ) {
+        let pitch = description.pitch as usize;
+        let pixel_bytes = usize::from(description.bpp / 8);
+        let end = 8 + pitch * description.height as usize;
+        for (index, &actual) in bytes.iter().enumerate() {
+            let expected = if (8..end).contains(&index) {
+                let offset = index - 8;
+                let row = offset / pitch;
+                let byte_in_row = offset % pitch;
+                if byte_in_row < description.width as usize * pixel_bytes {
+                    color_at(byte_in_row / pixel_bytes, row)
+                        .map(|color| {
+                            expected_byte(color, byte_in_row % pixel_bytes, description.bpp)
+                        })
+                        .unwrap_or(0xa5)
+                } else {
+                    0xa5
+                }
+            } else {
+                0xa5
+            };
+            assert_eq!(actual, expected, "surface changed unexpected byte {index}");
+        }
+    }
+
+    for bpp in [24, 32] {
+        let pixel_bytes = usize::from(bpp / 8);
+        let description = Description {
+            width: 40,
+            height: 36,
+            pitch: (40 * pixel_bytes + 3) as u64,
+            bpp,
+            red: Mask {
+                size: 8,
+                shift: if bpp == 24 { 0 } else { 16 },
+            },
+            green: Mask { size: 8, shift: 8 },
+            blue: Mask {
+                size: 8,
+                shift: if bpp == 24 { 16 } else { 0 },
+            },
+        };
+        let end = 8 + description.pitch as usize * description.height as usize;
+        let mut canvas = [0xa5; 5920];
+        let info = Layout::validate(0x1000, description).unwrap().info;
+        let region = SurfaceRegion::new(info, 5, 7, 20, 18).unwrap();
+        assert_eq!(region.dimensions(), (20, 18));
+        for (x, y, width, height) in [
+            (0, 0, 0, 1),
+            (0, 0, 1, 0),
+            (39, 0, 2, 1),
+            (0, 35, 1, 2),
+            (usize::MAX, 0, 1, 1),
+            (0, usize::MAX, 1, 1),
+        ] {
+            assert!(SurfaceRegion::new(info, x, y, width, height).is_err());
+        }
+        {
+            let mut driver = surface(&mut canvas[8..end], description);
+            driver
+                .blit_rgbx(
+                    region,
+                    1,
+                    2,
+                    2,
+                    2,
+                    &[1, 2, 3, 0, 4, 5, 6, 0xff, 7, 8, 9, 0x80, 10, 11, 12, 0x42],
+                )
+                .unwrap();
+            for (x, y) in [(0, 0), (19, 0), (0, 17), (19, 17)] {
+                driver
+                    .blit_rgbx(region, x, y, 1, 1, &[13, 14, 15, 0xee])
+                    .unwrap();
+            }
+        }
+        check_pixels(&canvas, description, |x, y| match (x, y) {
+            (6, 9) => Some([1, 2, 3]),
+            (7, 9) => Some([4, 5, 6]),
+            (6, 10) => Some([7, 8, 9]),
+            (7, 10) => Some([10, 11, 12]),
+            (5, 7) | (24, 7) | (5, 24) | (24, 24) => Some([13, 14, 15]),
+            _ => None,
+        });
+        let before = canvas;
+        for (x, y, width, height, length) in [
+            (0, 0, 0, 1, 4),
+            (0, 0, 1, 0, 4),
+            (0, 0, 17, 1, 4),
+            (0, 0, 1, 17, 4),
+            (0, 0, usize::MAX, 1, 4),
+            (usize::MAX, 0, 1, 1, 4),
+            (0, usize::MAX, 1, 1, 4),
+            (19, 0, 2, 1, 8),
+            (0, 17, 1, 2, 8),
+            (20, 0, 1, 1, 4),
+            (0, 18, 1, 1, 4),
+            (0, 0, 1, 1, 3),
+            (0, 0, 1, 1, 5),
+        ] {
+            {
+                let mut driver = surface(&mut canvas[8..end], description);
+                assert!(
+                    driver
+                        .blit_rgbx(region, x, y, width, height, &[99; 8][..length])
+                        .is_err()
+                );
+            }
+            assert_eq!(canvas, before, "invalid tile changed display memory");
+        }
+        let foreign_region = SurfaceRegion::new(Info { width: 80, ..info }, 60, 0, 8, 8).unwrap();
+        {
+            let mut driver = surface(&mut canvas[8..end], description);
+            assert_eq!(
+                driver.blit_rgbx(foreign_region, 0, 0, 1, 1, &[0; 4]),
+                Err(BlitError::InvalidRegion)
+            );
+        }
+        assert_eq!(canvas, before);
+
+        canvas.fill(0xa5);
+        let mut packet = [0; MAX_PACKET];
+        header(&mut packet, [2, 3, MAX_TILE as u32, MAX_TILE as u32]);
+        for pixel in packet[16..].chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[17, 34, 51, 0xff]);
+        }
+        {
+            let mut driver = surface(&mut canvas[8..end], description);
+            let mut session = Session::new(&mut driver).unwrap();
+            assert_eq!(info_fields(session.info()), [1, 40, 36, 1, 16, 0]);
+            assert_eq!(session.totals(), (0, 0));
+            assert_eq!(session.present(&packet), Ok(256));
+            header(&mut packet, [39, 35, 1, 1]);
+            packet[16..20].copy_from_slice(&[68, 85, 102, 0x77]);
+            assert_eq!(session.present(&packet[..20]), Ok(1));
+            assert_eq!(session.totals(), (2, 257));
+            for invalid in [
+                &[][..],
+                &packet[..15],
+                &packet[..16],
+                &packet[..19],
+                &packet[..21],
+                &[0; MAX_PACKET + 1][..],
+            ] {
+                assert!(session.present(invalid).is_err());
+                assert_eq!(session.totals(), (2, 257));
+            }
+            for values in [
+                [0, 0, 0, 1],
+                [0, 0, 1, 0],
+                [0, 0, 17, 1],
+                [0, 0, 1, 17],
+                [u32::MAX, 0, 1, 1],
+                [0, u32::MAX, 1, 1],
+                [40, 0, 1, 1],
+                [0, 36, 1, 1],
+            ] {
+                header(&mut packet, values);
+                assert!(session.present(&packet[..20]).is_err());
+                assert_eq!(session.totals(), (2, 257));
+            }
+            header(&mut packet, [0, 0, 16, 16]);
+            assert!(session.present(&packet[..MAX_PACKET - 1]).is_err());
+            assert_eq!(session.totals(), (2, 257));
+        }
+        check_pixels(&canvas, description, |x, y| {
+            if (2..18).contains(&x) && (3..19).contains(&y) {
+                Some([17, 34, 51])
+            } else if (x, y) == (39, 35) {
+                Some([68, 85, 102])
+            } else {
+                None
+            }
+        });
+
+        // Thin surfaces exercise each centered, nonzero session origin without
+        // allocating a screen-size buffer on the small bootstrap stack.
+        for (width, height, origin_x, origin_y, owned_width, owned_height) in
+            [(300, 4, 22, 0, 256, 4), (4, 140, 0, 6, 4, 128)]
+        {
+            canvas.fill(0xa5);
+            let description = Description {
+                width,
+                height,
+                pitch: width * pixel_bytes as u64 + 3,
+                ..description
+            };
+            let end = 8 + description.pitch as usize * height as usize;
+            {
+                let mut driver = surface(&mut canvas[8..end], description);
+                let mut session = Session::new(&mut driver).unwrap();
+                assert_eq!(
+                    info_fields(session.info()),
+                    [1, owned_width, owned_height, 1, 16, 0]
+                );
+                header(&mut packet, [0, 0, 1, 1]);
+                packet[16..20].copy_from_slice(&[7, 17, 27, 0xaa]);
+                assert_eq!(session.present(&packet[..20]), Ok(1));
+                header(&mut packet, [owned_width - 1, owned_height - 1, 1, 1]);
+                assert_eq!(session.present(&packet[..20]), Ok(1));
+                assert_eq!(session.totals(), (2, 2));
+            }
+            check_pixels(&canvas, description, |x, y| {
+                if (x, y) == (origin_x, origin_y)
+                    || (x, y)
+                        == (
+                            origin_x + owned_width as usize - 1,
+                            origin_y + owned_height as usize - 1,
+                        )
+                {
+                    Some([7, 17, 27])
+                } else {
+                    None
+                }
+            });
+        }
     }
 }
 

@@ -22,6 +22,7 @@ mod pci;
 mod pointer;
 mod ps2;
 mod serial;
+mod surface;
 mod timer;
 mod userspace;
 
@@ -150,6 +151,7 @@ pub extern "C" fn _start() -> ! {
     {
         pci::self_test();
         framebuffer::self_test();
+        surface::self_test();
         // SAFETY: IF is clear; the sole allocator and preserved writable HHDM
         // exclusively own these test pages, which are never sent to a device.
         unsafe { dma::self_test(&mut frames, boot.direct_map_offset) };
@@ -239,6 +241,7 @@ pub extern "C" fn _start() -> ! {
         boot.init,
         boot.direct_map_offset,
         scenario,
+        display.as_mut(),
     );
     if let Some(display) = &mut display {
         display.update_status("KERNEL READY - NATIVE TASKS COMPLETE", 100);

@@ -18,6 +18,8 @@ static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 pub(crate) enum Object {
     Console,
     Channel(usize),
+    /// The single borrowed graphics surface lives for the complete run session.
+    Surface,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,7 +56,7 @@ impl HandleTable {
 
     pub(crate) fn insert(&mut self, object: Object, rights: u64) -> Result<u64, CapError> {
         let permitted = match object {
-            Object::Console => WRITE,
+            Object::Console | Object::Surface => WRITE,
             Object::Channel(_) => SEND | RECEIVE,
         };
         if rights & !permitted != 0 {
@@ -226,6 +228,30 @@ pub(crate) fn self_test() {
     assert!(owner.is_empty());
     assert_eq!(owner.take_one(), None);
     assert_eq!(owner.get(replacement), Err(CapError::BadHandle));
+
+    // Surface authority is scoped like any other object and permits only WRITE.
+    // An inert duplicate retains object identity without granting info or paint.
+    for rights in [SEND, RECEIVE, SEND | WRITE, 8] {
+        assert_eq!(
+            owner.insert(Object::Surface, rights),
+            Err(CapError::InvalidRights)
+        );
+    }
+    let surface = owner.insert(Object::Surface, WRITE).unwrap();
+    assert_eq!(
+        owner.require(surface, WRITE).unwrap().object,
+        Object::Surface
+    );
+    assert_eq!(other.get(surface), Err(CapError::BadHandle));
+    let (inert_surface, inert) = owner.duplicate(surface, 0).unwrap();
+    assert_eq!(inert.object, Object::Surface);
+    assert_eq!(owner.require(inert_surface, WRITE), Err(CapError::Denied));
+    assert_eq!(owner.duplicate(inert_surface, WRITE), Err(CapError::Denied));
+    assert_eq!(owner.duplicate(surface, SEND), Err(CapError::Denied));
+    owner.close(surface).unwrap();
+    owner.close(inert_surface).unwrap();
+    assert_eq!(owner.require(surface, WRITE), Err(CapError::BadHandle));
+    assert!(owner.is_empty());
 
     // Do not exhaust the real boot-wide allocator; later processes need tokens.
     let near_end = AtomicU64::new(MAX_TOKEN);

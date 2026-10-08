@@ -7,12 +7,12 @@ use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use crate::{
     arch,
     capability::{self, CapError, Capability, HandleTable, Object},
-    elf,
+    elf, framebuffer,
     interrupts::{self, TrapFrame},
     ipc::{Ipc, IpcError, MESSAGE_SIZE},
     memory::{FrameAllocator, PAGE_SIZE},
     paging::{PageTables, PagingError, UserAddressSpace, UserPermissions},
-    serial, timer,
+    serial, surface, timer,
 };
 
 const STACK_BASE: u64 = 0x7fff_0000;
@@ -21,6 +21,8 @@ const KERNEL_STACK_SIZE: usize = 64 * 1024;
 const MAX_WRITE: usize = 256;
 const CHECKS_PASSED: &[u8] = b"Mirror init: userspace checks passed\n";
 const IPC_CHECKS_PASSED: &[u8] = b"Mirror init: IPC checks passed\n";
+const SURFACE_CHECKS_PASSED: &[u8] = b"Mirror init: surface checks passed\n";
+const SURFACE_DENIED_CHECKS: &[u8] = b"Mirror init: surface denied\n";
 const PROCESS_COUNT: usize = 2;
 const QUANTUM_TICKS: u64 = 2;
 const USER_TICK_BUDGET: u64 = 32;
@@ -35,6 +37,7 @@ static mut KERNEL_STACK: KernelStack = KernelStack([0; KERNEL_STACK_SIZE]);
 // entry and cleared after the synchronous return; it never owns the context.
 static ACTIVE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 static ACTIVE_IPC: AtomicPtr<Ipc> = AtomicPtr::new(core::ptr::null_mut());
+static ACTIVE_SURFACE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,7 +93,7 @@ struct Process<'kernel> {
     preemptions: usize,
     post_checks_preemptions: usize,
     handles: HandleTable,
-    boot_handles: [u64; 3],
+    boot_handles: [u64; 4],
     handles_closed: bool,
     ipc_checks: bool,
     ipc_sent: usize,
@@ -98,6 +101,13 @@ struct Process<'kernel> {
     ipc_waits: usize,
     ipc_closed_wakes: usize,
     ipc_timeouts: usize,
+    surface_checks: bool,
+    surface_denied_checks: bool,
+    surface_info_reads: u64,
+    surface_tiles: u64,
+    surface_pixels: u64,
+    foreign_surface: u64,
+    foreign_surface_denials: u8,
 }
 
 pub fn run_init(
@@ -106,6 +116,7 @@ pub fn run_init(
     bytes: &[u8],
     direct_map: u64,
     scenario: u64,
+    display: Option<&mut framebuffer::Driver<'_>>,
 ) {
     assert!(!arch::interrupts_enabled());
     let image = elf::parse(bytes).expect("invalid native init ELF");
@@ -121,11 +132,25 @@ pub fn run_init(
         assert!(deadline_reached(3, u64::MAX - 2));
         test_load_rollback(kernel, frames, bytes, &image, direct_map);
     }
-    run_pair(kernel, frames, bytes, &image, direct_map, scenario);
+    #[cfg(feature = "boot-smoke")]
+    let mut display = display;
+    #[cfg(feature = "boot-smoke")]
+    let first_display = display.as_deref_mut();
+    #[cfg(not(feature = "boot-smoke"))]
+    let first_display = display;
+    run_pair(
+        kernel,
+        frames,
+        bytes,
+        &image,
+        direct_map,
+        scenario,
+        first_display,
+    );
     #[cfg(feature = "boot-smoke")]
     // Relaunch from the same ELF after teardown. Fresh BSS and successful entry
     // exercise frame reuse and continuation recovery after both exit and fault.
-    run_pair(kernel, frames, bytes, &image, direct_map, 0);
+    run_pair(kernel, frames, bytes, &image, direct_map, 0, display);
 }
 
 #[cfg(feature = "boot-smoke")]
@@ -201,7 +226,7 @@ fn create_process<'kernel>(
         preemptions: 0,
         post_checks_preemptions: 0,
         handles: HandleTable::new(),
-        boot_handles: [0; 3],
+        boot_handles: [0; 4],
         handles_closed: false,
         ipc_checks: false,
         ipc_sent: 0,
@@ -209,6 +234,13 @@ fn create_process<'kernel>(
         ipc_waits: 0,
         ipc_closed_wakes: 0,
         ipc_timeouts: 0,
+        surface_checks: false,
+        surface_denied_checks: false,
+        surface_info_reads: 0,
+        surface_tiles: 0,
+        surface_pixels: 0,
+        foreign_surface: 0,
+        foreign_surface_denials: 0,
     };
     if let Err(error) = load(&mut process.space, frames, bytes, image, direct_map) {
         // SAFETY: This root has never been active; mapped frames belong to it.
@@ -233,7 +265,14 @@ fn run_pair(
     image: &elf::Image,
     direct_map: u64,
     scenario: u64,
+    display: Option<&mut framebuffer::Driver<'_>>,
 ) {
+    // The framebuffer borrow belongs to this whole session, never to a user
+    // mapping or handle. Only syscall handlers may reborrow it during resume.
+    let mut surface = display
+        .map(surface::Session::new)
+        .transpose()
+        .expect("surface session");
     let before = frames.stats().expect("recycling required").allocated_frames;
     let mut first = create_process(kernel, frames, bytes, image, direct_map, scenario)
         .expect("load first native process");
@@ -267,7 +306,21 @@ fn run_pair(
         }
         assert_eq!(process.handles.len(), 3);
     }
+    if surface.is_some() {
+        let handle = processes[0]
+            .handles
+            .insert(Object::Surface, capability::WRITE)
+            .expect("bootstrap surface capability");
+        processes[0].boot_handles[3] = handle;
+        // Trusted verification knows the owner's token but grants no entry to
+        // the peer. Its real IPC fixture must receive and try this exact token.
+        processes[1].foreign_surface = handle;
+        assert_eq!(processes[0].handles.len(), 4);
+    }
+    assert_eq!(processes[1].handles.len(), 3);
+    assert_eq!(processes[1].boot_handles[3], 0);
     assert!(ACTIVE_IPC.load(Ordering::SeqCst).is_null());
+    assert!(ACTIVE_SURFACE.load(Ordering::SeqCst).is_null());
     assert_ne!(processes[0].pid, processes[1].pid);
     assert_ne!(
         processes[0].space.root_physical_address(),
@@ -376,6 +429,10 @@ fn run_pair(
         // shared borrow of that field may span execution and its callbacks.
         let context = processes[index].frame;
         // Refresh after scheduler borrows end, and revoke before the next one.
+        let surface_pointer = surface.as_mut().map_or(core::ptr::null_mut(), |session| {
+            (session as *mut surface::Session<'_, '_>).cast()
+        });
+        ACTIVE_SURFACE.store(surface_pointer, Ordering::SeqCst);
         ACTIVE_IPC.store(&raw mut ipc, Ordering::SeqCst);
         ACTIVE.store((&raw mut processes[index]).cast(), Ordering::SeqCst);
         // SAFETY: Only this process executes in its isolated root. Shared upper
@@ -390,6 +447,7 @@ fn run_pair(
         }
         ACTIVE.store(core::ptr::null_mut(), Ordering::SeqCst);
         ACTIVE_IPC.store(core::ptr::null_mut(), Ordering::SeqCst);
+        ACTIVE_SURFACE.store(core::ptr::null_mut(), Ordering::SeqCst);
         // SAFETY: The user is suspended, handlers have returned, and IF=0.
         unsafe { kernel.activate() }.expect("restore kernel root");
         assert_ne!(
@@ -412,6 +470,7 @@ fn run_pair(
         }
     }
     release_finished_handles(&mut processes, &mut ipc);
+    assert!(ACTIVE_SURFACE.load(Ordering::SeqCst).is_null());
     assert!(
         ipc.is_drained(),
         "IPC messages or endpoint references leaked"
@@ -428,6 +487,53 @@ fn run_pair(
         "user frame leak"
     );
     serial::println!("MIRROR_USER_CLEANUP_OK allocated={}", before);
+    assert_eq!(
+        processes[1].surface_tiles, 0,
+        "peer painted without authority"
+    );
+    // Taking the session releases its display borrow when this branch ends.
+    if let Some(session) = surface.take() {
+        assert!(
+            processes[0].surface_checks,
+            "owner surface checks did not complete"
+        );
+        assert!(
+            processes[1].surface_denied_checks,
+            "peer surface checks did not complete"
+        );
+        let (tiles, pixels) = session.totals();
+        let info = session.info();
+        let width = u64::from(u32::from_le_bytes(info[4..8].try_into().unwrap()));
+        let height = u64::from(u32::from_le_bytes(info[8..12].try_into().unwrap()));
+        let edge = surface::MAX_TILE as u64;
+        // Native init paints the complete owned rectangle, plus three one-pixel
+        // edge/read-only-source/duplicate-authority probes before its marker.
+        assert_eq!(tiles, width.div_ceil(edge) * height.div_ceil(edge) + 3);
+        assert_eq!(pixels, width * height + 3);
+        assert_eq!(tiles, processes[0].surface_tiles);
+        assert_eq!(pixels, processes[0].surface_pixels);
+        assert!(processes[0].surface_info_reads > 0);
+        assert_eq!(processes[1].surface_info_reads, 0);
+        assert_eq!(
+            processes[1].foreign_surface_denials, 3,
+            "both foreign surface syscalls must fail"
+        );
+        serial::println!(
+            "MIRROR_USER_SURFACE_OK tiles={} pixels={} foreign_denied={}",
+            tiles,
+            pixels,
+            processes[1].foreign_surface_denials.count_ones()
+        );
+    } else {
+        assert_eq!(processes[0].surface_tiles, 0);
+        assert_eq!(processes[0].surface_info_reads, 0);
+        assert_eq!(processes[0].boot_handles[3], 0);
+        serial::println!("MIRROR_USER_SURFACE_SKIPPED reason=no_display");
+    }
+    // All tables are empty and the published pointer is revoked before this
+    // session releases its exclusive display borrow back to the kernel console.
+    assert!(processes.iter().all(|process| process.handles.is_empty()));
+    serial::println!("MIRROR_USER_SURFACE_CLEANUP_OK handles_reclaimed=1");
     validate_process(&processes[0], scenario);
     validate_process(&processes[1], 0);
     assert_eq!(
@@ -673,6 +779,20 @@ fn with_ipc<T>(operation: impl FnOnce(&mut Ipc) -> T) -> T {
     unsafe { operation(&mut *pointer) }
 }
 
+fn with_surface<T>(operation: impl FnOnce(&mut surface::Session<'_, '_>) -> T) -> T {
+    assert!(!arch::interrupts_enabled());
+    let pointer = ACTIVE_SURFACE
+        .load(Ordering::SeqCst)
+        .cast::<surface::Session<'_, '_>>();
+    assert!(!pointer.is_null(), "no active surface session");
+    // SAFETY: run_pair owns this stack-local session and its exclusive display
+    // borrow until every process finishes. It derives this raw pointer after
+    // ending scheduler borrows, publishes only while resume_user runs, and clears
+    // it before accessing the session again. Neither IRQ nor another CPU touches
+    // the display, and no process/IPC field aliases this distinct session.
+    unsafe { operation(&mut *pointer) }
+}
+
 fn cap_error(error: CapError) -> i64 {
     match error {
         CapError::BadHandle => -9,
@@ -694,7 +814,63 @@ fn channel_for(process: &Process<'_>, handle: u64, rights: u64) -> Result<usize,
     let capability = process.handles.require(handle, rights).map_err(cap_error)?;
     match capability.object {
         Object::Channel(index) => Ok(index),
-        Object::Console => Err(-13),
+        Object::Console | Object::Surface => Err(-13),
+    }
+}
+
+fn require_surface(process: &mut Process<'_>, handle: u64, operation: u8) -> Result<(), i64> {
+    match process.handles.require(handle, capability::WRITE) {
+        Ok(capability) if capability.object == Object::Surface => Ok(()),
+        Ok(_) => Err(-13),
+        Err(error) => {
+            if error == CapError::BadHandle && handle != 0 && handle == process.foreign_surface {
+                process.foreign_surface_denials |= operation;
+            }
+            Err(cap_error(error))
+        }
+    }
+}
+
+fn surface_info(process: &mut Process<'_>, handle: u64, address: u64, length: u64) -> i64 {
+    if let Err(error) = require_surface(process, handle, 1) {
+        return error;
+    }
+    if length != surface::INFO_SIZE as u64 {
+        return -22;
+    }
+    let bytes = with_surface(|session| session.info());
+    // SAFETY: This user is suspended, mappings are immutable on the sole BSP,
+    // and the complete fixed-size destination is checked before any write.
+    // The owned kernel info bytes cannot alias an owned user physical page.
+    if unsafe { process.space.copy_to_user(address, &bytes) }.is_err() {
+        return -14;
+    }
+    process.surface_info_reads += 1;
+    surface::INFO_SIZE as i64
+}
+
+fn surface_present(process: &mut Process<'_>, handle: u64, address: u64, length: u64) -> i64 {
+    if let Err(error) = require_surface(process, handle, 2) {
+        return error;
+    }
+    if !(16..=surface::MAX_PACKET as u64).contains(&length) {
+        return -22;
+    }
+    let length = length as usize;
+    let mut packet = [0_u8; surface::MAX_PACKET];
+    // SAFETY: No user or other CPU runs during the checked complete copy. This
+    // disjoint fixed-size kernel buffer is the sole source passed to the driver;
+    // no user pointer or partial packet can survive into framebuffer mutation.
+    if unsafe { process.space.copy_from_user(address, &mut packet[..length]) }.is_err() {
+        return -14;
+    }
+    match with_surface(|session| session.present(&packet[..length])) {
+        Ok(pixels) => {
+            process.surface_tiles += 1;
+            process.surface_pixels += pixels as u64;
+            length as i64
+        }
+        Err(_) => -22,
     }
 }
 
@@ -820,6 +996,8 @@ pub(crate) fn syscall(frame: &mut TrapFrame) {
                     serial::println!("user: {}", message.escape_debug());
                     process.checks_passed |= &buffer[..length] == CHECKS_PASSED;
                     process.ipc_checks |= &buffer[..length] == IPC_CHECKS_PASSED;
+                    process.surface_checks |= &buffer[..length] == SURFACE_CHECKS_PASSED;
+                    process.surface_denied_checks |= &buffer[..length] == SURFACE_DENIED_CHECKS;
                     result = length as i64;
                 } else {
                     result = -22;
@@ -893,6 +1071,8 @@ pub(crate) fn syscall(frame: &mut TrapFrame) {
                     Err(error) => cap_error(error),
                 };
             }
+            13 => result = surface_info(process, frame.rdi, frame.rsi, frame.rdx),
+            14 => result = surface_present(process, frame.rdi, frame.rsi, frame.rdx),
             _ => process.unknown_calls += 1,
         }
     });

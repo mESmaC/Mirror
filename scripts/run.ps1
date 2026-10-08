@@ -146,6 +146,7 @@ try {
     }
     $markers = @('MIRROR_FRAMES_OK', 'MIRROR_ALLOCATOR_TESTS_OK', 'MIRROR_FRAME_REUSE_OK', 'MIRROR_EXCEPTIONS_OK', 'MIRROR_PAGING_OK', 'MIRROR_HEAP_OK', 'MIRROR_TIMER_OK', 'MIRROR_HEAP_IRQ_OK', 'MIRROR_USER_PAGING_OK', 'MIRROR_ELF_TESTS_OK', 'MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_USER_LOAD_ROLLBACK_OK', 'MIRROR_SCHEDULER_OK', 'MIRROR_CAPABILITY_TESTS_OK', 'MIRROR_IPC_TESTS_OK', 'MIRROR_IPC_OK')
     $markers += @('MIRROR_PCI_TESTS_OK', 'MIRROR_PCI_READY', 'MIRROR_FRAMEBUFFER_TESTS_OK')
+    $markers += @('MIRROR_SURFACE_TESTS_OK', 'MIRROR_USER_SURFACE_CLEANUP_OK')
     $markers += @('MIRROR_CONTIGUOUS_TESTS_OK', 'MIRROR_DMA_TESTS_OK', 'MIRROR_BLOCK_TESTS_OK')
     $markers += @('MIRROR_KEYBOARD_TESTS_OK', 'MIRROR_CONSOLE_TESTS_OK')
     $markers += @('MIRROR_PS2_TESTS_OK', 'MIRROR_MOUSE_TESTS_OK', 'MIRROR_POINTER_TESTS_OK')
@@ -184,6 +185,10 @@ try {
         throw "Mirror did not discover its VirtIO boot disk. See $serialLog."
     }
     if ($NoDisplayDevice) {
+        $markers += 'MIRROR_USER_SURFACE_SKIPPED reason=no_display'
+        if ($serial -match '(?m)^MIRROR_USER_SURFACE_OK(?:\s|$)') {
+            throw "Mirror granted a surface without a display. See $serialLog."
+        }
         if ($serial -notmatch '(?m)^MIRROR_FRAMEBUFFER_SKIPPED reason=missing(?:\s|$)' -or
             $serial -notmatch '(?m)^MIRROR_PCI_READY .*display=0(?:\s|$)' -or
             $serial -match '(?m)^MIRROR_FRAMEBUFFER_(?:READY|PRESENTED)(?:\s|$)') {
@@ -192,10 +197,17 @@ try {
     }
     else {
         $markers += @('MIRROR_FRAMEBUFFER_READY', 'MIRROR_FRAMEBUFFER_PRESENTED')
+        $markers += 'MIRROR_USER_SURFACE_OK'
+        if ($serial -match '(?m)^MIRROR_USER_SURFACE_SKIPPED(?:\s|$)') {
+            throw "Mirror skipped its userspace surface checks. See $serialLog."
+        }
         if ($serial -match '(?m)^MIRROR_FRAMEBUFFER_SKIPPED(?:\s|$)' -or
             $serial -notmatch '(?m)^MIRROR_PCI_READY .*display=[1-9][0-9]*(?:\s|$)') {
             throw "Mirror did not use its display device. See $serialLog."
         }
+    }
+    if (@([regex]::Matches($serial, '(?m)^MIRROR_USER_SURFACE_CLEANUP_OK handles_reclaimed=1\r?$')).Count -ne 2) {
+        throw "Both native process runs must reclaim their surface handles. See $serialLog."
     }
     $scenario = switch ($Fault) {
         'UserKernelRead' { 1 }
