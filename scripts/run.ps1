@@ -6,6 +6,7 @@ param(
     [switch]$Graphical,
     [switch]$NoDisplayDevice,
     [switch]$NoTestDisk,
+    [switch]$NoKeyboard,
     [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
@@ -72,7 +73,7 @@ $stdoutLog = Join-Path $buildDirectory 'qemu.stdout.log'
 $stderrLog = Join-Path $buildDirectory 'qemu.stderr.log'
 
 $qemuArguments = @(
-    '-machine', 'q35,accel=tcg',
+    '-machine', $(if ($NoKeyboard) { 'q35,accel=tcg,i8042=off,vmport=off' } else { 'q35,accel=tcg' }),
     '-cpu', 'qemu64',
     '-m', "$MemoryMiB",
     '-smp', '1',
@@ -146,6 +147,19 @@ try {
     $markers = @('MIRROR_FRAMES_OK', 'MIRROR_ALLOCATOR_TESTS_OK', 'MIRROR_FRAME_REUSE_OK', 'MIRROR_EXCEPTIONS_OK', 'MIRROR_PAGING_OK', 'MIRROR_HEAP_OK', 'MIRROR_TIMER_OK', 'MIRROR_HEAP_IRQ_OK', 'MIRROR_USER_PAGING_OK', 'MIRROR_ELF_TESTS_OK', 'MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_USER_LOAD_ROLLBACK_OK', 'MIRROR_SCHEDULER_OK', 'MIRROR_CAPABILITY_TESTS_OK', 'MIRROR_IPC_TESTS_OK', 'MIRROR_IPC_OK')
     $markers += @('MIRROR_PCI_TESTS_OK', 'MIRROR_PCI_READY', 'MIRROR_FRAMEBUFFER_TESTS_OK')
     $markers += @('MIRROR_CONTIGUOUS_TESTS_OK', 'MIRROR_DMA_TESTS_OK', 'MIRROR_BLOCK_TESTS_OK')
+    $markers += @('MIRROR_KEYBOARD_TESTS_OK', 'MIRROR_CONSOLE_TESTS_OK')
+    if ($NoKeyboard) {
+        $markers += 'MIRROR_KEYBOARD_SKIPPED'
+        if ($serial -match '(?m)^MIRROR_KEYBOARD_READY(?:\s|$)') {
+            throw "Mirror unexpectedly initialized an absent keyboard controller. See $serialLog."
+        }
+    }
+    else {
+        $markers += 'MIRROR_KEYBOARD_READY'
+        if ($serial -match '(?m)^MIRROR_KEYBOARD_SKIPPED(?:\s|$)') {
+            throw "Mirror skipped its PS/2 keyboard. See $serialLog."
+        }
+    }
     if ($serial -match '(?m)^MIRROR_BLOCK_FAILED(?:\s|$)') {
         throw "Mirror block driver failed. See $serialLog."
     }

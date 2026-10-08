@@ -1,8 +1,9 @@
 //! Exclusive, allocation-free drawing into an optional Limine boot framebuffer.
 //!
 //! This preserves the firmware-selected mode; it is not a GPU modesetting or
-//! acceleration driver. All device writes are volatile bytes, and no framebuffer
-//! slice/reference or read is created, including for initially uninitialized VRAM.
+//! acceleration driver. Device writes are volatile bytes or aligned RGB32 words;
+//! no framebuffer slice/reference or read is created, including for initially
+//! uninitialized VRAM.
 //! Protocol: https://github.com/Limine-Bootloader/limine-protocol/blob/trunk/PROTOCOL.md
 //! Binding: https://docs.rs/limine/0.5.0/limine/framebuffer/struct.Framebuffer.html
 
@@ -154,6 +155,56 @@ const TEXT: Color = Color::rgb(230, 239, 245);
 const MUTED: Color = Color::rgb(141, 161, 177);
 const ACCENT: Color = Color::rgb(89, 221, 202);
 
+#[derive(Clone, Copy)]
+struct ConsoleGeometry {
+    large: bool,
+    scale: u8,
+    cell: usize,
+    row_height: usize,
+    margin: usize,
+    inset: usize,
+    width: usize,
+    height: usize,
+    x: i64,
+    content_width: usize,
+    columns: usize,
+    prompt_y: usize,
+    history_y: usize,
+    history_rows: usize,
+}
+
+impl ConsoleGeometry {
+    fn new(info: Info) -> Self {
+        let large = info.width >= 640 && info.height >= 400;
+        let scale = if large { 2 } else { 1 };
+        let cell = 6 * usize::from(scale);
+        let row_height = 12 * usize::from(scale);
+        let margin = if large { 24 } else { 0 };
+        let inset = if large { 24 } else { 4 };
+        let width = info.width.saturating_sub(margin * 2);
+        let height = info.height.saturating_sub(margin * 2);
+        let content_width = width.saturating_sub(inset * 2);
+        let prompt_y = margin + height.saturating_sub(if large { 80 } else { 28 });
+        let history_y = margin + if large { 112 } else { 40 };
+        Self {
+            large,
+            scale,
+            cell,
+            row_height,
+            margin,
+            inset,
+            width,
+            height,
+            x: (margin + inset) as i64,
+            content_width,
+            columns: content_width / cell,
+            prompt_y,
+            history_y,
+            history_rows: prompt_y.saturating_sub(history_y + row_height) / row_height,
+        }
+    }
+}
+
 /// A sole-writer handle. It is intentionally neither Clone nor Send/Sync.
 pub struct Driver<'a> {
     address: NonNull<u8>,
@@ -206,6 +257,7 @@ impl<'a> Driver<'a> {
         self.layout.info
     }
 
+    #[cfg(feature = "boot-smoke")]
     fn pixel(&mut self, x: usize, y: usize, color: Color) -> bool {
         if x >= self.layout.info.width || y >= self.layout.info.height {
             return false;
@@ -233,9 +285,46 @@ impl<'a> Driver<'a> {
         // deliberately enormous/offscreen rectangles clip without wrapping.
         let horizontal = clipped_span(x, width, self.layout.info.width);
         let vertical = clipped_span(y, height, self.layout.info.height);
-        for row in vertical.0..vertical.1 {
-            for column in horizontal.0..horizontal.1 {
-                self.pixel(column, row, color);
+        let pixels = horizontal.1 - horizontal.0;
+        if pixels == 0 || vertical.0 == vertical.1 {
+            return;
+        }
+        let bytes = self.layout.encode(color);
+        let pitch = self.layout.info.pitch;
+        let pixel_bytes = self.layout.bytes_per_pixel;
+        let address = self.address.as_ptr();
+        if pixel_bytes == 4 && address as usize & 3 == 0 && pitch & 3 == 0 {
+            let color = u32::from_le_bytes(bytes);
+            for row in vertical.0..vertical.1 {
+                let offset = row * pitch + horizontal.0 * 4;
+                let destination = address.wrapping_add(offset).cast::<u32>();
+                for column in 0..pixels {
+                    // SAFETY: Clipping bounds rows/columns to the validated
+                    // surface, whose pitch covers the complete row. The base,
+                    // pitch, and four-byte pixel offset are aligned, so every
+                    // store is an aligned, fully mapped RGB32 pixel. No padding
+                    // or adjacent memory is written. Construction grants sole
+                    // access; wrapping_add supports MMIO without a Rust slice.
+                    unsafe { destination.wrapping_add(column).write_volatile(color) };
+                }
+            }
+        } else {
+            for row in vertical.0..vertical.1 {
+                let offset = row * pitch + horizontal.0 * pixel_bytes;
+                let destination = address.wrapping_add(offset);
+                for column in 0..pixels {
+                    for (index, &byte) in bytes.iter().take(pixel_bytes).enumerate() {
+                        // SAFETY: The same clipped rectangle and validated
+                        // pitch bound each complete pixel. Byte stores need no
+                        // alignment and preserve padding for RGB24, unaligned
+                        // RGB32 bases, and RGB32 modes with an odd pitch.
+                        unsafe {
+                            destination
+                                .wrapping_add(column * pixel_bytes + index)
+                                .write_volatile(byte)
+                        };
+                    }
+                }
             }
         }
     }
@@ -245,7 +334,7 @@ impl<'a> Driver<'a> {
         // Bound work even if a future boot-status caller supplies a long string.
         for (index, byte) in text.bytes().take(128).enumerate() {
             let origin = x.saturating_add(index as i64 * 6 * scale as i64);
-            for (row, bits) in glyph(byte.to_ascii_uppercase()).into_iter().enumerate() {
+            for (row, bits) in glyph(byte).into_iter().enumerate() {
                 for column in 0..5 {
                     if bits & (1 << (4 - column)) != 0 {
                         self.fill_rect(
@@ -335,6 +424,213 @@ impl<'a> Driver<'a> {
         let filled = content_width.saturating_sub(4) * usize::from(progress.min(100)) / 100;
         self.fill_rect(x + 34, status_y + 26, filled as u64, 6, ACCENT);
     }
+
+    /// Render the main-context diagnostic editor. The console snapshot contains
+    /// bounded ASCII only; IRQ handlers never read or draw through this driver.
+    /// This immediate renderer has no compositor, windows, or display flipping.
+    pub fn render_console(&mut self, console: &crate::console::Console) {
+        let info = self.info();
+        let geometry = ConsoleGeometry::new(info);
+        let ConsoleGeometry {
+            large,
+            scale,
+            margin,
+            inset,
+            width,
+            height,
+            x,
+            content_width,
+            history_y,
+            ..
+        } = geometry;
+
+        self.fill_rect(0, 0, info.width as u64, info.height as u64, BACKGROUND);
+        self.fill_rect(
+            margin as i64,
+            margin as i64,
+            width as u64,
+            height as u64,
+            PANEL,
+        );
+        self.fill_rect(margin as i64, margin as i64, width as u64, 1, BORDER);
+        self.fill_rect(
+            margin as i64,
+            (margin + height.saturating_sub(1)) as i64,
+            width as u64,
+            1,
+            BORDER,
+        );
+        self.fill_rect(margin as i64, margin as i64, 1, height as u64, BORDER);
+        self.fill_rect(
+            (margin + width.saturating_sub(1)) as i64,
+            margin as i64,
+            1,
+            height as u64,
+            BORDER,
+        );
+        self.fill_rect(
+            margin as i64 + 1,
+            margin as i64 + 1,
+            3,
+            height.saturating_sub(2) as u64,
+            ACCENT,
+        );
+        self.text(x, (margin + inset) as i64, "Mirror", scale * 2, TEXT);
+        self.text(
+            x,
+            (margin + if large { 64 } else { 23 }) as i64,
+            "Kernel diagnostic console",
+            scale,
+            ACCENT,
+        );
+        if large {
+            self.text(
+                x,
+                (margin + 88) as i64,
+                "Native keyboard input / help / status / echo / clear",
+                1,
+                MUTED,
+            );
+        }
+        self.fill_rect(
+            x,
+            (history_y.saturating_sub(12)) as i64,
+            content_width as u64,
+            1,
+            BORDER,
+        );
+
+        self.draw_console_history(console, geometry);
+        self.draw_console_input(console, geometry);
+    }
+
+    /// Refresh command output and editor text while retaining the static header.
+    /// Call after submission or input loss, following an initial render_console.
+    pub fn update_console_content(&mut self, console: &crate::console::Console) {
+        let geometry = ConsoleGeometry::new(self.info());
+        // Tiny layouts can overlap the header or clip the prompt outside its
+        // inner column area. Repaint everything rather than leave stale pixels.
+        if geometry.columns < 3 || geometry.prompt_y < geometry.history_y {
+            self.render_console(console);
+            return;
+        }
+        self.fill_rect(
+            geometry.x,
+            geometry.history_y as i64,
+            geometry.content_width as u64,
+            geometry.prompt_y.saturating_sub(geometry.history_y) as u64,
+            PANEL,
+        );
+        self.draw_console_history(console, geometry);
+        self.update_console_input(console);
+    }
+
+    /// Refresh only the prompt, caret, and notice after line editing. This keeps
+    /// per-key redraw work independent of the framebuffer's full height.
+    pub fn update_console_input(&mut self, console: &crate::console::Console) {
+        let geometry = ConsoleGeometry::new(self.info());
+        if geometry.columns < 3 || geometry.prompt_y < geometry.history_y {
+            self.render_console(console);
+            return;
+        }
+        self.fill_rect(
+            geometry.x,
+            geometry.prompt_y as i64,
+            geometry.content_width as u64,
+            (geometry.margin + geometry.height).saturating_sub(geometry.prompt_y + 1) as u64,
+            PANEL,
+        );
+        self.draw_console_input(console, geometry);
+    }
+
+    fn draw_console_history(
+        &mut self,
+        console: &crate::console::Console,
+        geometry: ConsoleGeometry,
+    ) {
+        let ConsoleGeometry {
+            history_rows,
+            history_y,
+            row_height,
+            columns,
+            x,
+            cell,
+            scale,
+            ..
+        } = geometry;
+        let history = console.history();
+        let first = history.len().saturating_sub(history_rows);
+        for (index, line) in history[first..].iter().enumerate() {
+            let y = (history_y + index * row_height) as i64;
+            let (indent, color) = if line.prompt {
+                self.text(x, y, ">", scale, ACCENT);
+                (2, MUTED)
+            } else {
+                (0, TEXT)
+            };
+            let text = line.text.as_str();
+            let visible = text.len().min(columns.saturating_sub(indent));
+            self.text(
+                x + (indent * cell) as i64,
+                y,
+                &text[..visible],
+                scale,
+                color,
+            );
+        }
+    }
+
+    fn draw_console_input(&mut self, console: &crate::console::Console, geometry: ConsoleGeometry) {
+        let ConsoleGeometry {
+            x,
+            prompt_y,
+            content_width,
+            scale,
+            columns,
+            cell,
+            row_height,
+            large,
+            ..
+        } = geometry;
+        self.fill_rect(
+            x,
+            prompt_y.saturating_sub(12) as i64,
+            content_width as u64,
+            1,
+            BORDER,
+        );
+        self.text(x, prompt_y as i64, ">", scale, ACCENT);
+        // Reserve the prompt and one cursor cell. Scroll by ASCII byte cells so
+        // a full line still exposes the caret on narrow framebuffer modes.
+        let visible = columns.saturating_sub(3);
+        let start = console.cursor().saturating_sub(visible);
+        let end = console.input().len().min(start + visible);
+        self.text(
+            x + (2 * cell) as i64,
+            prompt_y as i64,
+            &console.input()[start..end],
+            scale,
+            TEXT,
+        );
+        if columns >= 3 {
+            let cursor_x = x + ((2 + console.cursor() - start) * cell) as i64;
+            self.fill_rect(
+                cursor_x,
+                (prompt_y + 8 * usize::from(scale)) as i64,
+                (5 * usize::from(scale)) as u64,
+                u64::from(scale),
+                ACCENT,
+            );
+        }
+        let notice = console.notice();
+        self.text(
+            x,
+            (prompt_y + row_height + if large { 16 } else { 2 }) as i64,
+            &notice[..notice.len().min(columns)],
+            scale,
+            MUTED,
+        );
+    }
 }
 
 fn clipped_span(start: i64, length: u64, limit: usize) -> (usize, usize) {
@@ -343,7 +639,7 @@ fn clipped_span(start: i64, length: u64, limit: usize) -> (usize, usize) {
     (first, last)
 }
 
-// Original hand-authored 5x7 cell font for this boot panel. Rows use bits 4..0
+// Original hand-authored 5x7 printable ASCII font. Rows use bits 4..0
 // from left to right. No external font, bitmap, or licensed asset is embedded.
 fn glyph(character: u8) -> [u8; 7] {
     match character {
@@ -373,6 +669,32 @@ fn glyph(character: u8) -> [u8; 7] {
         b'X' => [17, 17, 10, 4, 10, 17, 17],
         b'Y' => [17, 17, 10, 4, 4, 4, 4],
         b'Z' => [31, 1, 2, 4, 8, 16, 31],
+        b'a' => [0, 0, 14, 1, 15, 17, 15],
+        b'b' => [16, 16, 30, 17, 17, 17, 30],
+        b'c' => [0, 0, 14, 17, 16, 17, 14],
+        b'd' => [1, 1, 15, 17, 17, 17, 15],
+        b'e' => [0, 0, 14, 17, 31, 16, 14],
+        b'f' => [6, 9, 8, 28, 8, 8, 8],
+        b'g' => [0, 0, 15, 17, 15, 1, 14],
+        b'h' => [16, 16, 30, 17, 17, 17, 17],
+        b'i' => [4, 0, 12, 4, 4, 4, 14],
+        b'j' => [2, 0, 6, 2, 2, 18, 12],
+        b'k' => [16, 16, 18, 20, 24, 20, 18],
+        b'l' => [12, 4, 4, 4, 4, 4, 14],
+        b'm' => [0, 0, 26, 21, 21, 21, 21],
+        b'n' => [0, 0, 30, 17, 17, 17, 17],
+        b'o' => [0, 0, 14, 17, 17, 17, 14],
+        b'p' => [0, 0, 30, 17, 30, 16, 16],
+        b'q' => [0, 0, 15, 17, 15, 1, 1],
+        b'r' => [0, 0, 22, 25, 16, 16, 16],
+        b's' => [0, 0, 15, 16, 14, 1, 30],
+        b't' => [8, 8, 28, 8, 8, 9, 6],
+        b'u' => [0, 0, 17, 17, 17, 19, 13],
+        b'v' => [0, 0, 17, 17, 17, 10, 4],
+        b'w' => [0, 0, 17, 17, 21, 21, 10],
+        b'x' => [0, 0, 17, 10, 4, 10, 17],
+        b'y' => [0, 0, 17, 17, 15, 1, 14],
+        b'z' => [0, 0, 31, 2, 4, 8, 31],
         b'0' => [14, 17, 19, 21, 25, 17, 14],
         b'1' => [4, 12, 4, 4, 4, 4, 14],
         b'2' => [14, 17, 1, 2, 4, 8, 31],
@@ -383,11 +705,38 @@ fn glyph(character: u8) -> [u8; 7] {
         b'7' => [31, 1, 2, 4, 8, 8, 8],
         b'8' => [14, 17, 17, 14, 17, 17, 14],
         b'9' => [14, 17, 17, 15, 1, 1, 14],
+        b'!' => [4, 4, 4, 4, 4, 0, 4],
+        b'"' => [10, 10, 10, 0, 0, 0, 0],
+        b'#' => [10, 10, 31, 10, 31, 10, 10],
+        b'$' => [4, 15, 20, 14, 5, 30, 4],
+        b'%' => [25, 25, 2, 4, 8, 19, 19],
+        b'&' => [12, 18, 20, 8, 21, 18, 13],
+        b'\'' => [4, 4, 8, 0, 0, 0, 0],
+        b'(' => [2, 4, 8, 8, 8, 4, 2],
+        b')' => [8, 4, 2, 2, 2, 4, 8],
+        b'*' => [0, 21, 14, 31, 14, 21, 0],
+        b'+' => [0, 4, 4, 31, 4, 4, 0],
+        b',' => [0, 0, 0, 0, 0, 4, 8],
         b'-' => [0, 0, 0, 31, 0, 0, 0],
         b'/' => [1, 1, 2, 4, 8, 16, 16],
         b':' => [0, 4, 4, 0, 4, 4, 0],
+        b';' => [0, 4, 4, 0, 4, 4, 8],
+        b'<' => [2, 4, 8, 16, 8, 4, 2],
+        b'=' => [0, 0, 31, 0, 31, 0, 0],
+        b'>' => [8, 4, 2, 1, 2, 4, 8],
+        b'?' => [14, 17, 1, 2, 4, 0, 4],
+        b'@' => [14, 17, 23, 21, 23, 16, 14],
+        b'[' => [14, 8, 8, 8, 8, 8, 14],
+        b'\\' => [16, 16, 8, 4, 2, 1, 1],
+        b']' => [14, 2, 2, 2, 2, 2, 14],
+        b'^' => [4, 10, 17, 0, 0, 0, 0],
         b'.' => [0, 0, 0, 0, 0, 4, 4],
         b'_' => [0, 0, 0, 0, 0, 0, 31],
+        b'`' => [8, 4, 2, 0, 0, 0, 0],
+        b'{' => [2, 4, 4, 8, 4, 4, 2],
+        b'|' => [4, 4, 4, 4, 4, 4, 4],
+        b'}' => [8, 4, 4, 2, 4, 4, 8],
+        b'~' => [0, 0, 9, 22, 0, 0, 0],
         b' ' => [0; 7],
         _ => [14, 17, 1, 2, 4, 0, 4],
     }
@@ -472,6 +821,47 @@ pub fn self_test() {
         assert_eq!(byte, expected);
     }
 
+    // Force the aligned RGB32 fast path and both byte fallbacks (unaligned
+    // base, non-word pitch). Check every byte, including untouched pixels,
+    // row padding, and the prefix/suffix guards of the same backing storage.
+    #[repr(align(4))]
+    struct Aligned([u8; 64]);
+    for start in [8, 9] {
+        for pitch in [16, 13] {
+            let mut storage = Aligned([0xa5; 64]);
+            let end = start + pitch * 2;
+            {
+                let mut driver = surface(
+                    &mut storage.0[start..end],
+                    Description {
+                        pitch: pitch as u64,
+                        ..bgr32
+                    },
+                )
+                .expect("aligned/unaligned RGB32 rectangle");
+                assert_eq!(driver.address.as_ptr() as usize & 3, start & 3);
+                driver.fill_rect(-1, 0, 3, u64::MAX, Color::rgb(0x12, 0x34, 0x56));
+                driver.fill_rect(2, 1, u64::MAX, u64::MAX, Color::rgb(7, 8, 9));
+            }
+            for (index, &byte) in storage.0.iter().enumerate() {
+                let expected = if (start..end).contains(&index) {
+                    let offset = index - start;
+                    let column_byte = offset % pitch;
+                    if column_byte < 8 {
+                        [0x56, 0x34, 0x12, 0][column_byte % 4]
+                    } else if offset / pitch == 1 && column_byte < 12 {
+                        [9, 8, 7, 0][column_byte % 4]
+                    } else {
+                        0xa5
+                    }
+                } else {
+                    0xa5
+                };
+                assert_eq!(byte, expected);
+            }
+        }
+    }
+
     // Exercise the complete panel, glyphs, clamped progress, and tiny-screen
     // clipping through the same renderer while guarding both rows and edges.
     let description = Description {
@@ -502,6 +892,149 @@ pub fn self_test() {
     assert!(canvas[8..1448].iter().any(|&byte| byte != 0xa5));
     assert_eq!(clipped_span(i64::MIN, u64::MAX, 19), (0, 19));
     assert_eq!(clipped_span(19, u64::MAX, 19), (19, 19));
+
+    // The console preserves case and supports every printable ASCII key,
+    // rather than silently displaying lowercase input as uppercase/fallbacks.
+    assert_ne!(glyph(b'M'), glyph(b'm'));
+    for byte in b'!'..=b'~' {
+        assert!(glyph(byte).iter().all(|&row| row < 32));
+        assert!(byte == b'?' || glyph(byte) != glyph(b'?'));
+    }
+    let mut console = crate::console::Console::new();
+    console.dispatch(crate::console::Operation::Echo(
+        crate::console::Text::new("Mirror Aa!? []{}").unwrap(),
+    ));
+    {
+        let mut driver = surface(&mut canvas[8..1448], description).expect("tiny console");
+        driver.render_console(&console);
+        driver.update_console_input(&console);
+        driver.update_console_content(&console);
+    }
+    assert!(
+        canvas[..8]
+            .iter()
+            .chain(&canvas[1448..])
+            .all(|&byte| byte == 0xa5)
+    );
+    for row in 0..18 {
+        assert_eq!(&canvas[8 + row * 80 + 76..8 + row * 80 + 80], &[0xa5; 4]);
+    }
+
+    let mut tiny_reference = [0xa5u8; 1456];
+    {
+        let mut driver =
+            surface(&mut tiny_reference[8..1448], description).expect("tiny full reference");
+        driver.render_console(&console);
+    }
+    assert_eq!(canvas, tiny_reference);
+
+    // Include visible history, a full scrolled editor, and its caret on a
+    // padded surface. Prefix/suffix guards and every row's padding must survive.
+    let mut console_canvas = [0xa5u8; 38_816];
+    let console_description = Description {
+        width: 96,
+        height: 100,
+        pitch: 388,
+        ..bgr32
+    };
+    for _ in 0..crate::console::LINE_CAPACITY {
+        console.process(crate::keyboard::KeyEvent {
+            key: crate::keyboard::Key::Character(b'x'),
+            pressed: true,
+            repeat: false,
+            modifiers: crate::keyboard::Modifiers::default(),
+        });
+    }
+    {
+        let mut driver =
+            surface(&mut console_canvas[8..38_808], console_description).expect("console surface");
+        driver.render_console(&console);
+    }
+    assert!(
+        console_canvas[..8]
+            .iter()
+            .chain(&console_canvas[38_808..])
+            .all(|&byte| byte == 0xa5)
+    );
+    for row in 0..100 {
+        assert_eq!(
+            &console_canvas[8 + row * 388 + 384..8 + row * 388 + 388],
+            &[0xa5; 4]
+        );
+    }
+    // 14 text columns reserve two prompt cells and one caret cell, leaving
+    // eleven visible bytes; the cursor after 96 input bytes scrolls to x=82.
+    let caret = 8 + 80 * 388 + 82 * 4;
+    assert_eq!(&console_canvas[caret..caret + 4], &[202, 221, 89, 0]);
+    {
+        let mut driver = surface(&mut console_canvas[8..38_808], console_description)
+            .expect("partial console update");
+        // Distinct markers prove an input-only refresh does not repaint the
+        // header/history; a content refresh must erase old history afterward.
+        assert!(driver.pixel(4, 4, Color::rgb(1, 2, 3)));
+        assert!(driver.pixel(4, 40, Color::rgb(4, 5, 6)));
+        console.process(crate::keyboard::KeyEvent {
+            key: crate::keyboard::Key::Escape,
+            pressed: true,
+            repeat: false,
+            modifiers: crate::keyboard::Modifiers::default(),
+        });
+        driver.update_console_input(&console);
+    }
+    let header_marker = 8 + 4 * 388 + 4 * 4;
+    let history_marker = 8 + 40 * 388 + 4 * 4;
+    assert_eq!(
+        &console_canvas[header_marker..header_marker + 4],
+        &[3, 2, 1, 0]
+    );
+    assert_eq!(
+        &console_canvas[history_marker..history_marker + 4],
+        &[6, 5, 4, 0]
+    );
+    assert_eq!(&console_canvas[caret..caret + 4], &[36, 25, 17, 0]);
+    let cleared_caret = 8 + 80 * 388 + 16 * 4;
+    assert_eq!(
+        &console_canvas[cleared_caret..cleared_caret + 4],
+        &[202, 221, 89, 0]
+    );
+    console.dispatch(crate::console::Operation::Clear);
+    {
+        let mut driver = surface(&mut console_canvas[8..38_808], console_description)
+            .expect("history clear update");
+        driver.update_console_content(&console);
+    }
+    assert_eq!(
+        &console_canvas[header_marker..header_marker + 4],
+        &[3, 2, 1, 0]
+    );
+    assert_eq!(
+        &console_canvas[history_marker..history_marker + 4],
+        &[36, 25, 17, 0]
+    );
+    console.input_lost();
+    {
+        let mut driver = surface(&mut console_canvas[8..38_808], console_description)
+            .expect("cleared console surface");
+        driver.update_console_content(&console);
+        driver.fill_rect(0, 0, 18, 7, PANEL);
+        driver.text(0, 0, "Mm!", 1, TEXT);
+    }
+    assert_eq!(&console_canvas[8..12], &[245, 239, 230, 0]);
+    // Uppercase M has top-row ink; lowercase m has two empty leading rows.
+    assert_eq!(&console_canvas[8 + 6 * 4..8 + 7 * 4], &[36, 25, 17, 0]);
+    assert_eq!(&console_canvas[8 + 14 * 4..8 + 15 * 4], &[245, 239, 230, 0]);
+    assert!(
+        console_canvas[..8]
+            .iter()
+            .chain(&console_canvas[38_808..])
+            .all(|&byte| byte == 0xa5)
+    );
+    for row in 0..100 {
+        assert_eq!(
+            &console_canvas[8 + row * 388 + 384..8 + row * 388 + 388],
+            &[0xa5; 4]
+        );
+    }
 
     rejected(
         Description { width: 0, ..rgb24 },

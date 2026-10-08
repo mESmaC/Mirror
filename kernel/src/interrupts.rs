@@ -445,8 +445,12 @@ extern "C" fn mirror_exception_dispatch(frame: &mut TrapFrame) {
 
 fn dispatch(frame: &mut TrapFrame) {
     // IRQs must never consume an armed synchronous-exception expectation.
-    // The timer driver itself does not allocate, print or take a lock.
+    // Device handlers do not allocate, print or take a lock.
     if (32..48).contains(&frame.vector) {
+        if frame.vector == 33 {
+            // Drain device output before the PIC owner acknowledges IRQ1.
+            crate::keyboard::handle_irq();
+        }
         timer::handle_irq(frame.vector as u8);
         if frame.vector == 32 && frame.cs & 3 == 3 {
             // Acknowledge IRQ0 before scheduling. timer_tick must validate the

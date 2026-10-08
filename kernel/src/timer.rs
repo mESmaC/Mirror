@@ -94,6 +94,20 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+/// Unmask IRQ1 after the keyboard driver has initialized its controller and
+/// queue. This boot CPU remains the sole PIC owner; leave all other masks intact.
+pub fn enable_keyboard_irq() {
+    assert!(INITIALIZED.load(Ordering::SeqCst), "PIC not initialized");
+    assert!(!arch::interrupts_enabled(), "IRQ1 setup requires IF clear");
+    // SAFETY: The BSP owns these PIC registers, IF is clear, and the IRQ1 gate
+    // and initialized device handler are installed before this call.
+    unsafe {
+        let mask = arch::in8(MASTER_DATA);
+        arch::out8(MASTER_DATA, mask & !(1 << 1));
+        assert_eq!(arch::in8(MASTER_DATA), mask & !(1 << 1));
+    }
+}
+
 /// Called only by installed IRQ gates for vectors 32..47, with IF clear.
 /// No allocation, locks, printing, scheduling or interrupt nesting here.
 pub(crate) fn handle_irq(vector: u8) {

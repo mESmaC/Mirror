@@ -7,12 +7,14 @@ mod arch;
 mod block;
 mod boot;
 mod capability;
+mod console;
 mod dma;
 mod elf;
 mod framebuffer;
 mod heap;
 mod interrupts;
 mod ipc;
+mod keyboard;
 mod memory;
 mod paging;
 mod pci;
@@ -149,6 +151,8 @@ pub extern "C" fn _start() -> ! {
         // exclusively own these test pages, which are never sent to a device.
         unsafe { dma::self_test(&mut frames, boot.direct_map_offset) };
         block::self_test();
+        keyboard::self_test();
+        console::self_test();
         assert!(devices.functions > 0, "no PCI devices discovered");
         assert!(
             devices.virtio_block_devices > 0,
@@ -180,6 +184,20 @@ pub extern "C" fn _start() -> ! {
         boot.direct_map_offset,
         inject_block_error,
     );
+
+    let keyboard_ready = match keyboard::init() {
+        Ok(()) => {
+            serial::println!("MIRROR_KEYBOARD_READY transport=i8042 set=2 irq=1");
+            true
+        }
+        Err(error) => {
+            serial::println!("MIRROR_KEYBOARD_SKIPPED reason={:?}", error);
+            false
+        }
+    };
+    if keyboard_ready {
+        timer::enable_keyboard_irq();
+    }
 
     let scenario = {
         #[cfg(feature = "boot-smoke")]
@@ -237,9 +255,97 @@ pub extern "C" fn _start() -> ! {
     {
         serial::println!("MIRROR_BOOT_OK");
         serial::println!("Mirror idle: timer ticks={}", timer::ticks());
-        // SAFETY: The PIC unmasks only the installed timer IRQ; the heap and
-        // descriptors are initialized. Keep allocator/table state alive here.
+        if keyboard_ready {
+            run_console(&mut display);
+        }
+        // SAFETY: Only initialized IRQ sources are unmasked; the heap and
+        // descriptors are ready. Keep allocator/table state alive here.
         unsafe { arch::idle() }
+    }
+}
+
+#[cfg(not(feature = "boot-smoke"))]
+fn run_console(display: &mut Option<framebuffer::Driver<'_>>) -> ! {
+    assert!(!arch::interrupts_enabled());
+    // Discard the bounded queue left by boot. Limit work even if new bytes keep
+    // arriving through the controller's deferred-drain path.
+    for _ in 0..128 {
+        let discarded = keyboard::pop_event().is_some();
+        let lost = keyboard::take_overflow();
+        if !discarded && !lost {
+            break;
+        }
+    }
+    let _ = keyboard::take_overflow();
+    let mut console = console::Console::new();
+    if let Some(display) = display {
+        display.render_console(&console);
+    }
+    serial::println!(
+        "MIRROR_CONSOLE_READY input=ps2 display={}",
+        u8::from(display.is_some())
+    );
+    let mut revision = 0_u64;
+    loop {
+        let mut dirty = false;
+        let mut redraw_content = false;
+        let mut full_batch = true;
+        // Keep work per pass bounded. IRQs may append while an event is handled,
+        // but only this loop owns console state and the framebuffer writer.
+        for _ in 0..32 {
+            let mut event = keyboard::pop_event();
+            // pop_event can perform a bounded deferred controller drain and
+            // discover loss. Clear the edit line before using any returned key.
+            if keyboard::take_overflow() {
+                console.input_lost();
+                event = None;
+                dirty = true;
+                redraw_content = true;
+                serial::println!("MIRROR_CONSOLE_INPUT_LOST");
+            }
+            let Some(event) = event else {
+                full_batch = false;
+                break;
+            };
+            // SAFETY: IRQ handlers only update independent timer/input state;
+            // the console/display are never borrowed or accessed by an IRQ.
+            unsafe { arch::restore_interrupts(true) };
+            if let Some(action) = console.process(event) {
+                redraw_content |= matches!(action, console::Action::Submitted { .. });
+                action.log();
+                dirty = true;
+            }
+            arch::disable_interrupts();
+        }
+        if dirty {
+            // Rendering must not hold off IRQ delivery for a whole frame.
+            // SAFETY: Same initialized sources and exclusive display ownership.
+            unsafe { arch::restore_interrupts(true) };
+            if let Some(display) = display {
+                if redraw_content {
+                    display.update_console_content(&console);
+                } else {
+                    display.update_console_input(&console);
+                }
+            }
+            revision = revision.wrapping_add(1);
+            serial::println!(
+                "MIRROR_CONSOLE_UPDATED revision={} display={} irq={}",
+                revision,
+                u8::from(display.is_some()),
+                keyboard::irq_count()
+            );
+            arch::disable_interrupts();
+            continue;
+        }
+        if full_batch {
+            continue;
+        }
+        // SAFETY: Installed IRQ handlers are ready; IF stayed clear since the
+        // empty-queue check. STI's interrupt shadow
+        // makes the following HLT atomic with enabling delivery; a pending key
+        // or timer wakes us instead of being lost before sleep.
+        unsafe { core::arch::asm!("sti", "hlt", "cli", options(nostack)) };
     }
 }
 
