@@ -1,8 +1,8 @@
 # Mirror
 
-Mirror is a proposed operating system, written primarily in Rust, designed for people and AI agents to use the same computer efficiently. Its goals are to run selected Windows and Linux applications, expose fast and controllable automation, and coordinate local inference with the rest of the system.
+Mirror is an independent operating system being built around a new Rust kernel and native userspace, designed for people and AI agents to use the same computer efficiently. Mirror owns the system interfaces for processes, memory, scheduling, devices, and native services. Windows and Linux are application compatibility targets: separate compatibility implementations will translate their application interfaces onto Mirror. Other goals are fast and controllable automation and coordination of local inference with the rest of the system.
 
-**Status:** the freestanding Rust kernel boots through UEFI/Limine in QEMU with its own exception descriptors and page tables, reusable physical pages, a 1 MiB kernel heap, and timer interrupts. It preemptively schedules two isolated native Rust processes, with six native syscalls, sleeping and yielding, and a coarse per-process timer-interrupt budget. Processes retain separate page tables and data while faults, exits, and budget exhaustion return control to the scheduler. Formatting, Clippy, and all 20 debug/release boot cases pass; normal boot also completes both processes and reaches idle. IPC, capability handles, broader driver ports, application compatibility, unified resource management, and inference services remain future work. The broader designs below are proposals; performance improvements must be demonstrated with measurements.
+**Status:** the freestanding Rust kernel boots through UEFI/Limine in QEMU with its own exception descriptors and page tables, reusable physical pages, a 1 MiB kernel heap, and timer interrupts. It preemptively schedules two isolated native Rust processes, with twelve native syscalls, process-local capability handles, bounded message channels, sleeping, yielding, and a coarse per-process timer-interrupt budget. Receive operations can block until a message, endpoint closure, or a timeout; checked user copies preserve permissions and message ownership. Process termination releases handles and private memory. Formatting, Clippy, and all 24 debug/release boot cases pass; a separate normal boot also completes both processes, IPC, cleanup, and idle entry. Broader driver ports, application compatibility, unified resource management, and inference services remain future work. The broader designs below are proposals; performance improvements must be demonstrated with measurements.
 
 ## Build and boot the kernel
 
@@ -16,7 +16,7 @@ From the repository root in PowerShell:
 # Compile the kernel and native init, then stage their UEFI boot files.
 .\scripts\build.ps1
 
-# Run formatting, Clippy, and all 20 debug/release boot cases.
+# Run formatting, Clippy, and all 24 debug/release boot cases.
 .\scripts\test.ps1
 
 # Build the smoke-test kernel, boot it, and verify its serial results and exit code.
@@ -40,6 +40,12 @@ From the repository root in PowerShell:
 # Verify that timer preemption lets a peer finish beside a CPU-bound process.
 .\scripts\run.ps1 -Smoke -Fault UserBudget
 
+# Verify that process exit closes its last sender and wakes a blocked receiver.
+.\scripts\run.ps1 -Smoke -Fault IpcPeerExit
+
+# Verify receive timeout while the peer keeps the endpoint open, then recovery.
+.\scripts\run.ps1 -Smoke -Fault IpcTimeout
+
 # Boot normally; both native processes exit before the idle loop. Ctrl+C stops QEMU.
 .\scripts\run.ps1
 ```
@@ -50,7 +56,11 @@ Running requires `qemu-system-x86_64.exe` and a matching pair of EDK II/OVMF fir
 
 The smoke test has a 30-second boot timeout. It checks frame ownership, alignment, reuse, rejected invalid frees, physical-page contents, returning breakpoints, and mapping/unmapping. Heap checks cover mixed layouts, data preservation, exhaustion, hole reuse/coalescing, rejected oversized layouts, and actual `Box`/`Vec` allocation without leaks. Timer checks require repeated hardware IRQ delivery and acknowledgement. A separate allocation loop requires timer progress while verifying that the heap lock restores enabled interrupts.
 
-Userspace checks cover private page-table permissions and reclamation, bounded ELF validation, rollback after a partially completed load fails, ring-3 execution, initialized data and zeroed BSS, stack writes, rejected syscall pointers and unknown calls, preserved registers, and timer progress while user code runs. Two instances of init are loaded simultaneously into distinct address spaces. Scheduler checks require repeated dispatch of both processes, yielding, sleeping, resumption, preservation of private data identified by each PID, and complete frame reclamation. PID-specific register canaries and the direction flag are checked across yield; finite arithmetic loops check registers and carry-dependent results while actual timer preemption occurs. Sleep tests verify wake deadlines, counter wraparound comparisons, and that sleeping or idle time does not increase user tick charges. Every smoke boot tears down its first pair and launches a fresh normal pair, checking fresh BSS and frame reuse after exit or a contained failure. The runner requires `MIRROR_USER_PAGING_OK`, `MIRROR_ELF_TESTS_OK`, `MIRROR_USER_LOAD_ROLLBACK_OK`, `MIRROR_USERSPACE_OK`, `MIRROR_USER_CLEANUP_OK`, and `MIRROR_SCHEDULER_OK` along with the earlier subsystem markers. The scheduler marker reports process, switch, yield, sleep, preemption, and idle-tick counts. Nonfatal cases finish with the expected kernel page-fault probe, `MIRROR_PAGE_FAULT_OK`, `MIRROR_BOOT_OK`, and QEMU exit status 33.
+Userspace checks cover private page-table permissions and reclamation, bounded ELF validation, rollback after a partially completed load fails, ring-3 execution, initialized data and zeroed BSS, stack writes, rejected syscall pointers and unknown calls, preserved registers, and timer progress while user code runs. Copy tests cross noncontiguous physical pages and require unchanged destination bytes when a later page is absent or read-only. Two instances of init are loaded simultaneously into distinct address spaces. Scheduler checks require repeated dispatch of both processes, yielding, sleeping, resumption, preservation of private data identified by each PID, and complete frame reclamation. PID-specific register canaries and the direction flag are checked across yield; finite arithmetic loops check registers and carry-dependent results while actual timer preemption occurs. Sleep and receive-wait tests check that blocked or idle time does not increase user tick charges; deadline checks cover counter wraparound.
+
+Capability checks cover missing, stale, and foreign handles; denied operations; restricted duplicates; zero-rights handles; table exhaustion; and token exhaustion without reuse. Queue checks cover capacity, FIFO wraparound, message preservation, endpoint reference counts, and scrubbing after the last receiver closes. The native processes exchange three messages, verify that learning a peer's token grants no authority, and recover from short or read-only receive buffers without losing the queued message. Each smoke boot tears down its first pair and launches a fresh normal pair, checking fresh BSS, frame reuse, and complete handle/message cleanup after exit or a contained failure.
+
+The runner requires `MIRROR_USER_PAGING_OK`, `MIRROR_ELF_TESTS_OK`, `MIRROR_USER_LOAD_ROLLBACK_OK`, `MIRROR_USERSPACE_OK`, `MIRROR_USER_CLEANUP_OK`, `MIRROR_SCHEDULER_OK`, `MIRROR_CAPABILITY_TESTS_OK`, `MIRROR_IPC_TESTS_OK`, and `MIRROR_IPC_OK` along with the earlier subsystem markers. The scheduler marker reports process, switch, yield, sleep, preemption, and idle-tick counts; the IPC marker reports messages, waits, timeouts, and handle reclamation. Nonfatal cases finish with the expected kernel page-fault probe, `MIRROR_PAGE_FAULT_OK`, `MIRROR_BOOT_OK`, and QEMU exit status 33.
 
 `-Fault PageFault` and `-Fault InvalidOpcode` select intentional unexpected exceptions through the smoke kernel's boot command line. These cases require the matching exception vector, error code, page-fault address where applicable, and QEMU exit status 35. A panic, timeout, or ordinary successful boot cannot satisfy them. The normal kernel excludes these fault triggers and QEMU exit-port writes.
 
@@ -60,15 +70,17 @@ The five user-fault modes attempt to read supervisor kernel memory, write an RX 
 
 `-Fault UserBudget` finishes the ordinary user checks, then enters an infinite CPU loop. Timer interrupts must preempt it, its peer must complete before its budget expires, and the kernel must terminate the loop after 32 timer interrupts charged to that process. This requires `MIRROR_USER_BUDGET_CONTAINED`, full cleanup and relaunch, and QEMU exit status 33. A hardware-fault marker cannot satisfy the budget test; an unexpected budget marker fails every other scenario.
 
-Serial and QEMU diagnostic logs are saved under `build/`. `scripts/test.ps1` runs all ten cases in debug with 128 MiB and release with 256 MiB, retains their logs under `build/test-logs/`, and leaves a normal kernel and init staged afterward. Build and boot commands should run one at a time because they share the staged files.
+`-Fault IpcPeerExit` leaves a duplicate sender open until its owning process exits. Teardown must release that final endpoint reference and wake the peer's blocked receive with the closed-channel result, reported by `MIRROR_IPC_PEER_CLOSED_OK`. `-Fault IpcTimeout` keeps the sender open while its owner sleeps for 110 ticks; the peer must observe exactly one 100-tick receive timeout and then recover when the sender closes, reported by `MIRROR_IPC_TIMEOUT_OK`. Both cases require ordinary process completion, cleanup and relaunch, and QEMU exit status 33. Hardware faults or a scenario marker in the wrong test fail validation.
 
-The current kernel runs one CPU. Its GDT, TSS, 32 exception gates, 16 legacy IRQ gates, a user-callable `INT 0x80` gate, and dedicated double-fault stack are installed before interrupts are enabled. Ring-3 entries use a dedicated kernel stack through TSS.RSP0. The QEMU q35 timer uses the legacy PIC/PIT at approximately 100 Hz. Only IRQ0 is unmasked; its handler increments a counter and acknowledges the interrupt without allocation, logging, or locking. IRQs delivered during user execution also charge that process's budget and can save its context for another process to run. The scheduler idles with interrupts enabled when all unfinished processes are sleeping. After both processes exit, the kernel's idle loop continues waking on IRQs. Ticks measure delivered interrupts, not calibrated elapsed time; long critical sections can lose ticks. APIC/IOAPIC support and hardware discovery remain future work.
+Serial and QEMU diagnostic logs are saved under `build/`. `scripts/test.ps1` runs all twelve cases in debug with 128 MiB and release with 256 MiB, retains their logs under `build/test-logs/`, and leaves a normal kernel and init staged afterward. Build and boot commands should run one at a time because they share the staged files.
+
+The current kernel runs one CPU. Its GDT, TSS, 32 exception gates, 16 legacy IRQ gates, a user-callable `INT 0x80` gate, and dedicated double-fault stack are installed before interrupts are enabled. Ring-3 entries use a dedicated kernel stack through TSS.RSP0. The QEMU q35 timer uses the legacy PIC/PIT at approximately 100 Hz. Only IRQ0 is unmasked; its handler increments a counter and acknowledges the interrupt without allocation, logging, or locking. IRQs delivered during user execution also charge that process's budget and can save its context for another process to run. The scheduler idles with interrupts enabled when all unfinished processes are sleeping or waiting to receive. After both processes exit, the kernel's idle loop continues waking on IRQs. Ticks measure delivered interrupts, not calibrated elapsed time; long critical sections can lose ticks. APIC/IOAPIC support and hardware discovery remain future work.
 
 Paging ownership is established by deep-copying Limine's four-level hierarchy, retaining existing mappings and huge-page leaves, and switching CR3. New heap and scratch mappings are supervisor-only, writable, and non-executable; unmapping invalidates the local TLB. NX and supervisor write protection are enabled. Each user address space owns its lower-half mappings and page tables while sharing supervisor-only upper-half kernel mappings. User text is RX, constants are read-only/NX, and data and stack pages are writable/NX; writable/executable user mappings are rejected. The user-fault suite exercises these restrictions. Existing kernel aliases remain, so user W^X does not establish complete kernel memory protection. Double-fault stack installation is still untested with an induced double fault. Five-level paging is explicitly rejected for now.
 
 Physical allocation begins with a bump allocator, then tracks usable pages with a dynamically sized two-bit bitmap. Previously allocated page tables remain tracked, bitmap pages stay reserved, and released pages can be reused. Metadata currently needs one contiguous usable span. Freeing a page requires ending its uses and withdrawing non-direct-map aliases first; checks reject reserved, misaligned, never-allocated, metadata, and already-free pages. They cannot detect a stale ownership claim after a page has been reallocated. The bootstrap stack and boot responses still belong to Limine, so bootloader memory remains reserved.
 
-The fixed 1 MiB heap has unmapped guard pages and uses `linked_list_allocator` 0.10.6 with an interrupt-state-preserving lock. Blocks are reused and coalesced; heap backing pages stay mapped. Unsupported sizes/alignments return allocation failure before entering the dependency. Interrupt, exception, and syscall handlers must not allocate. Process teardown restores the kernel root and releases the entire private user tree, including mapped frames and page-table frames. Kernel page-table reclamation, heap growth, bounded allocation latency, and a general device framework remain future work.
+The fixed 1 MiB heap has unmapped guard pages and uses `linked_list_allocator` 0.10.6 with an interrupt-state-preserving lock. Blocks are reused and coalesced; heap backing pages stay mapped. Unsupported sizes/alignments return allocation failure before entering the dependency. Interrupt, exception, and syscall handlers must not allocate. The scheduler restores the kernel root before closing a finished process's remaining handles and checking peer wakeups. After both processes finish, it releases their private user trees, including mapped frames and page-table frames, and checks that channel references and messages are gone. Kernel page-table reclamation, heap growth, bounded allocation latency, and a general device framework remain future work.
 
 ### Native userspace and syscall ABI
 
@@ -78,26 +90,61 @@ The initial native ABI uses `INT 0x80`: RAX holds the call number, RDI/RSI/RDX h
 
 | Call | Arguments | Result |
 | --- | --- | --- |
-| `WRITE` (1) | RDI = user buffer address; RSI = byte length. | Writes UTF-8 diagnostics with a `user:` prefix and escaped controls; returns bytes accepted. Maximum 256 bytes. A zero length returns 0 without accessing the pointer; invalid user memory returns -14; oversized input or invalid UTF-8 returns -22. |
+| `WRITE` (1) | RDI = user buffer address; RSI = byte length; RDX = console handle. | Requires console `WRITE` authority. Writes UTF-8 diagnostics with a `user:` prefix and escaped controls; returns bytes accepted. Maximum 256 bytes. After checking the handle, a zero length returns 0 without accessing the pointer; invalid user memory returns -14; oversized input or invalid UTF-8 returns -22. |
 | `TICKS` (2) | None. | Current delivered timer-interrupt count. |
 | `EXIT` (3) | RDI = exit status. | Returns control to the kernel and ends this process; does not resume user code. |
 | `YIELD` (4) | None. | Makes the process runnable and returns 0 when the scheduler resumes it. |
 | `SLEEP` (5) | RDI = number of timer ticks. | Sleeps for the requested ticks and returns 0 on resumption. Zero acts as a yield; more than 1000 returns -22. |
 | `PID` (6) | None. | This process's positive identifier. |
+| `BOOT_HANDLE` (7) | RDI = bootstrap slot: 0 console, 1 outbound sender, 2 inbound receiver. | Returns the existing handle if still open. An invalid slot or a closed original handle returns -9; this call does not mint replacement authority. |
+| `SEND` (8) | RDI = channel handle; RSI = readable user buffer; RDX = byte length. | Requires `SEND`. Enqueues one complete message of 1–64 bytes and returns its length. Nonblocking: a full queue returns -11, and no remaining receiver returns -32. |
+| `RECV` (9) | RDI = channel handle; RSI = writable user buffer; RDX = capacity. | Requires `RECEIVE`. Copies and removes one complete message, returning its length. Capacity must be 1–64; an empty open queue returns -11 and an empty queue with no senders returns -32. |
+| `RECV_WAIT` (10) | Same as `RECV`. | Receives immediately if possible, otherwise suspends the process for up to a fixed 100 delivered timer ticks. Returns -110 if the queue remains empty and open at the deadline check. |
+| `CLOSE` (11) | RDI = handle. | Removes this handle and releases its endpoint authority; returns 0. Invalid, stale, or foreign handles return -9. Other duplicates remain valid. |
+| `DUP` (12) | RDI = existing handle; RSI = requested rights mask. | Creates a new handle with the same or fewer rights. Returns the new positive token; zero rights creates an inert handle. Adding rights is denied. |
 | Unknown call | Any. | -38. |
 
-The kernel validates an entire user buffer before copying it into a fixed kernel buffer. It never formats a raw user pointer directly. Every return to user mode, including an IRQ return, requires canonical lower-half instruction and stack pointers above the null page and the native CPL3 code/data selectors. An invalid context ends the process before IRET. Yield, sleep, timer preemption, exit, budget exhaustion, and ordinary user exceptions return through a trusted kernel continuation. Resumable cases first save the user's interrupt frame, and Rust handlers return normally before IRET resumes the scheduler. It restores the kernel page table before choosing the next process, then activates that process's private root and resumes its saved registers. NMI, double fault, and machine check remain fatal platform/kernel paths.
+Capability operations resolve the caller's handle and required rights before accessing the resource. Error results are:
 
-The scheduler keeps two processes on the boot CPU with one user thread each. A quantum ends after two delivered timer interrupts during that process's user execution, or sooner on yield, sleep, exit, or a fault. Sleeping processes become runnable at their wake tick. Each process has a 32-interrupt execution budget, charged only when IRQ0 interrupts CPL3. This is a coarse responsiveness guard rather than precise CPU-time accounting: ticks during kernel execution or sleep do not count, and long critical sections or frequent syscalls can undercount execution. No wall-clock runtime limit is implied.
+| Result | Meaning |
+| --- | --- |
+| -9 | Missing, closed, stale, or foreign handle; invalid bootstrap slot. |
+| -11 | Queue full on send, or empty with live senders on nonblocking receive. |
+| -13 | Insufficient rights or the wrong object type. |
+| -14 | Invalid user range or missing effective read/write permission. |
+| -22 | Invalid ordinary argument, unsupported rights bits, oversized console write, or invalid UTF-8. |
+| -24 | Eight-slot handle table full or the monotonic token allocator exhausted. |
+| -32 | No receivers remain on send, or no senders remain and the receive queue is empty. |
+| -38 | Unknown syscall. |
+| -90 | Message length or receive capacity outside 1–64, or the head message exceeds the supplied capacity. |
+| -110 | A blocking receive is still empty and open when its deadline is checked. |
 
-There is no process-creation syscall, additional thread support, SMP scheduler, IPC, capability-handle API, or TLS yet. Initial general-purpose registers are cleared except RDI, which contains the test scenario in its low byte and the process role in its next byte; FS/GS bases are cleared. The integer-only ABI sets CR0.TS during user execution so x87/SIMD use faults until extended-state management is implemented. These limits apply to the current executable milestone, while the architecture below describes the intended broader system.
+The kernel validates an entire user buffer before copying it. It never formats a raw user pointer directly. Receive checks the whole advertised capacity, including effective user and write permissions at every page-table level, even when the queue is empty. It rechecks the handle and destination on wake. A short buffer or failed copy leaves the message queued, and rejected copies leave the destination unchanged. Copies follow each physical page through the direct map, including ranges that cross noncontiguous frames.
 
-Kernel entry is in [kernel/src/main.rs](kernel/src/main.rs), boot requests in [kernel/src/boot.rs](kernel/src/boot.rs), physical allocation in [kernel/src/memory.rs](kernel/src/memory.rs), paging in [kernel/src/paging.rs](kernel/src/paging.rs), and exception handling in [kernel/src/interrupts.rs](kernel/src/interrupts.rs). User transitions are in [kernel/src/userspace_entry.S](kernel/src/userspace_entry.S), ELF validation in [kernel/src/elf.rs](kernel/src/elf.rs), and process loading, scheduling, syscalls, and cleanup in [kernel/src/userspace.rs](kernel/src/userspace.rs). The heap is in [kernel/src/heap.rs](kernel/src/heap.rs) and the first timer driver in [kernel/src/timer.rs](kernel/src/timer.rs). See Rust's [bare-metal target documentation](https://doc.rust-lang.org/rustc/platform-support/x86_64-unknown-none.html) and the [Limine bootloader](https://github.com/Limine-Bootloader/Limine) for the underlying build and handoff contracts.
+Every return to user mode, including an IRQ return, requires canonical lower-half instruction and stack pointers above the null page and the native CPL3 code/data selectors. An invalid context ends the process before IRET. Yield, sleep, blocking receive, timer preemption, exit, budget exhaustion, and ordinary user exceptions return through a trusted kernel continuation. Resumable cases first save the user's interrupt frame, and Rust handlers return normally before IRET resumes the scheduler. It restores the kernel page table before choosing the next process, then activates that process's private root and resumes its saved registers. NMI, double fault, and machine check remain fatal platform/kernel paths.
+
+The scheduler keeps two processes on the boot CPU with one user thread each. A quantum ends after two delivered timer interrupts during that process's user execution, or sooner on yield, sleep, blocking receive, exit, or a fault. Sleeping processes become runnable at their wake tick. A waiting receiver becomes runnable when a message, endpoint closure, or timeout is observed by the scheduler. Readiness or end-of-stream wins over timeout when observed in the same scheduler check. Receive deadlines count delivered timer ticks and do not imply a precise wall-clock bound.
+
+Each process has a 32-interrupt execution budget, charged only when IRQ0 interrupts CPL3. This is a coarse responsiveness guard rather than precise CPU-time accounting: ticks during kernel execution, sleep, or receive waits do not count, and long critical sections or frequent syscalls can undercount execution. No wall-clock runtime limit is implied.
+
+### Capability and channel ownership
+
+Each process has an eight-slot handle table. Handle tokens are positive, globally monotonic for the boot, and never reused; the allocator stops at the signed-result limit. Authority comes from finding the token in the caller's own table. Tokens are not secrets, and learning another process's token through a message does not grant access to its object.
+
+Rights are a bitmask: `SEND = 1`, `RECEIVE = 2`, and console `WRITE = 4`. Bootstrap grants one console writer, one sender to the peer, and one receiver from the peer. `DUP` operates within the same process and can preserve or reduce these rights. A zero-rights duplicate takes a table slot but cannot perform resource operations or regain rights. It holds no channel sender/receiver reference. Closing a handle invalidates that token immediately; closing a bootstrap token also makes that `BOOT_HANDLE` slot fail, even if a duplicate remains open.
+
+The pair has two directional channels with four queued messages each. Messages contain 1–64 copied bytes; a handle number sent in those bytes remains ordinary data and transfers no authority. Queues retain kernel-owned copies rather than pointers into user buffers. A queued message survives the last sender closing and remains receivable; once drained, receive reports -32. Closing the last receiver discards and scrubs any queued messages, and subsequent sends report -32. Endpoint references track every duplicate with the relevant right.
+
+On exit, fault, rejected return context, or budget exhaustion, the scheduler closes all remaining process handles before checking waiting peers. This lets a blocked peer observe closure without waiting for the finished process's memory to be reclaimed. Pair teardown requires both empty handle tables and fully drained channel storage. There is no channel-creation syscall, handle transfer between processes, blocking send, caller-selected receive timeout, or general revocation mechanism yet.
+
+There is also no process-creation syscall, additional thread support, SMP scheduler, or TLS yet. Initial general-purpose registers are cleared except RDI, which contains the test scenario in its low byte and the process role in its next byte; FS/GS bases are cleared. The integer-only ABI sets CR0.TS during user execution so x87/SIMD use faults until extended-state management is implemented. These limits apply to the current executable milestone, while the architecture below describes the intended broader system.
+
+Kernel entry is in [kernel/src/main.rs](kernel/src/main.rs), boot requests in [kernel/src/boot.rs](kernel/src/boot.rs), physical allocation in [kernel/src/memory.rs](kernel/src/memory.rs), paging in [kernel/src/paging.rs](kernel/src/paging.rs), and exception handling in [kernel/src/interrupts.rs](kernel/src/interrupts.rs). User transitions are in [kernel/src/userspace_entry.S](kernel/src/userspace_entry.S), ELF validation in [kernel/src/elf.rs](kernel/src/elf.rs), and process loading, scheduling, syscalls, and cleanup in [kernel/src/userspace.rs](kernel/src/userspace.rs). Handle tables are in [kernel/src/capability.rs](kernel/src/capability.rs), channel queues in [kernel/src/ipc.rs](kernel/src/ipc.rs), the heap in [kernel/src/heap.rs](kernel/src/heap.rs), and the first timer driver in [kernel/src/timer.rs](kernel/src/timer.rs). See Rust's [bare-metal target documentation](https://doc.rust-lang.org/rustc/platform-support/x86_64-unknown-none.html) and the [Limine bootloader](https://github.com/Limine-Bootloader/Limine) for the underlying build and handoff contracts.
 
 ## Goals
 
 - A responsive desktop with a small baseline resource footprint and optional background services.
-- Windows and Linux application compatibility, expanded through a published, tested application matrix.
+- Independent Windows and Linux application compatibility implementations over Mirror's native kernel and services, expanded through a published, tested application matrix.
 - Structured application operations that agents can discover and invoke without repeatedly interpreting screenshots.
 - OS-enforced limits on agent access to files, processes, networks, devices, credentials, and compute.
 - A common resource policy for RAM, VRAM, storage, and cache locality, aware of the differences between them.
@@ -108,17 +155,20 @@ Rust is the primary implementation language. Existing compatibility and inferenc
 
 ## Proposed architecture
 
-Development begins with the custom Mirror kernel and then builds its native userspace. The first executable milestone is a kernel booting on virtual hardware in QEMU. Resource policies and inference services will be implemented against Mirror's own memory, scheduling, and device interfaces as those become available; a simulator or hosted operating-system prototype is not the starting point.
+Mirror's foundation is its own Rust kernel and native userspace. That work is already executable: the kernel boots on virtual hardware in QEMU and schedules native Rust programs through Mirror's syscall interface. Native init, services, the device framework, and future desktop use Mirror interfaces. Resource policies and inference services will build on those same memory, scheduling, and device mechanisms.
+
+Two separate application compatibility personalities are planned. A personality implements the interfaces expected by applications from another operating system and translates their behavior onto Mirror's native primitives. The Windows personality targets Windows executables and APIs; the Linux personality targets Linux executables and its syscall ABI. Neither personality defines Mirror's kernel or native system services, and implementing the Windows personality does not depend on adopting Linux as a system base.
 
 | Component | Responsibility |
 | --- | --- |
-| Kernel | Address spaces, threads, scheduling mechanisms, interrupts, memory mappings, IPC, capability enforcement, and device isolation where hardware supports it. |
-| System services | Filesystems, networking, device management, application lifecycle, and desktop services. Place services outside the kernel where practical. |
+| Mirror kernel | New Rust implementations of address spaces, threads, scheduling mechanisms, interrupts, memory mappings, IPC, capability enforcement, and device isolation where hardware supports it. |
+| Native system services | Mirror filesystems, networking, device management, application lifecycle, and desktop services using native Mirror interfaces. Place services outside the kernel where practical. |
 | Agent broker | Discover typed operations, validate arguments and authority, apply quotas, dispatch actions, and record results. |
 | Capacity manager | Account for resources, choose object placement, reserve transfers, and coordinate reclamation and prefetching. |
 | Inference services | Execute models through replaceable backends and supply workload hints to the capacity manager and scheduler. |
 | Storage service | Manage a logical pool, extent placement, checksums, redundancy, recovery, and background rebalancing. |
-| Compatibility environments | Provide the Linux ABI and a host substrate for Windows compatibility components, with their own isolation boundaries. |
+| Windows application personality | Load Windows PE executables and supply the Windows APIs and NT behavior required by selected applications, using Mirror's native kernel and services. |
+| Linux application personality | Load Linux ELF applications and implement their required syscall and userspace ABI behavior over Mirror's native kernel and services. |
 
 The kernel supplies bounded mechanisms and enforces authority. Higher-level resource policy and model execution belong in restartable services. A model crash or unavailable cloud provider must not stop the machine from booting or being used manually.
 
@@ -155,25 +205,29 @@ Mirror's distribution model and license are still undecided. Select the appropri
 
 ## Windows and Linux applications
 
-Loading an executable is only one part of compatibility. Applications also depend on system calls, libraries, threading, graphics, filesystem behavior, services, and sometimes kernel drivers.
+Windows `.exe` files and Linux applications are independent execution targets for Mirror. Both will run against compatibility personalities built on Mirror's own kernel and native userspace. Linux application support means implementing the required application ABI; it does not mean using the Linux kernel or a Linux distribution as Mirror's foundation.
+
+Loading an executable is only one part of compatibility. Applications also depend on system calls, libraries, threading, graphics, filesystem behavior, services, and sometimes kernel drivers. Each personality must supply the observable behavior required by its selected applications while preserving Mirror's process isolation and resource controls.
 
 | Application class | Proposed route | Initial boundary |
 | --- | --- | --- |
-| Native Mirror applications | Rust services and applications using Mirror's APIs. | First supported environment. |
-| Linux command-line programs | ELF loading and an explicitly bounded Linux ABI. | Start with small static binaries and the calls they actually require. |
-| Larger Linux applications | Expand the ABI, dynamic loading, libraries, graphics, and service support. | Compatibility is verified per application and version. |
-| Windows user applications | Port Wine onto a sufficient Mirror host substrate. | Start with named applications; PE loading alone is insufficient. |
-| Applications needing a full guest OS | Investigate integrated Linux or Windows VMs later. | Requires a virtualization backend, guest integration, suitable hardware, and appropriate guest software licensing. |
+| Native Mirror applications | Rust services and applications using Mirror's own APIs. | Native init is running now; more services build on this environment. |
+| Windows user applications | Mirror's Windows personality: PE loading plus the Windows API and NT behavior required by selected applications, implemented over Mirror primitives. | Start with named applications and bounded workflows; loading PE files alone is insufficient. |
+| Linux command-line programs | Mirror's Linux personality: ELF loading and a bounded Linux syscall ABI mapped to Mirror primitives. | Start with small static binaries and the calls they actually require. |
+| Larger Linux applications | Expand the Linux personality's dynamic loading, libraries, graphics, and service support. | Compatibility is verified per application and version. |
+| Applications needing a full guest OS | Investigate optional integrated Linux or Windows VMs later. | Separate from either application personality; requires a virtualization backend, guest integration, suitable hardware, and appropriate guest software licensing. |
 
-[FreeBSD's Linux compatibility documentation](https://docs.freebsd.org/en/books/handbook/linuxemu/) illustrates both the feasibility of implementing a foreign ABI and the limits of that approach. POSIX source compatibility is not equivalent to Linux binary compatibility.
+For Windows applications, the implementation scope includes executable and DLL loading, imported APIs, and required NT-style object, handle, thread, synchronization, exception, and filesystem behavior. Graphics and platform services follow the needs of the selected workflows. This is incremental application compatibility, with explicit supported behaviors and gaps; it is not a commitment to recreate every Windows subsystem before the first application runs.
 
-[Wine](https://www.winehq.org/about) supplies Windows API compatibility on supported hosts. [Proton](https://github.com/ValveSoftware/Proton) combines Wine and other components for Windows games on Linux; it is a potential source of reusable work, not a component that immediately makes a new kernel Windows-compatible. Kernel drivers, anti-cheat, DRM, and applications with deep platform dependencies need separate assessment.
+For Linux applications, the ELF format and syscall ABI are application contracts to implement on Mirror. Native Mirror programs also use ELF today, but they already have a distinct native syscall interface. [FreeBSD's Linux compatibility documentation](https://docs.freebsd.org/en/books/handbook/linuxemu/) is a precedent for implementing a foreign application ABI on another kernel. POSIX source compatibility alone does not establish Linux binary compatibility.
+
+Existing projects such as [Wine](https://www.winehq.org/about) may offer code worth reusing for particular Windows behaviors. Adopting any of that code requires an explicit later decision about licensing, dependencies, adaptation to Mirror interfaces, and maintainability. A Wine port is not a predetermined architecture or a roadmap acceptance gate. Kernel drivers, anti-cheat, DRM, and applications with deep platform dependencies require separate assessment.
 
 GPU support is an early feasibility gate. For example, Mesa's RADV Vulkan driver depends on the Linux `amdgpu` kernel interface; a Vulkan API alone does not supply the required driver stack. CUDA likewise has supported OS and driver requirements. Mirror will pursue native driver ports for a selected hardware family and adapt the corresponding userspace graphics and compute stack. Accelerated inference is a milestone that depends on that working port. See [Mesa RADV](https://docs.mesa3d.org/drivers/radv.html) and [CUDA system requirements](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/).
 
 Booting Mirror inside QEMU does not give Mirror the ability to host accelerated guest operating systems. That is a separate project; [QEMU's accelerators](https://www.qemu.org/docs/master/system/introduction.html) rely on host facilities.
 
-The first Windows application targets are still to be selected. Record application versions, dependencies, required workflows, graphics needs, and known failures in the compatibility matrix.
+The first Windows and Linux application targets are still to be selected. Record application versions, dependencies, required workflows, graphics needs, and known failures in the compatibility matrix. Advance each personality against those concrete tests without making universal compatibility claims.
 
 ### Native driver ports
 
@@ -255,7 +309,7 @@ Milestones are acceptance gates, not delivery-date promises. Work proceeds from 
 | 2. Memory and exceptions | Physical frame allocation, virtual memory ownership, kernel allocation, exception handling, interrupts, and timers. | Reserved memory is never allocated; mapping operations preserve ownership; faults produce useful diagnostics; timer interrupts work. |
 | 3. Native userspace and syscalls | User address spaces, executable loading, syscall entry, threads, scheduling, IPC, capability handles, and a minimal native init process. | A native user program runs; process faults remain contained; invalid pointers and unauthorized handles are rejected; tasks yield and resume. |
 | 4. Device framework and driver ports | Platform adaptation layer, device discovery, DMA and interrupt support, VirtIO storage/network drivers, and selected physical-device ports. | Named devices work through Mirror's interfaces; DMA ownership and interrupt handling are checked; failure and device recovery paths are exercised. |
-| 5. Native services, compatibility, and AI | Filesystem and shell, bounded Linux ABI, selected Wine host interfaces, typed-operation broker, CPU inference, and capacity-manager integration. | Selected native and static Linux programs run; named Windows workflows pass as Wine support arrives; agent permissions are enforced; inference preserves interactive headroom. |
+| 5. Native services, application personalities, and AI | Mirror filesystem and shell; initial, separately scoped Windows PE/API/NT and Linux ELF/syscall personalities over Mirror interfaces; typed-operation broker, CPU inference, and capacity-manager integration. | Native services run on Mirror; selected Windows and Linux workflows pass their personality-specific tests as support arrives; agent permissions are enforced; inference preserves interactive headroom. |
 | 6. GPU ports and accelerated inference | Selected GPU driver port, userspace graphics/compute integration, real RAM/VRAM placement, and responsiveness controls. | Correct rendering and model outputs on named hardware; reproducible mixed-load measurements; migration and resource-pressure recovery. Assess the port's dependencies during earlier stages. |
 | 7. Usable desktop and durable pool | Human/agent desktop, installer/update recovery, storage pooling and recovery, expanded compatibility, and broader device testing. | Recovery after interrupted writes/updates and device failures, usable manual controls, application-specific workflow tests, and repeatable agent permission tests. |
 
@@ -273,7 +327,7 @@ The first boot slice's acceptance criteria are:
 4. Memory-map accounting and frame allocation distinguish usable memory from reserved regions. Frame recycling, page-table ownership, and the initial heap are implemented; private user trees are reclaimed on process teardown. Bootloader and kernel page-table reclamation remain later work.
 5. Panic and normal idle paths remain within Mirror. Fatal paths disable maskable interrupts and halt; normal idle enables them and wakes for timer IRQs.
 
-This original slice establishes boot and handoff behavior. Work has now reached stage 3 with isolated native user processes, syscalls, teardown, and the first preemptive scheduler. Broader thread and process lifecycle support, IPC, and capability handles are still needed to complete that stage. Driver compatibility, general application compatibility, and inference capability remain later milestones.
+This original slice establishes boot and handoff behavior. Work has now reached stage 3 with isolated native user processes, syscalls, teardown, preemptive scheduling, console/channel capabilities, and bounded IPC. Broader thread and process lifecycle support, capability delegation, and additional IPC mechanisms remain work for this stage. Driver compatibility, general application compatibility, and inference capability remain later milestones.
 
 ### Performance evidence
 

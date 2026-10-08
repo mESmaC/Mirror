@@ -13,9 +13,25 @@ const SYS_EXIT: u64 = 3;
 const SYS_YIELD: u64 = 4;
 const SYS_SLEEP: u64 = 5;
 const SYS_PID: u64 = 6;
+const SYS_BOOT_HANDLE: u64 = 7;
+const SYS_SEND: u64 = 8;
+const SYS_RECV: u64 = 9;
+const SYS_RECV_WAIT: u64 = 10;
+const SYS_CLOSE: u64 = 11;
+const SYS_DUP: u64 = 12;
+const RIGHT_SEND: u64 = 1;
+const RIGHT_RECEIVE: u64 = 2;
+const RIGHT_WRITE: u64 = 4;
+const EBADF: i64 = -9;
+const EAGAIN: i64 = -11;
+const EACCES: i64 = -13;
 const EFAULT: i64 = -14;
 const EINVAL: i64 = -22;
+const EMFILE: i64 = -24;
+const EPIPE: i64 = -32;
 const ENOSYS: i64 = -38;
+const EMSGSIZE: i64 = -90;
+const ETIMEDOUT: i64 = -110;
 const KERNEL_BASE: u64 = 0xffff_ffff_8000_0000;
 const CODE_BASE: u64 = 0x0040_0000;
 const STACK_GUARD: u64 = 0x7ffe_f000;
@@ -65,8 +81,13 @@ fn syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
     result
 }
 
-fn write(message: &[u8]) {
-    if syscall(SYS_WRITE, message.as_ptr() as u64, message.len() as u64, 0) != message.len() as i64
+fn write(console: u64, message: &[u8]) {
+    if syscall(
+        SYS_WRITE,
+        message.as_ptr() as u64,
+        message.len() as u64,
+        console,
+    ) != message.len() as i64
     {
         exit(10);
     }
@@ -82,6 +103,154 @@ fn require(condition: bool, status: u64) {
     if !condition {
         exit(status);
     }
+}
+
+fn duplicate(handle: u64, rights: u64, status: u64) -> u64 {
+    let token = syscall(SYS_DUP, handle, rights, 0);
+    require(token > 0 && token as u64 != handle, status);
+    token as u64
+}
+
+fn check_capabilities(console: u64, outbound: u64, inbound: u64) -> u64 {
+    let mut buffer = [0u8; 64];
+    let pointer = buffer.as_mut_ptr() as u64;
+    require(syscall(SYS_SEND, u64::MAX, pointer, 64) == EBADF, 63);
+    require(syscall(SYS_CLOSE, u64::MAX, 0, 0) == EBADF, 64);
+    require(syscall(SYS_SEND, inbound, pointer, 64) == EACCES, 65);
+    require(syscall(SYS_RECV, outbound, pointer, 64) == EACCES, 66);
+    require(syscall(SYS_WRITE, pointer, 1, outbound) == EACCES, 67);
+    require(
+        syscall(SYS_DUP, outbound, RIGHT_SEND | RIGHT_RECEIVE, 0) == EACCES,
+        68,
+    );
+
+    let inert = duplicate(outbound, 0, 69);
+    require(syscall(SYS_SEND, inert, pointer, 64) == EACCES, 70);
+    require(syscall(SYS_DUP, inert, RIGHT_SEND, 0) == EACCES, 71);
+    require(syscall(SYS_CLOSE, inert, 0, 0) == 0, 72);
+
+    // Three boot capabilities plus five duplicates exhaust the eight slots.
+    let mut clones = [0u64; 5];
+    for index in 0..clones.len() {
+        let clone = duplicate(console, RIGHT_WRITE, 73);
+        require(!clones[..index].contains(&clone), 74);
+        clones[index] = clone;
+    }
+    require(syscall(SYS_DUP, console, RIGHT_WRITE, 0) == EMFILE, 75);
+    let stale = clones[0];
+    require(syscall(SYS_CLOSE, stale, 0, 0) == 0, 76);
+    let replacement = duplicate(console, RIGHT_WRITE, 77);
+    require(replacement != stale, 78);
+    clones[0] = replacement;
+    require(syscall(SYS_WRITE, pointer, 1, stale) == EBADF, 79);
+    write(replacement, b"Mirror init: console capability checked\n");
+    for clone in clones {
+        require(syscall(SYS_CLOSE, clone, 0, 0) == 0, 80);
+    }
+    require(syscall(SYS_WRITE, pointer, 1, replacement) == EBADF, 81);
+    require(syscall(SYS_BOOT_HANDLE, 0, 0, 0) == console as i64, 82);
+
+    let sender = duplicate(outbound, RIGHT_SEND, 83);
+    require(syscall(SYS_CLOSE, outbound, 0, 0) == 0, 84);
+    require(syscall(SYS_SEND, outbound, pointer, 64) == EBADF, 85);
+    require(syscall(SYS_BOOT_HANDLE, 1, 0, 0) == EBADF, 86);
+    require(syscall(SYS_DUP, outbound, RIGHT_SEND, 0) == EBADF, 87);
+    require(syscall(SYS_SEND, sender, 0, 64) == EFAULT, 88);
+    require(syscall(SYS_SEND, sender, pointer, 65) == EMSGSIZE, 89);
+    sender
+}
+
+fn message(role: u64, tag: u8, sender: u64) -> [u8; 64] {
+    let mut bytes = [0u8; 64];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = (index as u8).wrapping_mul(17) ^ tag ^ (role as u8).wrapping_mul(0x5b);
+    }
+    bytes[0] = tag;
+    bytes[1] = role as u8;
+    bytes[8..16].copy_from_slice(&sender.to_le_bytes());
+    bytes
+}
+
+fn send_message(sender: u64, role: u64, tag: u8) {
+    let bytes = message(role, tag, sender);
+    require(
+        syscall(SYS_SEND, sender, bytes.as_ptr() as u64, 64) == 64,
+        100,
+    );
+}
+
+fn validate_message(bytes: &[u8; 64], role: u64, tag: u8) {
+    let foreign_sender = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    require(foreign_sender > 0, 101);
+    require(*bytes == message(role, tag, foreign_sender), 102);
+    // Learning another process's integer token does not grant its authority.
+    require(
+        syscall(SYS_SEND, foreign_sender, bytes.as_ptr() as u64, 64) == EBADF,
+        103,
+    );
+}
+
+fn receive_message(receiver: u64, role: u64, tag: u8, check_rejections: bool) {
+    let mut bytes = [0u8; 64];
+    let pointer = bytes.as_mut_ptr() as u64;
+    if check_rejections {
+        require(
+            syscall(SYS_RECV_WAIT, receiver, pointer, 1) == EMSGSIZE,
+            104,
+        );
+        require(syscall(SYS_RECV, receiver, CODE_BASE, 64) == EFAULT, 105);
+    }
+    // Both failed copies above must leave the full message at the FIFO head.
+    require(syscall(SYS_RECV_WAIT, receiver, pointer, 64) == 64, 106);
+    validate_message(&bytes, role, tag);
+}
+
+fn check_ipc(console: u64, role: u64, probe: u64) {
+    let outbound = syscall(SYS_BOOT_HANDLE, 1, 0, 0);
+    let inbound = syscall(SYS_BOOT_HANDLE, 2, 0, 0);
+    require(outbound > 0, 61);
+    require(inbound > 0, 62);
+    let receiver = inbound as u64;
+    let sender = check_capabilities(console, outbound as u64, receiver);
+    if role == 0 {
+        receive_message(receiver, 1, 1, true);
+        send_message(sender, 0, 2);
+        receive_message(receiver, 1, 3, false);
+        // Give the peer a deterministic opportunity to block waiting for EOF.
+        require(syscall(SYS_YIELD, 0, 0, 0) == 0, 108);
+        if probe == 9 {
+            require(syscall(SYS_SLEEP, 110, 0, 0) == 0, 109);
+        }
+        if probe != 8 {
+            require(syscall(SYS_CLOSE, sender, 0, 0) == 0, 110);
+        }
+        // Probe 8 intentionally retains this last sender until process teardown.
+    } else {
+        // The primary cannot send its reply until we send the first message,
+        // so this queue is empty regardless of timer preemption.
+        let mut empty_buffer = [0u8; 64];
+        require(
+            syscall(SYS_RECV, receiver, empty_buffer.as_mut_ptr() as u64, 64) == EAGAIN,
+            107,
+        );
+        require(syscall(SYS_SLEEP, 4, 0, 0) == 0, 111);
+        send_message(sender, 1, 1);
+        receive_message(receiver, 0, 2, true);
+        send_message(sender, 1, 3);
+        let mut buffer = [0u8; 64];
+        let mut saw_eof = false;
+        for _ in 0..3 {
+            let result = syscall(SYS_RECV_WAIT, receiver, buffer.as_mut_ptr() as u64, 64);
+            if result == EPIPE {
+                saw_eof = true;
+                break;
+            }
+            require(result == ETIMEDOUT, 112);
+        }
+        require(saw_eof, 113);
+        require(syscall(SYS_CLOSE, sender, 0, 0) == 0, 114);
+    }
+    write(console, b"Mirror init: IPC checks passed\n");
 }
 
 fn check_syscall_registers(pid: i64) {
@@ -241,7 +410,7 @@ fn check_preempted_arithmetic(pid: i64) {
 extern "C" fn init_main(launch: u64) -> ! {
     let probe = launch & 0xff;
     let role = launch >> 8;
-    require(role <= 1 && probe <= 7 && (role == 0 || probe == 0), 33);
+    require(role <= 1 && probe <= 9 && (role == 0 || probe == 0), 33);
     let code_segment: u16;
     // SAFETY: reading CS is permitted at every privilege level.
     unsafe {
@@ -249,7 +418,10 @@ extern "C" fn init_main(launch: u64) -> ! {
     };
     require(code_segment & 3 == 3, 11);
 
-    write(b"Mirror init: running Rust in ring 3\n");
+    let console = syscall(SYS_BOOT_HANDLE, 0, 0, 0);
+    require(console > 0, 60);
+    let console = console as u64;
+    write(console, b"Mirror init: running Rust in ring 3\n");
     let pid = syscall(SYS_PID, 0, 0, 0);
     require(pid > 0, 34);
     require(syscall(SYS_PID, 0, 0, 0) == pid, 35);
@@ -284,14 +456,19 @@ extern "C" fn init_main(launch: u64) -> ! {
         );
     }
 
-    require(syscall(SYS_WRITE, KERNEL_BASE, 1, 0) == EFAULT, 20);
-    require(syscall(SYS_WRITE, 0, 1, 0) == EFAULT, 21);
-    require(syscall(SYS_WRITE, u64::MAX - 1, 4, 0) == EFAULT, 22);
+    check_ipc(console, role, probe);
+
+    require(syscall(SYS_WRITE, KERNEL_BASE, 1, console) == EFAULT, 20);
+    require(syscall(SYS_WRITE, 0, 1, console) == EFAULT, 21);
+    require(syscall(SYS_WRITE, u64::MAX - 1, 4, console) == EFAULT, 22);
     let readonly_end = (&raw const __readonly_end) as u64;
-    require(syscall(SYS_WRITE, readonly_end - 1, 2, 0) == EFAULT, 23);
+    require(
+        syscall(SYS_WRITE, readonly_end - 1, 2, console) == EFAULT,
+        23,
+    );
     require(syscall(u64::MAX, 0, 0, 0) == ENOSYS, 24);
-    require(syscall(SYS_WRITE, 0, 0, 0) == 0, 29);
-    require(syscall(SYS_WRITE, CODE_BASE, 257, 0) == EINVAL, 32);
+    require(syscall(SYS_WRITE, 0, 0, console) == 0, 29);
+    require(syscall(SYS_WRITE, CODE_BASE, 257, console) == EINVAL, 32);
     check_syscall_registers(pid);
 
     let initial_ticks = syscall(SYS_TICKS, 0, 0, 0);
@@ -339,12 +516,12 @@ extern "C" fn init_main(launch: u64) -> ! {
         check_private_state(pid, &stack_value);
     }
 
-    write(b"Mirror init: userspace checks passed\n");
+    write(console, b"Mirror init: userspace checks passed\n");
 
     // Each boot runs at most one destructive protection probe. Assembly avoids
     // expressing deliberately invalid accesses as undefined Rust operations.
     match probe {
-        0 => exit(0),
+        0 | 8 | 9 => exit(0),
         1 => unsafe {
             asm!("mov rax, [rdi]", in("rdi") KERNEL_BASE, out("rax") _, options(nostack));
         },

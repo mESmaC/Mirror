@@ -5,9 +5,11 @@ extern crate alloc;
 
 mod arch;
 mod boot;
+mod capability;
 mod elf;
 mod heap;
 mod interrupts;
+mod ipc;
 mod memory;
 mod paging;
 mod serial;

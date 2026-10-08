@@ -3,7 +3,7 @@ param(
     [switch]$Release,
     [switch]$Smoke,
     [switch]$NoBuild,
-    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget')][string]$Fault = 'None',
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -46,6 +46,8 @@ $testMode = switch ($Fault) {
     'UserPrivileged' { 'user-privileged' }
     'UserBadStack' { 'user-bad-stack' }
     'UserBudget' { 'user-budget' }
+    'IpcPeerExit' { 'ipc-peer-exit' }
+    'IpcTimeout' { 'ipc-timeout' }
     default { $null }
 }
 if ($null -ne $testMode) { $bootConfig += "`n    cmdline: mirror.test=$testMode`n" }
@@ -106,7 +108,7 @@ try {
         $qemuError = [System.IO.File]::ReadAllText($stderrLog)
         throw "Mirror smoke test expected QEMU exit $expectedExitCode; got $qemuExitCode. $qemuError See $serialLog."
     }
-    $markers = @('MIRROR_FRAMES_OK', 'MIRROR_ALLOCATOR_TESTS_OK', 'MIRROR_FRAME_REUSE_OK', 'MIRROR_EXCEPTIONS_OK', 'MIRROR_PAGING_OK', 'MIRROR_HEAP_OK', 'MIRROR_TIMER_OK', 'MIRROR_HEAP_IRQ_OK', 'MIRROR_USER_PAGING_OK', 'MIRROR_ELF_TESTS_OK', 'MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_USER_LOAD_ROLLBACK_OK', 'MIRROR_SCHEDULER_OK')
+    $markers = @('MIRROR_FRAMES_OK', 'MIRROR_ALLOCATOR_TESTS_OK', 'MIRROR_FRAME_REUSE_OK', 'MIRROR_EXCEPTIONS_OK', 'MIRROR_PAGING_OK', 'MIRROR_HEAP_OK', 'MIRROR_TIMER_OK', 'MIRROR_HEAP_IRQ_OK', 'MIRROR_USER_PAGING_OK', 'MIRROR_ELF_TESTS_OK', 'MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_USER_LOAD_ROLLBACK_OK', 'MIRROR_SCHEDULER_OK', 'MIRROR_CAPABILITY_TESTS_OK', 'MIRROR_IPC_TESTS_OK', 'MIRROR_IPC_OK')
     $scenario = switch ($Fault) {
         'UserKernelRead' { 1 }
         'UserCodeWrite' { 2 }
@@ -115,6 +117,8 @@ try {
         'UserPrivileged' { 5 }
         'UserBadStack' { 6 }
         'UserBudget' { 7 }
+        'IpcPeerExit' { 8 }
+        'IpcTimeout' { 9 }
         default { 0 }
     }
     if ($serial -notmatch "(?m)^MIRROR_USERSPACE_OK scenario=$scenario(?:\s|$)") {
@@ -136,6 +140,15 @@ try {
             throw "Mirror faulted instead of containing the CPU-bound process. See $serialLog."
         }
     }
+    elseif ($Fault -in @('IpcPeerExit', 'IpcTimeout')) {
+        $ipcMarker = if ($Fault -eq 'IpcPeerExit') { 'MIRROR_IPC_PEER_CLOSED_OK' } else { 'MIRROR_IPC_TIMEOUT_OK' }
+        if ($serial -notmatch "(?m)^$ipcMarker(?:\s|$)") {
+            throw "Mirror did not complete the intended $Fault recovery. See $serialLog."
+        }
+        if ($serial -match '(?m)^MIRROR_USER_FAULT_CONTAINED(?:\s|$)') {
+            throw "Mirror faulted instead of completing the intended $Fault recovery. See $serialLog."
+        }
+    }
     elseif ($scenario -ne 0) {
         $userVector = if ($Fault -eq 'UserPrivileged') { 13 } else { 14 }
         if ($serial -notmatch "(?m)^MIRROR_USER_FAULT_CONTAINED vector=$userVector(?:\s|$)") {
@@ -150,6 +163,12 @@ try {
     }
     if ($Fault -ne 'UserBudget' -and $serial -match '(?m)^MIRROR_USER_BUDGET_CONTAINED(?:\s|$)') {
         throw "Mirror unexpectedly exhausted a process timer-interrupt budget. See $serialLog."
+    }
+    if ($Fault -ne 'IpcPeerExit' -and $serial -match '(?m)^MIRROR_IPC_PEER_CLOSED_OK(?:\s|$)') {
+        throw "Mirror unexpectedly reported the IPC peer-exit scenario. See $serialLog."
+    }
+    if ($Fault -ne 'IpcTimeout' -and $serial -match '(?m)^MIRROR_IPC_TIMEOUT_OK(?:\s|$)') {
+        throw "Mirror unexpectedly reported the IPC timeout scenario. See $serialLog."
     }
     if (-not $fatalKernelFault) {
         $markers += @('MIRROR_PAGE_FAULT_OK', 'MIRROR_BOOT_OK')

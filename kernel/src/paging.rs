@@ -487,6 +487,22 @@ impl<'kernel> UserAddressSpace<'kernel> {
     /// Validate the whole range before producing any syscall side effects.
     /// Empty ranges still require a valid lower-half, non-null-page address.
     pub fn validate_readable(&self, address: u64, length: usize) -> Result<(), PagingError> {
+        self.validate_access(address, length, false)
+    }
+
+    /// Validate that every byte is user writable, accumulating U/S and R/W
+    /// permissions at every level. No destination bytes are changed on failure.
+    /// Empty ranges still require a valid lower-half, non-null-page address.
+    pub fn validate_writable(&self, address: u64, length: usize) -> Result<(), PagingError> {
+        self.validate_access(address, length, true)
+    }
+
+    fn validate_access(
+        &self,
+        address: u64,
+        length: usize,
+        writable: bool,
+    ) -> Result<(), PagingError> {
         check_user_address(address)?;
         self.check_live()?;
         if length == 0 {
@@ -499,7 +515,14 @@ impl<'kernel> UserAddressSpace<'kernel> {
         let final_page = last & !(PAGE_SIZE - 1);
         let mut current = address & !(PAGE_SIZE - 1);
         loop {
-            self.translate(current)?.ok_or(PagingError::NotMapped)?;
+            let translation = self.translate(current)?.ok_or(PagingError::NotMapped)?;
+            if writable && !translation.writable {
+                return Err(PagingError::UserAccessDenied);
+            }
+            // Preflight the whole HHDM page as well as its user permissions.
+            // A later copy cannot encounter a direct-map representation error
+            // after partially modifying its destination while tables are stable.
+            self.kernel.table_pointer(translation.physical)?;
             if current == final_page {
                 return Ok(());
             }
@@ -539,6 +562,44 @@ impl<'kernel> UserAddressSpace<'kernel> {
                 core::ptr::copy_nonoverlapping(
                     source as *const u8,
                     destination.as_mut_ptr().add(copied),
+                    count,
+                );
+            }
+            copied += count;
+        }
+        Ok(())
+    }
+
+    /// Copy to owned user pages only after validating the entire writable range.
+    /// This follows each page's physical mapping through the HHDM rather than
+    /// dereferencing the supplied user address or assuming physical contiguity.
+    ///
+    /// # Safety
+    /// The sole CPU must be in the kernel with this user suspended, and no DMA
+    /// or concurrent access may modify its mappings or access destination bytes.
+    /// No live kernel references may cover those bytes. The source must not
+    /// alias any destination page, including through the HHDM or another mapping.
+    pub unsafe fn copy_to_user(&self, address: u64, source: &[u8]) -> Result<(), PagingError> {
+        self.validate_writable(address, source.len())?;
+        let mut copied = 0;
+        while copied < source.len() {
+            let current = address + copied as u64;
+            let translation = self.translate(current)?.ok_or(PagingError::NotMapped)?;
+            let page_offset = (current & (PAGE_SIZE - 1)) as usize;
+            let count = (PAGE_SIZE as usize - page_offset).min(source.len() - copied);
+            let destination = self
+                .kernel
+                .offset
+                .checked_add(translation.physical)
+                .ok_or(PagingError::DirectMapOverflow)?;
+            // SAFETY: The complete range was checked for effective user write
+            // permission and valid HHDM addresses before any write. This chunk
+            // stays inside its page and source bounds; the caller excludes
+            // concurrent access, changes to mappings, and aliasing references.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    source.as_ptr().add(copied),
+                    destination as *mut u8,
                     count,
                 );
             }
@@ -1013,6 +1074,9 @@ unsafe fn self_test_userspace(kernel: &PageTables, frames: &mut FrameAllocator<'
         );
     }
     assert_eq!(copied, previous, "invalid copy changed its destination");
+    // SAFETY: The user is inactive, all frames are exclusively owned, and the
+    // same sole-CPU, disabled-IRQ and HHDM contracts still apply.
+    unsafe { self_test_copy_to_user(&mut user, kernel, frames, DATA, CODE) };
 
     // Exercise permission accumulation, not merely the leaf's permission bits.
     for level in (2..=4).rev() {
@@ -1071,4 +1135,169 @@ unsafe fn self_test_userspace(kernel: &PageTables, frames: &mut FrameAllocator<'
         before.allocated_frames
     );
     crate::serial::println!("MIRROR_USER_PAGING_OK");
+}
+
+#[cfg(feature = "boot-smoke")]
+unsafe fn self_test_copy_to_user(
+    user: &mut UserAddressSpace<'_>,
+    kernel: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    existing_data: u64,
+    existing_code: u64,
+) {
+    const WRITES: u64 = 0x6000_0000;
+    let first = frames.allocate().expect("copy-out first page");
+    let second = frames.allocate().expect("copy-out second page");
+    let readonly = frames.allocate().expect("copy-out read-only page");
+    // Descending physical addresses ensure a cross-page copy cannot succeed by
+    // treating the first physical page and its successor as a contiguous span.
+    let (first, second) = (first.max(second), first.min(second));
+    assert!(first > second);
+    for (address, physical, permissions, value) in [
+        (WRITES, first, UserPermissions::READ_WRITE, 0x33),
+        (
+            WRITES + PAGE_SIZE,
+            second,
+            UserPermissions::READ_WRITE,
+            0x44,
+        ),
+        (
+            WRITES + 2 * PAGE_SIZE,
+            readonly,
+            UserPermissions::READ_ONLY,
+            0x55,
+        ),
+    ] {
+        let pointer = kernel.table_pointer(physical).expect("copy-out HHDM");
+        // SAFETY: This fresh frame is uniquely owned and fully HHDM mapped.
+        // Initialization finishes before ownership is transferred to the root.
+        unsafe {
+            pointer.cast::<u8>().write_bytes(value, PAGE_SIZE as usize);
+            user.map_page(address, physical, permissions, frames)
+                .expect("copy-out test mapping");
+        }
+    }
+    assert_eq!(user.validate_writable(PAGE_SIZE, 0), Ok(()));
+    assert_eq!(
+        user.validate_writable(WRITES, 2 * PAGE_SIZE as usize),
+        Ok(())
+    );
+    assert_eq!(
+        user.validate_writable(WRITES, usize::MAX),
+        Err(PagingError::AddressRangeOverflow)
+    );
+    assert_eq!(
+        user.validate_writable(USER_END - 1, 2),
+        Err(PagingError::InvalidUserAddress)
+    );
+    let source: [u8; 32] = core::array::from_fn(|index| 0x80 + index as u8);
+    let mut around_boundary = [0_u8; 48];
+    // SAFETY: The inactive user's frames and these kernel buffers are disjoint.
+    // No references, DMA, or concurrent accesses cover destination user bytes.
+    unsafe {
+        user.copy_to_user(WRITES + PAGE_SIZE - 16, &source)
+            .expect("cross-page user copy-out");
+        user.copy_from_user(WRITES + PAGE_SIZE - 24, &mut around_boundary)
+            .expect("verify copied bytes and neighbors");
+    }
+    assert_eq!(&around_boundary[..8], &[0x33; 8]);
+    assert_eq!(&around_boundary[8..40], &source);
+    assert_eq!(&around_boundary[40..], &[0x44; 8]);
+
+    for address in [0, PAGE_SIZE - 1, TEST_ADDRESS, USER_END - 8, u64::MAX - 8] {
+        // SAFETY: Invalid integer destinations must be rejected without any
+        // write; the source is a disjoint, initialized kernel buffer.
+        unsafe {
+            assert_eq!(
+                user.copy_to_user(address, &source),
+                Err(PagingError::InvalidUserAddress)
+            );
+        }
+    }
+    for (address, expected) in [
+        (existing_data, 0x11),
+        (existing_code, 0xcc),
+        (WRITES + 2 * PAGE_SIZE, 0x55),
+    ] {
+        assert_eq!(
+            user.validate_writable(address, 1),
+            Err(PagingError::UserAccessDenied)
+        );
+        let mut after = [0_u8; 1];
+        // SAFETY: Owned initialized user frames and disjoint kernel buffers.
+        // The copy-out must fail before touching the RO or RX destination.
+        unsafe {
+            assert_eq!(
+                user.copy_to_user(address, &source[..1]),
+                Err(PagingError::UserAccessDenied)
+            );
+            user.copy_from_user(address, &mut after)
+                .expect("read rejected copy-out destination");
+        }
+        assert_eq!(after, [expected]);
+    }
+
+    let readonly_boundary = WRITES + 2 * PAGE_SIZE - 16;
+    let mut before = [0_u8; 32];
+    let mut after = [0_u8; 32];
+    // SAFETY: Both pages are readable and only the first is writable. All
+    // buffers are disjoint; rejection must preserve the entire destination.
+    unsafe {
+        user.copy_from_user(readonly_boundary, &mut before).unwrap();
+        assert_eq!(
+            user.copy_to_user(readonly_boundary, &source),
+            Err(PagingError::UserAccessDenied)
+        );
+        user.copy_from_user(readonly_boundary, &mut after).unwrap();
+    }
+    assert_eq!(after, before, "copy-out wrote before finding the RO page");
+    let missing_boundary = existing_data + 2 * PAGE_SIZE - 16;
+    let mut writable_tail = [0_u8; 16];
+    // SAFETY: The first 16 bytes belong to the existing writable page, while
+    // the rest is unmapped. Full-range validation must prevent partial writes.
+    unsafe {
+        assert_eq!(
+            user.copy_to_user(missing_boundary, &source),
+            Err(PagingError::NotMapped)
+        );
+        user.copy_from_user(missing_boundary, &mut writable_tail)
+            .unwrap();
+    }
+    assert_eq!(writable_tail, [0x22; 16]);
+
+    for level in (2..=4).rev() {
+        let mut physical = user.root;
+        for parent in ((level + 1)..=4).rev() {
+            let table = kernel.table_pointer(physical).expect("copy-out parent");
+            // SAFETY: This in-range entry belongs to the inactive owned tree.
+            physical =
+                unsafe { table.add(index(WRITES, parent)).read_volatile() } & kernel.physical_mask;
+        }
+        let table = kernel.table_pointer(physical).expect("copy-out table");
+        // SAFETY: The root is inactive; this aligned, initialized entry is ours.
+        let slot = unsafe { table.add(index(WRITES, level)) };
+        // SAFETY: No concurrent software modifies the owned table.
+        let original = unsafe { slot.read_volatile() };
+        for denied_bit in [WRITABLE, USER] {
+            // SAFETY: Restrict an inactive parent and ensure the effective
+            // permission check rejects its otherwise writable user leaf.
+            unsafe {
+                slot.write_volatile(original & !denied_bit);
+                assert_eq!(
+                    user.validate_writable(WRITES, 1),
+                    Err(PagingError::UserAccessDenied)
+                );
+                assert_eq!(
+                    user.copy_to_user(WRITES, &source[..1]),
+                    Err(PagingError::UserAccessDenied)
+                );
+                slot.write_volatile(original);
+            }
+        }
+    }
+    let mut unchanged = [0_u8; 1];
+    // SAFETY: Restrictions are restored, the inactive page is readable, and
+    // unchanged is a disjoint kernel buffer.
+    unsafe { user.copy_from_user(WRITES, &mut unchanged) }.unwrap();
+    assert_eq!(unchanged, [0x33], "parent denial did not prevent writing");
 }

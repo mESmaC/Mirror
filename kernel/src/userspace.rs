@@ -5,8 +5,11 @@
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::{
-    arch, elf,
+    arch,
+    capability::{self, CapError, Capability, HandleTable, Object},
+    elf,
     interrupts::{self, TrapFrame},
+    ipc::{Ipc, IpcError, MESSAGE_SIZE},
     memory::{FrameAllocator, PAGE_SIZE},
     paging::{PageTables, PagingError, UserAddressSpace, UserPermissions},
     serial, timer,
@@ -17,10 +20,12 @@ const STACK_TOP: u64 = 0x8000_0000;
 const KERNEL_STACK_SIZE: usize = 64 * 1024;
 const MAX_WRITE: usize = 256;
 const CHECKS_PASSED: &[u8] = b"Mirror init: userspace checks passed\n";
+const IPC_CHECKS_PASSED: &[u8] = b"Mirror init: IPC checks passed\n";
 const PROCESS_COUNT: usize = 2;
 const QUANTUM_TICKS: u64 = 2;
 const USER_TICK_BUDGET: u64 = 32;
 const MAX_SLEEP_TICKS: u64 = 1000;
+const RECEIVE_TIMEOUT: u64 = 100;
 
 #[repr(C, align(16))]
 struct KernelStack([u8; KERNEL_STACK_SIZE]);
@@ -29,6 +34,7 @@ static mut KERNEL_STACK: KernelStack = KernelStack([0; KERNEL_STACK_SIZE]);
 // Only the BSP accesses this slot, with IF=0. It is populated immediately before
 // entry and cleared after the synchronous return; it never owns the context.
 static ACTIVE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+static ACTIVE_IPC: AtomicPtr<Ipc> = AtomicPtr::new(core::ptr::null_mut());
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,7 +60,16 @@ enum State {
     Ready,
     Running,
     Sleeping(u64),
+    Receiving(PendingReceive),
     Finished,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingReceive {
+    handle: u64,
+    address: u64,
+    capacity: usize,
+    deadline: u64,
 }
 
 struct Process<'kernel> {
@@ -74,6 +89,15 @@ struct Process<'kernel> {
     quantum_left: u64,
     preemptions: usize,
     post_checks_preemptions: usize,
+    handles: HandleTable,
+    boot_handles: [u64; 3],
+    handles_closed: bool,
+    ipc_checks: bool,
+    ipc_sent: usize,
+    ipc_received: usize,
+    ipc_waits: usize,
+    ipc_closed_wakes: usize,
+    ipc_timeouts: usize,
 }
 
 pub fn run_init(
@@ -87,6 +111,8 @@ pub fn run_init(
     let image = elf::parse(bytes).expect("invalid native init ELF");
     #[cfg(feature = "boot-smoke")]
     {
+        capability::self_test();
+        crate::ipc::self_test();
         assert!(!deadline_reached(4, 5));
         assert!(deadline_reached(5, 5));
         assert!(deadline_reached(6, 5));
@@ -174,6 +200,15 @@ fn create_process<'kernel>(
         quantum_left: QUANTUM_TICKS,
         preemptions: 0,
         post_checks_preemptions: 0,
+        handles: HandleTable::new(),
+        boot_handles: [0; 3],
+        handles_closed: false,
+        ipc_checks: false,
+        ipc_sent: 0,
+        ipc_received: 0,
+        ipc_waits: 0,
+        ipc_closed_wakes: 0,
+        ipc_timeouts: 0,
     };
     if let Err(error) = load(&mut process.space, frames, bytes, image, direct_map) {
         // SAFETY: This root has never been active; mapped frames belong to it.
@@ -213,6 +248,26 @@ fn run_pair(
         }
     };
     let mut processes = [first, second];
+    let mut ipc = Ipc::new();
+    for (index, process) in processes.iter_mut().enumerate() {
+        // Each process can send only to its peer's inbound channel. Console
+        // access is an explicit bootstrap capability, independent of IPC rights.
+        let grants = [
+            (Object::Console, capability::WRITE),
+            (Object::Channel(1 - index), capability::SEND),
+            (Object::Channel(index), capability::RECEIVE),
+        ];
+        for (slot, (object, rights)) in grants.into_iter().enumerate() {
+            let handle = process
+                .handles
+                .insert(object, rights)
+                .expect("bootstrap capability");
+            ipc.grant(Capability { object, rights });
+            process.boot_handles[slot] = handle;
+        }
+        assert_eq!(process.handles.len(), 3);
+    }
+    assert!(ACTIVE_IPC.load(Ordering::SeqCst).is_null());
     assert_ne!(processes[0].pid, processes[1].pid);
     assert_ne!(
         processes[0].space.root_physical_address(),
@@ -245,6 +300,7 @@ fn run_pair(
         .any(|process| process.state != State::Finished)
     {
         assert!(!arch::interrupts_enabled());
+        release_finished_handles(&mut processes, &mut ipc);
         let now = timer::ticks();
         for process in &mut processes {
             if let State::Sleeping(deadline) = process.state
@@ -256,15 +312,40 @@ fn run_pair(
                 );
                 process.state = State::Ready;
             }
+            if let State::Receiving(pending) = process.state {
+                assert_eq!(
+                    process.charged_ticks, process.sleep_charge,
+                    "IPC wait charged user CPU ticks"
+                );
+                let mut result = receive(
+                    process,
+                    &mut ipc,
+                    pending.handle,
+                    pending.address,
+                    pending.capacity,
+                );
+                if result == -11 && deadline_reached(now, pending.deadline) {
+                    result = -110;
+                    process.ipc_timeouts += 1;
+                }
+                if result != -11 {
+                    if result == -32 {
+                        process.ipc_closed_wakes += 1;
+                    }
+                    process.frame.rax = result as u64;
+                    process.state = State::Ready;
+                }
+            }
         }
         let selected = (0..PROCESS_COUNT)
             .map(|offset| (cursor + offset) % PROCESS_COUNT)
             .find(|&index| processes[index].state == State::Ready);
         let Some(index) = selected else {
             assert!(
-                processes
-                    .iter()
-                    .any(|process| matches!(process.state, State::Sleeping(_)))
+                processes.iter().any(|process| matches!(
+                    process.state,
+                    State::Sleeping(_) | State::Receiving(_)
+                ))
             );
             let before_idle = timer::ticks();
             let before_charge: u64 = processes.iter().map(|process| process.charged_ticks).sum();
@@ -294,6 +375,8 @@ fn run_pair(
         // Copy before publishing ACTIVE. Handlers mutate process.frame, so no
         // shared borrow of that field may span execution and its callbacks.
         let context = processes[index].frame;
+        // Refresh after scheduler borrows end, and revoke before the next one.
+        ACTIVE_IPC.store(&raw mut ipc, Ordering::SeqCst);
         ACTIVE.store((&raw mut processes[index]).cast(), Ordering::SeqCst);
         // SAFETY: Only this process executes in its isolated root. Shared upper
         // mappings cover both kernel stacks. All handlers finish before resume
@@ -306,6 +389,7 @@ fn run_pair(
             interrupts::resume_user(&context);
         }
         ACTIVE.store(core::ptr::null_mut(), Ordering::SeqCst);
+        ACTIVE_IPC.store(core::ptr::null_mut(), Ordering::SeqCst);
         // SAFETY: The user is suspended, handlers have returned, and IF=0.
         unsafe { kernel.activate() }.expect("restore kernel root");
         assert_ne!(
@@ -327,7 +411,13 @@ fn run_pair(
             );
         }
     }
+    release_finished_handles(&mut processes, &mut ipc);
+    assert!(
+        ipc.is_drained(),
+        "IPC messages or endpoint references leaked"
+    );
     for process in &mut processes {
+        assert!(process.handles.is_empty());
         // SAFETY: All contexts are finished, ACTIVE is clear, the kernel root
         // is active, and no handler retains a reference into either user tree.
         unsafe { process.space.destroy(frames) }.expect("release user address space");
@@ -340,6 +430,41 @@ fn run_pair(
     serial::println!("MIRROR_USER_CLEANUP_OK allocated={}", before);
     validate_process(&processes[0], scenario);
     validate_process(&processes[1], 0);
+    assert_eq!(
+        processes
+            .iter()
+            .map(|process| process.ipc_sent)
+            .sum::<usize>(),
+        3
+    );
+    assert_eq!(
+        processes
+            .iter()
+            .map(|process| process.ipc_received)
+            .sum::<usize>(),
+        3
+    );
+    let waits: usize = processes.iter().map(|process| process.ipc_waits).sum();
+    let timeouts: usize = processes.iter().map(|process| process.ipc_timeouts).sum();
+    assert!(waits > 0, "no receive ever blocked");
+    if scenario == 8 {
+        assert!(
+            processes[1].ipc_closed_wakes > 0,
+            "exit did not wake peer receive"
+        );
+        serial::println!("MIRROR_IPC_PEER_CLOSED_OK");
+    }
+    if scenario == 9 {
+        assert_eq!(timeouts, 1, "receive timeout was not observed exactly once");
+        serial::println!("MIRROR_IPC_TIMEOUT_OK");
+    } else {
+        assert_eq!(timeouts, 0, "unexpected IPC timeout");
+    }
+    serial::println!(
+        "MIRROR_IPC_OK messages=3 waits={} timeouts={} handles_reclaimed=1",
+        waits,
+        timeouts
+    );
     let yields: usize = processes.iter().map(|process| process.yields).sum();
     let sleeps: usize = processes.iter().map(|process| process.sleeps).sum();
     let preemptions: usize = processes.iter().map(|process| process.preemptions).sum();
@@ -360,7 +485,23 @@ fn deadline_reached(now: u64, deadline: u64) -> bool {
     now.wrapping_sub(deadline) < (1 << 63)
 }
 
+fn release_finished_handles(processes: &mut [Process<'_>], ipc: &mut Ipc) {
+    for process in processes {
+        if process.state == State::Finished && !process.handles_closed {
+            while let Some(capability) = process.handles.take_one() {
+                ipc.release(capability);
+            }
+            process.handles_closed = true;
+        }
+    }
+}
+
 fn validate_process(process: &Process<'_>, scenario: u64) {
+    assert!(
+        process.ipc_checks,
+        "IPC checks did not complete: {:?}",
+        process.outcome
+    );
     assert!(
         process.checks_passed,
         "init checks did not complete: {:?}",
@@ -376,7 +517,7 @@ fn validate_process(process: &Process<'_>, scenario: u64) {
         "user computation was never preempted"
     );
     match (scenario, process.outcome.expect("missing process outcome")) {
-        (0, Outcome::Exit(0)) => {}
+        (0 | 8 | 9, Outcome::Exit(0)) => {}
         #[cfg(feature = "boot-smoke")]
         (6, Outcome::InvalidStack(0x0000_8000_0000_0000)) => {
             serial::println!("MIRROR_USER_RETURN_REJECTED rsp=0x800000000000");
@@ -522,6 +663,115 @@ fn with_active(frame: &TrapFrame, operation: impl FnOnce(&mut Process<'_>)) {
     }
 }
 
+fn with_ipc<T>(operation: impl FnOnce(&mut Ipc) -> T) -> T {
+    assert!(!arch::interrupts_enabled());
+    let pointer = ACTIVE_IPC.load(Ordering::SeqCst);
+    assert!(!pointer.is_null(), "no IPC session");
+    // SAFETY: run_pair publishes this disjoint stack-owned object only while
+    // tasks can run. Scheduler borrows end before entry; handlers run with IF=0
+    // on the sole CPU and do not reenter this helper or retain references.
+    unsafe { operation(&mut *pointer) }
+}
+
+fn cap_error(error: CapError) -> i64 {
+    match error {
+        CapError::BadHandle => -9,
+        CapError::Denied => -13,
+        CapError::InvalidRights => -22,
+        CapError::TableFull | CapError::IdsExhausted => -24,
+    }
+}
+
+fn ipc_error(error: IpcError) -> i64 {
+    match error {
+        IpcError::WouldBlock => -11,
+        IpcError::Closed => -32,
+        IpcError::MessageSize => -90,
+    }
+}
+
+fn channel_for(process: &Process<'_>, handle: u64, rights: u64) -> Result<usize, i64> {
+    let capability = process.handles.require(handle, rights).map_err(cap_error)?;
+    match capability.object {
+        Object::Channel(index) => Ok(index),
+        Object::Console => Err(-13),
+    }
+}
+
+fn send(process: &mut Process<'_>, ipc: &mut Ipc, handle: u64, address: u64, length: u64) -> i64 {
+    let channel = match channel_for(process, handle, capability::SEND) {
+        Ok(channel) => channel,
+        Err(error) => return error,
+    };
+    if !(1..=MESSAGE_SIZE as u64).contains(&length) {
+        return -90;
+    }
+    let mut buffer = [0_u8; MESSAGE_SIZE];
+    // SAFETY: The sole CPU suspended this user, its mappings are immutable,
+    // and the kernel buffer cannot alias an owned user frame. No references
+    // into the user address space escape the checked copy.
+    if unsafe {
+        process
+            .space
+            .copy_from_user(address, &mut buffer[..length as usize])
+    }
+    .is_err()
+    {
+        return -14;
+    }
+    match ipc.send(channel, &buffer[..length as usize]) {
+        Ok(length) => {
+            process.ipc_sent += 1;
+            length as i64
+        }
+        Err(error) => ipc_error(error),
+    }
+}
+
+fn receive(
+    process: &mut Process<'_>,
+    ipc: &mut Ipc,
+    handle: u64,
+    address: u64,
+    capacity: usize,
+) -> i64 {
+    let channel = match channel_for(process, handle, capability::RECEIVE) {
+        Ok(channel) => channel,
+        Err(error) => return error,
+    };
+    if !(1..=MESSAGE_SIZE).contains(&capacity) {
+        return -90;
+    }
+    // Check the caller's entire advertised buffer even when the queue is empty,
+    // before blocking or consuming anything. Repeat on wake to avoid retaining
+    // authority or trusting an old validation across a scheduling boundary.
+    if process.space.validate_writable(address, capacity).is_err() {
+        return -14;
+    }
+    let message = match ipc.peek(channel) {
+        Ok(message) => message,
+        Err(error) => return ipc_error(error),
+    };
+    if message.length > capacity {
+        return -90;
+    }
+    // SAFETY: User execution is suspended, mappings cannot race on the BSP,
+    // and this kernel-owned message copy cannot alias destination user pages.
+    // copy_to_user prevalidates every page, including effective write access.
+    if unsafe {
+        process
+            .space
+            .copy_to_user(address, &message.bytes[..message.length])
+    }
+    .is_err()
+    {
+        return -14;
+    }
+    ipc.consume(channel);
+    process.ipc_received += 1;
+    message.length as i64
+}
+
 pub(crate) fn syscall(frame: &mut TrapFrame) {
     let mut result = -38_i64;
     let mut finished = false;
@@ -529,6 +779,17 @@ pub(crate) fn syscall(frame: &mut TrapFrame) {
     with_active(frame, |process| {
         match frame.rax {
             1 => {
+                match process.handles.require(frame.rdx, capability::WRITE) {
+                    Ok(capability) if capability.object == Object::Console => {}
+                    Ok(_) => {
+                        result = -13;
+                        return;
+                    }
+                    Err(error) => {
+                        result = cap_error(error);
+                        return;
+                    }
+                }
                 if frame.rsi > MAX_WRITE as u64 {
                     result = -22;
                     return;
@@ -558,6 +819,7 @@ pub(crate) fn syscall(frame: &mut TrapFrame) {
                 if let Ok(message) = core::str::from_utf8(&buffer[..length]) {
                     serial::println!("user: {}", message.escape_debug());
                     process.checks_passed |= &buffer[..length] == CHECKS_PASSED;
+                    process.ipc_checks |= &buffer[..length] == IPC_CHECKS_PASSED;
                     result = length as i64;
                 } else {
                     result = -22;
@@ -590,6 +852,47 @@ pub(crate) fn syscall(frame: &mut TrapFrame) {
                 }
             }
             6 => result = process.pid as i64,
+            7 => {
+                result = match process.boot_handles.get(frame.rdi as usize) {
+                    Some(&handle) => match process.handles.get(handle) {
+                        Ok(_) => handle as i64,
+                        Err(error) => cap_error(error),
+                    },
+                    None => -9,
+                };
+            }
+            8 => result = with_ipc(|ipc| send(process, ipc, frame.rdi, frame.rsi, frame.rdx)),
+            9 | 10 => {
+                result =
+                    with_ipc(|ipc| receive(process, ipc, frame.rdi, frame.rsi, frame.rdx as usize));
+                if frame.rax == 10 && result == -11 {
+                    process.ipc_waits += 1;
+                    suspension = Some(State::Receiving(PendingReceive {
+                        handle: frame.rdi,
+                        address: frame.rsi,
+                        capacity: frame.rdx as usize,
+                        deadline: timer::ticks().wrapping_add(RECEIVE_TIMEOUT),
+                    }));
+                }
+            }
+            11 => {
+                result = match process.handles.close(frame.rdi) {
+                    Ok(capability) => {
+                        with_ipc(|ipc| ipc.release(capability));
+                        0
+                    }
+                    Err(error) => cap_error(error),
+                };
+            }
+            12 => {
+                result = match process.handles.duplicate(frame.rdi, frame.rsi) {
+                    Ok((handle, capability)) => {
+                        with_ipc(|ipc| ipc.grant(capability));
+                        handle as i64
+                    }
+                    Err(error) => cap_error(error),
+                };
+            }
             _ => process.unknown_calls += 1,
         }
     });
@@ -637,9 +940,12 @@ fn suspend(frame: &mut TrapFrame, state: State) {
         return;
     }
     with_active(frame, |process| {
-        assert!(matches!(state, State::Ready | State::Sleeping(_)));
+        assert!(matches!(
+            state,
+            State::Ready | State::Sleeping(_) | State::Receiving(_)
+        ));
         process.frame = *frame;
-        if matches!(state, State::Sleeping(_)) {
+        if matches!(state, State::Sleeping(_) | State::Receiving(_)) {
             process.sleep_charge = process.charged_ticks;
         }
         process.state = state;

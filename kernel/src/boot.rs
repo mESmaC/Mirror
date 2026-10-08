@@ -108,6 +108,8 @@ pub fn smoke_mode() -> SmokeMode {
         b"mirror.test=user-privileged" => SmokeMode::User(5),
         b"mirror.test=user-bad-stack" => SmokeMode::User(6),
         b"mirror.test=user-budget" => SmokeMode::User(7),
+        b"mirror.test=ipc-peer-exit" => SmokeMode::User(8),
+        b"mirror.test=ipc-timeout" => SmokeMode::User(9),
         _ => panic!("unknown smoke-test command line"),
     }
 }
