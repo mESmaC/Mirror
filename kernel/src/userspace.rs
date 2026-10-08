@@ -1,7 +1,8 @@
-//! One synchronous native process on the BSP. No scheduling or handles yet.
+//! Bounded round-robin userspace scheduling on the BSP, with integer contexts.
+//! IRQ/syscall handlers return to the scheduler before another process resumes.
 //! User buffers are checked and copied through the direct map before use.
 
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::{
     arch, elf,
@@ -16,6 +17,10 @@ const STACK_TOP: u64 = 0x8000_0000;
 const KERNEL_STACK_SIZE: usize = 64 * 1024;
 const MAX_WRITE: usize = 256;
 const CHECKS_PASSED: &[u8] = b"Mirror init: userspace checks passed\n";
+const PROCESS_COUNT: usize = 2;
+const QUANTUM_TICKS: u64 = 2;
+const USER_TICK_BUDGET: u64 = 32;
+const MAX_SLEEP_TICKS: u64 = 1000;
 
 #[repr(C, align(16))]
 struct KernelStack([u8; KERNEL_STACK_SIZE]);
@@ -24,8 +29,9 @@ static mut KERNEL_STACK: KernelStack = KernelStack([0; KERNEL_STACK_SIZE]);
 // Only the BSP accesses this slot, with IF=0. It is populated immediately before
 // entry and cleared after the synchronous return; it never owns the context.
 static ACTIVE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Outcome {
     Exit(u64),
     Fault {
@@ -35,14 +41,39 @@ enum Outcome {
         rip: u64,
     },
     InvalidStack(u64),
+    InvalidContext {
+        rip: u64,
+        cs: u64,
+        ss: u64,
+    },
+    BudgetExhausted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum State {
+    Ready,
+    Running,
+    Sleeping(u64),
+    Finished,
 }
 
 struct Process<'kernel> {
+    pid: u64,
     space: UserAddressSpace<'kernel>,
+    frame: TrapFrame,
+    state: State,
     outcome: Option<Outcome>,
     checks_passed: bool,
     bad_pointers: usize,
     unknown_calls: usize,
+    dispatches: usize,
+    yields: usize,
+    sleeps: usize,
+    sleep_charge: u64,
+    charged_ticks: u64,
+    quantum_left: u64,
+    preemptions: usize,
+    post_checks_preemptions: usize,
 }
 
 pub fn run_init(
@@ -55,12 +86,20 @@ pub fn run_init(
     assert!(!arch::interrupts_enabled());
     let image = elf::parse(bytes).expect("invalid native init ELF");
     #[cfg(feature = "boot-smoke")]
-    test_load_rollback(kernel, frames, bytes, &image, direct_map);
-    run_one(kernel, frames, bytes, &image, direct_map, scenario);
+    {
+        assert!(!deadline_reached(4, 5));
+        assert!(deadline_reached(5, 5));
+        assert!(deadline_reached(6, 5));
+        assert!(!deadline_reached(u64::MAX - 2, 3));
+        assert!(!deadline_reached(2, 3));
+        assert!(deadline_reached(3, u64::MAX - 2));
+        test_load_rollback(kernel, frames, bytes, &image, direct_map);
+    }
+    run_pair(kernel, frames, bytes, &image, direct_map, scenario);
     #[cfg(feature = "boot-smoke")]
     // Relaunch from the same ELF after teardown. Fresh BSS and successful entry
     // exercise frame reuse and continuation recovery after both exit and fault.
-    run_one(kernel, frames, bytes, &image, direct_map, 0);
+    run_pair(kernel, frames, bytes, &image, direct_map, 0);
 }
 
 #[cfg(feature = "boot-smoke")]
@@ -72,7 +111,7 @@ fn test_load_rollback(
     direct_map: u64,
 ) {
     let before = frames.stats().unwrap().allocated_frames;
-    // SAFETY: Same exclusive, inactive process construction as run_one.
+    // SAFETY: Same exclusive, inactive process construction as run_pair.
     let mut space = unsafe { UserAddressSpace::new(kernel, frames) }.unwrap();
     // Force a real map failure after ELF pages have already been installed.
     map_initialized(
@@ -102,7 +141,57 @@ fn test_load_rollback(
     serial::println!("MIRROR_USER_LOAD_ROLLBACK_OK");
 }
 
-fn run_one(
+fn create_process<'kernel>(
+    kernel: &'kernel PageTables,
+    frames: &mut FrameAllocator<'_>,
+    bytes: &[u8],
+    image: &elf::Image,
+    direct_map: u64,
+    argument: u64,
+) -> Result<Process<'kernel>, PagingError> {
+    // SAFETY: The BSP is alone with IF=0, kernel root active, and the shared
+    // upper mappings and unique allocator remain live throughout this run.
+    let space = unsafe { UserAddressSpace::new(kernel, frames) }?;
+    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    assert!(
+        (1..=i64::MAX as u64).contains(&pid),
+        "process IDs exhausted"
+    );
+    let mut process = Process {
+        pid,
+        space,
+        frame: interrupts::user_frame(image.entry, STACK_TOP - 8, argument),
+        state: State::Ready,
+        outcome: None,
+        checks_passed: false,
+        bad_pointers: 0,
+        unknown_calls: 0,
+        dispatches: 0,
+        yields: 0,
+        sleeps: 0,
+        sleep_charge: 0,
+        charged_ticks: 0,
+        quantum_left: QUANTUM_TICKS,
+        preemptions: 0,
+        post_checks_preemptions: 0,
+    };
+    if let Err(error) = load(&mut process.space, frames, bytes, image, direct_map) {
+        // SAFETY: This root has never been active; mapped frames belong to it.
+        unsafe { process.space.destroy(frames) }.expect("failed-load cleanup");
+        return Err(error);
+    }
+    serial::println!(
+        "Native init: pid={} entry={:#x} root={:#x} pages={} tables={}",
+        pid,
+        image.entry,
+        process.space.root_physical_address(),
+        process.space.owned_page_count(),
+        process.space.owned_table_count()
+    );
+    Ok(process)
+}
+
+fn run_pair(
     kernel: &PageTables,
     frames: &mut FrameAllocator<'_>,
     bytes: &[u8],
@@ -111,50 +200,137 @@ fn run_one(
     scenario: u64,
 ) {
     let before = frames.stats().expect("recycling required").allocated_frames;
-    // SAFETY: The BSP is alone with IF=0, kernel root active, and the shared
-    // upper mappings and unique allocator remain live throughout this run.
-    let space = unsafe { UserAddressSpace::new(kernel, frames) }.expect("user page tables");
-    let mut process = Process {
-        space,
-        outcome: None,
-        checks_passed: false,
-        bad_pointers: 0,
-        unknown_calls: 0,
+    let mut first = create_process(kernel, frames, bytes, image, direct_map, scenario)
+        .expect("load first native process");
+    let second = match create_process(kernel, frames, bytes, image, direct_map, 1 << 8) {
+        Ok(process) => process,
+        Err(error) => {
+            // SAFETY: Neither process has been activated; the failed creation
+            // cleaned its own tree and this first process has no live users.
+            unsafe { first.space.destroy(frames) }.expect("peer-load cleanup");
+            assert_eq!(frames.stats().unwrap().allocated_frames, before);
+            panic!("could not load peer: {error:?}");
+        }
     };
-    if let Err(error) = load(&mut process.space, frames, bytes, image, direct_map) {
-        // SAFETY: This root has never been active; mapped frames belong to it.
-        unsafe { process.space.destroy(frames) }.expect("failed-load cleanup");
-        assert_eq!(frames.stats().unwrap().allocated_frames, before);
-        panic!("native init load failed: {error:?}");
-    }
-    serial::println!(
-        "Native init: entry={:#x} root={:#x} pages={} tables={}",
-        image.entry,
-        process.space.root_physical_address(),
-        process.space.owned_page_count(),
-        process.space.owned_table_count()
+    let mut processes = [first, second];
+    assert_ne!(processes[0].pid, processes[1].pid);
+    assert_ne!(
+        processes[0].space.root_physical_address(),
+        processes[1].space.root_physical_address()
+    );
+    assert_ne!(
+        processes[0]
+            .space
+            .translate(STACK_BASE)
+            .unwrap()
+            .unwrap()
+            .physical,
+        processes[1]
+            .space
+            .translate(STACK_BASE)
+            .unwrap()
+            .unwrap()
+            .physical
     );
     let stack_top = (&raw const KERNEL_STACK) as u64 + KERNEL_STACK_SIZE as u64;
     assert!(ACTIVE.load(Ordering::SeqCst).is_null());
     // SAFETY: Dedicated static upper-half stack, IF=0, no active user process.
     unsafe { interrupts::set_kernel_stack(stack_top) };
-    ACTIVE.store((&raw mut process).cast(), Ordering::SeqCst);
-    // SAFETY: Loaded pages and the stack obey the validated user layout. The
-    // upper mappings cover our suspended stack, handler stack and all Rust data.
-    // No locks/interrupt guards span entry; handlers return before this resumes.
-    unsafe {
-        process.space.activate().expect("activate user root");
-        interrupts::enter_user(image.entry, STACK_TOP - 8, scenario);
+    let mut cursor = 0;
+    let mut last = None;
+    let mut switches = 0;
+    let mut idle_ticks = 0;
+    while processes
+        .iter()
+        .any(|process| process.state != State::Finished)
+    {
+        assert!(!arch::interrupts_enabled());
+        let now = timer::ticks();
+        for process in &mut processes {
+            if let State::Sleeping(deadline) = process.state
+                && deadline_reached(now, deadline)
+            {
+                assert_eq!(
+                    process.charged_ticks, process.sleep_charge,
+                    "sleep charged user CPU ticks"
+                );
+                process.state = State::Ready;
+            }
+        }
+        let selected = (0..PROCESS_COUNT)
+            .map(|offset| (cursor + offset) % PROCESS_COUNT)
+            .find(|&index| processes[index].state == State::Ready);
+        let Some(index) = selected else {
+            assert!(
+                processes
+                    .iter()
+                    .any(|process| matches!(process.state, State::Sleeping(_)))
+            );
+            let before_idle = timer::ticks();
+            let before_charge: u64 = processes.iter().map(|process| process.charged_ticks).sum();
+            // SAFETY: No active process or locks, kernel root restored, timer
+            // ready. STI's interrupt shadow closes the check-to-HLT wakeup race.
+            // The CPL0 IRQ path only acknowledges/increments; CLI restores IF=0.
+            unsafe { core::arch::asm!("sti", "hlt", "cli", options(nostack)) };
+            idle_ticks += timer::ticks().wrapping_sub(before_idle);
+            assert_eq!(
+                processes
+                    .iter()
+                    .map(|process| process.charged_ticks)
+                    .sum::<u64>(),
+                before_charge,
+                "idle charged user CPU ticks"
+            );
+            continue;
+        };
+        cursor = (index + 1) % PROCESS_COUNT;
+        if last != Some(index) {
+            switches += 1;
+            last = Some(index);
+        }
+        processes[index].state = State::Running;
+        processes[index].quantum_left = QUANTUM_TICKS;
+        processes[index].dispatches += 1;
+        // Copy before publishing ACTIVE. Handlers mutate process.frame, so no
+        // shared borrow of that field may span execution and its callbacks.
+        let context = processes[index].frame;
+        ACTIVE.store((&raw mut processes[index]).cast(), Ordering::SeqCst);
+        // SAFETY: Only this process executes in its isolated root. Shared upper
+        // mappings cover both kernel stacks. All handlers finish before resume
+        // returns, and no locks or Rust references to process data span entry.
+        unsafe {
+            processes[index]
+                .space
+                .activate()
+                .expect("activate user root");
+            interrupts::resume_user(&context);
+        }
+        ACTIVE.store(core::ptr::null_mut(), Ordering::SeqCst);
+        // SAFETY: The user is suspended, handlers have returned, and IF=0.
+        unsafe { kernel.activate() }.expect("restore kernel root");
+        assert_ne!(
+            processes[index].state,
+            State::Running,
+            "process returned without transition"
+        );
+        if processes[index].outcome == Some(Outcome::BudgetExhausted) {
+            assert_eq!(index, 0, "peer exhausted its budget");
+            assert_eq!(scenario, 7, "unexpected budget exhaustion");
+            assert_eq!(
+                processes[1].outcome,
+                Some(Outcome::Exit(0)),
+                "CPU-bound task starved peer"
+            );
+            assert!(
+                processes[0].post_checks_preemptions > 0,
+                "CPU-only loop was never preempted"
+            );
+        }
     }
-    ACTIVE.store(core::ptr::null_mut(), Ordering::SeqCst);
-    // SAFETY: User execution has ended, IF=0, and no user pointers survive the
-    // handlers. Restore the owner before releasing the inactive private tree.
-    unsafe {
-        kernel.activate().expect("restore kernel root");
-        process
-            .space
-            .destroy(frames)
-            .expect("release user address space");
+    for process in &mut processes {
+        // SAFETY: All contexts are finished, ACTIVE is clear, the kernel root
+        // is active, and no handler retains a reference into either user tree.
+        unsafe { process.space.destroy(frames) }.expect("release user address space");
     }
     assert_eq!(
         frames.stats().unwrap().allocated_frames,
@@ -162,6 +338,29 @@ fn run_one(
         "user frame leak"
     );
     serial::println!("MIRROR_USER_CLEANUP_OK allocated={}", before);
+    validate_process(&processes[0], scenario);
+    validate_process(&processes[1], 0);
+    let yields: usize = processes.iter().map(|process| process.yields).sum();
+    let sleeps: usize = processes.iter().map(|process| process.sleeps).sum();
+    let preemptions: usize = processes.iter().map(|process| process.preemptions).sum();
+    assert!(switches >= 4, "processes did not alternate");
+    serial::println!(
+        "MIRROR_SCHEDULER_OK processes={} switches={} yields={} sleeps={} preemptions={} idle_ticks={}",
+        PROCESS_COUNT,
+        switches,
+        yields,
+        sleeps,
+        preemptions,
+        idle_ticks
+    );
+}
+
+fn deadline_reached(now: u64, deadline: u64) -> bool {
+    // Delays are at most 1000 ticks, safely within half the counter range.
+    now.wrapping_sub(deadline) < (1 << 63)
+}
+
+fn validate_process(process: &Process<'_>, scenario: u64) {
     assert!(
         process.checks_passed,
         "init checks did not complete: {:?}",
@@ -169,11 +368,27 @@ fn run_one(
     );
     assert_eq!(process.bad_pointers, 4);
     assert_eq!(process.unknown_calls, 1);
+    assert!(process.dispatches > 1, "context did not resume");
+    assert!(process.yields >= 5, "yield checks did not complete");
+    assert!(process.sleeps >= 4, "sleep checks did not complete");
+    assert!(
+        process.preemptions > 0,
+        "user computation was never preempted"
+    );
     match (scenario, process.outcome.expect("missing process outcome")) {
         (0, Outcome::Exit(0)) => {}
         #[cfg(feature = "boot-smoke")]
         (6, Outcome::InvalidStack(0x0000_8000_0000_0000)) => {
             serial::println!("MIRROR_USER_RETURN_REJECTED rsp=0x800000000000");
+        }
+        #[cfg(feature = "boot-smoke")]
+        (7, Outcome::BudgetExhausted) => {
+            assert_eq!(process.charged_ticks, USER_TICK_BUDGET);
+            serial::println!(
+                "MIRROR_USER_BUDGET_CONTAINED pid={} ticks={}",
+                process.pid,
+                process.charged_ticks
+            );
         }
         #[cfg(feature = "boot-smoke")]
         (
@@ -296,16 +511,21 @@ fn with_active(frame: &TrapFrame, operation: impl FnOnce(&mut Process<'_>)) {
     assert!(!arch::interrupts_enabled());
     let pointer = ACTIVE.load(Ordering::SeqCst).cast::<Process<'_>>();
     assert!(!pointer.is_null(), "no active process");
-    // SAFETY: run_one suspends its stack while this pointer is published. Only
+    // SAFETY: run_pair suspends its stack while this pointer is published. Only
     // this BSP, with IF=0, accesses it; no handler retains a reference or reenters
     // userspace. Kernel/NMI faults never invoke this function. Closure references
     // cannot escape this call, and the borrowed kernel root remains live.
-    unsafe { operation(&mut *pointer) };
+    unsafe {
+        let process = &mut *pointer;
+        assert_eq!(process.state, State::Running);
+        operation(process);
+    }
 }
 
 pub(crate) fn syscall(frame: &mut TrapFrame) {
     let mut result = -38_i64;
     let mut finished = false;
+    let mut suspension = None;
     with_active(frame, |process| {
         match frame.rax {
             1 => {
@@ -347,15 +567,85 @@ pub(crate) fn syscall(frame: &mut TrapFrame) {
             3 => {
                 assert!(process.outcome.is_none());
                 process.outcome = Some(Outcome::Exit(frame.rdi));
+                process.state = State::Finished;
                 finished = true;
             }
+            4 => {
+                result = 0;
+                process.yields += 1;
+                suspension = Some(State::Ready);
+            }
+            5 => {
+                if frame.rdi > MAX_SLEEP_TICKS {
+                    result = -22;
+                } else {
+                    result = 0;
+                    if frame.rdi == 0 {
+                        process.yields += 1;
+                        suspension = Some(State::Ready);
+                    } else {
+                        process.sleeps += 1;
+                        suspension = Some(State::Sleeping(timer::ticks().wrapping_add(frame.rdi)));
+                    }
+                }
+            }
+            6 => result = process.pid as i64,
             _ => process.unknown_calls += 1,
         }
     });
     frame.rax = result as u64;
     if finished {
         interrupts::return_from_user(frame);
+    } else if let Some(state) = suspension {
+        suspend(frame, state);
     }
+}
+
+/// Runs after IRQ0 acknowledgement, only for an interrupted CPL3 context.
+/// A tick charges the interrupted user only; kernel and sleeping time are not
+/// charged. This bounds delivered user IRQ ticks, not exact CPU or wall time.
+pub(crate) fn timer_tick(frame: &mut TrapFrame) {
+    let mut expired = false;
+    let mut preempt = false;
+    with_active(frame, |process| {
+        process.charged_ticks += 1;
+        process.quantum_left -= 1;
+        if process.charged_ticks >= USER_TICK_BUDGET {
+            process.outcome = Some(Outcome::BudgetExhausted);
+            process.state = State::Finished;
+            expired = true;
+        } else if process.quantum_left == 0 {
+            process.preemptions += 1;
+            if process.checks_passed {
+                process.post_checks_preemptions += 1;
+            }
+            preempt = true;
+        }
+    });
+    if expired {
+        interrupts::return_from_user(frame);
+    } else if preempt {
+        suspend(frame, State::Ready);
+    }
+}
+
+fn suspend(frame: &mut TrapFrame, state: State) {
+    // Validate before saving. Otherwise a malformed user stack could enter a
+    // ready context and fail a kernel invariant on its next resume.
+    prepare_return(frame);
+    if frame.cs & 3 != 3 {
+        return;
+    }
+    with_active(frame, |process| {
+        assert!(matches!(state, State::Ready | State::Sleeping(_)));
+        process.frame = *frame;
+        if matches!(state, State::Sleeping(_)) {
+            process.sleep_charge = process.charged_ticks;
+        }
+        process.state = state;
+    });
+    // The current handler must unwind before the scheduler touches other tasks.
+    interrupts::return_from_user(frame);
 }
 
 pub(crate) fn fault(frame: &mut TrapFrame, cr2: u64) {
@@ -367,6 +657,7 @@ pub(crate) fn fault(frame: &mut TrapFrame, cr2: u64) {
             address: cr2,
             rip: frame.rip,
         });
+        process.state = State::Finished;
     });
     serial::println!(
         "MIRROR_USER_FAULT vector={} error={:#x} rip={:#x} cr2={:#x}",
@@ -378,15 +669,30 @@ pub(crate) fn fault(frame: &mut TrapFrame, cr2: u64) {
     interrupts::return_from_user(frame);
 }
 
-/// Validate saved RSP against the native userspace address contract before
-/// IRETQ. Check every user return, including timer IRQs, and end an invalid
-/// context on the trusted continuation instead. Unmapped canonical user stacks can
-/// return safely; a subsequent user access is handled as an ordinary user fault.
+/// Validate saved addresses and selectors against the native userspace contract
+/// before IRETQ. Check every user return, including timer IRQs, and end invalid
+/// contexts on the trusted continuation. Unmapped canonical user addresses may
+/// return safely; subsequent user accesses produce ordinary contained faults.
 pub(crate) fn prepare_return(frame: &mut TrapFrame) {
-    if !(PAGE_SIZE..(1_u64 << 47)).contains(&frame.rsp) {
+    let invalid = if !(PAGE_SIZE..(1_u64 << 47)).contains(&frame.rsp) {
+        Some(Outcome::InvalidStack(frame.rsp))
+    } else if !(PAGE_SIZE..(1_u64 << 47)).contains(&frame.rip)
+        || frame.cs != 0x33
+        || frame.ss != 0x2b
+    {
+        Some(Outcome::InvalidContext {
+            rip: frame.rip,
+            cs: frame.cs,
+            ss: frame.ss,
+        })
+    } else {
+        None
+    };
+    if let Some(outcome) = invalid {
         with_active(frame, |process| {
             assert!(process.outcome.is_none());
-            process.outcome = Some(Outcome::InvalidStack(frame.rsp));
+            process.outcome = Some(outcome);
+            process.state = State::Finished;
         });
         interrupts::return_from_user(frame);
     }

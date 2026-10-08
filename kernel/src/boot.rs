@@ -107,6 +107,7 @@ pub fn smoke_mode() -> SmokeMode {
         b"mirror.test=user-guard" => SmokeMode::User(4),
         b"mirror.test=user-privileged" => SmokeMode::User(5),
         b"mirror.test=user-bad-stack" => SmokeMode::User(6),
+        b"mirror.test=user-budget" => SmokeMode::User(7),
         _ => panic!("unknown smoke-test command line"),
     }
 }

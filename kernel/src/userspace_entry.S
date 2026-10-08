@@ -1,10 +1,10 @@
-# Single-BSP synchronous user entry, SysV ABI, integer/soft-float only.
+# Single-BSP resumable user context, SysV ABI, integer/soft-float only.
 # The original kernel call stack remains mapped but is never used by ring-3
 # interrupts: TSS.RSP0 selects a separate supervisor stack for those entries.
 .section .text.userspace_entry,"ax",@progbits
-.global mirror_enter_user
-.type mirror_enter_user, @function
-mirror_enter_user:
+.global mirror_resume_user
+.type mirror_resume_user, @function
+mirror_resume_user:
     # Caller guarantees IF=0. Save every SysV callee-saved GPR and original CR0.
     push rbp
     push rbx
@@ -15,7 +15,8 @@ mirror_enter_user:
     mov rax, cr0
     push rax
     mov [rip + MIRROR_USER_KERNEL_RSP], rsp
-    mov r8, rdx
+    # Preserve the source frame while setting up segments and writing MSRs.
+    mov r8, rdi
 
     # No x87/SIMD state management yet. TS makes user use trap with #NM instead
     # of exposing prior extended state; the soft-float kernel needs no such state.
@@ -35,31 +36,34 @@ mirror_enter_user:
     inc ecx
     wrmsr
 
-    # IRETQ consumes SS:RSP, RFLAGS, CS:RIP and transitions to CPL3.
-    push {user_data}
-    push rsi
-    push 0x202
-    push {user_code}
-    push rdi
-    mov rdi, r8
-
-    # RDI is the explicit integer argument. Other GPRs and flags are cleared.
-    xor eax, eax
-    xor ebx, ebx
-    xor ecx, ecx
-    xor edx, edx
-    xor esi, esi
-    xor ebp, ebp
-    xor r8d, r8d
-    xor r9d, r9d
-    xor r10d, r10d
-    xor r11d, r11d
-    xor r12d, r12d
-    xor r13d, r13d
-    xor r14d, r14d
-    xor r15d, r15d
+    # Copy the validated frame below the suspended kernel context. The borrowed
+    # source lives in the caller's stack frame, above this destination, and the
+    # full copy finishes before restoring any user-controlled register.
+    sub rsp, {frame_size}
+    mov rsi, r8
+    mov rdi, rsp
+    mov ecx, {frame_words}
+    cld
+    rep movsq
+    # Match TrapFrame and the common interrupt epilogue exactly.
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp, 16
     iretq
-.size mirror_enter_user, .-mirror_enter_user
+.size mirror_resume_user, .-mirror_resume_user
 
 .global mirror_resume_kernel
 .type mirror_resume_kernel, @function

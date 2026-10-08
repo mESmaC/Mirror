@@ -20,7 +20,8 @@ global_asm!(
     include_str!("userspace_entry.S"),
     kernel_data = const DATA_SELECTOR,
     user_data = const USER_DATA_SELECTOR,
-    user_code = const USER_CODE_SELECTOR,
+    frame_size = const size_of::<TrapFrame>(),
+    frame_words = const size_of::<TrapFrame>() / size_of::<u64>(),
 );
 
 const CODE_SELECTOR: u16 = 0x08;
@@ -28,6 +29,9 @@ const DATA_SELECTOR: u16 = 0x10;
 const TSS_SELECTOR: u16 = 0x18;
 const USER_DATA_SELECTOR: u16 = 0x2b;
 const USER_CODE_SELECTOR: u16 = 0x33;
+// CF/PF/AF/ZF/SF/TF/DF/OF/RF/AC/ID. Force IF and bit 1 separately; never
+// restore IOPL, NT, VM, VIF, VIP, or reserved bits from a saved user context.
+const USER_RFLAGS_MASK: u64 = 0x25_0dd5;
 const DOUBLE_FAULT_IST: u8 = 1;
 const DOUBLE_FAULT_STACK_SIZE: usize = 16 * 1024;
 
@@ -104,6 +108,7 @@ impl IdtEntry {
 // Match interrupts.S exactly. Long mode always saves SS:RSP, including CPL0
 // entries without an IST switch. The common stub saves every integer register.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct TrapFrame {
     pub r15: u64,
     pub r14: u64,
@@ -150,7 +155,8 @@ static USER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 // Assembly saves the BSP's suspended kernel stack here, with IF clear. User
 // pages cannot access this supervisor-only kernel object. SMP will need a
-// per-CPU context and scheduling will need one suspended stack per thread.
+// per-CPU context. The BSP scheduler resumes after each yield or preemption;
+// it retains user trap frames rather than suspended Rust handler stacks.
 #[unsafe(no_mangle)]
 static mut MIRROR_USER_KERNEL_RSP: u64 = 0;
 
@@ -166,7 +172,7 @@ static PAGE_FAULT_ARMED: AtomicBool = AtomicBool::new(false);
 unsafe extern "C" {
     static mirror_exception_entries: [u64; 48];
     fn mirror_exception_128();
-    fn mirror_enter_user(entry: u64, user_stack: u64, argument: u64);
+    fn mirror_resume_user(frame: *const TrapFrame);
     fn mirror_resume_kernel();
 }
 
@@ -289,21 +295,63 @@ pub(crate) unsafe fn set_kernel_stack(top: u64) {
     }
 }
 
-/// Run one integer-only user context until its handler requests kernel return.
-/// RDI starts at `argument`; other GPRs and FS/GS bases start at zero. IF=1 and
-/// IOPL=0. No kernel address is passed to user code in the initial register state.
-/// x87/SIMD instructions fault because extended state is not yet supported.
+/// Construct a fresh integer-only context with no inherited general registers.
+/// RDI contains the explicit argument, IF=1, and IOPL=0. The caller must map the
+/// image and stack; resume_user checks canonical addresses before CPU entry.
+pub(crate) fn user_frame(entry: u64, stack: u64, argument: u64) -> TrapFrame {
+    TrapFrame {
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        r11: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rbp: 0,
+        rdi: argument,
+        rsi: 0,
+        rdx: 0,
+        rcx: 0,
+        rbx: 0,
+        rax: 0,
+        vector: 0,
+        error: 0,
+        rip: entry,
+        cs: u64::from(USER_CODE_SELECTOR),
+        rflags: 0x202,
+        rsp: stack,
+        ss: u64::from(USER_DATA_SELECTOR),
+    }
+}
+
+/// Resume saved integer registers until a handler requests kernel return.
+/// User status flags are preserved, IF is forced on, and privilege bits are
+/// cleared. FS/GS bases start at zero; TLS and x87/SIMD state are unsupported.
 /// Returns on the original kernel stack with IF=0 and callee-saved GPRs intact.
 ///
 /// # Safety
 /// Only the BSP may call; interrupts must be disabled. The active page tables
-/// must isolate user mappings from kernel mappings. `entry` and `user_stack`
-/// must be valid canonical CPL3 addresses, and set_kernel_stack must have
-/// installed a mapped kernel stack. IRQ handlers must be initialized. No
-/// interrupt-disabling guard may span this call: user mode deliberately sets IF.
-pub(crate) unsafe fn enter_user(entry: u64, user_stack: u64, argument: u64) {
+/// must isolate user mappings from kernel mappings and belong to this context.
+/// The frame must contain the intended user's state; set_kernel_stack must have
+/// installed a mapped kernel stack. IRQ handlers and scheduling state must be
+/// initialized. No interrupt-disabling guard may span this call: user mode
+/// deliberately sets IF. The saved frame and kernel caller remain mapped.
+pub(crate) unsafe fn resume_user(frame: &TrapFrame) {
     assert!(is_initialized(), "IDT not initialized");
     assert!(!arch::interrupts_enabled(), "user entry requires IF=0");
+    assert_eq!(frame.cs, u64::from(USER_CODE_SELECTOR), "invalid user CS");
+    assert_eq!(frame.ss, u64::from(USER_DATA_SELECTOR), "invalid user SS");
+    assert!(
+        (4096..(1 << 47)).contains(&frame.rip),
+        "invalid user instruction pointer"
+    );
+    assert!(
+        (4096..(1 << 47)).contains(&frame.rsp),
+        "invalid user stack pointer"
+    );
+    let mut prepared = *frame;
+    prepared.rflags = (prepared.rflags & USER_RFLAGS_MASK) | 0x202;
     // SAFETY: Exclusive BSP call with IF clear; no mutable reference is formed.
     let rsp0 = unsafe {
         addr_of!(TSS.privilege_stacks)
@@ -315,10 +363,11 @@ pub(crate) unsafe fn enter_user(entry: u64, user_stack: u64, argument: u64) {
         !USER_ACTIVE.swap(true, Ordering::SeqCst),
         "nested user entry"
     );
-    // SAFETY: Caller guarantees mapped kernel/user stacks and user isolation.
-    // The assembly preserves the SysV callee-saved registers, suspends this
-    // stack, and resumes here only through the trusted return trampoline.
-    unsafe { mirror_enter_user(entry, user_stack, argument) };
+    // SAFETY: Caller guarantees this context's address space and kernel stacks.
+    // The validated copy has only CPL3 selectors and unprivileged flags. Assembly
+    // copies it before restoring registers, preserves kernel callee-saved GPRs,
+    // and resumes here only through the trusted return trampoline.
+    unsafe { mirror_resume_user(&prepared) };
     assert!(!arch::interrupts_enabled(), "user return requires IF=0");
     // SAFETY: Assembly has returned to the saved stack with IF clear.
     unsafe { addr_of_mut!(MIRROR_USER_KERNEL_RSP).write(0) };
@@ -396,9 +445,14 @@ extern "C" fn mirror_exception_dispatch(frame: &mut TrapFrame) {
 
 fn dispatch(frame: &mut TrapFrame) {
     // IRQs must never consume an armed synchronous-exception expectation.
-    // The IRQ path does not allocate, print or take a lock.
+    // The timer driver itself does not allocate, print or take a lock.
     if (32..48).contains(&frame.vector) {
         timer::handle_irq(frame.vector as u8);
+        if frame.vector == 32 && frame.cs & 3 == 3 {
+            // Acknowledge IRQ0 before scheduling. timer_tick must validate the
+            // return frame before saving it, and unwind before switching roots.
+            crate::userspace::timer_tick(frame);
+        }
         return;
     }
 
