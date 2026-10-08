@@ -1,4 +1,4 @@
-//! BSP exception and legacy PIC IRQ delivery; no userspace yet.
+//! BSP exception, legacy PIC IRQ, and synchronous ring-3 entry/return delivery.
 //!
 //! Descriptor and frame layouts follow Intel SDM vol. 3A, sections 6.14 and 7.7:
 //! https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
@@ -16,10 +16,18 @@ use core::sync::atomic::{AtomicU64, AtomicUsize};
 use crate::{arch, serial, timer};
 
 global_asm!(include_str!("interrupts.S"));
+global_asm!(
+    include_str!("userspace_entry.S"),
+    kernel_data = const DATA_SELECTOR,
+    user_data = const USER_DATA_SELECTOR,
+    user_code = const USER_CODE_SELECTOR,
+);
 
 const CODE_SELECTOR: u16 = 0x08;
 const DATA_SELECTOR: u16 = 0x10;
 const TSS_SELECTOR: u16 = 0x18;
+const USER_DATA_SELECTOR: u16 = 0x2b;
+const USER_CODE_SELECTOR: u16 = 0x33;
 const DOUBLE_FAULT_IST: u8 = 1;
 const DOUBLE_FAULT_STACK_SIZE: usize = 16 * 1024;
 
@@ -43,7 +51,7 @@ struct TaskStateSegment {
 impl TaskStateSegment {
     const EMPTY: Self = Self {
         reserved0: 0,
-        // No ring transitions are supported until userspace gets its own RSP0.
+        // set_kernel_stack installs RSP0 before any ring-3 transition.
         privilege_stacks: [0; 3],
         reserved1: 0,
         interrupt_stacks: [0; 7],
@@ -96,29 +104,29 @@ impl IdtEntry {
 // Match interrupts.S exactly. Long mode always saves SS:RSP, including CPL0
 // entries without an IST switch. The common stub saves every integer register.
 #[repr(C)]
-struct ExceptionFrame {
-    r15: u64,
-    r14: u64,
-    r13: u64,
-    r12: u64,
-    r11: u64,
-    r10: u64,
-    r9: u64,
-    r8: u64,
-    rbp: u64,
-    rdi: u64,
-    rsi: u64,
-    rdx: u64,
-    rcx: u64,
-    rbx: u64,
-    rax: u64,
-    vector: u64,
-    error: u64,
-    rip: u64,
-    cs: u64,
-    rflags: u64,
-    rsp: u64,
-    ss: u64,
+pub(crate) struct TrapFrame {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rbp: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
+    pub vector: u64,
+    pub error: u64,
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
 }
 
 const _: () = assert!(size_of::<DescriptorPointer>() == 10);
@@ -126,17 +134,25 @@ const _: () = assert!(size_of::<TaskStateSegment>() == 104);
 const _: () = assert!(offset_of!(TaskStateSegment, interrupt_stacks) == 36);
 const _: () = assert!(offset_of!(TaskStateSegment, io_map_offset) == 102);
 const _: () = assert!(size_of::<IdtEntry>() == 16);
-const _: () = assert!(size_of::<ExceptionFrame>() == 22 * 8);
-const _: () = assert!(offset_of!(ExceptionFrame, vector) == 15 * 8);
-const _: () = assert!(offset_of!(ExceptionFrame, error) == 16 * 8);
-const _: () = assert!(offset_of!(ExceptionFrame, rip) == 17 * 8);
-const _: () = assert!(offset_of!(ExceptionFrame, rsp) == 20 * 8);
+const _: () = assert!(size_of::<TrapFrame>() == 22 * 8);
+const _: () = assert!(offset_of!(TrapFrame, vector) == 15 * 8);
+const _: () = assert!(offset_of!(TrapFrame, error) == 16 * 8);
+const _: () = assert!(offset_of!(TrapFrame, rip) == 17 * 8);
+const _: () = assert!(offset_of!(TrapFrame, rsp) == 20 * 8);
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut TSS: TaskStateSegment = TaskStateSegment::EMPTY;
 static mut DOUBLE_FAULT_STACK: ExceptionStack = ExceptionStack([0; DOUBLE_FAULT_STACK_SIZE]);
-static mut GDT: [u64; 5] = [0; 5];
+static mut GDT: [u64; 7] = [0; 7];
 static mut IDT: [IdtEntry; 256] = [IdtEntry::MISSING; 256];
+
+static USER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+// Assembly saves the BSP's suspended kernel stack here, with IF clear. User
+// pages cannot access this supervisor-only kernel object. SMP will need a
+// per-CPU context and scheduling will need one suspended stack per thread.
+#[unsafe(no_mangle)]
+static mut MIRROR_USER_KERNEL_RSP: u64 = 0;
 
 #[cfg(feature = "boot-smoke")]
 static BREAKPOINT_ARMED: AtomicBool = AtomicBool::new(false);
@@ -149,6 +165,9 @@ static PAGE_FAULT_ARMED: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "C" {
     static mirror_exception_entries: [u64; 48];
+    fn mirror_exception_128();
+    fn mirror_enter_user(entry: u64, user_stack: u64, argument: u64);
+    fn mirror_resume_kernel();
 }
 
 pub(crate) fn is_initialized() -> bool {
@@ -187,6 +206,8 @@ pub fn init() {
             0x00cf_9300_0000_ffff, // Accessed, writable data; L bit clear.
             tss_low,
             tss_address >> 32,
+            0x00cf_f300_0000_ffff, // DPL3 accessed, writable data.
+            0x00af_fb00_0000_ffff, // DPL3 accessed, 64-bit code.
         ]);
         let handlers = addr_of!(mirror_exception_entries).cast::<u64>();
         let entries = addr_of_mut!(IDT).cast::<IdtEntry>();
@@ -196,10 +217,13 @@ pub fn init() {
                 .add(vector)
                 .write(IdtEntry::interrupt(handlers.add(vector).read(), ist));
         }
+        let mut syscall = IdtEntry::interrupt(mirror_exception_128 as *const () as u64, 0);
+        syscall.attributes |= 3 << 5; // CPL3 may invoke INT 0x80.
+        entries.add(0x80).write(syscall);
     }
 
     let gdtr = DescriptorPointer {
-        limit: (size_of::<[u64; 5]>() - 1) as u16,
+        limit: (size_of::<[u64; 7]>() - 1) as u16,
         base: addr_of!(GDT) as u64,
     };
     let idtr = DescriptorPointer {
@@ -239,6 +263,83 @@ pub fn init() {
         );
     }
     serial::println!("MIRROR_IDT_READY exceptions=32 double_fault_ist=1 irqs=16");
+}
+
+/// Set the dedicated kernel stack used by hardware on CPL3 -> CPL0 entry.
+///
+/// # Safety
+/// Only the BSP may call, with interrupts disabled and no active user context.
+/// `top` must be 16-byte aligned and immediately above a writable, supervisor
+/// stack large enough for hardware frames, handlers, and nested exceptions.
+/// The stack must stay mapped in every address space until replaced.
+pub(crate) unsafe fn set_kernel_stack(top: u64) {
+    assert!(is_initialized(), "IDT not initialized");
+    assert!(!arch::interrupts_enabled(), "RSP0 update requires IF=0");
+    assert!(
+        !USER_ACTIVE.load(Ordering::SeqCst),
+        "user context is active"
+    );
+    assert!(top != 0 && top.is_multiple_of(16), "invalid RSP0");
+    // SAFETY: Caller supplies exclusive BSP access and a persistent stack.
+    // TSS is packed, so the RSP0 field requires an unaligned raw-pointer write.
+    unsafe {
+        addr_of_mut!(TSS.privilege_stacks)
+            .cast::<u64>()
+            .write_unaligned(top);
+    }
+}
+
+/// Run one integer-only user context until its handler requests kernel return.
+/// RDI starts at `argument`; other GPRs and FS/GS bases start at zero. IF=1 and
+/// IOPL=0. No kernel address is passed to user code in the initial register state.
+/// x87/SIMD instructions fault because extended state is not yet supported.
+/// Returns on the original kernel stack with IF=0 and callee-saved GPRs intact.
+///
+/// # Safety
+/// Only the BSP may call; interrupts must be disabled. The active page tables
+/// must isolate user mappings from kernel mappings. `entry` and `user_stack`
+/// must be valid canonical CPL3 addresses, and set_kernel_stack must have
+/// installed a mapped kernel stack. IRQ handlers must be initialized. No
+/// interrupt-disabling guard may span this call: user mode deliberately sets IF.
+pub(crate) unsafe fn enter_user(entry: u64, user_stack: u64, argument: u64) {
+    assert!(is_initialized(), "IDT not initialized");
+    assert!(!arch::interrupts_enabled(), "user entry requires IF=0");
+    // SAFETY: Exclusive BSP call with IF clear; no mutable reference is formed.
+    let rsp0 = unsafe {
+        addr_of!(TSS.privilege_stacks)
+            .cast::<u64>()
+            .read_unaligned()
+    };
+    assert_ne!(rsp0, 0, "user entry requires a kernel stack");
+    assert!(
+        !USER_ACTIVE.swap(true, Ordering::SeqCst),
+        "nested user entry"
+    );
+    // SAFETY: Caller guarantees mapped kernel/user stacks and user isolation.
+    // The assembly preserves the SysV callee-saved registers, suspends this
+    // stack, and resumes here only through the trusted return trampoline.
+    unsafe { mirror_enter_user(entry, user_stack, argument) };
+    assert!(!arch::interrupts_enabled(), "user return requires IF=0");
+    // SAFETY: Assembly has returned to the saved stack with IF clear.
+    unsafe { addr_of_mut!(MIRROR_USER_KERNEL_RSP).write(0) };
+    assert!(USER_ACTIVE.swap(false, Ordering::SeqCst));
+}
+
+/// Request a return to the suspended kernel caller after this handler unwinds.
+/// Never long-jumps through live Rust frames or interrupt/allocator guards.
+pub(crate) fn return_from_user(frame: &mut TrapFrame) {
+    assert_eq!(frame.cs & 3, 3, "kernel return requires a user frame");
+    assert!(!arch::interrupts_enabled(), "user handler requires IF=0");
+    assert!(USER_ACTIVE.load(Ordering::SeqCst), "no active user context");
+    // SAFETY: Only the BSP runs, and IF is clear. The entry assembly published
+    // this trusted supervisor-only stack pointer before enabling user execution.
+    let kernel_rsp = unsafe { addr_of!(MIRROR_USER_KERNEL_RSP).read() };
+    assert_ne!(kernel_rsp, 0, "no suspended kernel stack");
+    frame.rip = mirror_resume_kernel as *const () as u64;
+    frame.cs = u64::from(CODE_SELECTOR);
+    frame.rflags = 2; // Reserved bit 1 only: IF/DF/TF/AC/IOPL/NT are all clear.
+    frame.rsp = kernel_rsp;
+    frame.ss = u64::from(DATA_SELECTOR);
 }
 
 #[cfg(feature = "boot-smoke")]
@@ -283,7 +384,17 @@ pub fn arm_expected_page_fault(address: u64) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn mirror_exception_dispatch(frame: &ExceptionFrame) {
+extern "C" fn mirror_exception_dispatch(frame: &mut TrapFrame) {
+    dispatch(frame);
+    // User RSP is arbitrary even when the interrupt came from a valid RIP.
+    // Validate every user return, including IRQs, before assembly reaches IRETQ.
+    // Exit/fault handlers already rewrite CS to the trusted kernel continuation.
+    if frame.cs & 3 == 3 {
+        crate::userspace::prepare_return(frame);
+    }
+}
+
+fn dispatch(frame: &mut TrapFrame) {
     // IRQs must never consume an armed synchronous-exception expectation.
     // The IRQ path does not allocate, print or take a lock.
     if (32..48).contains(&frame.vector) {
@@ -291,10 +402,22 @@ extern "C" fn mirror_exception_dispatch(frame: &ExceptionFrame) {
         return;
     }
 
+    if frame.vector == 0x80 {
+        crate::userspace::syscall(frame);
+        return;
+    }
+
     let cr2: u64;
     // SAFETY: Every gate targets this CPL0 handler. Capture CR2 before printing
     // diagnostics, so a secondary fault cannot silently replace its value.
     unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
+
+    // NMI, double fault, and machine check are kernel/platform failures even
+    // when delivered while CPL3 was running. Ordinary user exceptions are local.
+    if frame.cs & 3 == 3 && !matches!(frame.vector, 2 | 8 | 18) {
+        crate::userspace::fault(frame, cr2);
+        return;
+    }
 
     #[cfg(feature = "boot-smoke")]
     {

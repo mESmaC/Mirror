@@ -2,19 +2,21 @@
 
 Mirror is a proposed operating system, written primarily in Rust, designed for people and AI agents to use the same computer efficiently. Its goals are to run selected Windows and Linux applications, expose fast and controllable automation, and coordinate local inference with the rest of the system.
 
-**Status:** the freestanding Rust kernel boots through UEFI/Limine in QEMU with its own exception descriptors and page tables, reusable physical pages, a 1 MiB kernel heap, and timer interrupts. Debug and optimized boot tests cover these features, including allocation while interrupts run and fatal exception diagnostics. Native userspace, broader driver ports, application compatibility, unified resource management, and inference services remain future work. The broader designs below are proposals; performance improvements must be demonstrated with measurements.
+**Status:** the freestanding Rust kernel boots through UEFI/Limine in QEMU with its own exception descriptors and page tables, reusable physical pages, a 1 MiB kernel heap, and timer interrupts. It loads a native Rust init process into a separate ring-3 address space, handles three native syscalls, contains tested user faults, and reclaims the process's pages and tables. Formatting, Clippy, and all 18 debug/release boot cases pass. Scheduling, IPC, capability handles, broader driver ports, application compatibility, unified resource management, and inference services remain future work. The broader designs below are proposals; performance improvements must be demonstrated with measurements.
 
 ## Build and boot the kernel
 
-The kernel targets `x86_64-unknown-none` using stable Rust (minimum 1.88; developed with 1.96.0). Rustup installs the target and components declared in `rust-toolchain.toml`. Cargo dependencies are locked, and the boot scripts download Limine v12.9.3 from its official release and verify the archive's pinned SHA-256. The Rust protocol bindings are pinned to 0.5.0, which supports stable Rust and Limine base revision 3.
+The kernel and native init target `x86_64-unknown-none` using stable Rust (minimum 1.88; developed with 1.96.0). Rustup installs the target and components declared in `rust-toolchain.toml`. Cargo dependencies are locked, and the boot scripts download Limine v12.9.3 from its official release and verify the archive's pinned SHA-256. The Rust protocol bindings are pinned to 0.5.0, which supports stable Rust and Limine base revision 3. `scripts/build.ps1` builds each package with its own linker settings using Rust's bundled linker; no host C linker is required. The workspace defaults to the kernel, so use the script to build and stage both executables.
+
+Init uses the small code model for its low virtual addresses. Its optimized build disables LTO to avoid merging incompatible code-model metadata with Rust's prebuilt `core`; kernel release LTO remains enabled. A dedicated userspace target with a matching rebuilt `core` remains future build-system work.
 
 From the repository root in PowerShell:
 
 ```powershell
-# Compile the kernel and stage its UEFI boot files.
+# Compile the kernel and native init, then stage their UEFI boot files.
 .\scripts\build.ps1
 
-# Run formatting, Clippy, and all six debug/release boot cases.
+# Run formatting, Clippy, and all 18 debug/release boot cases.
 .\scripts\test.ps1
 
 # Build the smoke-test kernel, boot it, and verify its serial results and exit code.
@@ -27,29 +29,60 @@ From the repository root in PowerShell:
 .\scripts\run.ps1 -Smoke -Fault PageFault
 .\scripts\run.ps1 -Smoke -Fault InvalidOpcode
 
-# Boot normally; diagnostics precede an idle loop woken by timer IRQs. Ctrl+C stops QEMU.
+# Verify containment of userspace protection faults.
+.\scripts\run.ps1 -Smoke -Fault UserKernelRead
+.\scripts\run.ps1 -Smoke -Fault UserCodeWrite
+.\scripts\run.ps1 -Smoke -Fault UserNx
+.\scripts\run.ps1 -Smoke -Fault UserGuard
+.\scripts\run.ps1 -Smoke -Fault UserPrivileged
+.\scripts\run.ps1 -Smoke -Fault UserBadStack
+
+# Boot normally; native init exits before the timer-driven idle loop. Ctrl+C stops QEMU.
 .\scripts\run.ps1
 ```
 
 Running requires `qemu-system-x86_64.exe` and a matching pair of EDK II/OVMF firmware files. The runner checks `.tools/qemu/`, then PATH; alternatively pass `-QemuPath`, `-FirmwareCode`, and `-FirmwareVars`, or set `QEMU_PATH`, `OVMF_CODE`, and `OVMF_VARS`. QEMU's bundled `edk2-x86_64-code.fd` pairs with `edk2-i386-vars.fd`. Obtain Windows builds through the [official QEMU download page](https://www.qemu.org/download/#windows); QEMU is a local development prerequisite, not a checked-in dependency.
 
-`build/esp/` contains `EFI/BOOT/BOOTX64.EFI`, `limine.conf`, and `kernel.elf`. QEMU exposes this directory as a virtual FAT boot disk; the scripts do not format physical disks. Firmware variables are copied into `build/` before use. `.tools/`, `build/`, and `target/` are ignored by Git. This produces an EFI boot tree, not an installer or standalone disk image.
+`build/esp/` contains `EFI/BOOT/BOOTX64.EFI`, `limine.conf`, `kernel.elf`, and `init.elf`. Limine supplies `init.elf` as a boot module for Mirror's ELF loader. QEMU exposes this directory as a virtual FAT boot disk; the scripts do not format physical disks. Firmware variables are copied into `build/` before use. `.tools/`, `build/`, and `target/` are ignored by Git. This produces an EFI boot tree, not an installer or standalone disk image.
 
-The smoke test has a 30-second boot timeout. It checks frame ownership, alignment, reuse, rejected invalid frees, physical-page contents, returning breakpoints, and mapping/unmapping. Heap checks cover mixed layouts, data preservation, exhaustion, hole reuse/coalescing, rejected oversized layouts, and actual `Box`/`Vec` allocation without leaks. Timer checks require repeated hardware IRQ delivery and acknowledgement. A separate allocation loop requires timer progress while verifying that the heap lock restores enabled interrupts. The final unmapped access must reach the expected page-fault handler. The runner requires each subsystem's success marker, `MIRROR_BOOT_OK`, and QEMU exit status 33.
+The smoke test has a 30-second boot timeout. It checks frame ownership, alignment, reuse, rejected invalid frees, physical-page contents, returning breakpoints, and mapping/unmapping. Heap checks cover mixed layouts, data preservation, exhaustion, hole reuse/coalescing, rejected oversized layouts, and actual `Box`/`Vec` allocation without leaks. Timer checks require repeated hardware IRQ delivery and acknowledgement. A separate allocation loop requires timer progress while verifying that the heap lock restores enabled interrupts.
+
+Userspace checks cover private page-table permissions and reclamation, bounded ELF validation, rollback after a partially completed load fails, ring-3 execution, initialized data and zeroed BSS, stack writes, rejected syscall pointers and unknown calls, preserved registers, and timer progress while user code runs. Every smoke boot tears down its first process and launches a fresh normal init, checking fresh BSS and frame reuse after exit or a contained fault. The runner requires `MIRROR_USER_PAGING_OK`, `MIRROR_ELF_TESTS_OK`, `MIRROR_USER_LOAD_ROLLBACK_OK`, `MIRROR_USERSPACE_OK`, and `MIRROR_USER_CLEANUP_OK` along with the earlier subsystem markers. Nonfatal cases finish with the expected kernel page-fault probe, `MIRROR_PAGE_FAULT_OK`, `MIRROR_BOOT_OK`, and QEMU exit status 33.
 
 `-Fault PageFault` and `-Fault InvalidOpcode` select intentional unexpected exceptions through the smoke kernel's boot command line. These cases require the matching exception vector, error code, page-fault address where applicable, and QEMU exit status 35. A panic, timeout, or ordinary successful boot cannot satisfy them. The normal kernel excludes these fault triggers and QEMU exit-port writes.
 
-Serial and QEMU diagnostic logs are saved under `build/`. `scripts/test.ps1` runs all three cases in debug with 128 MiB and release with 256 MiB, retains their logs under `build/test-logs/`, and leaves a normal kernel staged afterward. Build and boot commands should run one at a time because they share the staged files.
+The five user-fault modes attempt to read supervisor kernel memory, write an RX code page, execute an NX stack page, read a stack guard page, and execute privileged `CLI`. The kernel checks the expected exception vector, error code, and fault address where applicable before reporting `MIRROR_USER_FAULT_CONTAINED`. Each case must recover to the kernel, reclaim the process, and launch normal init successfully; a fatal guest exception cannot satisfy these tests.
 
-The current kernel runs one CPU. Its GDT, TSS, 32 exception gates, 16 legacy IRQ gates, and dedicated double-fault stack are installed before interrupts are enabled. The QEMU q35 timer uses the legacy PIC/PIT at approximately 100 Hz. Only IRQ0 is unmasked; its handler increments a counter and acknowledges the interrupt without allocation, logging, or locking. The normal idle loop wakes on IRQs. Ticks measure delivered interrupts, not calibrated elapsed time; long critical sections can lose ticks. APIC/IOAPIC support and hardware discovery remain future work.
+`-Fault UserBadStack` supplies a noncanonical user stack pointer. The return validator must reject it before IRET, report `MIRROR_USER_RETURN_REJECTED`, and complete the same cleanup and relaunch path without a hardware-fault marker. It also requires QEMU exit status 33.
 
-Paging ownership is established by deep-copying Limine's four-level hierarchy, retaining existing mappings and huge-page leaves, and switching CR3. New heap and scratch mappings are supervisor-only, writable, and non-executable; unmapping invalidates the local TLB. NX and supervisor write protection are enabled, but dedicated execute/write-protection fault tests are not yet implemented. Double-fault stack installation is also not yet tested with an induced double fault. Existing aliases are retained; this ownership transition does not establish complete kernel memory protection. Five-level paging is explicitly rejected for now.
+Serial and QEMU diagnostic logs are saved under `build/`. `scripts/test.ps1` runs all nine cases in debug with 128 MiB and release with 256 MiB, retains their logs under `build/test-logs/`, and leaves a normal kernel and init staged afterward. Build and boot commands should run one at a time because they share the staged files.
+
+The current kernel runs one CPU. Its GDT, TSS, 32 exception gates, 16 legacy IRQ gates, a user-callable `INT 0x80` gate, and dedicated double-fault stack are installed before interrupts are enabled. Ring-3 entries use a dedicated kernel stack through TSS.RSP0. The QEMU q35 timer uses the legacy PIC/PIT at approximately 100 Hz. Only IRQ0 is unmasked; its handler increments a counter and acknowledges the interrupt without allocation, logging, or locking. IRQs can interrupt user execution and resume it. After normal init exits, the idle loop wakes on IRQs. Ticks measure delivered interrupts, not calibrated elapsed time; long critical sections can lose ticks. APIC/IOAPIC support and hardware discovery remain future work.
+
+Paging ownership is established by deep-copying Limine's four-level hierarchy, retaining existing mappings and huge-page leaves, and switching CR3. New heap and scratch mappings are supervisor-only, writable, and non-executable; unmapping invalidates the local TLB. NX and supervisor write protection are enabled. Each user address space owns its lower-half mappings and page tables while sharing supervisor-only upper-half kernel mappings. User text is RX, constants are read-only/NX, and data and stack pages are writable/NX; writable/executable user mappings are rejected. The user-fault suite exercises these restrictions. Existing kernel aliases remain, so user W^X does not establish complete kernel memory protection. Double-fault stack installation is still untested with an induced double fault. Five-level paging is explicitly rejected for now.
 
 Physical allocation begins with a bump allocator, then tracks usable pages with a dynamically sized two-bit bitmap. Previously allocated page tables remain tracked, bitmap pages stay reserved, and released pages can be reused. Metadata currently needs one contiguous usable span. Freeing a page requires ending its uses and withdrawing non-direct-map aliases first; checks reject reserved, misaligned, never-allocated, metadata, and already-free pages. They cannot detect a stale ownership claim after a page has been reallocated. The bootstrap stack and boot responses still belong to Limine, so bootloader memory remains reserved.
 
-The fixed 1 MiB heap has unmapped guard pages and uses `linked_list_allocator` 0.10.6 with an interrupt-state-preserving lock. Blocks are reused and coalesced; heap backing pages stay mapped. Unsupported sizes/alignments return allocation failure before entering the dependency. Interrupt and exception handlers must not allocate. Heap growth, bounded allocation latency, page-table reclamation, address-space isolation, scheduling, userspace, and a general device framework remain future work.
+The fixed 1 MiB heap has unmapped guard pages and uses `linked_list_allocator` 0.10.6 with an interrupt-state-preserving lock. Blocks are reused and coalesced; heap backing pages stay mapped. Unsupported sizes/alignments return allocation failure before entering the dependency. Interrupt, exception, and syscall handlers must not allocate. Process teardown restores the kernel root and releases the entire private user tree, including mapped frames and page-table frames. Kernel page-table reclamation, heap growth, bounded allocation latency, scheduling, and a general device framework remain future work.
 
-Kernel entry is in [kernel/src/main.rs](kernel/src/main.rs), boot requests in [kernel/src/boot.rs](kernel/src/boot.rs), physical allocation in [kernel/src/memory.rs](kernel/src/memory.rs), paging in [kernel/src/paging.rs](kernel/src/paging.rs), and exception handling in [kernel/src/interrupts.rs](kernel/src/interrupts.rs). The heap is in [kernel/src/heap.rs](kernel/src/heap.rs) and the first timer driver in [kernel/src/timer.rs](kernel/src/timer.rs). See Rust's [bare-metal target documentation](https://doc.rust-lang.org/rustc/platform-support/x86_64-unknown-none.html) and the [Limine bootloader](https://github.com/Limine-Bootloader/Limine) for the underlying build and handoff contracts.
+### Native userspace and syscall ABI
+
+The loader accepts a bounded subset of static x86-64 ELF `ET_EXEC` images: at most 16 program headers and 2 MiB of mapped image pages, with aligned, readable, non-overlapping segments. It validates the image before mapping segments, copies file data into fresh zeroed pages, and leaves the remainder zeroed for BSS. Dynamic linking and a general Linux or Windows ABI are not implemented. The first application is [userspace/init/src/main.rs](userspace/init/src/main.rs), built with its [own linker script](userspace/init/linker.ld). It runs on a 64 KiB user stack with an unmapped guard page at each end.
+
+The initial native ABI uses `INT 0x80`: RAX holds the call number, RDI/RSI/RDX hold arguments, and RAX returns the result. Returning calls preserve the other general-purpose registers. Negative results are signed error codes. This is Mirror's native interface; matching an interrupt number does not imply Linux ABI compatibility.
+
+| Call | Arguments | Result |
+| --- | --- | --- |
+| `WRITE` (1) | RDI = user buffer address; RSI = byte length. | Writes UTF-8 diagnostics with a `user:` prefix and escaped controls; returns bytes accepted. Maximum 256 bytes. A zero length returns 0 without accessing the pointer; invalid user memory returns -14; oversized input or invalid UTF-8 returns -22. |
+| `TICKS` (2) | None. | Current delivered timer-interrupt count. |
+| `EXIT` (3) | RDI = exit status. | Returns control to the kernel and ends this process; does not resume user code. |
+| Unknown call | Any. | -38. |
+
+The kernel validates an entire user buffer before copying it into a fixed kernel buffer. It never formats a raw user pointer directly. Every return to user mode, including an IRQ return, requires a canonical lower-half RSP above the null page. An invalid stack pointer ends the process before IRET. An exit or ordinary user exception likewise rewrites the saved interrupt frame to a trusted kernel continuation; Rust handlers return normally before IRET resumes the suspended kernel caller. NMI, double fault, and machine check remain fatal platform/kernel paths.
+
+Execution currently supports one synchronous process on the boot CPU. There is no task scheduler, IPC, capability-handle API, or TLS. Initial general-purpose registers are cleared except RDI, which contains the selected test scenario; FS/GS bases are cleared. The integer-only ABI sets CR0.TS during user execution so x87/SIMD use faults until extended-state management is implemented. These limits apply to the current executable milestone, while the architecture below describes the intended broader system.
+
+Kernel entry is in [kernel/src/main.rs](kernel/src/main.rs), boot requests in [kernel/src/boot.rs](kernel/src/boot.rs), physical allocation in [kernel/src/memory.rs](kernel/src/memory.rs), paging in [kernel/src/paging.rs](kernel/src/paging.rs), and exception handling in [kernel/src/interrupts.rs](kernel/src/interrupts.rs). User transitions are in [kernel/src/userspace_entry.S](kernel/src/userspace_entry.S), ELF validation in [kernel/src/elf.rs](kernel/src/elf.rs), and process loading, syscalls, and cleanup in [kernel/src/userspace.rs](kernel/src/userspace.rs). The heap is in [kernel/src/heap.rs](kernel/src/heap.rs) and the first timer driver in [kernel/src/timer.rs](kernel/src/timer.rs). See Rust's [bare-metal target documentation](https://doc.rust-lang.org/rustc/platform-support/x86_64-unknown-none.html) and the [Limine bootloader](https://github.com/Limine-Bootloader/Limine) for the underlying build and handoff contracts.
 
 ## Goals
 
@@ -227,10 +260,10 @@ The first boot slice's acceptance criteria are:
 1. The kernel builds for a bare-metal x86-64 target without a host operating-system runtime.
 2. The EFI boot tree reaches Mirror's entry point under QEMU and emits an identifiable serial boot message.
 3. The kernel validates the required boot-protocol revision and memory-map response before inspecting entries; missing required data produces a diagnostic halt.
-4. Memory-map accounting and frame allocation distinguish usable memory from reserved regions. Frame recycling, page-table ownership, and the initial heap are implemented; bootloader and page-table reclamation remain later work.
+4. Memory-map accounting and frame allocation distinguish usable memory from reserved regions. Frame recycling, page-table ownership, and the initial heap are implemented; private user trees are reclaimed on process teardown. Bootloader and kernel page-table reclamation remain later work.
 5. Panic and normal idle paths remain within Mirror. Fatal paths disable maskable interrupts and halt; normal idle enables them and wakes for timer IRQs.
 
-This slice establishes boot and handoff behavior. It does not yet claim process isolation, driver compatibility, application execution, or inference capability.
+This original slice establishes boot and handoff behavior. Work has now reached the first part of stage 3: one native user process with isolated user mappings, syscalls, and teardown. Scheduling, IPC, and capability handles are still needed to complete that stage. Driver compatibility, general application compatibility, and inference capability remain later milestones.
 
 ### Performance evidence
 

@@ -3,7 +3,7 @@ param(
     [switch]$Release,
     [switch]$Smoke,
     [switch]$NoBuild,
-    [ValidateSet('None', 'PageFault', 'InvalidOpcode')][string]$Fault = 'None',
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -27,7 +27,7 @@ if (-not $NoBuild) {
 
 $buildDirectory = Join-Path $repositoryRoot 'build'
 $espDirectory = Join-Path $buildDirectory 'esp'
-foreach ($relativePath in @('EFI/BOOT/BOOTX64.EFI', 'kernel.elf', 'limine.conf')) {
+foreach ($relativePath in @('EFI/BOOT/BOOTX64.EFI', 'kernel.elf', 'init.elf', 'limine.conf')) {
     if (-not (Test-Path -LiteralPath (Join-Path $espDirectory $relativePath) -PathType Leaf)) {
         throw "The boot tree is incomplete: $relativePath. Run scripts/build.ps1 first."
     }
@@ -36,8 +36,18 @@ foreach ($relativePath in @('EFI/BOOT/BOOTX64.EFI', 'kernel.elf', 'limine.conf')
 # All fault cases use the same smoke binary, selected by its boot command line.
 # Always start from the repository config so -NoBuild cannot retain a stale mode.
 $bootConfig = [System.IO.File]::ReadAllText((Join-Path $repositoryRoot 'boot/limine.conf'))
-if ($Fault -eq 'PageFault') { $bootConfig += "`n    cmdline: mirror.test=page-fault`n" }
-if ($Fault -eq 'InvalidOpcode') { $bootConfig += "`n    cmdline: mirror.test=invalid-opcode`n" }
+$testMode = switch ($Fault) {
+    'PageFault' { 'page-fault' }
+    'InvalidOpcode' { 'invalid-opcode' }
+    'UserKernelRead' { 'user-kernel-read' }
+    'UserCodeWrite' { 'user-code-write' }
+    'UserNx' { 'user-nx' }
+    'UserGuard' { 'user-guard' }
+    'UserPrivileged' { 'user-privileged' }
+    'UserBadStack' { 'user-bad-stack' }
+    default { $null }
+}
+if ($null -ne $testMode) { $bootConfig += "`n    cmdline: mirror.test=$testMode`n" }
 [System.IO.File]::WriteAllText((Join-Path $espDirectory 'limine.conf'), $bootConfig)
 
 # Never write to the QEMU installation's firmware template. A fresh local copy
@@ -89,13 +99,46 @@ try {
     if ($serial -match '(?im)^(?:MIRROR_PANIC|PANIC|\[panic\])') {
         throw "Mirror reported a panic. See $serialLog."
     }
-    $expectedExitCode = if ($Fault -eq 'None') { 33 } else { 35 }
+    $fatalKernelFault = $Fault -in @('PageFault', 'InvalidOpcode')
+    $expectedExitCode = if ($fatalKernelFault) { 35 } else { 33 }
     if ($qemuExitCode -ne $expectedExitCode) {
         $qemuError = [System.IO.File]::ReadAllText($stderrLog)
         throw "Mirror smoke test expected QEMU exit $expectedExitCode; got $qemuExitCode. $qemuError See $serialLog."
     }
-    $markers = @('MIRROR_FRAMES_OK', 'MIRROR_ALLOCATOR_TESTS_OK', 'MIRROR_FRAME_REUSE_OK', 'MIRROR_EXCEPTIONS_OK', 'MIRROR_PAGING_OK', 'MIRROR_HEAP_OK', 'MIRROR_TIMER_OK', 'MIRROR_HEAP_IRQ_OK')
-    if ($Fault -eq 'None') {
+    $markers = @('MIRROR_FRAMES_OK', 'MIRROR_ALLOCATOR_TESTS_OK', 'MIRROR_FRAME_REUSE_OK', 'MIRROR_EXCEPTIONS_OK', 'MIRROR_PAGING_OK', 'MIRROR_HEAP_OK', 'MIRROR_TIMER_OK', 'MIRROR_HEAP_IRQ_OK', 'MIRROR_USER_PAGING_OK', 'MIRROR_ELF_TESTS_OK', 'MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_USER_LOAD_ROLLBACK_OK')
+    $scenario = switch ($Fault) {
+        'UserKernelRead' { 1 }
+        'UserCodeWrite' { 2 }
+        'UserNx' { 3 }
+        'UserGuard' { 4 }
+        'UserPrivileged' { 5 }
+        'UserBadStack' { 6 }
+        default { 0 }
+    }
+    if ($serial -notmatch "(?m)^MIRROR_USERSPACE_OK scenario=$scenario(?:\s|$)") {
+        throw "Mirror did not finish userspace scenario $scenario. See $serialLog."
+    }
+    if ($Fault -eq 'UserBadStack') {
+        if ($serial -notmatch '(?m)^MIRROR_USER_RETURN_REJECTED(?:\s|$)') {
+            throw "Mirror did not reject the invalid userspace return stack. See $serialLog."
+        }
+        if ($serial -match '(?m)^MIRROR_USER_FAULT_CONTAINED(?:\s|$)') {
+            throw "Mirror faulted instead of rejecting the invalid userspace return stack. See $serialLog."
+        }
+    }
+    elseif ($scenario -ne 0) {
+        $userVector = if ($Fault -eq 'UserPrivileged') { 13 } else { 14 }
+        if ($serial -notmatch "(?m)^MIRROR_USER_FAULT_CONTAINED vector=$userVector(?:\s|$)") {
+            throw "Mirror did not contain the intended $Fault exception. See $serialLog."
+        }
+    }
+    elseif ($serial -match '(?m)^MIRROR_USER_FAULT_CONTAINED(?:\s|$)') {
+        throw "Mirror reported an unexpected userspace fault. See $serialLog."
+    }
+    if ($Fault -ne 'UserBadStack' -and $serial -match '(?m)^MIRROR_USER_RETURN_REJECTED(?:\s|$)') {
+        throw "Mirror unexpectedly rejected a userspace return stack. See $serialLog."
+    }
+    if (-not $fatalKernelFault) {
         $markers += @('MIRROR_PAGE_FAULT_OK', 'MIRROR_BOOT_OK')
         if ($serial -match '(?im)^(?:EXCEPTION|MIRROR_EXCEPTION)(?:\s|:|$)') {
             throw "Mirror reported an unexpected exception. See $serialLog."

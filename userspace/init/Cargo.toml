@@ -1,0 +1,13 @@
+[package]
+name = "mirror-init"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "mirror-init"
+path = "src/main.rs"
+test = false
+bench = false
+

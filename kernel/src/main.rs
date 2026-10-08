@@ -5,12 +5,14 @@ extern crate alloc;
 
 mod arch;
 mod boot;
+mod elf;
 mod heap;
 mod interrupts;
 mod memory;
 mod paging;
 mod serial;
 mod timer;
+mod userspace;
 
 use core::panic::PanicInfo;
 use limine::memory_map::EntryType;
@@ -108,8 +110,37 @@ pub extern "C" fn _start() -> ! {
         heap::self_test();
         timer::self_test();
         test_heap_with_interrupts();
+        elf::self_test();
+    }
+
+    let scenario = {
+        #[cfg(feature = "boot-smoke")]
+        {
+            if let boot::SmokeMode::User(value) = boot::smoke_mode() {
+                value
+            } else {
+                0
+            }
+        }
+        #[cfg(not(feature = "boot-smoke"))]
+        {
+            0
+        }
+    };
+    userspace::run_init(
+        &tables,
+        &mut frames,
+        boot.init,
+        boot.direct_map_offset,
+        scenario,
+    );
+
+    #[cfg(feature = "boot-smoke")]
+    {
         match boot::smoke_mode() {
-            boot::SmokeMode::Normal => interrupts::arm_expected_page_fault(paging::TEST_ADDRESS),
+            boot::SmokeMode::Normal | boot::SmokeMode::User(_) => {
+                interrupts::arm_expected_page_fault(paging::TEST_ADDRESS)
+            }
             boot::SmokeMode::PageFault => {
                 serial::println!("MIRROR_TEST_EXPECT_FATAL vector=14");
             }

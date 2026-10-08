@@ -51,6 +51,10 @@ MIRROR_EXCEPTION 31
     MIRROR_EXCEPTION \vector
 .endr
 
+# Native syscall interrupt gate is the only software gate callable at CPL3.
+.global mirror_exception_128
+MIRROR_EXCEPTION 128
+
 .type mirror_exception_common, @function
 mirror_exception_common:
     push rax

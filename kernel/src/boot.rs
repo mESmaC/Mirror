@@ -4,7 +4,8 @@
 use limine::{
     BaseRevision,
     request::{
-        HhdmRequest, MemoryMapRequest, RequestsEndMarker, RequestsStartMarker, StackSizeRequest,
+        HhdmRequest, MemoryMapRequest, ModuleRequest, RequestsEndMarker, RequestsStartMarker,
+        StackSizeRequest,
     },
     response::MemoryMapResponse,
 };
@@ -25,6 +26,10 @@ static MEMORY_MAP: MemoryMapRequest = MemoryMapRequest::new();
 #[unsafe(link_section = ".limine_requests")]
 static HHDM: HhdmRequest = HhdmRequest::new();
 
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static MODULES: ModuleRequest = ModuleRequest::new();
+
 #[cfg(feature = "boot-smoke")]
 #[used]
 #[unsafe(link_section = ".limine_requests")]
@@ -42,13 +47,39 @@ static END: RequestsEndMarker = RequestsEndMarker::new();
 pub struct BootInfo {
     pub memory_map: &'static MemoryMapResponse,
     pub direct_map_offset: u64,
+    pub init: &'static [u8],
 }
 
 pub fn info() -> BootInfo {
     assert!(BASE.is_supported(), "unsupported Limine base revision");
+    let modules = MODULES
+        .get_response()
+        .expect("missing native init module")
+        .modules();
+    assert_eq!(modules.len(), 1, "expected exactly one boot module");
+    let init = modules[0];
+    assert_eq!(
+        init.string().to_bytes(),
+        b"mirror-init",
+        "unexpected boot module"
+    );
+    let length = usize::try_from(init.size()).expect("init module too large");
+    assert!(
+        (64..=16 * 1024 * 1024).contains(&length),
+        "invalid init module size"
+    );
+    assert!(!init.addr().is_null(), "null init module");
+    assert!(
+        (init.addr() as usize).checked_add(length).is_some(),
+        "init module wraps"
+    );
+    // SAFETY: Limine supplies this immutable, contiguous module of the reported
+    // length; its reserved pages and boot responses remain live for the kernel.
+    let init = unsafe { core::slice::from_raw_parts(init.addr(), length) };
     BootInfo {
         memory_map: MEMORY_MAP.get_response().expect("missing memory map"),
         direct_map_offset: HHDM.get_response().expect("missing direct map").offset(),
+        init,
     }
 }
 
@@ -57,6 +88,7 @@ pub enum SmokeMode {
     Normal,
     PageFault,
     InvalidOpcode,
+    User(u64),
 }
 
 #[cfg(feature = "boot-smoke")]
@@ -69,6 +101,12 @@ pub fn smoke_mode() -> SmokeMode {
         b"" => SmokeMode::Normal,
         b"mirror.test=page-fault" => SmokeMode::PageFault,
         b"mirror.test=invalid-opcode" => SmokeMode::InvalidOpcode,
+        b"mirror.test=user-kernel-read" => SmokeMode::User(1),
+        b"mirror.test=user-code-write" => SmokeMode::User(2),
+        b"mirror.test=user-nx" => SmokeMode::User(3),
+        b"mirror.test=user-guard" => SmokeMode::User(4),
+        b"mirror.test=user-privileged" => SmokeMode::User(5),
+        b"mirror.test=user-bad-stack" => SmokeMode::User(6),
         _ => panic!("unknown smoke-test command line"),
     }
 }
