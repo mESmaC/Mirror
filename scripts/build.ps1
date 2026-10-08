@@ -15,16 +15,18 @@ try {
     $previousFlags = $env:CARGO_ENCODED_RUSTFLAGS
     $previousReleaseLto = $env:CARGO_PROFILE_RELEASE_LTO
     try {
-        $initLinker = Join-Path $repositoryRoot 'userspace/init/linker.ld'
-        # Init lives in the low half, so use the small code model. Rust's
+        # Native programs live in the low half, so use the small code model. Rust's
         # prebuilt core uses the kernel model; do not merge their LLVM bitcode.
         # The kernel build below retains the workspace's release LTO setting.
         $env:CARGO_PROFILE_RELEASE_LTO = 'false'
-        $env:CARGO_ENCODED_RUSTFLAGS = @('-C', 'relocation-model=static', '-C', 'code-model=small', '-C', "link-arg=-T$initLinker", '-C', 'link-arg=-zmax-page-size=0x1000') -join [char]31
-        $initArguments = @('build', '--locked', '-p', 'mirror-init', '--target', 'x86_64-unknown-none')
-        if ($Release) { $initArguments += '--release' }
-        & cargo @initArguments
-        if ($LASTEXITCODE -ne 0) { throw "Init build failed with exit code $LASTEXITCODE." }
+        foreach ($nativePackage in @('init', 'desktop')) {
+            $nativeLinker = Join-Path $repositoryRoot "userspace/$nativePackage/linker.ld"
+            $env:CARGO_ENCODED_RUSTFLAGS = @('-C', 'relocation-model=static', '-C', 'code-model=small', '-C', "link-arg=-T$nativeLinker", '-C', 'link-arg=-zmax-page-size=0x1000') -join [char]31
+            $nativeArguments = @('build', '--locked', '-p', "mirror-$nativePackage", '--target', 'x86_64-unknown-none')
+            if ($Release) { $nativeArguments += '--release' }
+            & cargo @nativeArguments
+            if ($LASTEXITCODE -ne 0) { throw "$nativePackage build failed with exit code $LASTEXITCODE." }
+        }
     }
     finally {
         $env:CARGO_ENCODED_RUSTFLAGS = $previousFlags
@@ -76,8 +78,9 @@ try {
     Copy-Item -LiteralPath $bootFiles[0].FullName -Destination (Join-Path $efiDirectory 'BOOTX64.EFI') -Force
     Copy-Item -LiteralPath $kernelPath -Destination (Join-Path $espDirectory 'kernel.elf') -Force
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "target/x86_64-unknown-none/$profile/mirror-init") -Destination (Join-Path $espDirectory 'init.elf') -Force
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "target/x86_64-unknown-none/$profile/mirror-desktop") -Destination (Join-Path $espDirectory 'desktop.elf') -Force
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'boot/limine.conf') -Destination (Join-Path $espDirectory 'limine.conf') -Force
-    Write-Host "Mirror $profile kernel, native init, and verified Limine $limineVersion staged in $espDirectory"
+    Write-Host "Mirror $profile kernel, native init/desktop, and verified Limine $limineVersion staged in $espDirectory"
 }
 finally {
     Pop-Location

@@ -17,7 +17,7 @@ $codePath = Get-MirrorFirmware -RequestedPath $FirmwareCode -QemuDirectory $qemu
 $varsTemplate = Get-MirrorFirmware -RequestedPath $FirmwareVars -QemuDirectory $qemuDirectory -Names @('edk2-i386-vars.fd', 'OVMF_VARS.fd', 'OVMF_VARS.4m.fd') -ParameterName 'FirmwareVars'
 $buildDirectory = Join-Path $repositoryRoot 'build'
 $espDirectory = Join-Path $buildDirectory 'esp'
-foreach ($relativePath in @('EFI/BOOT/BOOTX64.EFI', 'kernel.elf', 'init.elf', 'limine.conf')) {
+foreach ($relativePath in @('EFI/BOOT/BOOTX64.EFI', 'kernel.elf', 'init.elf', 'desktop.elf', 'limine.conf')) {
     if (-not (Test-Path -LiteralPath (Join-Path $espDirectory $relativePath) -PathType Leaf)) {
         throw "The boot tree is incomplete: $relativePath. Run scripts/build.ps1 first."
     }
@@ -31,6 +31,10 @@ $consoleScreenshot = Join-Path $buildDirectory 'normal-console.png'
 $pointerScreenshot = Join-Path $buildDirectory 'normal-pointer.png'
 $cursorAwayScreenshot = Join-Path $buildDirectory 'cursor-away.png'
 $cursorRestoredScreenshot = Join-Path $buildDirectory 'cursor-restored.png'
+$desktopScreenshot = Join-Path $buildDirectory 'desktop.png'
+$desktopInputScreenshot = Join-Path $buildDirectory 'desktop-input.png'
+$desktopAwayScreenshot = Join-Path $buildDirectory 'desktop-cursor-away.png'
+$desktopRestoredScreenshot = Join-Path $buildDirectory 'desktop-cursor-restored.png'
 [System.IO.File]::WriteAllText($serialLog, '')
 
 function Read-MirrorSerial {
@@ -124,6 +128,27 @@ function Save-MirrorScreenshot {
     }
 }
 
+function Wait-MirrorDesktopMessage {
+    param([System.Diagnostics.Process]$Process, [string]$Pattern, [int]$AfterOffset = 0)
+    $deadline = [System.Diagnostics.Stopwatch]::StartNew()
+    do {
+        if ($Process.HasExited) { throw 'Kernel exited during desktop capture.' }
+        $serial = Read-MirrorSerial
+        if ($serial -match '(?m)^(?:MIRROR_PANIC|MIRROR_EXCEPTION|MIRROR_USER_FAULT)(?:\s|:|$)') {
+            throw "Desktop or kernel faulted. See $serialLog."
+        }
+        if ($serial.Length -lt $AfterOffset) { throw 'Serial log unexpectedly shrank.' }
+        if ($serial.Substring($AfterOffset) -match $Pattern) { return }
+        if ($deadline.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw "Desktop did not report $Pattern. See $serialLog." }
+        Start-Sleep -Milliseconds 50
+    } while ($true)
+}
+
+function Wait-MirrorDesktopPointer {
+    param([System.Diagnostics.Process]$Process, [int]$X, [int]$Y, [int]$Buttons, [int]$AfterOffset)
+    Wait-MirrorDesktopMessage $Process "(?m)^user: Mirror desktop: pointer $X $Y $Buttons\\n\r?`$" $AfterOffset
+}
+
 function Send-MirrorPointerMotion {
     param([System.Diagnostics.Process]$Process, [int]$Dx, [int]$Dy)
     # Keep each delta below a standard PS/2 packet's range, while allowing the
@@ -203,6 +228,73 @@ try {
     $greeting = Read-MirrorQmp $process
     if (-not $greeting.PSObject.Properties['QMP']) { throw 'Missing QMP greeting.' }
     Invoke-MirrorQmp $process 'qmp_capabilities'
+    Wait-MirrorDesktopMessage $process '(?m)^MIRROR_DESKTOP_READY(?:\s|$)'
+    $desktopReady = [regex]::Match((Read-MirrorSerial), '(?m)^MIRROR_DESKTOP_READY .*width=(\d+) height=(\d+)(?:\s|$)')
+    if (-not $desktopReady.Success) { throw 'Native desktop surface geometry is missing.' }
+    $desktopWidth = [int]$desktopReady.Groups[1].Value
+    $desktopHeight = [int]$desktopReady.Groups[2].Value
+    $desktopStartX = [int][Math]::Floor($desktopWidth / 2)
+    $desktopStartY = [int][Math]::Floor($desktopHeight / 2)
+    Save-MirrorScreenshot $process $desktopScreenshot
+    Wait-MirrorDesktopMessage $process '(?m)^MIRROR_DESKTOP_INPUT_TIMEOUT(?:\s|$)'
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorPointerMotion $process (-2 * $desktopWidth) (-2 * $desktopHeight)
+    Wait-MirrorDesktopPointer $process 0 0 0 $offset
+    Save-MirrorScreenshot $process $desktopAwayScreenshot
+    if ((Get-FileHash -LiteralPath $desktopScreenshot).Hash -eq (Get-FileHash -LiteralPath $desktopAwayScreenshot).Hash) {
+        throw 'Userspace cursor movement did not change the display.'
+    }
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorPointerMotion $process (2 * $desktopWidth) (2 * $desktopHeight)
+    Wait-MirrorDesktopPointer $process ($desktopWidth - 1) ($desktopHeight - 1) 0 $offset
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorPointerMotion $process ($desktopStartX - $desktopWidth + 1) ($desktopStartY - $desktopHeight + 1)
+    Wait-MirrorDesktopPointer $process $desktopStartX $desktopStartY 0 $offset
+    Save-MirrorScreenshot $process $desktopRestoredScreenshot
+    if ((Get-FileHash -LiteralPath $desktopScreenshot).Hash -ne (Get-FileHash -LiteralPath $desktopRestoredScreenshot).Hash) {
+        throw 'Userspace cursor restoration left stale pixels.'
+    }
+
+    Send-MirrorText $process 'abcd'
+    $windowWidth = [Math]::Min(896, $desktopWidth - 48)
+    $windowHeight = [Math]::Min(424, $desktopHeight - 96)
+    $windowX = [int][Math]::Floor(($desktopWidth - $windowWidth) / 2)
+    $windowY = [int][Math]::Floor(($desktopHeight - $windowHeight) / 2)
+    $desktopClickX = $windowX + 28 + 12 + 2 * 12 + 1
+    $desktopClickY = $windowY + 104 + 22
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorPointerMotion $process ($desktopClickX - $desktopStartX) ($desktopClickY - $desktopStartY)
+    Wait-MirrorDesktopPointer $process $desktopClickX $desktopClickY 0 $offset
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorPointerButton $process 'left' $true
+    Wait-MirrorDesktopPointer $process $desktopClickX $desktopClickY 1 $offset
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorPointerButton $process 'left' $false
+    Wait-MirrorDesktopPointer $process $desktopClickX $desktopClickY 0 $offset
+    Send-MirrorKey $process 'x'
+    $applyX = $windowX + $windowWidth - 88
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorPointerMotion $process ($applyX - $desktopClickX) 0
+    Wait-MirrorDesktopPointer $process $applyX $desktopClickY 0 $offset
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorPointerButton $process 'left' $true
+    Wait-MirrorDesktopMessage $process '(?m)^user: Mirror desktop: submit abxcd\\n\r?$' $offset
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorPointerButton $process 'left' $false
+    Wait-MirrorDesktopPointer $process $applyX $desktopClickY 0 $offset
+    # Compare edited pixels with identical cursor placement in both frames.
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorPointerMotion $process ($desktopStartX - $applyX) ($desktopStartY - $desktopClickY)
+    Wait-MirrorDesktopPointer $process $desktopStartX $desktopStartY 0 $offset
+    Save-MirrorScreenshot $process $desktopInputScreenshot
+    if ((Get-FileHash -LiteralPath $desktopScreenshot).Hash -eq (Get-FileHash -LiteralPath $desktopInputScreenshot).Hash) {
+        throw 'Native desktop did not change after editing and Apply.'
+    }
+    if ((Read-MirrorSerial) -notmatch '(?m)^MIRROR_DESKTOP_FRAME .*keyboard_irq=[1-9][0-9]* mouse_irq=[1-9][0-9]*(?:\s|$)') {
+        throw 'Native desktop did not confirm a frame after real keyboard/mouse IRQs.'
+    }
+    Send-MirrorKey $process 'esc'
+    Wait-MirrorDesktopMessage $process '(?m)^MIRROR_DESKTOP_CLEANUP_OK reason=exit handles_reclaimed=1 status=0\r?$'
     $elapsed = [System.Diagnostics.Stopwatch]::StartNew()
     do {
         if ($process.HasExited) { throw 'Normal kernel exited before reaching idle.' }
@@ -310,7 +402,7 @@ try {
     if ((Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash -ne $testDiskHash) {
         throw 'The read-only block fixture was modified during the capture.'
     }
-    Write-Host "Normal boot, keyboard/mouse input, cursor restoration, and click editing passed. Image: $pointerScreenshot"
+    Write-Host "Native desktop, input isolation, cursor restoration, and fallback console captures passed. Image: $desktopInputScreenshot"
 }
 finally {
     if ($started) {

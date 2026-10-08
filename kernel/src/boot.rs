@@ -52,6 +52,7 @@ pub struct BootInfo {
     pub memory_map: &'static MemoryMapResponse,
     pub direct_map_offset: u64,
     pub init: &'static [u8],
+    pub desktop: &'static [u8],
     pub framebuffer: Option<limine::framebuffer::Framebuffer<'static>>,
 }
 
@@ -59,32 +60,37 @@ pub fn info() -> BootInfo {
     assert!(BASE.is_supported(), "unsupported Limine base revision");
     let modules = MODULES
         .get_response()
-        .expect("missing native init module")
+        .expect("missing native modules")
         .modules();
-    assert_eq!(modules.len(), 1, "expected exactly one boot module");
-    let init = modules[0];
-    assert_eq!(
-        init.string().to_bytes(),
-        b"mirror-init",
-        "unexpected boot module"
-    );
-    let length = usize::try_from(init.size()).expect("init module too large");
-    assert!(
-        (64..=16 * 1024 * 1024).contains(&length),
-        "invalid init module size"
-    );
-    assert!(!init.addr().is_null(), "null init module");
-    assert!(
-        (init.addr() as usize).checked_add(length).is_some(),
-        "init module wraps"
-    );
-    // SAFETY: Limine supplies this immutable, contiguous module of the reported
-    // length; its reserved pages and boot responses remain live for the kernel.
-    let init = unsafe { core::slice::from_raw_parts(init.addr(), length) };
+    assert_eq!(modules.len(), 2, "expected two native boot modules");
+    let mut init = None;
+    let mut desktop = None;
+    for module in modules {
+        let slot = match module.string().to_bytes() {
+            b"mirror-init" => &mut init,
+            b"mirror-desktop" => &mut desktop,
+            _ => panic!("unexpected native boot module"),
+        };
+        assert!(slot.is_none(), "duplicate native boot module");
+        let length = usize::try_from(module.size()).expect("native module too large");
+        assert!(
+            (64..=16 * 1024 * 1024).contains(&length),
+            "invalid module size"
+        );
+        assert!(!module.addr().is_null(), "null native module");
+        assert!(
+            (module.addr() as usize).checked_add(length).is_some(),
+            "module wraps"
+        );
+        // SAFETY: Limine supplies each immutable, contiguous module of the
+        // reported length; reserved module pages remain live for the kernel.
+        *slot = Some(unsafe { core::slice::from_raw_parts(module.addr(), length) });
+    }
     BootInfo {
         memory_map: MEMORY_MAP.get_response().expect("missing memory map"),
         direct_map_offset: HHDM.get_response().expect("missing direct map").offset(),
-        init,
+        init: init.expect("missing native init"),
+        desktop: desktop.expect("missing native desktop"),
         framebuffer: FRAMEBUFFER
             .get_response()
             .and_then(|response| response.framebuffers().next()),

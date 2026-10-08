@@ -1,5 +1,5 @@
 [workspace]
-members = ["kernel", "userspace/init"]
+members = ["kernel", "userspace/init", "userspace/desktop"]
 default-members = ["kernel"]
 resolver = "3"
 

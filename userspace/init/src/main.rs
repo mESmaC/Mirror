@@ -508,6 +508,20 @@ fn check_ipc(console: u64, role: u64, probe: u64, surface: u64) {
     require(outbound > 0, 61);
     require(inbound > 0, 62);
     let receiver = inbound as u64;
+    // A channel has RECEIVE rights but is not an input object. Neither probe
+    // process receives slot 4, and rejected calls must not touch an input lease.
+    require(syscall(SYS_BOOT_HANDLE, 4, 0, 0) == EBADF, 185);
+    let mut input_bytes = [0u8; 32];
+    for call in [15, 16] {
+        require(
+            syscall(call, receiver, input_bytes.as_mut_ptr() as u64, 32) == EACCES,
+            186,
+        );
+        require(
+            syscall(call, u64::MAX, input_bytes.as_mut_ptr() as u64, 32) == EBADF,
+            187,
+        );
+    }
     let sender = check_capabilities(console, outbound as u64, receiver, surface);
     if role == 0 {
         require(receive_message(receiver, 1, 1, true) == 0, 180);

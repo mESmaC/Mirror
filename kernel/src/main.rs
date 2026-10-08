@@ -12,6 +12,7 @@ mod dma;
 mod elf;
 mod framebuffer;
 mod heap;
+mod input;
 mod interrupts;
 mod ipc;
 mod keyboard;
@@ -159,6 +160,7 @@ pub extern "C" fn _start() -> ! {
         keyboard::self_test();
         mouse::self_test();
         ps2::self_test();
+        input::self_test();
         pointer::self_test();
         console::self_test();
         assert!(devices.functions > 0, "no PCI devices discovered");
@@ -248,6 +250,23 @@ pub extern "C" fn _start() -> ! {
         serial::println!("MIRROR_FRAMEBUFFER_PRESENTED");
     }
 
+    #[cfg(not(feature = "boot-smoke"))]
+    serial::println!("MIRROR_BOOT_OK");
+    let mut input_consumer = ps2::Consumer::claim().expect("exclusive input consumer");
+    if let Some(display) = display.as_mut().filter(|_| keyboard_ready || mouse_ready) {
+        userspace::run_desktop(
+            &tables,
+            &mut frames,
+            boot.desktop,
+            boot.direct_map_offset,
+            display,
+            &mut input_consumer,
+            cfg!(feature = "boot-smoke"),
+        );
+    } else {
+        serial::println!("MIRROR_DESKTOP_SKIPPED reason=missing_display_or_input");
+    }
+
     #[cfg(feature = "boot-smoke")]
     {
         match boot::smoke_mode() {
@@ -276,10 +295,9 @@ pub extern "C" fn _start() -> ! {
 
     #[cfg(not(feature = "boot-smoke"))]
     {
-        serial::println!("MIRROR_BOOT_OK");
         serial::println!("Mirror idle: timer ticks={}", timer::ticks());
         if keyboard_ready || mouse_ready {
-            run_console(&mut display, mouse_ready);
+            run_console(&mut display, mouse_ready, &mut input_consumer);
         }
         // SAFETY: Only initialized IRQ sources are unmasked; the heap and
         // descriptors are ready. Keep allocator/table state alive here.
@@ -288,12 +306,16 @@ pub extern "C" fn _start() -> ! {
 }
 
 #[cfg(not(feature = "boot-smoke"))]
-fn run_console(display: &mut Option<framebuffer::Driver<'_>>, mouse_ready: bool) -> ! {
+fn run_console(
+    display: &mut Option<framebuffer::Driver<'_>>,
+    mouse_ready: bool,
+    input_consumer: &mut ps2::Consumer,
+) -> ! {
     assert!(!arch::interrupts_enabled());
     // Discard the bounded queue left by boot. Limit work even if new bytes keep
     // arriving through the controller's deferred-drain path.
     for _ in 0..128 {
-        if ps2::next_event().is_none() {
+        if input_consumer.next_event().is_none() {
             break;
         }
     }
@@ -338,7 +360,7 @@ fn run_console(display: &mut Option<framebuffer::Driver<'_>>, mouse_ready: bool)
         for _ in 0..32 {
             // One controller consumer preserves keyboard/mouse event order and
             // places a loss barrier before any input after a discarded queue.
-            let Some(event) = ps2::next_event() else {
+            let Some(event) = input_consumer.next_event() else {
                 full_batch = false;
                 break;
             };

@@ -37,7 +37,7 @@ if (-not $NoBuild) {
 
 $buildDirectory = Join-Path $repositoryRoot 'build'
 $espDirectory = Join-Path $buildDirectory 'esp'
-foreach ($relativePath in @('EFI/BOOT/BOOTX64.EFI', 'kernel.elf', 'init.elf', 'limine.conf')) {
+foreach ($relativePath in @('EFI/BOOT/BOOTX64.EFI', 'kernel.elf', 'init.elf', 'desktop.elf', 'limine.conf')) {
     if (-not (Test-Path -LiteralPath (Join-Path $espDirectory $relativePath) -PathType Leaf)) {
         throw "The boot tree is incomplete: $relativePath. Run scripts/build.ps1 first."
     }
@@ -150,6 +150,18 @@ try {
     $markers += @('MIRROR_CONTIGUOUS_TESTS_OK', 'MIRROR_DMA_TESTS_OK', 'MIRROR_BLOCK_TESTS_OK')
     $markers += @('MIRROR_KEYBOARD_TESTS_OK', 'MIRROR_CONSOLE_TESTS_OK')
     $markers += @('MIRROR_PS2_TESTS_OK', 'MIRROR_MOUSE_TESTS_OK', 'MIRROR_POINTER_TESTS_OK')
+    $markers += @('MIRROR_INPUT_TESTS_OK', 'MIRROR_SERVICE_POLICY_TESTS_OK')
+    if ($NoKeyboard -or $NoDisplayDevice) {
+        $markers += 'MIRROR_DESKTOP_SKIPPED reason=missing_display_or_input'
+        if ($serial -match '(?m)^MIRROR_DESKTOP_(?:TESTS_OK|CLEANUP_OK)(?:\s|$)') {
+            throw "Mirror unexpectedly ran a desktop without input/display. See $serialLog."
+        }
+    } else {
+        $markers += @('MIRROR_DESKTOP_TESTS_OK', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'MIRROR_DESKTOP_CLEANUP_OK reason=fault handles_reclaimed=1')
+        if ($serial -match '(?m)^MIRROR_DESKTOP_SKIPPED(?:\s|$)') {
+            throw "Mirror skipped its desktop lifecycle checks. See $serialLog."
+        }
+    }
     if ($NoKeyboard) {
         $markers += @('MIRROR_KEYBOARD_SKIPPED', 'MIRROR_MOUSE_SKIPPED')
         if ($serial -match '(?m)^MIRROR_(?:KEYBOARD|MOUSE)_READY(?:\s|$)') {

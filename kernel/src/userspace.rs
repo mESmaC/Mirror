@@ -1,4 +1,4 @@
-//! Bounded round-robin userspace scheduling on the BSP, with integer contexts.
+//! Native BSP scheduling with finite probes and a periodically limited desktop.
 //! IRQ/syscall handlers return to the scheduler before another process resumes.
 //! User buffers are checked and copied through the direct map before use.
 
@@ -7,12 +7,12 @@ use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use crate::{
     arch,
     capability::{self, CapError, Capability, HandleTable, Object},
-    elf, framebuffer,
+    elf, framebuffer, input,
     interrupts::{self, TrapFrame},
     ipc::{Ipc, IpcError, MESSAGE_SIZE},
     memory::{FrameAllocator, PAGE_SIZE},
     paging::{PageTables, PagingError, UserAddressSpace, UserPermissions},
-    serial, surface, timer,
+    ps2, serial, surface, timer,
 };
 
 const STACK_BASE: u64 = 0x7fff_0000;
@@ -28,6 +28,11 @@ const QUANTUM_TICKS: u64 = 2;
 const USER_TICK_BUDGET: u64 = 32;
 const MAX_SLEEP_TICKS: u64 = 1000;
 const RECEIVE_TIMEOUT: u64 = 100;
+const SERVICE_ALLOWANCE: u64 = 32;
+const SERVICE_PERIOD: u64 = 100;
+const DESKTOP_READY: &[u8] = b"Mirror desktop: ready\n";
+const DESKTOP_FRAME: &[u8] = b"Mirror desktop: frame\n";
+const DESKTOP_CHECKS: &[u8] = b"Mirror desktop: checks passed\n";
 
 #[repr(C, align(16))]
 struct KernelStack([u8; KERNEL_STACK_SIZE]);
@@ -38,6 +43,7 @@ static mut KERNEL_STACK: KernelStack = KernelStack([0; KERNEL_STACK_SIZE]);
 static ACTIVE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 static ACTIVE_IPC: AtomicPtr<Ipc> = AtomicPtr::new(core::ptr::null_mut());
 static ACTIVE_SURFACE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+static ACTIVE_INPUT: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +70,7 @@ enum State {
     Running,
     Sleeping(u64),
     Receiving(PendingReceive),
+    InputWaiting(PendingInput),
     Finished,
 }
 
@@ -73,6 +80,56 @@ struct PendingReceive {
     address: u64,
     capacity: usize,
     deadline: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingInput {
+    handle: u64,
+    address: u64,
+    deadline: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ServicePolicy {
+    window_start: u64,
+    used: u64,
+}
+
+impl ServicePolicy {
+    fn new(now: u64) -> Self {
+        Self {
+            window_start: now,
+            used: 0,
+        }
+    }
+
+    fn refresh(&mut self, now: u64) {
+        let elapsed = now.wrapping_sub(self.window_start);
+        if (SERVICE_PERIOD..(1_u64 << 63)).contains(&elapsed) {
+            // Advance complete anchored periods. Sleeping through many periods
+            // earns one allowance, never accumulated credit or a shifted window.
+            self.window_start = now.wrapping_sub(elapsed % SERVICE_PERIOD);
+            self.used = 0;
+        }
+    }
+
+    fn eligible(&mut self, now: u64) -> bool {
+        self.refresh(now);
+        self.used < SERVICE_ALLOWANCE
+    }
+
+    fn charge(&mut self, now: u64) -> bool {
+        self.refresh(now);
+        assert!(self.used < SERVICE_ALLOWANCE, "throttled service resumed");
+        self.used += 1;
+        self.used == SERVICE_ALLOWANCE
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CpuPolicy {
+    Probe,
+    Desktop(ServicePolicy),
 }
 
 struct Process<'kernel> {
@@ -90,10 +147,12 @@ struct Process<'kernel> {
     sleep_charge: u64,
     charged_ticks: u64,
     quantum_left: u64,
+    policy: CpuPolicy,
+    throttles: u64,
     preemptions: usize,
     post_checks_preemptions: usize,
     handles: HandleTable,
-    boot_handles: [u64; 4],
+    boot_handles: [u64; 5],
     handles_closed: bool,
     ipc_checks: bool,
     ipc_sent: usize,
@@ -108,6 +167,13 @@ struct Process<'kernel> {
     surface_pixels: u64,
     foreign_surface: u64,
     foreign_surface_denials: u8,
+    desktop_ready: bool,
+    desktop_checks: bool,
+    desktop_revision: u64,
+    input_events: u64,
+    input_lost: u64,
+    input_waits: u64,
+    input_timeouts: u64,
 }
 
 pub fn run_init(
@@ -124,6 +190,7 @@ pub fn run_init(
     {
         capability::self_test();
         crate::ipc::self_test();
+        service_policy_self_test();
         assert!(!deadline_reached(4, 5));
         assert!(deadline_reached(5, 5));
         assert!(deadline_reached(6, 5));
@@ -223,10 +290,12 @@ fn create_process<'kernel>(
         sleep_charge: 0,
         charged_ticks: 0,
         quantum_left: QUANTUM_TICKS,
+        policy: CpuPolicy::Probe,
+        throttles: 0,
         preemptions: 0,
         post_checks_preemptions: 0,
         handles: HandleTable::new(),
-        boot_handles: [0; 4],
+        boot_handles: [0; 5],
         handles_closed: false,
         ipc_checks: false,
         ipc_sent: 0,
@@ -241,6 +310,13 @@ fn create_process<'kernel>(
         surface_pixels: 0,
         foreign_surface: 0,
         foreign_surface_denials: 0,
+        desktop_ready: false,
+        desktop_checks: false,
+        desktop_revision: 0,
+        input_events: 0,
+        input_lost: 0,
+        input_waits: 0,
+        input_timeouts: 0,
     };
     if let Err(error) = load(&mut process.space, frames, bytes, image, direct_map) {
         // SAFETY: This root has never been active; mapped frames belong to it.
@@ -248,7 +324,7 @@ fn create_process<'kernel>(
         return Err(error);
     }
     serial::println!(
-        "Native init: pid={} entry={:#x} root={:#x} pages={} tables={}",
+        "Native process: pid={} entry={:#x} root={:#x} pages={} tables={}",
         pid,
         image.entry,
         process.space.root_physical_address(),
@@ -319,8 +395,10 @@ fn run_pair(
     }
     assert_eq!(processes[1].handles.len(), 3);
     assert_eq!(processes[1].boot_handles[3], 0);
+    assert!(processes.iter().all(|process| process.boot_handles[4] == 0));
     assert!(ACTIVE_IPC.load(Ordering::SeqCst).is_null());
     assert!(ACTIVE_SURFACE.load(Ordering::SeqCst).is_null());
+    assert!(ACTIVE_INPUT.load(Ordering::SeqCst).is_null());
     assert_ne!(processes[0].pid, processes[1].pid);
     assert_ne!(
         processes[0].space.root_physical_address(),
@@ -422,38 +500,12 @@ fn run_pair(
             switches += 1;
             last = Some(index);
         }
-        processes[index].state = State::Running;
-        processes[index].quantum_left = QUANTUM_TICKS;
-        processes[index].dispatches += 1;
-        // Copy before publishing ACTIVE. Handlers mutate process.frame, so no
-        // shared borrow of that field may span execution and its callbacks.
-        let context = processes[index].frame;
-        // Refresh after scheduler borrows end, and revoke before the next one.
-        let surface_pointer = surface.as_mut().map_or(core::ptr::null_mut(), |session| {
-            (session as *mut surface::Session<'_, '_>).cast()
-        });
-        ACTIVE_SURFACE.store(surface_pointer, Ordering::SeqCst);
-        ACTIVE_IPC.store(&raw mut ipc, Ordering::SeqCst);
-        ACTIVE.store((&raw mut processes[index]).cast(), Ordering::SeqCst);
-        // SAFETY: Only this process executes in its isolated root. Shared upper
-        // mappings cover both kernel stacks. All handlers finish before resume
-        // returns, and no locks or Rust references to process data span entry.
-        unsafe {
-            processes[index]
-                .space
-                .activate()
-                .expect("activate user root");
-            interrupts::resume_user(&context);
-        }
-        ACTIVE.store(core::ptr::null_mut(), Ordering::SeqCst);
-        ACTIVE_IPC.store(core::ptr::null_mut(), Ordering::SeqCst);
-        ACTIVE_SURFACE.store(core::ptr::null_mut(), Ordering::SeqCst);
-        // SAFETY: The user is suspended, handlers have returned, and IF=0.
-        unsafe { kernel.activate() }.expect("restore kernel root");
-        assert_ne!(
-            processes[index].state,
-            State::Running,
-            "process returned without transition"
+        resume_process(
+            kernel,
+            &mut processes[index],
+            &mut ipc,
+            surface.as_mut(),
+            None,
         );
         if processes[index].outcome == Some(Outcome::BudgetExhausted) {
             assert_eq!(index, 0, "peer exhausted its budget");
@@ -471,6 +523,7 @@ fn run_pair(
     }
     release_finished_handles(&mut processes, &mut ipc);
     assert!(ACTIVE_SURFACE.load(Ordering::SeqCst).is_null());
+    assert!(ACTIVE_INPUT.load(Ordering::SeqCst).is_null());
     assert!(
         ipc.is_drained(),
         "IPC messages or endpoint references leaked"
@@ -584,6 +637,241 @@ fn run_pair(
         preemptions,
         idle_ticks
     );
+}
+
+/// Publish disjoint scheduler-owned objects only while the saved kernel caller
+/// is suspended. Every handler unwinds before any of these borrows is used again.
+fn resume_process(
+    kernel: &PageTables,
+    process: &mut Process<'_>,
+    ipc: &mut Ipc,
+    surface: Option<&mut surface::Session<'_, '_>>,
+    input: Option<&mut input::Session<'_>>,
+) {
+    assert!(!arch::interrupts_enabled());
+    assert!(ACTIVE.load(Ordering::SeqCst).is_null());
+    assert!(ACTIVE_IPC.load(Ordering::SeqCst).is_null());
+    assert!(ACTIVE_SURFACE.load(Ordering::SeqCst).is_null());
+    assert!(ACTIVE_INPUT.load(Ordering::SeqCst).is_null());
+    assert_eq!(process.state, State::Ready);
+    process.state = State::Running;
+    process.quantum_left = QUANTUM_TICKS;
+    process.dispatches += 1;
+    // Save a copy, not a reference into a context that handlers can mutate.
+    let context = process.frame;
+    let process_pointer = core::ptr::from_mut(process);
+    let surface_pointer = surface.map_or(core::ptr::null_mut(), |session| {
+        core::ptr::from_mut(session).cast()
+    });
+    let input_pointer = input.map_or(core::ptr::null_mut(), |session| {
+        core::ptr::from_mut(session).cast()
+    });
+    ACTIVE_SURFACE.store(surface_pointer, Ordering::SeqCst);
+    ACTIVE_INPUT.store(input_pointer, Ordering::SeqCst);
+    ACTIVE_IPC.store(core::ptr::from_mut(ipc), Ordering::SeqCst);
+    ACTIVE.store(process_pointer.cast(), Ordering::SeqCst);
+    // SAFETY: Single BSP and IF=0, disjoint exclusively owned session objects,
+    // and shared upper mappings cover both kernel stacks. The raw pointers are
+    // derived from fresh reborrows; no original reference is accessed until all
+    // IRQ/syscall reborrows have ended and the published pointers are revoked.
+    unsafe {
+        (*process_pointer)
+            .space
+            .activate()
+            .expect("activate user root");
+        interrupts::resume_user(&context);
+    }
+    ACTIVE.store(core::ptr::null_mut(), Ordering::SeqCst);
+    ACTIVE_IPC.store(core::ptr::null_mut(), Ordering::SeqCst);
+    ACTIVE_SURFACE.store(core::ptr::null_mut(), Ordering::SeqCst);
+    ACTIVE_INPUT.store(core::ptr::null_mut(), Ordering::SeqCst);
+    // SAFETY: All handlers returned, the user is suspended, and IF remains clear.
+    unsafe { kernel.activate() }.expect("restore kernel root");
+    assert_ne!(
+        process.state,
+        State::Running,
+        "process returned without transition"
+    );
+}
+
+/// Run a separate native desktop until exit or a contained user fault. Its CPU
+/// allowance renews periodically; finite init probes retain their original cap.
+pub fn run_desktop(
+    kernel: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    bytes: &[u8],
+    direct_map: u64,
+    display: &mut framebuffer::Driver<'_>,
+    consumer: &mut ps2::Consumer,
+    smoke: bool,
+) {
+    assert!(!arch::interrupts_enabled());
+    let before = frames.stats().expect("recycling required").allocated_frames;
+    let outcome = {
+        let image = elf::parse(bytes).expect("invalid native desktop ELF");
+        let mut process =
+            create_process(kernel, frames, bytes, &image, direct_map, u64::from(smoke))
+                .expect("load native desktop");
+        process.policy = CpuPolicy::Desktop(ServicePolicy::new(timer::ticks()));
+        let mut ipc = Ipc::new();
+        let mut surface = surface::Session::desktop(display).expect("desktop surface");
+        let mut input = input::Session::new(consumer);
+        for (slot, object, rights) in [
+            (0, Object::Console, capability::WRITE),
+            (3, Object::Surface, capability::WRITE),
+            (4, Object::Input, capability::RECEIVE),
+        ] {
+            process.boot_handles[slot] = process
+                .handles
+                .insert(object, rights)
+                .expect("desktop bootstrap capability");
+        }
+        assert_eq!(process.handles.len(), 3);
+        let stack_top = (&raw const KERNEL_STACK) as u64 + KERNEL_STACK_SIZE as u64;
+        // SAFETY: IF=0, no active user, and the dedicated static kernel stack
+        // remains mapped in the shared upper half of every process root.
+        unsafe { interrupts::set_kernel_stack(stack_top) };
+
+        while process.state != State::Finished {
+            assert!(!arch::interrupts_enabled());
+            let now = timer::ticks();
+            match process.state {
+                State::Sleeping(deadline) if deadline_reached(now, deadline) => {
+                    assert_eq!(process.charged_ticks, process.sleep_charge);
+                    process.state = State::Ready;
+                }
+                State::InputWaiting(pending) => {
+                    assert_eq!(
+                        process.charged_ticks, process.sleep_charge,
+                        "blocked input charged user CPU ticks"
+                    );
+                    let mut result = receive_input(
+                        &mut process,
+                        &mut input,
+                        pending.handle,
+                        pending.address,
+                        input::EVENT_SIZE as u64,
+                    );
+                    if result == -11 && deadline_reached(now, pending.deadline) {
+                        result = -110;
+                        process.input_timeouts += 1;
+                        if process.input_timeouts == 1 {
+                            serial::println!("MIRROR_DESKTOP_INPUT_TIMEOUT");
+                        }
+                    }
+                    if result != -11 {
+                        process.frame.rax = result as u64;
+                        process.state = State::Ready;
+                    }
+                }
+                State::Ready | State::Sleeping(_) => {}
+                // This process owns no IPC channel; a receiving state would
+                // violate capability checks before any legitimate IPC wait.
+                _ => panic!("invalid desktop scheduler state"),
+            }
+            let CpuPolicy::Desktop(policy) = &mut process.policy else {
+                panic!("desktop lost its service policy");
+            };
+            // Eligibility is independent of Ready/Sleeping/InputWaiting. A
+            // yield or a newly completed input wait cannot reset spent credit.
+            let eligible = policy.eligible(now);
+            if process.state == State::Ready && eligible {
+                resume_process(
+                    kernel,
+                    &mut process,
+                    &mut ipc,
+                    Some(&mut surface),
+                    Some(&mut input),
+                );
+            } else {
+                let before_charge = process.charged_ticks;
+                // SAFETY: No published user/session pointers or outstanding
+                // borrows. IF stays clear from the queue/deadline check through
+                // STI-HLT, so a pending input IRQ cannot create a lost wakeup.
+                unsafe { core::arch::asm!("sti", "hlt", "cli", options(nostack)) };
+                assert_eq!(
+                    process.charged_ticks, before_charge,
+                    "desktop idle/throttling charged user CPU ticks"
+                );
+            }
+        }
+        assert!(ACTIVE.load(Ordering::SeqCst).is_null());
+        assert!(ACTIVE_IPC.load(Ordering::SeqCst).is_null());
+        assert!(ACTIVE_INPUT.load(Ordering::SeqCst).is_null());
+        assert!(ACTIVE_SURFACE.load(Ordering::SeqCst).is_null());
+        assert_eq!(
+            surface.totals(),
+            (process.surface_tiles, process.surface_pixels)
+        );
+        release_finished_handles(core::slice::from_mut(&mut process), &mut ipc);
+        assert!(process.handles.is_empty() && ipc.is_drained());
+        // SAFETY: The process is finished, all handlers unwound, every published
+        // pointer is clear, and the kernel root is active with IF=0.
+        unsafe { process.space.destroy(frames) }.expect("desktop address-space cleanup");
+        assert_eq!(
+            frames.stats().unwrap().allocated_frames,
+            before,
+            "desktop frame leak"
+        );
+        let outcome = process.outcome.expect("desktop finished without outcome");
+        if smoke {
+            assert!(
+                matches!(outcome, Outcome::Fault { vector: 6, .. }),
+                "desktop smoke did not end in contained UD2: {outcome:?}"
+            );
+            assert!(process.desktop_checks, "desktop smoke checks missing");
+            assert!(process.throttles > 0, "desktop allowance never throttled");
+            assert!(process.input_timeouts > 0, "desktop input never timed out");
+            assert!(
+                process.input_lost > 0,
+                "desktop did not read initial loss barrier"
+            );
+            assert!(process.input_waits > 0);
+            serial::println!(
+                "MIRROR_DESKTOP_TESTS_OK throttles={} timeouts={} input_events={}",
+                process.throttles,
+                process.input_timeouts,
+                process.input_events
+            );
+        }
+        // Surface and input sessions leave scope before the caller can start
+        // the kernel console. No desktop handle or frame survives this return.
+        outcome
+    };
+    match outcome {
+        Outcome::Exit(status) => serial::println!(
+            "MIRROR_DESKTOP_CLEANUP_OK reason=exit handles_reclaimed=1 status={}",
+            status
+        ),
+        _ => serial::println!("MIRROR_DESKTOP_CLEANUP_OK reason=fault handles_reclaimed=1"),
+    }
+}
+
+#[cfg(feature = "boot-smoke")]
+fn service_policy_self_test() {
+    for start in [0, 17, u64::MAX - 20] {
+        let mut policy = ServicePolicy::new(start);
+        for tick in 1..=SERVICE_ALLOWANCE {
+            assert!(policy.eligible(start.wrapping_add(tick)));
+            assert_eq!(
+                policy.charge(start.wrapping_add(tick)),
+                tick == SERVICE_ALLOWANCE
+            );
+        }
+        // Repeated scheduling attempts, including wakes/yields, cannot refill.
+        for tick in SERVICE_ALLOWANCE..SERVICE_PERIOD {
+            assert!(!policy.eligible(start.wrapping_add(tick)));
+            assert_eq!(policy.used, SERVICE_ALLOWANCE);
+        }
+        assert!(policy.eligible(start.wrapping_add(SERVICE_PERIOD)));
+        assert_eq!(policy.used, 0);
+        assert!(!policy.charge(start.wrapping_add(SERVICE_PERIOD)));
+        assert_eq!(policy.used, 1);
+        assert!(policy.eligible(start.wrapping_add(3 * SERVICE_PERIOD + 7)));
+        assert_eq!(policy.window_start, start.wrapping_add(3 * SERVICE_PERIOD));
+        assert_eq!(policy.used, 0); // Sleeping earns no stacked allowance.
+    }
+    serial::println!("MIRROR_SERVICE_POLICY_TESTS_OK");
 }
 
 fn deadline_reached(now: u64, deadline: u64) -> bool {
@@ -758,7 +1046,7 @@ fn with_active(frame: &TrapFrame, operation: impl FnOnce(&mut Process<'_>)) {
     assert!(!arch::interrupts_enabled());
     let pointer = ACTIVE.load(Ordering::SeqCst).cast::<Process<'_>>();
     assert!(!pointer.is_null(), "no active process");
-    // SAFETY: run_pair suspends its stack while this pointer is published. Only
+    // SAFETY: The owning scheduler suspends its stack while this is published. Only
     // this BSP, with IF=0, accesses it; no handler retains a reference or reenters
     // userspace. Kernel/NMI faults never invoke this function. Closure references
     // cannot escape this call, and the borrowed kernel root remains live.
@@ -773,7 +1061,7 @@ fn with_ipc<T>(operation: impl FnOnce(&mut Ipc) -> T) -> T {
     assert!(!arch::interrupts_enabled());
     let pointer = ACTIVE_IPC.load(Ordering::SeqCst);
     assert!(!pointer.is_null(), "no IPC session");
-    // SAFETY: run_pair publishes this disjoint stack-owned object only while
+    // SAFETY: resume_process publishes this disjoint stack-owned object only while
     // tasks can run. Scheduler borrows end before entry; handlers run with IF=0
     // on the sole CPU and do not reenter this helper or retain references.
     unsafe { operation(&mut *pointer) }
@@ -785,11 +1073,24 @@ fn with_surface<T>(operation: impl FnOnce(&mut surface::Session<'_, '_>) -> T) -
         .load(Ordering::SeqCst)
         .cast::<surface::Session<'_, '_>>();
     assert!(!pointer.is_null(), "no active surface session");
-    // SAFETY: run_pair owns this stack-local session and its exclusive display
-    // borrow until every process finishes. It derives this raw pointer after
+    // SAFETY: The scheduler owns this session and its exclusive display borrow
+    // until every process finishes. resume_process derives this pointer after
     // ending scheduler borrows, publishes only while resume_user runs, and clears
     // it before accessing the session again. Neither IRQ nor another CPU touches
     // the display, and no process/IPC field aliases this distinct session.
+    unsafe { operation(&mut *pointer) }
+}
+
+fn with_input<T>(operation: impl FnOnce(&mut input::Session<'_>) -> T) -> T {
+    assert!(!arch::interrupts_enabled());
+    let pointer = ACTIVE_INPUT
+        .load(Ordering::SeqCst)
+        .cast::<input::Session<'_>>();
+    assert!(!pointer.is_null(), "no active input session");
+    // SAFETY: The desktop scheduler owns this separate stack-local session and
+    // its exclusive Consumer borrow. resume_process publishes a fresh raw
+    // reborrow only during user entry and revokes it before scheduler access.
+    // Device IRQs mutate queues, never this staged session; IF=0 excludes races.
     unsafe { operation(&mut *pointer) }
 }
 
@@ -814,7 +1115,81 @@ fn channel_for(process: &Process<'_>, handle: u64, rights: u64) -> Result<usize,
     let capability = process.handles.require(handle, rights).map_err(cap_error)?;
     match capability.object {
         Object::Channel(index) => Ok(index),
-        Object::Console | Object::Surface => Err(-13),
+        Object::Console | Object::Surface | Object::Input => Err(-13),
+    }
+}
+
+fn receive_input(
+    process: &mut Process<'_>,
+    session: &mut input::Session<'_>,
+    handle: u64,
+    address: u64,
+    length: u64,
+) -> i64 {
+    match process.handles.require(handle, capability::RECEIVE) {
+        Ok(capability) if capability.object == Object::Input => {}
+        Ok(_) => return -13,
+        Err(error) => return cap_error(error),
+    }
+    if length != input::EVENT_SIZE as u64 {
+        return -22;
+    }
+    // Validate before even peeking/staging an event, and repeat this on wake.
+    // A failed copy must not consume input or expose a partial wire record.
+    if process
+        .space
+        .validate_writable(address, input::EVENT_SIZE)
+        .is_err()
+    {
+        return -14;
+    }
+    let Some(event) = session.peek() else {
+        return -11;
+    };
+    // SAFETY: The user is suspended with immutable mappings on the BSP. This
+    // owned encoded snapshot cannot alias the checked destination user pages.
+    if unsafe { process.space.copy_to_user(address, &event) }.is_err() {
+        return -14;
+    }
+    session.consume();
+    let kind = u32::from_le_bytes(event[4..8].try_into().unwrap());
+    if process.input_events == 0 {
+        assert_eq!(kind, input::KIND_LOST, "missing initial input barrier");
+    }
+    process.input_events += 1;
+    if kind == input::KIND_LOST {
+        process.input_lost += 1;
+    }
+    input::EVENT_SIZE as i64
+}
+
+fn desktop_message(process: &mut Process<'_>, message: &[u8]) {
+    if !matches!(process.policy, CpuPolicy::Desktop(_)) {
+        return;
+    }
+    if message == DESKTOP_READY && !process.desktop_ready {
+        process.desktop_ready = true;
+        let info = with_surface(|session| session.info());
+        let width = u32::from_le_bytes(info[4..8].try_into().unwrap());
+        let height = u32::from_le_bytes(info[8..12].try_into().unwrap());
+        serial::println!(
+            "MIRROR_DESKTOP_READY pid={} width={} height={}",
+            process.pid,
+            width,
+            height
+        );
+    } else if message == DESKTOP_FRAME {
+        process.desktop_revision += 1;
+        serial::println!(
+            "MIRROR_DESKTOP_FRAME revision={} tiles={} input_events={} keyboard_irq={} mouse_irq={}",
+            process.desktop_revision,
+            process.surface_tiles,
+            process.input_events,
+            crate::keyboard::irq_count(),
+            crate::mouse::irq_count()
+        );
+    } else if message == DESKTOP_CHECKS {
+        process.desktop_checks = true;
     }
 }
 
@@ -998,6 +1373,7 @@ pub(crate) fn syscall(frame: &mut TrapFrame) {
                     process.ipc_checks |= &buffer[..length] == IPC_CHECKS_PASSED;
                     process.surface_checks |= &buffer[..length] == SURFACE_CHECKS_PASSED;
                     process.surface_denied_checks |= &buffer[..length] == SURFACE_DENIED_CHECKS;
+                    desktop_message(process, &buffer[..length]);
                     result = length as i64;
                 } else {
                     result = -22;
@@ -1073,6 +1449,32 @@ pub(crate) fn syscall(frame: &mut TrapFrame) {
             }
             13 => result = surface_info(process, frame.rdi, frame.rsi, frame.rdx),
             14 => result = surface_present(process, frame.rdi, frame.rsi, frame.rdx),
+            15 | 16 => {
+                // Reject ungranted/wrong objects before entering the optional
+                // session: finite init has no ACTIVE_INPUT pointer or grant.
+                match process.handles.require(frame.rdi, capability::RECEIVE) {
+                    Ok(capability) if capability.object == Object::Input => {}
+                    Ok(_) => {
+                        result = -13;
+                        return;
+                    }
+                    Err(error) => {
+                        result = cap_error(error);
+                        return;
+                    }
+                }
+                result = with_input(|session| {
+                    receive_input(process, session, frame.rdi, frame.rsi, frame.rdx)
+                });
+                if frame.rax == 15 && result == -11 {
+                    process.input_waits += 1;
+                    suspension = Some(State::InputWaiting(PendingInput {
+                        handle: frame.rdi,
+                        address: frame.rsi,
+                        deadline: timer::ticks().wrapping_add(RECEIVE_TIMEOUT),
+                    }));
+                }
+            }
             _ => process.unknown_calls += 1,
         }
     });
@@ -1093,11 +1495,18 @@ pub(crate) fn timer_tick(frame: &mut TrapFrame) {
     with_active(frame, |process| {
         process.charged_ticks += 1;
         process.quantum_left -= 1;
-        if process.charged_ticks >= USER_TICK_BUDGET {
+        let throttled = match &mut process.policy {
+            CpuPolicy::Probe => false,
+            CpuPolicy::Desktop(policy) => policy.charge(timer::ticks()),
+        };
+        if matches!(process.policy, CpuPolicy::Probe) && process.charged_ticks >= USER_TICK_BUDGET {
             process.outcome = Some(Outcome::BudgetExhausted);
             process.state = State::Finished;
             expired = true;
-        } else if process.quantum_left == 0 {
+        } else if throttled || process.quantum_left == 0 {
+            if throttled {
+                process.throttles += 1;
+            }
             process.preemptions += 1;
             if process.checks_passed {
                 process.post_checks_preemptions += 1;
@@ -1122,10 +1531,13 @@ fn suspend(frame: &mut TrapFrame, state: State) {
     with_active(frame, |process| {
         assert!(matches!(
             state,
-            State::Ready | State::Sleeping(_) | State::Receiving(_)
+            State::Ready | State::Sleeping(_) | State::Receiving(_) | State::InputWaiting(_)
         ));
         process.frame = *frame;
-        if matches!(state, State::Sleeping(_) | State::Receiving(_)) {
+        if matches!(
+            state,
+            State::Sleeping(_) | State::Receiving(_) | State::InputWaiting(_)
+        ) {
             process.sleep_charge = process.charged_ticks;
         }
         process.state = state;

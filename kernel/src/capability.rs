@@ -1,6 +1,7 @@
 //! Fixed-size process handle tables with globally unique, attenuable tokens.
 //! Object lifetimes belong to the caller; this module neither grants nor drops
-//! references to the underlying console/channel when a table entry changes.
+//! references to the underlying object when a table entry changes. Input and
+//! surface sessions outlive all their handles and keep exclusive device borrows.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -20,6 +21,8 @@ pub(crate) enum Object {
     Channel(usize),
     /// The single borrowed graphics surface lives for the complete run session.
     Surface,
+    /// The desktop alone receives the borrowed, ordered input stream.
+    Input,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +61,7 @@ impl HandleTable {
         let permitted = match object {
             Object::Console | Object::Surface => WRITE,
             Object::Channel(_) => SEND | RECEIVE,
+            Object::Input => RECEIVE,
         };
         if rights & !permitted != 0 {
             return Err(CapError::InvalidRights);
@@ -251,6 +255,24 @@ pub(crate) fn self_test() {
     owner.close(surface).unwrap();
     owner.close(inert_surface).unwrap();
     assert_eq!(owner.require(surface, WRITE), Err(CapError::BadHandle));
+    assert!(owner.is_empty());
+
+    for rights in [SEND, WRITE, RECEIVE | WRITE] {
+        assert_eq!(
+            owner.insert(Object::Input, rights),
+            Err(CapError::InvalidRights)
+        );
+    }
+    let input = owner.insert(Object::Input, RECEIVE).unwrap();
+    assert_eq!(owner.require(input, RECEIVE).unwrap().object, Object::Input);
+    assert_eq!(other.get(input), Err(CapError::BadHandle));
+    let (inert_input, inert) = owner.duplicate(input, 0).unwrap();
+    assert_eq!(inert.object, Object::Input);
+    assert_eq!(owner.require(inert_input, RECEIVE), Err(CapError::Denied));
+    assert_eq!(owner.duplicate(inert_input, RECEIVE), Err(CapError::Denied));
+    owner.close(input).unwrap();
+    owner.close(inert_input).unwrap();
+    assert_eq!(owner.get(input), Err(CapError::BadHandle));
     assert!(owner.is_empty());
 
     // Do not exhaust the real boot-wide allocator; later processes need tokens.

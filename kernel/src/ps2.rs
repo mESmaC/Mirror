@@ -11,7 +11,8 @@
 //! https://intel.github.io/ecfw-zephyr/reference/kbchost/index.html
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::{arch, keyboard, mouse};
 
@@ -121,6 +122,37 @@ static STATE: SharedState = SharedState(UnsafeCell::new(State::new()));
 static KEYBOARD_IRQS: AtomicU64 = AtomicU64::new(0);
 static MOUSE_IRQS: AtomicU64 = AtomicU64::new(0);
 static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static CONSUMER_CLAIMED: AtomicBool = AtomicBool::new(false);
+
+/// Exclusive ownership of completed input delivery on the BSP. Interrupts may
+/// still append device events, but only this non-cloneable token can consume
+/// them. Borrow it into a userspace input session or the kernel fallback, never
+/// both. The raw-pointer marker also forbids moving/sharing it across threads.
+pub struct Consumer {
+    _bsp_only: PhantomData<*mut ()>,
+}
+
+impl Consumer {
+    pub fn claim() -> Option<Self> {
+        CONSUMER_CLAIMED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(Self {
+            _bsp_only: PhantomData,
+        })
+    }
+
+    /// Preserve entry IF; no controller or decoder borrow escapes this call.
+    pub fn next_event(&mut self) -> Option<InputEvent> {
+        next_event()
+    }
+}
+
+impl Drop for Consumer {
+    fn drop(&mut self) {
+        CONSUMER_CLAIMED.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputEvent {
@@ -144,7 +176,7 @@ fn keyboard_first(keyboard: u64, mouse: u64) -> bool {
 /// Drain once, then consume the oldest keyboard/mouse event under one IF guard.
 /// Loss is a shared ordering barrier: acknowledge both flags and discard both
 /// queues before delivering any later event. Device pop functions perform no I/O.
-pub fn next_event() -> Option<InputEvent> {
+fn next_event() -> Option<InputEvent> {
     let enabled = arch::save_and_disable_interrupts();
     // poll_pending ends its controller borrow before any device queue is read.
     poll_pending();

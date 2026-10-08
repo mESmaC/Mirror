@@ -984,6 +984,36 @@ fn glyph(character: u8) -> [u8; 7] {
 }
 
 #[cfg(feature = "boot-smoke")]
+pub(crate) fn test_rgb32_driver(
+    bytes: &mut [u8],
+    width: usize,
+    height: usize,
+    pitch: usize,
+) -> Result<Driver<'_>, FramebufferError> {
+    let description = Description {
+        width: width as u64,
+        height: height as u64,
+        pitch: pitch as u64,
+        bpp: 32,
+        red: Mask { size: 8, shift: 16 },
+        green: Mask { size: 8, shift: 8 },
+        blue: Mask { size: 8, shift: 0 },
+    };
+    let layout = Layout::validate(bytes.as_mut_ptr() as usize, description)?;
+    if layout.info.byte_len > bytes.len() {
+        return Err(FramebufferError::BufferTooSmall);
+    }
+    // The slice grants exclusive initialized RAM ownership for the returned
+    // lifetime, exactly as the guarded renderer fixtures in this module.
+    Ok(Driver {
+        address: NonNull::new(bytes.as_mut_ptr()).ok_or(FramebufferError::NullAddress)?,
+        layout,
+        clip: None,
+        _exclusive: PhantomData,
+    })
+}
+
+#[cfg(feature = "boot-smoke")]
 pub(crate) fn test_surface_upload() {
     use crate::surface::{INFO_SIZE, MAX_PACKET, MAX_TILE, Session};
 
