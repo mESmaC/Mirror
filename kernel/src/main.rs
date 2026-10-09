@@ -205,22 +205,23 @@ pub extern "C" fn _start() -> ! {
         elf::self_test();
     }
 
-    let inject_block_error = {
-        #[cfg(feature = "boot-smoke")]
-        {
-            matches!(boot::smoke_mode(), boot::SmokeMode::BlockIoError)
+    #[cfg(feature = "boot-smoke")]
+    match boot::smoke_mode() {
+        mode @ (boot::SmokeMode::BlockWrite
+        | boot::SmokeMode::BlockWriteError
+        | boot::SmokeMode::BlockFlushError
+        | boot::SmokeMode::BlockNoFlush) => {
+            probe_writable_block_device(&devices, &mut frames, boot.direct_map_offset, mode);
         }
-        #[cfg(not(feature = "boot-smoke"))]
-        {
-            false
-        }
-    };
-    probe_block_device(
-        &devices,
-        &mut frames,
-        boot.direct_map_offset,
-        inject_block_error,
-    );
+        mode => probe_block_device(
+            &devices,
+            &mut frames,
+            boot.direct_map_offset,
+            matches!(mode, boot::SmokeMode::BlockIoError),
+        ),
+    }
+    #[cfg(not(feature = "boot-smoke"))]
+    probe_block_device(&devices, &mut frames, boot.direct_map_offset, false);
 
     let input_devices = ps2::init();
     let keyboard_ready = match input_devices.keyboard {
@@ -346,6 +347,10 @@ pub extern "C" fn _start() -> ! {
             boot::SmokeMode::Normal
             | boot::SmokeMode::User(_)
             | boot::SmokeMode::BlockIoError
+            | boot::SmokeMode::BlockWrite
+            | boot::SmokeMode::BlockWriteError
+            | boot::SmokeMode::BlockFlushError
+            | boot::SmokeMode::BlockNoFlush
             | boot::SmokeMode::SmpUnmap
             | boot::SmokeMode::TimerCalibration
             | boot::SmokeMode::ClockActivation
@@ -572,7 +577,9 @@ fn probe_block_device(
     // SAFETY: IF is clear; this boot path alone claims the device. Firmware has
     // exited; the sole allocator owns DMA pages and its HHDM remains mapped.
     // No other driver or interrupt handler accesses this transport or buffers.
-    let mut driver = match unsafe { block::Driver::open(devices, frames, direct_map) } {
+    let mut driver = match unsafe {
+        block::Driver::open(devices, frames, direct_map, block::Access::ReadOnly)
+    } {
         Ok(Some(driver)) => driver,
         Ok(None) => {
             assert!(!inject_error, "block error probe requires its test disk");
@@ -588,10 +595,11 @@ fn probe_block_device(
     let capacity = driver.capacity_sectors();
     let queue_size = driver.queue_size();
     serial::println!(
-        "MIRROR_BLOCK_READY sectors={} queue={} readonly={}",
+        "MIRROR_BLOCK_READY sectors={} queue={} readonly={} flush={}",
         capacity,
         queue_size,
-        u8::from(driver.is_read_only())
+        u8::from(driver.is_read_only()),
+        u8::from(driver.supports_flush())
     );
     let result = check_block_data(&mut driver, inject_error);
     // SAFETY: IF is clear; no users or handlers retain this device/buffers.
@@ -633,6 +641,16 @@ fn check_block_data(
         return Ok(None);
     }
     assert!(driver.is_read_only(), "fixture must be read-only");
+    check_fixture_sector(0, &bytes);
+    assert!(matches!(
+        driver.write_sector(0, &bytes),
+        Err(block::BlockError::ReadOnly)
+    ));
+    assert!(matches!(driver.flush(), Err(block::BlockError::ReadOnly)));
+    assert!(
+        !driver.needs_flush(),
+        "read-only rejection dirtied the device"
+    );
     check_fixture_sector(0, &bytes);
     if inject_error {
         bytes.fill(0xcc);
@@ -676,6 +694,259 @@ fn check_fixture_sector(sector: u64, bytes: &[u8; 512]) {
         let expected = ((sector * 73) ^ (sector >> 8) ^ (offset as u64 * 29) ^ 0xa5) as u8;
         assert_eq!(value, expected, "fixture data mismatch");
     }
+}
+
+/// Only the explicitly selected smoke modes may request write authority. The
+/// runner supplies a fresh disposable fixture, separate from firmware storage.
+#[cfg(feature = "boot-smoke")]
+fn probe_writable_block_device(
+    devices: &pci::Inventory,
+    frames: &mut memory::FrameAllocator<'_>,
+    direct_map: u64,
+    mode: boot::SmokeMode,
+) {
+    assert!(!arch::interrupts_enabled());
+    let baseline = frames.stats().expect("frame accounting").allocated_frames;
+    let sectors = [0_u64, 1234, 2047];
+    let neighbors = [1_u64, 1233, 1235, 2046];
+    let mut bytes = [0_u8; 512];
+
+    // SAFETY: IF is clear; this boot path alone claims the disposable device.
+    // Firmware has exited, the allocator owns DMA pages, and HHDM is mapped.
+    let mut driver =
+        unsafe { block::Driver::open(devices, frames, direct_map, block::Access::ReadOnly) }
+            .expect("open write fixture without write authority")
+            .expect("missing writable fixture");
+    assert_eq!(driver.capacity_sectors(), 2048);
+    assert!(
+        !driver.is_read_only(),
+        "write fixture is hardware read-only"
+    );
+    driver
+        .read_sector(0, &mut bytes)
+        .expect("identify write fixture");
+    check_fixture_sector(0, &bytes);
+    let denied_payload = writable_fixture_sector(0, 1);
+    assert!(matches!(
+        driver.write_sector(0, &denied_payload),
+        Err(block::BlockError::WriteDenied)
+    ));
+    assert_eq!(denied_payload, writable_fixture_sector(0, 1));
+    assert!(matches!(
+        driver.flush(),
+        Err(block::BlockError::WriteDenied)
+    ));
+    assert!(
+        !driver.needs_flush(),
+        "denied operations dirtied the device"
+    );
+    driver
+        .read_sector(0, &mut bytes)
+        .expect("read fixture after denied write");
+    check_fixture_sector(0, &bytes);
+    // SAFETY: No request, reference, or handler retains these DMA buffers.
+    unsafe { driver.shutdown(frames) }.expect("reset read-only policy probe");
+    assert_eq!(frames.stats().unwrap().allocated_frames, baseline);
+    serial::println!("MIRROR_BLOCK_POLICY_OK writes_denied=1 flush_denied=1");
+
+    // SAFETY: The previous driver confirmed reset before releasing its DMA.
+    // This sole owner now explicitly requests writes to the identified fixture.
+    let mut driver =
+        unsafe { block::Driver::open(devices, frames, direct_map, block::Access::ReadWrite) }
+            .expect("open writable fixture")
+            .expect("writable fixture disappeared");
+    let queue = driver.queue_size();
+    assert_eq!(driver.capacity_sectors(), 2048);
+    assert!(!driver.is_read_only());
+    assert!(!driver.needs_flush());
+    driver
+        .read_sector(0, &mut bytes)
+        .expect("recheck write fixture");
+    check_fixture_sector(0, &bytes);
+    serial::println!(
+        "MIRROR_BLOCK_WRITABLE_READY sectors={} queue={} readonly=0 flush={}",
+        driver.capacity_sectors(),
+        queue,
+        u8::from(driver.supports_flush())
+    );
+
+    if matches!(mode, boot::SmokeMode::BlockNoFlush) {
+        assert!(
+            !driver.supports_flush(),
+            "flush feature unexpectedly offered"
+        );
+        let payload = writable_fixture_sector(0, 1);
+        assert!(matches!(
+            driver.write_sector(0, &payload),
+            Err(block::BlockError::FlushUnsupported)
+        ));
+        assert_eq!(payload, writable_fixture_sector(0, 1));
+        assert!(matches!(
+            driver.flush(),
+            Err(block::BlockError::FlushUnsupported)
+        ));
+        assert!(!driver.needs_flush());
+        for sector in sectors.into_iter().chain(neighbors) {
+            driver
+                .read_sector(sector, &mut bytes)
+                .expect("read no-flush fixture");
+            check_fixture_sector(sector, &bytes);
+        }
+        // SAFETY: All requests completed; rejected writes published no DMA.
+        unsafe { driver.shutdown(frames) }.expect("reset no-flush fixture");
+        assert_eq!(frames.stats().unwrap().allocated_frames, baseline);
+        serial::println!("MIRROR_BLOCK_NO_FLUSH_OK writes_denied=1 dirty=0");
+        serial::println!("MIRROR_BLOCK_CLEANUP_OK dma_reclaimed=1");
+        return;
+    }
+    assert!(
+        driver.supports_flush(),
+        "write probe requires negotiated flush"
+    );
+
+    if matches!(mode, boot::SmokeMode::BlockWriteError) {
+        let payload = writable_fixture_sector(1234, 0);
+        assert!(matches!(
+            driver.write_sector(1234, &payload),
+            Err(block::BlockError::IoError)
+        ));
+        assert_eq!(payload, writable_fixture_sector(1234, 0));
+        assert!(
+            driver.needs_flush(),
+            "submitted write error lost dirty state"
+        );
+        driver
+            .write_sector(1234, &payload)
+            .expect("retry failed write");
+        driver
+            .read_sector(1234, &mut bytes)
+            .expect("read retried write");
+        assert_eq!(bytes, payload);
+        assert!(driver.needs_flush(), "read cleared pending writes");
+        serial::println!("MIRROR_BLOCK_WRITE_ERROR_OK retry=1 input_preserved=1");
+    }
+
+    let writes = u64::from(queue) * 2 + 3;
+    let mut generations = [0_u64; 3];
+    for index in 0..writes {
+        let selected = index as usize % sectors.len();
+        let sector = sectors[selected];
+        let generation = index + 1;
+        let payload = writable_fixture_sector(sector, generation);
+        driver
+            .write_sector(sector, &payload)
+            .expect("write fixture sector");
+        assert_eq!(payload, writable_fixture_sector(sector, generation));
+        assert!(
+            driver.needs_flush(),
+            "successful write was not marked dirty"
+        );
+        driver
+            .read_sector(sector, &mut bytes)
+            .expect("read written fixture sector");
+        assert_eq!(bytes, payload, "written sector did not round-trip");
+        assert!(driver.needs_flush(), "read incorrectly cleared dirty state");
+        generations[selected] = generation;
+    }
+    let inject_flush_error = matches!(mode, boot::SmokeMode::BlockFlushError);
+    if inject_flush_error {
+        assert!(matches!(driver.flush(), Err(block::BlockError::IoError)));
+        assert!(driver.needs_flush(), "failed flush cleared dirty state");
+    }
+    driver.flush().expect("flush written fixture sectors");
+    assert!(
+        !driver.needs_flush(),
+        "successful flush did not clear dirty state"
+    );
+    if inject_flush_error {
+        serial::println!("MIRROR_BLOCK_FLUSH_ERROR_OK retry=1 dirty_preserved=1");
+    }
+    serial::println!("MIRROR_BLOCK_FLUSH_OK dirty=0");
+
+    // Rejections must not make a clean device dirty or touch caller memory.
+    for sector in [driver.capacity_sectors(), u64::MAX] {
+        let payload = [0x5a; 512];
+        assert!(matches!(
+            driver.write_sector(sector, &payload),
+            Err(block::BlockError::SectorOutOfRange)
+        ));
+        assert_eq!(payload, [0x5a; 512]);
+        assert!(!driver.needs_flush());
+    }
+    for sector in neighbors {
+        driver
+            .read_sector(sector, &mut bytes)
+            .expect("read untouched neighbor");
+        check_fixture_sector(sector, &bytes);
+    }
+    serial::println!(
+        "MIRROR_BLOCK_WRITE_OK sectors=2048 writes={} queue={} bounds_rejected=2",
+        writes,
+        queue
+    );
+
+    // A reset must report pending writes, while still quiescing and reclaiming
+    // DMA. Rewriting identical bytes preserves the deterministic final image.
+    let payload = writable_fixture_sector(sectors[0], generations[0]);
+    driver
+        .write_sector(sectors[0], &payload)
+        .expect("dirty shutdown probe");
+    assert!(driver.needs_flush());
+    // SAFETY: All requests completed, and this driver still exclusively owns
+    // the device. Successful reset releases DMA even when durability is pending.
+    let shutdown = unsafe { driver.shutdown(frames) };
+    assert!(matches!(shutdown, Err(block::BlockError::UnflushedWrites)));
+    assert_eq!(frames.stats().unwrap().allocated_frames, baseline);
+    serial::println!("MIRROR_BLOCK_DIRTY_SHUTDOWN_OK dma_reclaimed=1");
+
+    // SAFETY: The prior driver confirmed reset and released its entire DMA set.
+    let mut driver =
+        unsafe { block::Driver::open(devices, frames, direct_map, block::Access::ReadWrite) }
+            .expect("reopen fixture for explicit post-reset flush")
+            .expect("write fixture disappeared after reset");
+    // Reset alone does not establish durability. Send a real flush even though
+    // the freshly opened session has not itself submitted a write.
+    driver.flush().expect("flush after dirty reset");
+    assert!(!driver.needs_flush());
+    // SAFETY: Completed flush, exclusive device ownership, no retained DMA user.
+    unsafe { driver.shutdown(frames) }.expect("clean shutdown after explicit flush");
+    assert_eq!(frames.stats().unwrap().allocated_frames, baseline);
+
+    // SAFETY: The clean reset completed; this final owner requests reads only.
+    let mut driver =
+        unsafe { block::Driver::open(devices, frames, direct_map, block::Access::ReadOnly) }
+            .expect("reopen fixture for persistence checks")
+            .expect("write fixture disappeared during persistence check");
+    for (index, sector) in sectors.into_iter().enumerate() {
+        driver
+            .read_sector(sector, &mut bytes)
+            .expect("read persisted sector");
+        assert_eq!(bytes, writable_fixture_sector(sector, generations[index]));
+    }
+    for sector in neighbors {
+        driver
+            .read_sector(sector, &mut bytes)
+            .expect("read persisted neighbor");
+        check_fixture_sector(sector, &bytes);
+    }
+    assert!(!driver.needs_flush());
+    // SAFETY: Only completed read requests have used this final DMA allocation.
+    unsafe { driver.shutdown(frames) }.expect("reset persistence-check driver");
+    assert_eq!(frames.stats().unwrap().allocated_frames, baseline);
+    serial::println!("MIRROR_BLOCK_PERSIST_OK sectors=3 neighbors=4");
+    serial::println!("MIRROR_BLOCK_CLEANUP_OK dma_reclaimed=1");
+}
+
+#[cfg(feature = "boot-smoke")]
+fn writable_fixture_sector(sector: u64, generation: u64) -> [u8; 512] {
+    let mut bytes = [0_u8; 512];
+    bytes[..8].copy_from_slice(&sector.to_le_bytes());
+    bytes[8..16].copy_from_slice(b"MIRRORW1");
+    bytes[16..24].copy_from_slice(&generation.to_le_bytes());
+    for (offset, value) in bytes.iter_mut().enumerate().skip(24) {
+        *value = ((sector * 73) ^ (generation * 131) ^ (offset as u64 * 29) ^ 0x5a) as u8;
+    }
+    bytes
 }
 
 #[cfg(feature = "boot-smoke")]

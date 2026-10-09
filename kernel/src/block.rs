@@ -1,7 +1,8 @@
-//! Bounded, read-only VirtIO block I/O through the legacy PCI port transport.
+//! Bounded VirtIO block I/O through the legacy PCI port transport.
 //!
-//! One boot CPU, queue 0, one in-flight 512-byte read, and owned coherent DMA
-//! buffers. No interrupts, writes, indirect descriptors, event index, packed
+//! One boot CPU, queue 0, one in-flight sector read/write or cache flush, and
+//! owned coherent DMA buffers. Writes require explicit access and negotiated
+//! flush support. No interrupts, indirect descriptors, event index, packed
 //! rings, modern transport, hotplug, filesystem, or IOMMU is implemented here.
 //!
 //! Virtio 1.2: sections 2.4, 2.5.4, 2.7.2, 2.7.13/14, 3.1.2, 3.3,
@@ -45,6 +46,7 @@ const DRIVER_OK: u8 = 4;
 const DEVICE_NEEDS_RESET: u8 = 64;
 const FAILED: u8 = 128;
 const READ_ONLY: u32 = 1 << 5;
+const FLUSH: u32 = 1 << 9;
 const DESCRIPTOR_NEXT: u16 = 1;
 const DESCRIPTOR_WRITE: u16 = 2;
 const HEADER_SIZE: usize = 16;
@@ -65,6 +67,10 @@ pub enum BlockError {
     QueueAlreadyConfigured,
     QueueAddressReadback,
     DeviceNotReady,
+    WriteDenied,
+    ReadOnly,
+    FlushUnsupported,
+    UnflushedWrites,
     SectorOutOfRange,
     UnexpectedUsedIndex,
     UnexpectedUsedHead,
@@ -74,6 +80,42 @@ pub enum BlockError {
     Timeout,
     ResetTimeout,
     DmaQuarantined,
+}
+
+/// Kernel caller policy, independently enforced from device feature bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    ReadOnly,
+    ReadWrite,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Operation {
+    Read,
+    Write,
+    Flush,
+}
+
+impl Operation {
+    fn command(self) -> u32 {
+        match self {
+            Self::Read => 0,
+            Self::Write => 1,
+            Self::Flush => 4,
+        }
+    }
+}
+
+fn write_permission(access: Access, read_only: bool, flush: bool) -> Result<(), BlockError> {
+    if read_only {
+        Err(BlockError::ReadOnly)
+    } else if access != Access::ReadWrite {
+        Err(BlockError::WriteDenied)
+    } else if !flush {
+        Err(BlockError::FlushUnsupported)
+    } else {
+        Ok(())
+    }
 }
 
 impl fmt::Display for BlockError {
@@ -132,7 +174,7 @@ struct Descriptor {
 
 const _: [(); 16] = [(); mem::size_of::<Descriptor>()];
 
-fn read_descriptors(bounce: u64) -> Result<[Descriptor; 3], BlockError> {
+fn request_descriptors(bounce: u64, operation: Operation) -> Result<[Descriptor; 3], BlockError> {
     if bounce == 0
         || bounce & (PAGE_SIZE as u64 - 1) != 0
         || bounce
@@ -141,6 +183,12 @@ fn read_descriptors(bounce: u64) -> Result<[Descriptor; 3], BlockError> {
     {
         return Err(BlockError::InvalidDmaAddress);
     }
+    let status = Descriptor {
+        address: bounce + STATUS_OFFSET as u64,
+        length: 1,
+        flags: DESCRIPTOR_WRITE,
+        next: 0,
+    };
     Ok([
         Descriptor {
             address: bounce,
@@ -148,18 +196,23 @@ fn read_descriptors(bounce: u64) -> Result<[Descriptor; 3], BlockError> {
             flags: DESCRIPTOR_NEXT,
             next: 1,
         },
-        Descriptor {
-            address: bounce + DATA_OFFSET as u64,
-            length: SECTOR_SIZE as u32,
-            flags: DESCRIPTOR_NEXT | DESCRIPTOR_WRITE,
-            next: 2,
+        if operation == Operation::Flush {
+            status
+        } else {
+            Descriptor {
+                address: bounce + DATA_OFFSET as u64,
+                length: SECTOR_SIZE as u32,
+                flags: DESCRIPTOR_NEXT
+                    | if operation == Operation::Read {
+                        DESCRIPTOR_WRITE
+                    } else {
+                        0
+                    },
+                next: 2,
+            }
         },
-        Descriptor {
-            address: bounce + STATUS_OFFSET as u64,
-            length: 1,
-            flags: DESCRIPTOR_WRITE,
-            next: 0,
-        },
+        // Flush terminates at descriptor 1; descriptor 2 is never linked.
+        status,
     ])
 }
 
@@ -242,6 +295,9 @@ pub struct Driver {
     layout: QueueLayout,
     capacity: u64,
     read_only: bool,
+    access: Access,
+    flush_supported: bool,
+    dirty: bool,
     next_available: u16,
     next_used: u16,
     state: State,
@@ -260,6 +316,7 @@ impl Driver {
         inventory: &Inventory,
         frames: &mut FrameAllocator<'_>,
         direct_map: u64,
+        access: Access,
     ) -> Result<Option<Self>, BlockError> {
         let Some(transport) = LegacyBlock::discover(inventory).map_err(BlockError::Pci)? else {
             return Ok(None);
@@ -278,6 +335,9 @@ impl Driver {
             layout: QueueLayout::new(4).expect("minimum supported queue"),
             capacity: 0,
             read_only: false,
+            access,
+            flush_supported: false,
+            dirty: false,
             next_available: 0,
             next_used: 0,
             state: State::NeedsReset,
@@ -308,8 +368,9 @@ impl Driver {
         self.set_status(ACKNOWLEDGE)?;
         self.set_status(ACKNOWLEDGE | DRIVER)?;
         let offered = self.read32(DEVICE_FEATURES);
-        let accepted = offered & READ_ONLY;
-        self.read_only = accepted != 0;
+        let accepted = offered & (READ_ONLY | FLUSH);
+        self.read_only = accepted & READ_ONLY != 0;
+        self.flush_supported = accepted & FLUSH != 0;
         self.write32(DRIVER_FEATURES, accepted);
         if self.read32(DRIVER_FEATURES) != accepted {
             return Err(BlockError::FeatureReadback);
@@ -340,11 +401,12 @@ impl Driver {
         {
             return Err(BlockError::InvalidDmaAddress);
         }
-        read_descriptors(
+        request_descriptors(
             self.bounce
                 .as_ref()
                 .expect("allocated bounce")
                 .physical_address(),
+            Operation::Read,
         )?;
         dma_write(ring, self.layout.available, 1u16); // VIRTQ_AVAIL_F_NO_INTERRUPT
         dma_write(ring, self.layout.available + 2, 0u16);
@@ -373,23 +435,71 @@ impl Driver {
     pub fn is_read_only(&self) -> bool {
         self.read_only
     }
+    pub fn supports_flush(&self) -> bool {
+        self.flush_supported
+    }
+    /// This driver has submitted a write not yet covered by a successful flush.
+    /// A false value describes this session, not inherited device cache state.
+    pub fn needs_flush(&self) -> bool {
+        self.dirty
+    }
 
-    /// Read one sector. No write request is ever generated. Caller output is
-    /// changed only after a complete, validated successful request; completed
-    /// IOERR/UNSUPP results remain retryable on the same queue.
+    /// Read one sector. Caller output changes only after validated success.
     pub fn read_sector(
         &mut self,
         sector: u64,
         output: &mut [u8; SECTOR_SIZE],
     ) -> Result<(), BlockError> {
+        self.request(Operation::Read, sector, None)?;
+        let bounce = self.bounce.as_ref().expect("completed read owns bounce");
+        for (index, byte) in output.iter_mut().enumerate() {
+            *byte = dma_read(bounce, DATA_OFFSET + index);
+        }
+        Ok(())
+    }
+
+    /// Submit one copied sector. Completion does not establish persistence;
+    /// explicitly flush after the writes that must become stable. An error may
+    /// leave media changed. No ambiguous write is automatically retried.
+    pub fn write_sector(
+        &mut self,
+        sector: u64,
+        input: &[u8; SECTOR_SIZE],
+    ) -> Result<(), BlockError> {
+        self.request(Operation::Write, sector, Some(input))
+    }
+
+    /// Complete the device's negotiated cache-flush command. Only success
+    /// clears this session's dirty state; an error leaves durability unknown.
+    pub fn flush(&mut self) -> Result<(), BlockError> {
+        self.request(Operation::Flush, 0, None)
+    }
+
+    fn request(
+        &mut self,
+        operation: Operation,
+        sector: u64,
+        input: Option<&[u8; SECTOR_SIZE]>,
+    ) -> Result<(), BlockError> {
         if self.state != State::Live {
             return Err(BlockError::DeviceNotReady);
         }
-        if !valid_sector(sector, self.capacity) {
+        if operation != Operation::Read {
+            write_permission(self.access, self.read_only, self.flush_supported)?;
+        }
+        if operation != Operation::Flush && !valid_sector(sector, self.capacity) {
             return Err(BlockError::SectorOutOfRange);
         }
-        match self.perform_read(sector, output) {
-            Ok(()) => Ok(()),
+        assert_eq!(operation == Operation::Write, input.is_some());
+        match self.perform_request(operation, sector, input) {
+            Ok(()) => {
+                if operation == Operation::Flush {
+                    self.dirty = false;
+                }
+                Ok(())
+            }
+            // A valid used entry returns buffer ownership even on I/O failure.
+            // The caller may make a new request; the driver never retries it.
             Err(error @ (BlockError::IoError | BlockError::UnsupportedRequest)) => Err(error),
             Err(error) => {
                 self.write8(DEVICE_STATUS, self.read8(DEVICE_STATUS) | FAILED);
@@ -402,10 +512,11 @@ impl Driver {
         }
     }
 
-    fn perform_read(
+    fn perform_request(
         &mut self,
+        operation: Operation,
         sector: u64,
-        output: &mut [u8; SECTOR_SIZE],
+        input: Option<&[u8; SECTOR_SIZE]>,
     ) -> Result<(), BlockError> {
         if !ready_status(self.read8(DEVICE_STATUS)) {
             return Err(BlockError::DeviceNotReady);
@@ -423,11 +534,16 @@ impl Driver {
         for offset in 0..=STATUS_OFFSET {
             dma_write(bounce, offset, 0u8);
         }
-        dma_write(bounce, 0, 0u32); // VIRTIO_BLK_T_IN only.
+        dma_write(bounce, 0, operation.command());
         dma_write(bounce, 4, 0u32); // Reserved field.
         dma_write(bounce, 8, sector);
         dma_write(bounce, STATUS_OFFSET, STATUS_SENTINEL);
-        for (index, descriptor) in read_descriptors(bounce.physical_address())?
+        if let Some(input) = input {
+            for (index, &byte) in input.iter().enumerate() {
+                dma_write(bounce, DATA_OFFSET + index, byte);
+            }
+        }
+        for (index, descriptor) in request_descriptors(bounce.physical_address(), operation)?
             .into_iter()
             .enumerate()
         {
@@ -440,6 +556,10 @@ impl Driver {
         );
         // The device must see the complete header, buffers, descriptor chain,
         // and available slot before it can observe the incremented index.
+        if operation == Operation::Write {
+            // Submission can change media even if completion later fails.
+            self.dirty = true;
+        }
         fence(Ordering::SeqCst);
         self.next_available = self.next_available.wrapping_add(1);
         dma_write(ring, self.layout.available + 2, self.next_available);
@@ -471,11 +591,7 @@ impl Driver {
                 if interrupt_status & 2 != 0 || !ready_status(self.read8(DEVICE_STATUS)) {
                     return Err(BlockError::ConfigurationChanged);
                 }
-                result?;
-                for (index, byte) in output.iter_mut().enumerate() {
-                    *byte = dma_read(bounce, DATA_OFFSET + index);
-                }
-                return Ok(());
+                return result;
             }
             // Periodic bounded port reads also observe a device reset/error,
             // and allow emulators to service asynchronous backend completion.
@@ -546,6 +662,8 @@ impl Driver {
     /// ownership must remain valid through reset and frame release.
     /// If reset cannot be acknowledged, buffers and the PCI claim stay reserved;
     /// they are never returned to the allocator merely because polling stopped.
+    /// This operation does not flush. After successful resource cleanup it
+    /// reports UnflushedWrites if any submitted write lacks a successful flush.
     pub unsafe fn shutdown(mut self, frames: &mut FrameAllocator<'_>) -> Result<(), BlockError> {
         if self.state != State::Stopped && self.reset().is_err() {
             self.quarantine();
@@ -571,7 +689,12 @@ impl Driver {
         };
         restored?;
         ring_result?;
-        bounce_result
+        bounce_result?;
+        if self.dirty {
+            Err(BlockError::UnflushedWrites)
+        } else {
+            Ok(())
+        }
     }
 
     fn read8(&self, offset: u16) -> u8 {
@@ -630,7 +753,7 @@ pub fn self_test() {
     assert_eq!(QueueLayout::new(256).unwrap().used, 8192);
     assert_eq!(QueueLayout::new(256).unwrap().pages, 3);
     assert_eq!(QueueLayout::new(128).unwrap().pages, 2);
-    let descriptors = read_descriptors(0x2000).expect("aligned bounce");
+    let descriptors = request_descriptors(0x2000, Operation::Read).expect("aligned bounce");
     assert_eq!(
         descriptors[0],
         Descriptor {
@@ -640,6 +763,43 @@ pub fn self_test() {
             next: 1
         }
     );
+    let writes = request_descriptors(0x2000, Operation::Write).unwrap();
+    assert_eq!(writes[0], descriptors[0]);
+    assert_eq!(writes[1].address, 0x2010);
+    assert_eq!(writes[1].length, 512);
+    assert_eq!(writes[1].flags, DESCRIPTOR_NEXT);
+    assert_eq!(writes[1].next, 2);
+    assert_eq!(writes[2], descriptors[2]);
+    let flush = request_descriptors(0x2000, Operation::Flush).unwrap();
+    assert_eq!(flush[0], descriptors[0]);
+    assert_eq!(flush[1], descriptors[2]);
+    assert_eq!(
+        flush[1].flags & DESCRIPTOR_NEXT,
+        0,
+        "flush must have no data chain"
+    );
+    assert_eq!(Operation::Read.command(), 0);
+    assert_eq!(Operation::Write.command(), 1);
+    assert_eq!(Operation::Flush.command(), 4);
+    for access in [Access::ReadOnly, Access::ReadWrite] {
+        for flush in [false, true] {
+            assert!(matches!(
+                write_permission(access, true, flush),
+                Err(BlockError::ReadOnly)
+            ));
+        }
+    }
+    for flush in [false, true] {
+        assert!(matches!(
+            write_permission(Access::ReadOnly, false, flush),
+            Err(BlockError::WriteDenied)
+        ));
+    }
+    assert!(matches!(
+        write_permission(Access::ReadWrite, false, false),
+        Err(BlockError::FlushUnsupported)
+    ));
+    assert!(write_permission(Access::ReadWrite, false, true).is_ok());
     assert_eq!(
         descriptors[1],
         Descriptor {
@@ -660,11 +820,13 @@ pub fn self_test() {
     );
     for address in [0, 1, 0x2001, 1 << 32, u64::MAX] {
         assert!(matches!(
-            read_descriptors(address),
+            request_descriptors(address, Operation::Read),
             Err(BlockError::InvalidDmaAddress)
         ));
     }
-    assert!(read_descriptors((1 << 32) - PAGE_SIZE as u64).is_ok());
+    for operation in [Operation::Read, Operation::Write, Operation::Flush] {
+        assert!(request_descriptors((1 << 32) - PAGE_SIZE as u64, operation).is_ok());
+    }
     assert!(valid_sector(0, 2048));
     assert!(valid_sector(2047, 2048));
     assert!(!valid_sector(2048, 2048));

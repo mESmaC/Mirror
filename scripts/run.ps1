@@ -13,7 +13,7 @@ param(
     [switch]$LegacyPic,
     [switch]$PitTimer,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
-    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation')][string]$Fault = 'None',
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -194,8 +194,9 @@ if ($Fault -ne 'None' -and -not $Smoke) {
 if ($Graphical -and ($Smoke -or $NoDisplayDevice)) {
     throw '-Graphical requires a normal boot with a display device.'
 }
-if ($NoTestDisk -and $Fault -eq 'BlockIoError') {
-    throw '-Fault BlockIoError requires the test disk.'
+$writableBlock = $Fault -in @('BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush')
+if ($NoTestDisk -and ($Fault -eq 'BlockIoError' -or $writableBlock)) {
+    throw "-Fault $Fault requires the test disk."
 }
 if ($Fault -in @('SmpUnmap', 'SmpTlbTimeout') -and ($CpuCount -lt 2 -or $LegacyPic)) {
     throw 'SMP memory fault probes require at least two CPUs and the APIC backend.'
@@ -239,6 +240,10 @@ $testMode = switch ($Fault) {
     'IpcPeerExit' { 'ipc-peer-exit' }
     'IpcTimeout' { 'ipc-timeout' }
     'BlockIoError' { 'block-io-error' }
+    'BlockWrite' { 'block-write' }
+    'BlockWriteError' { 'block-write-error' }
+    'BlockFlushError' { 'block-flush-error' }
+    'BlockNoFlush' { 'block-no-flush' }
     'VmReadOnly' { 'vm-read-only' }
     'VmNx' { 'vm-nx' }
     'VmReleased' { 'vm-released' }
@@ -292,7 +297,37 @@ $qemuArguments = @(
 if (-not $NoTestDisk) {
     $testDisk = Get-MirrorTestDisk -RepositoryRoot $repositoryRoot
     $testDiskHash = (Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash
-    if ($Fault -eq 'BlockIoError') {
+    $testDevice = 'virtio-blk-pci,drive=mirror-test,disable-modern=on,disable-legacy=off'
+    if ($writableBlock) {
+        $writableDisk = New-MirrorWritableTestDisk -RepositoryRoot $repositoryRoot
+        $fileNode = @{ driver = 'file'; filename = $writableDisk; cache = @{ 'no-flush' = $false } }
+        if ($Fault -in @('BlockWriteError', 'BlockFlushError')) {
+            $fileNode = @{ driver = 'blkdebug'; image = $fileNode }
+            if ($Fault -eq 'BlockWriteError') {
+                $fileNode['inject-error'] = @(@{ event = 'write_aio'; errno = 5; sector = 1234; once = $true })
+            }
+            else {
+                # State 1 survives firmware flushes. The first data write arms
+                # a single flush error in state 2; retries then reach the file.
+                # https://www.qemu.org/docs/master/devel/testing/blkdebug.html
+                $fileNode['set-state'] = @(@{ event = 'write_aio'; state = 1; new_state = 2 })
+                $fileNode['inject-error'] = @(@{ event = 'flush_to_disk'; state = 2; errno = 5; once = $true })
+            }
+        }
+        $testNode = @{
+            driver = 'raw'; 'node-name' = 'mirror-test'; 'read-only' = $false
+            cache = @{ 'no-flush' = $false }; file = $fileNode
+        } | ConvertTo-Json -Compress -Depth 8
+        $qemuArguments += @('-blockdev', $testNode)
+        $testDevice += ',queue-size=256,werror=report,rerror=report'
+        if ($Fault -eq 'BlockNoFlush') {
+            # WCE is legacy FLUSH bit 9. Disable both sources of that feature
+            # in QEMU's virtio_blk_get_features, not just the guest's mask.
+            $testDevice += ',write-cache=off,config-wce=off,x-enable-wce-if-config-wce=off'
+        }
+        else { $testDevice += ',write-cache=on' }
+    }
+    elseif ($Fault -eq 'BlockIoError') {
         # Inject into a data sector used by the kernel probe, away from firmware
         # partition discovery. JSON preserves paths without blkdebug URL colons.
         $testNode = @{
@@ -308,7 +343,7 @@ if (-not $NoTestDisk) {
     else {
         $qemuArguments += @('-drive', "if=none,id=mirror-test,format=raw,readonly=on,file=$(ConvertTo-QemuOptionValue $testDisk)")
     }
-    $qemuArguments += @('-device', 'virtio-blk-pci,drive=mirror-test,disable-modern=on,disable-legacy=off')
+    $qemuArguments += @('-device', $testDevice)
 }
 if (-not $Graphical) { $qemuArguments += @('-display', 'none') }
 if (Test-Path -LiteralPath (Join-Path $qemuDirectory 'share') -PathType Container) {
@@ -373,6 +408,9 @@ try {
     if ($qemuExitCode -ne $expectedExitCode) {
         $qemuError = [System.IO.File]::ReadAllText($stderrLog)
         throw "Mirror smoke test expected QEMU exit $expectedExitCode; got $qemuExitCode. $qemuError See $serialLog."
+    }
+    if ($writableBlock) {
+        Assert-MirrorWritableTestDisk -OriginalPath $testDisk -WritablePath $writableDisk -WritesExpected ($Fault -ne 'BlockNoFlush')
     }
     $markers = @('MIRROR_FRAMES_OK', 'MIRROR_ALLOCATOR_TESTS_OK', 'MIRROR_FRAME_REUSE_OK', 'MIRROR_EXCEPTIONS_OK', 'MIRROR_PAGING_OK', 'MIRROR_HEAP_OK', 'MIRROR_TIMER_OK', 'MIRROR_HEAP_IRQ_OK', 'MIRROR_USER_PAGING_OK', 'MIRROR_ELF_TESTS_OK', 'MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_USER_LOAD_ROLLBACK_OK', 'MIRROR_SCHEDULER_OK', 'MIRROR_CAPABILITY_TESTS_OK', 'MIRROR_IPC_TESTS_OK', 'MIRROR_IPC_OK')
     $markers += @('MIRROR_PCI_TESTS_OK', 'MIRROR_PCI_READY', 'MIRROR_FRAMEBUFFER_TESTS_OK')
@@ -515,7 +553,10 @@ try {
     if ($serial -match '(?m)^MIRROR_BLOCK_FAILED(?:\s|$)') {
         throw "Mirror block driver failed. See $serialLog."
     }
-    if ($NoTestDisk) {
+    if ($writableBlock) {
+        Assert-MirrorWritableBlockMarkers -Serial $serial -FaultMode $Fault
+    }
+    elseif ($NoTestDisk) {
         $markers += 'MIRROR_BLOCK_SKIPPED'
         if ($serial -match '(?m)^MIRROR_BLOCK_(?:READY|READ_OK|IO_ERROR_OK)(?:\s|$)') {
             throw "Mirror unexpectedly bound a block device. See $serialLog."
@@ -526,6 +567,9 @@ try {
         if ($serial -match '(?m)^MIRROR_BLOCK_SKIPPED(?:\s|$)') {
             throw "Mirror skipped the attached block fixture. See $serialLog."
         }
+    }
+    if (-not $writableBlock -and $serial -match '(?m)^MIRROR_BLOCK_(?:WRITABLE_READY|POLICY_OK|NO_FLUSH_OK|WRITE_OK|FLUSH_OK|DIRTY_SHUTDOWN_OK|PERSIST_OK|WRITE_ERROR_OK|FLUSH_ERROR_OK)(?:\s|$)') {
+        throw "Mirror unexpectedly ran a writable storage probe. See $serialLog."
     }
     if ($Fault -eq 'BlockIoError') { $markers += 'MIRROR_BLOCK_IO_ERROR_OK' }
     elseif ($serial -match '(?m)^MIRROR_BLOCK_IO_ERROR_OK(?:\s|$)') {

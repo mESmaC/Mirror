@@ -395,3 +395,101 @@ function Get-MirrorTestDisk {
     }
     return $path
 }
+
+function New-MirrorWritableTestDisk {
+    param([Parameter(Mandatory = $true)][string]$RepositoryRoot)
+    # Reset this separate, disposable image on every run. The source fixture
+    # and the firmware boot disk are never exposed as writable storage.
+    $source = Get-MirrorTestDisk -RepositoryRoot $RepositoryRoot
+    $path = Join-Path $RepositoryRoot 'build/block-write-test.img'
+    Copy-Item -LiteralPath $source -Destination $path -Force
+    return $path
+}
+
+function Assert-MirrorWritableTestDisk {
+    param(
+        [Parameter(Mandatory = $true)][string]$OriginalPath,
+        [Parameter(Mandatory = $true)][string]$WritablePath,
+        [Parameter(Mandatory = $true)][bool]$WritesExpected
+    )
+    $expected = [System.IO.File]::ReadAllBytes($OriginalPath)
+    if ($expected.Length -ne 1048576) { throw 'Unexpected original block fixture size.' }
+    if ($WritesExpected) {
+        # Independently reconstruct the last generation for every target LBA.
+        # The runner pins the device queue to 256 entries; the guest performs
+        # twice that many writes plus three, interleaved with readback.
+        $sectors = @(0, 1234, 2047)
+        $generations = @(0, 0, 0)
+        for ($request = 0; $request -lt 256 * 2 + 3; $request++) {
+            $generations[$request % 3] = $request + 1
+        }
+        $signature = [System.Text.Encoding]::ASCII.GetBytes('MIRRORW1')
+        for ($slot = 0; $slot -lt $sectors.Count; $slot++) {
+            $sector = [uint64]$sectors[$slot]
+            $generation = [uint64]$generations[$slot]
+            $start = [int]$sector * 512
+            for ($index = 0; $index -lt 8; $index++) {
+                $expected[$start + $index] = [byte](($sector -shr (8 * $index)) -band 255)
+                $expected[$start + 8 + $index] = $signature[$index]
+                $expected[$start + 16 + $index] = [byte](($generation -shr (8 * $index)) -band 255)
+            }
+            for ($index = 24; $index -lt 512; $index++) {
+                $expected[$start + $index] = [byte]((($sector * 73) -bxor ($generation * 131) -bxor ($index * 29) -bxor 90) -band 255)
+            }
+        }
+    }
+    $hash = [System.Security.Cryptography.SHA256]::Create()
+    try { $expectedHash = [BitConverter]::ToString($hash.ComputeHash($expected)).Replace('-', '') }
+    finally { $hash.Dispose() }
+    if ((Get-Item -LiteralPath $WritablePath).Length -ne $expected.Length -or
+        (Get-FileHash -LiteralPath $WritablePath -Algorithm SHA256).Hash -ne $expectedHash) {
+        throw 'The writable block fixture does not match the complete expected post-boot image.'
+    }
+}
+
+function Assert-MirrorWritableBlockMarkers {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [Parameter(Mandatory = $true)][string]$FaultMode
+    )
+    $withoutFlush = $FaultMode -eq 'BlockNoFlush'
+    $flush = if ($withoutFlush) { 0 } else { 1 }
+    $expected = @{
+        MIRROR_BLOCK_WRITABLE_READY = "sectors=2048 queue=256 readonly=0 flush=$flush"
+        MIRROR_BLOCK_POLICY_OK = 'writes_denied=1 flush_denied=1'
+        MIRROR_BLOCK_CLEANUP_OK = 'dma_reclaimed=1'
+    }
+    if ($withoutFlush) {
+        $expected.MIRROR_BLOCK_NO_FLUSH_OK = 'writes_denied=1 dirty=0'
+    }
+    else {
+        $expected.MIRROR_BLOCK_WRITE_OK = 'sectors=2048 writes=515 queue=256 bounds_rejected=2'
+        $expected.MIRROR_BLOCK_FLUSH_OK = 'dirty=0'
+        $expected.MIRROR_BLOCK_DIRTY_SHUTDOWN_OK = 'dma_reclaimed=1'
+        $expected.MIRROR_BLOCK_PERSIST_OK = 'sectors=3 neighbors=4'
+    }
+    if ($FaultMode -eq 'BlockWriteError') {
+        $expected.MIRROR_BLOCK_WRITE_ERROR_OK = 'retry=1 input_preserved=1'
+    }
+    if ($FaultMode -eq 'BlockFlushError') {
+        $expected.MIRROR_BLOCK_FLUSH_ERROR_OK = 'retry=1 dirty_preserved=1'
+    }
+    foreach ($marker in @('MIRROR_BLOCK_WRITABLE_READY', 'MIRROR_BLOCK_POLICY_OK', 'MIRROR_BLOCK_CLEANUP_OK',
+            'MIRROR_BLOCK_NO_FLUSH_OK', 'MIRROR_BLOCK_WRITE_OK', 'MIRROR_BLOCK_FLUSH_OK',
+            'MIRROR_BLOCK_DIRTY_SHUTDOWN_OK', 'MIRROR_BLOCK_PERSIST_OK',
+            'MIRROR_BLOCK_WRITE_ERROR_OK', 'MIRROR_BLOCK_FLUSH_ERROR_OK')) {
+        $records = [regex]::Matches($Serial, "(?m)^$marker(?:\s|$)")
+        if ($expected.ContainsKey($marker)) {
+            $pattern = '(?m)^{0} {1}\r?$' -f $marker, [regex]::Escape($expected[$marker])
+            if ($records.Count -ne 1 -or [regex]::Matches($Serial, $pattern).Count -ne 1) {
+                throw "Writable storage scenario $FaultMode requires exactly one '$marker $($expected[$marker])'."
+            }
+        }
+        elseif ($records.Count -ne 0) {
+            throw "Writable storage scenario $FaultMode unexpectedly reported $marker."
+        }
+    }
+    if ($Serial -match '(?m)^MIRROR_BLOCK_(?:READY|READ_OK|PROBE_OK|SKIPPED|IO_ERROR_OK)(?:\s|$)') {
+        throw 'A writable storage scenario unexpectedly ran the ordinary read-only probe.'
+    }
+}
