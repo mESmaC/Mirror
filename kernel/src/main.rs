@@ -19,6 +19,7 @@ mod heap;
 mod input;
 mod interrupts;
 mod ipc;
+mod kernel_vm;
 mod keyboard;
 mod memory;
 mod mouse;
@@ -27,6 +28,7 @@ mod pci;
 mod pointer;
 mod ps2;
 mod serial;
+mod smp;
 mod surface;
 mod timer;
 mod userspace;
@@ -107,7 +109,8 @@ pub extern "C" fn _start() -> ! {
 
     // SAFETY: IRQs are still disabled. This allocator and active hierarchy own
     // the heap range exclusively, and frame recycling is now available.
-    unsafe { heap::init(&mut tables, &mut frames) }.expect("could not initialize kernel heap");
+    unsafe { heap::init(&mut tables, &mut frames, boot.direct_map_offset) }
+        .expect("could not initialize kernel heap");
     let heap_stats = heap::stats();
     serial::println!(
         "MIRROR_HEAP_READY size={} free={}",
@@ -237,6 +240,14 @@ pub extern "C" fn _start() -> ! {
         timer::enable_mouse_irq();
     }
 
+    // SAFETY: BSP owns the hierarchy and allocator, IF=0, no AP or retained
+    // user root has been released. Runtime leaf changes keep these tables pinned.
+    unsafe { tables.prepare_shared_window(&mut frames) }.expect("shared kernel window");
+    smp::init(&boot, topology.as_ref(), &mut tables, &mut frames);
+    kernel_vm::init(&tables, &mut frames, boot.direct_map_offset);
+    #[cfg(feature = "boot-smoke")]
+    kernel_vm::heap_window_self_test(&tables, &mut frames, boot.direct_map_offset);
+    grow_kernel_heap(&tables, &mut frames, boot.direct_map_offset, "boot");
     let scenario = {
         #[cfg(feature = "boot-smoke")]
         {
@@ -258,6 +269,13 @@ pub extern "C" fn _start() -> ! {
         boot.direct_map_offset,
         scenario,
         display.as_mut(),
+    );
+    smp::rendezvous("after_userspace", 4);
+    grow_kernel_heap(
+        &tables,
+        &mut frames,
+        boot.direct_map_offset,
+        "after_userspace",
     );
     if let Some(display) = &mut display {
         display.update_status("KERNEL READY - NATIVE TASKS COMPLETE", 100);
@@ -292,11 +310,35 @@ pub extern "C" fn _start() -> ! {
     } else {
         serial::println!("MIRROR_DESKTOP_SKIPPED reason=missing_display_or_input");
     }
+    smp::rendezvous("after_desktop", 4);
 
     #[cfg(feature = "boot-smoke")]
     {
+        // SAFETY: All CPU rendezvous completed, BSP/IF0 owns the active root
+        // and frame allocator. The desktop has relinquished its allocations.
+        unsafe { heap::capacity_self_test(&tables, &mut frames, boot.direct_map_offset) };
         match boot::smoke_mode() {
-            boot::SmokeMode::Normal | boot::SmokeMode::User(_) | boot::SmokeMode::BlockIoError => {
+            boot::SmokeMode::SmpUnmap => {
+                // SAFETY: The runtime probe removed this alias and completed
+                // its shootdowns. This boot intentionally faults the last AP.
+                unsafe { smp::unmapped_shared_fault_self_test(kernel_vm::PROBE_ADDRESS) };
+                kernel_vm::offline_self_test(&tables, &mut frames, boot.direct_map_offset);
+            }
+            boot::SmokeMode::SmpTlbTimeout => {
+                kernel_vm::timeout_self_test(&tables, &mut frames, boot.direct_map_offset);
+            }
+            _ => {
+                smp::guard_fault_self_test();
+                kernel_vm::offline_self_test(&tables, &mut frames, boot.direct_map_offset);
+            }
+        }
+        match boot::smoke_mode() {
+            boot::SmokeMode::Normal
+            | boot::SmokeMode::User(_)
+            | boot::SmokeMode::BlockIoError
+            | boot::SmokeMode::SmpUnmap
+            | boot::SmokeMode::TimerCalibration
+            | boot::SmokeMode::SmpTlbTimeout => {
                 interrupts::arm_expected_page_fault(paging::TEST_ADDRESS)
             }
             boot::SmokeMode::PageFault => {
@@ -328,6 +370,39 @@ pub extern "C" fn _start() -> ! {
         // SAFETY: Only initialized IRQ sources are unmasked; the heap and
         // descriptors are ready. Keep allocator/table state alive here.
         unsafe { arch::idle() }
+    }
+}
+
+fn grow_kernel_heap(
+    tables: &paging::PageTables,
+    frames: &mut memory::FrameAllocator<'_>,
+    offset: u64,
+    phase: &str,
+) {
+    #[cfg(feature = "boot-smoke")]
+    // SAFETY: BSP, IF=0, active kernel root and exclusive allocator; APs only
+    // service bounded IPI commands and IRQ handlers never allocate.
+    let result =
+        Ok::<_, heap::HeapError>(unsafe { heap::growth_self_test(tables, frames, offset, phase) });
+    #[cfg(not(feature = "boot-smoke"))]
+    // SAFETY: Same BSP ownership and quiescent uncommitted tail as above. No
+    // allocator or IRQ-needed lock is held while shootdowns enable interrupts.
+    let result = unsafe { heap::grow(tables, frames, offset, heap::MAX_GROW_PAGES) };
+    match result {
+        Ok(stats) => serial::println!(
+            "MIRROR_HEAP_GROWN phase={} size={} used={} free={} max={} added_pages={}",
+            phase,
+            stats.size,
+            stats.used,
+            stats.free,
+            heap::HEAP_MAX_SIZE,
+            heap::MAX_GROW_PAGES
+        ),
+        Err(error) => serial::println!(
+            "MIRROR_HEAP_GROW_SKIPPED phase={} reason={:?}",
+            phase,
+            error
+        ),
     }
 }
 
@@ -626,6 +701,9 @@ fn test_heap_with_interrupts() {
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
     arch::disable_interrupts();
+    if smp::is_secondary() {
+        smp::secondary_fault(u64::MAX, u64::MAX, 0, 0);
+    }
     serial::println!("MIRROR_PANIC: {}", info);
 
     #[cfg(feature = "boot-smoke")]

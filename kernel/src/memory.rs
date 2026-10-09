@@ -310,8 +310,10 @@ impl<'a> FrameAllocator<'a> {
     /// use, reference, DMA operation, and non-direct-map alias. Withdraw mappings
     /// and invalidate their TLB entries before freeing; a dormant direct-map
     /// alias may remain but must not be used until the frame is allocated again.
-    /// Run on the sole boot CPU with interrupts disabled. Invalid frame values
-    /// may be submitted to test validation; they never cause a frame write.
+    /// Run on the BSP with interrupts disabled and exclusive allocator access.
+    /// APs must never use a released frame, even through the shared direct map.
+    /// Invalid frame values may be submitted to test validation; they never
+    /// cause a frame write.
     /// Tracking cannot establish ownership or detect a stale free after reuse.
     pub unsafe fn deallocate(&mut self, frame: u64) -> Result<(), FrameError> {
         if self.recycling.is_none() {
@@ -342,7 +344,7 @@ impl<'a> FrameAllocator<'a> {
     ///
     /// # Safety
     /// The caller must satisfy deallocate's ownership, quiescence, mapping and
-    /// single-CPU requirements for every page. Use the same allocator that
+    /// BSP ownership requirements for every page. Use the same allocator that
     /// allocated the run. Invalid ranges may be submitted as validation probes.
     pub unsafe fn deallocate_contiguous(
         &mut self,

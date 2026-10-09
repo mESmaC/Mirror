@@ -1,9 +1,10 @@
-//! BSP xAPIC/IOAPIC routing for the PIT and i8042 devices discovered by MADT.
+//! xAPIC initialization, targeted IPIs, and BSP timer/device routing.
 //!
-//! APs remain stopped. Preparation validates every route before controller
-//! configuration; unsupported platforms keep the legacy PIC path. MMIO mappings
+//! Preparation validates every route before controller configuration;
+//! unsupported platforms keep the legacy PIC path. MMIO mappings
 //! are supervisor-only, NX, PAT3 UC, and precede all private userspace roots.
-//! No AML, SCI, PCI interrupt routing, x2APIC, or local timer calibration yet.
+//! No AML, SCI, PCI interrupt routing, or x2APIC yet. The timer driver owns
+//! BSP local-timer calibration; secondary local timers remain stopped.
 //!
 //! Register contracts: Intel SDM vol. 3A chapter 10 and Intel 82093AA datasheet.
 //! https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
@@ -12,7 +13,7 @@
 use core::{
     arch::{asm, x86_64::__cpuid},
     cell::UnsafeCell,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, Ordering, fence},
 };
 use limine::memory_map::{Entry, EntryType};
 use mirror_acpi::{LocalNmi, Polarity, Topology, Trigger};
@@ -25,7 +26,11 @@ use crate::{
     serial,
 };
 
-const DEVICE_WINDOW: u64 = 0xffff_d000_0020_0000;
+// Dedicated platform mappings must not consume reserved heap growth pages.
+const DEVICE_WINDOW: u64 = 0xffff_d300_0000_0000;
+const _: () = assert!(
+    DEVICE_WINDOW >= crate::heap::HEAP_START + crate::heap::HEAP_MAX_SIZE as u64 + PAGE_SIZE
+);
 const APIC_BASE: u32 = 0x1b;
 const MASKED: u32 = 1 << 16;
 const IRQ_LINES: [u8; 3] = [0, 1, 12];
@@ -34,6 +39,17 @@ const VERSION: u32 = 0x30;
 const TPR: u32 = 0x80;
 const EOI: u32 = 0xb0;
 const SVR: u32 = 0xf0;
+const ICR_LOW: u32 = 0x300;
+const ICR_HIGH: u32 = 0x310;
+const SEND_PENDING: u32 = 1 << 12;
+const ICR_SPINS: usize = 1_000_000;
+const TIMER_LVT: u32 = 0x320;
+const TIMER_INITIAL: u32 = 0x380;
+const TIMER_CURRENT: u32 = 0x390;
+const TIMER_DIVIDE: u32 = 0x3e0;
+const TIMER_VECTOR: u32 = 241;
+const TIMER_PERIODIC: u32 = 1 << 17;
+const TIMER_DIVIDE_16: u32 = 0x3;
 const LINT0: u32 = 0x350;
 
 #[derive(Clone, Copy)]
@@ -43,14 +59,15 @@ struct Mmio {
 
 impl Mmio {
     fn read(self, offset: u32) -> u32 {
-        // SAFETY: Only validated, exclusively owned controller pages construct
-        // Mmio. All register offsets below are aligned and within their page.
+        // SAFETY: Only validated controller pages construct Mmio. All register
+        // offsets below are aligned and within their page. The local APIC page
+        // addresses the current CPU's controller, even when its VA is shared.
         unsafe { ((self.address + u64::from(offset)) as *const u32).read_volatile() }
     }
 
     fn write(self, offset: u32, value: u32) {
-        // SAFETY: As above. IF=0 serializes IOREGSEL/window accesses on the BSP;
-        // no other CPU or driver is permitted to access these controllers.
+        // SAFETY: As above. IF=0 serializes this CPU's local APIC accesses;
+        // only the BSP accesses the shared IOREGSEL/window controller pages.
         unsafe {
             ((self.address + u64::from(offset)) as *mut u32).write_volatile(value);
         }
@@ -98,6 +115,7 @@ struct Route {
 
 struct Controller {
     local: Mmio,
+    local_physical: u64,
     bsp: u8,
     io: [IoApic; mirror_acpi::MAX_IO_APICS],
     io_count: usize,
@@ -107,8 +125,10 @@ struct Controller {
 }
 
 struct BootController(UnsafeCell<Option<Controller>>);
-// SAFETY: Only the boot CPU runs, all calls occur with IF=0, and the state is
-// published once before IRQ enablement. No handler holds a reference on return.
+// SAFETY: The BSP initializes this exactly once and publishes it with ENABLED's
+// release store before AP entry. Readers acquire that publication; the Rust
+// state then remains immutable. Local MMIO accesses act on each CPU separately,
+// and only the BSP may access the shared IOAPIC registers, always with IF=0.
 unsafe impl Sync for BootController {}
 static CONTROLLER: BootController = BootController(UnsafeCell::new(None));
 static ATTEMPTED: AtomicBool = AtomicBool::new(false);
@@ -179,25 +199,10 @@ fn prepare(
     if topology.io_apics().is_empty() {
         return Err("missing_ioapic");
     }
-    let low: u32;
-    let high: u32;
-    // SAFETY: CPUID reports the architectural local APIC and its base MSR.
-    unsafe {
-        asm!("rdmsr", in("ecx") APIC_BASE, out("eax") low, out("edx") high,
-            options(nomem, nostack, preserves_flags));
-    }
-    let base = u64::from(low) | (u64::from(high) << 32);
-    if base & (1 << 10) != 0 {
-        return Err("x2apic_active");
-    }
-    if base & (1 << 11) == 0 {
-        return Err("lapic_disabled");
-    }
+    let base = apic_base();
+    validate_base(base, topology.lapic_address)?;
     if base & (1 << 8) == 0 {
         return Err("not_boot_cpu");
-    }
-    if base & 0x000f_ffff_ffff_f000 != topology.lapic_address {
-        return Err("lapic_base_mismatch");
     }
     let local = map(topology.lapic_address, boot, tables, frames, mapped)?;
     let bsp = (local.read(ID) >> 24) as u8;
@@ -209,11 +214,7 @@ fn prepare(
         .iter()
         .find(|cpu| cpu.apic_id == u32::from(bsp) && cpu.enabled)
         .ok_or("missing_boot_cpu")?;
-    let version = local.read(VERSION);
-    let max_lvt = (version >> 16) & 0xff;
-    if version & 0xff < 0x10 || version & 0xff == 0xff || !(3..=6).contains(&max_lvt) {
-        return Err("unsupported_lapic");
-    }
+    let max_lvt = local_max_lvt(local.read(VERSION))?;
     // Base revision 3 does not guarantee an empty LAPIC ISR. An inherited
     // in-service vector can block our IRQs even after TPR is lowered. Do not
     // retire a firmware-owned interrupt with a blind EOI; retain the PIC path.
@@ -268,6 +269,7 @@ fn prepare(
     }
     Ok(Controller {
         local,
+        local_physical: topology.lapic_address,
         bsp,
         io,
         io_count,
@@ -318,6 +320,81 @@ fn lint_configuration(uid: u32, nmis: &[LocalNmi]) -> [u32; 2] {
 
 fn isr_clear(mut read: impl FnMut(u32) -> u32) -> bool {
     (0..8).all(|bank| read(0x100 + bank * 0x10) == 0)
+}
+
+fn irr_clear(mut read: impl FnMut(u32) -> u32) -> bool {
+    (0..8).all(|bank| read(0x200 + bank * 0x10) == 0)
+}
+
+fn local_max_lvt(version: u32) -> Result<u32, &'static str> {
+    let maximum = (version >> 16) & 0xff;
+    if version & 0xff < 0x10 || version & 0xff == 0xff || !(3..=6).contains(&maximum) {
+        return Err("unsupported_lapic");
+    }
+    Ok(maximum)
+}
+
+fn validate_base(base: u64, physical: u64) -> Result<(), &'static str> {
+    if base & (1 << 10) != 0 {
+        return Err("x2apic_active");
+    }
+    if base & (1 << 11) == 0 {
+        return Err("lapic_disabled");
+    }
+    if base & 0x000f_ffff_ffff_f000 != physical {
+        return Err("lapic_base_mismatch");
+    }
+    Ok(())
+}
+
+fn apic_base() -> u64 {
+    let low: u32;
+    let high: u32;
+    // SAFETY: Callers first verify the CPUID architectural local APIC bit.
+    unsafe {
+        asm!("rdmsr", in("ecx") APIC_BASE, out("eax") low, out("edx") high,
+            options(nomem, nostack, preserves_flags));
+    }
+    u64::from(low) | (u64::from(high) << 32)
+}
+
+fn configure_local(local: Mmio, max_lvt: u32, lint: [u32; 2]) -> Result<(), &'static str> {
+    // Mask every supported local source before replacing inherited ExtINT.
+    for offset in [TIMER_LVT, 0x350, 0x360, 0x370] {
+        local.write(offset, MASKED | 254);
+        if local.read(offset) & MASKED == 0 {
+            return Err("lapic_mask_readback");
+        }
+    }
+    for (minimum, offset) in [(4, 0x340), (5, 0x330), (6, 0x2f0)] {
+        if max_lvt >= minimum {
+            local.write(offset, MASKED | 254);
+            if local.read(offset) & MASKED == 0 {
+                return Err("lapic_mask_readback");
+            }
+        }
+    }
+    // This also runs on APs, whose timer must stay stopped throughout runtime.
+    local.write(TIMER_INITIAL, 0);
+    if local.read(TIMER_INITIAL) != 0 || local.read(TIMER_CURRENT) != 0 {
+        return Err("lapic_timer_stop_readback");
+    }
+    local.write(TPR, 0);
+    // Vector255, software enable, focus checking enabled, EOI broadcast on.
+    // The dedicated spurious gate sends no EOI.
+    local.write(SVR, (local.read(SVR) & !0x13ff) | 0x1ff);
+    if local.read(SVR) & 0x11ff != 0x1ff || local.read(TPR) & 0xff != 0 {
+        return Err("lapic_enable_readback");
+    }
+    for (index, value) in lint.into_iter().enumerate() {
+        let offset = LINT0 + 0x10 * index as u32;
+        local.write(offset, value);
+        // Delivery status and remote IRR are hardware-owned read-only bits.
+        if local.read(offset) & !(1 << 12 | 1 << 14) != value {
+            return Err("lapic_lint_readback");
+        }
+    }
+    Ok(())
 }
 
 fn electrical(polarity: Polarity, trigger: Trigger) -> u32 {
@@ -393,29 +470,7 @@ impl Controller {
                 assert_ne!(chip.read(low) & MASKED, 0, "IOAPIC mask readback");
             }
         }
-        // Mask every supported local source before replacing legacy ExtINT.
-        for offset in [0x320, 0x350, 0x360, 0x370] {
-            self.local.write(offset, MASKED | 254);
-        }
-        if self.max_lvt >= 4 {
-            self.local.write(0x340, MASKED | 254);
-        }
-        if self.max_lvt >= 5 {
-            self.local.write(0x330, MASKED | 254);
-        }
-        if self.max_lvt >= 6 {
-            self.local.write(0x2f0, MASKED | 254);
-        }
-        self.local.write(0x380, 0); // The uncalibrated LAPIC timer stays stopped.
-        self.local.write(TPR, 0);
-        // Use vector255, software enable, focus checking enabled, EOI broadcast
-        // enabled. The dedicated spurious gate sends no EOI.
-        self.local
-            .write(SVR, (self.local.read(SVR) & !0x13ff) | 0x1ff);
-        assert_eq!(self.local.read(SVR) & 0x11ff, 0x1ff);
-        for (index, value) in self.lint.into_iter().enumerate() {
-            self.local.write(LINT0 + 0x10 * index as u32, value);
-        }
+        configure_local(self.local, self.max_lvt, self.lint).expect("BSP local APIC configuration");
         for route in self.routes {
             let chip = &self.io[route.io];
             let register = chip.low_register(route.gsi);
@@ -450,15 +505,221 @@ impl Controller {
 }
 
 fn controller() -> &'static Controller {
-    assert!(is_enabled());
-    assert!(!arch::interrupts_enabled());
-    // SAFETY: Publication precedes IRQ enablement; immutable state is retained
-    // forever and all accesses to controller registers remain BSP-only, IF=0.
-    unsafe { (*CONTROLLER.0.get()).as_ref().expect("APIC publication") }
+    published_controller().expect("APIC publication with interrupts disabled")
+}
+
+fn published_controller() -> Result<&'static Controller, &'static str> {
+    if arch::interrupts_enabled() {
+        return Err("lapic_interrupts_enabled");
+    }
+    if !is_enabled() {
+        return Err("lapic_not_ready");
+    }
+    // SAFETY: Acquire observes the one BSP publication. The retained state is
+    // immutable thereafter; only local MMIO may be accessed by secondary CPUs.
+    unsafe { (*CONTROLLER.0.get()).as_ref().ok_or("lapic_not_ready") }
+}
+
+/// Return this CPU's physical xAPIC ID after validating its MMIO mode and base.
+/// Call with IF=0; this can also validate an AP before its local initialization.
+pub(crate) fn local_apic_id() -> Result<u32, &'static str> {
+    let controller = published_controller()?;
+    if cpuid_edx() & (1 << 9) == 0 {
+        return Err("unsupported_cpu");
+    }
+    validate_base(apic_base(), controller.local_physical)?;
+    let id = controller.local.read(ID) >> 24;
+    if id == 255 {
+        return Err("broadcast_cpu_id");
+    }
+    Ok(id)
+}
+
+/// Configure only the calling secondary CPU's local controller. The BSP must
+/// publish the kernel's controller mappings and install this CPU's IDT first.
+/// No allocation, logging, shared IOAPIC access, or EOI occurs in this path.
+pub(crate) fn init_secondary(
+    expected_apic_id: u32,
+    topology: &Topology,
+) -> Result<(), &'static str> {
+    let controller = published_controller()?;
+    let id = local_apic_id()?;
+    if id != expected_apic_id || id == u32::from(controller.bsp) {
+        return Err("secondary_id_mismatch");
+    }
+    if apic_base() & (1 << 8) != 0 {
+        return Err("secondary_is_boot_cpu");
+    }
+    if topology.lapic_address != controller.local_physical {
+        return Err("lapic_base_mismatch");
+    }
+    let cpu = topology
+        .cpus()
+        .iter()
+        .find(|cpu| cpu.enabled && cpu.apic_id == id)
+        .ok_or("missing_secondary_cpu")?;
+    let max_lvt = local_max_lvt(controller.local.read(VERSION))?;
+    // An inherited in-service interrupt must not be retired blindly. Pending
+    // firmware vectors are also rejected before IF can expose the new IDT.
+    if !isr_clear(|offset| controller.local.read(offset)) {
+        return Err("lapic_inherited_isr");
+    }
+    if !irr_clear(|offset| controller.local.read(offset)) {
+        return Err("lapic_inherited_irr");
+    }
+    configure_local(
+        controller.local,
+        max_lvt,
+        lint_configuration(cpu.uid, topology.local_nmis()),
+    )
+}
+
+fn ipi_command(apic_id: u32, vector: u8) -> Result<(u32, u32), &'static str> {
+    if apic_id >= 255 {
+        return Err("invalid_ipi_destination");
+    }
+    // Only the installed SMP rendezvous gate is available at this stage.
+    if vector != 240 {
+        return Err("unsupported_ipi_vector");
+    }
+    // Explicit physical destination, fixed delivery, edge trigger, asserted
+    // level. Write ICR high first; the low write actually submits the command.
+    Ok((apic_id << 24, (1 << 14) | u32::from(vector)))
+}
+
+fn wait_for_delivery(mut read: impl FnMut() -> u32, spins: usize) -> bool {
+    for _ in 0..spins {
+        if read() & SEND_PENDING == 0 {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+/// Submit a fixed physical IPI from the BSP, including a targeted self-IPI.
+/// The caller must publish any work before this call and await its own target
+/// acknowledgement: an idle ICR proves submission completion, not execution.
+pub(crate) fn send_ipi(apic_id: u32, vector: u8) -> Result<(), &'static str> {
+    let (high, low) = ipi_command(apic_id, vector)?;
+    let controller = published_controller()?;
+    if local_apic_id()? != u32::from(controller.bsp) {
+        return Err("ipi_sender_not_bsp");
+    }
+    let local = controller.local;
+    if !wait_for_delivery(|| local.read(ICR_LOW), ICR_SPINS) {
+        return Err("ipi_previous_delivery_timeout");
+    }
+    // The fence orders normal-memory mailbox publication before the UC MMIO
+    // notification. IF=0 and BSP-only submission serialize the ICR register pair.
+    fence(Ordering::SeqCst);
+    local.write(ICR_HIGH, high);
+    local.write(ICR_LOW, low);
+    if !wait_for_delivery(|| local.read(ICR_LOW), ICR_SPINS) {
+        return Err("ipi_delivery_timeout");
+    }
+    Ok(())
+}
+
+fn bsp_local() -> Result<Mmio, &'static str> {
+    let controller = published_controller()?;
+    if local_apic_id()? != u32::from(controller.bsp) {
+        return Err("lapic_timer_not_bsp");
+    }
+    Ok(controller.local)
+}
+
+fn timer_lvt(periodic: bool, masked: bool) -> u32 {
+    TIMER_VECTOR | if periodic { TIMER_PERIODIC } else { 0 } | if masked { MASKED } else { 0 }
+}
+
+fn timer_configuration(
+    lvt: u32,
+    divider: u32,
+    periodic: bool,
+    masked: bool,
+) -> Result<(), &'static str> {
+    // Delivery status is hardware-owned. All other LVT bits must match,
+    // including the vector, mask, and both timer-mode bits (never deadline).
+    if lvt & !SEND_PENDING != timer_lvt(periodic, masked) {
+        return Err("lapic_timer_lvt_readback");
+    }
+    if divider & 0xb != TIMER_DIVIDE_16 {
+        return Err("lapic_timer_divide_readback");
+    }
+    Ok(())
+}
+
+fn stop_timer(local: Mmio) -> Result<(), &'static str> {
+    // Intel SDM vol. 3A, section 12.5.4: zero initial count stops one-shot
+    // and periodic timers. Selecting one-shot also disarms inherited deadline
+    // mode. Mask before stopping; a previously pending vector is not EOI'd.
+    // https://cdrdv2-public.intel.com/843836/325384-sdm-vol-3abcd-dec-24.pdf
+    local.write(TIMER_LVT, timer_lvt(false, true));
+    local.write(TIMER_INITIAL, 0);
+    if local.read(TIMER_LVT) & !SEND_PENDING != timer_lvt(false, true)
+        || local.read(TIMER_INITIAL) != 0
+        || local.read(TIMER_CURRENT) != 0
+    {
+        return Err("lapic_timer_stop_readback");
+    }
+    Ok(())
+}
+
+/// Start the BSP's masked, divide-by-16 one-shot calibration counter.
+/// Call with IF=0 and IRQ0 still masked. Any error requires a successful
+/// `stop_local_timer` before a fallback source may be enabled.
+pub(crate) fn begin_timer_calibration() -> Result<(), &'static str> {
+    let local = bsp_local()?;
+    stop_timer(local)?;
+    local.write(TIMER_DIVIDE, TIMER_DIVIDE_16);
+    timer_configuration(local.read(TIMER_LVT), local.read(TIMER_DIVIDE), false, true)?;
+    local.write(TIMER_INITIAL, u32::MAX);
+    if local.read(TIMER_INITIAL) != u32::MAX {
+        return Err("lapic_timer_initial_readback");
+    }
+    Ok(())
+}
+
+/// Read the BSP's calibration counter with IF=0.
+pub(crate) fn timer_current_count() -> u32 {
+    bsp_local()
+        .expect("BSP local timer with interrupts disabled")
+        .read(TIMER_CURRENT)
+}
+
+/// Mask and stop the BSP's local timer with IF=0. The caller must fail-stop
+/// if cleanup fails: another timer source cannot safely replace this timer.
+/// An already pending interrupt remains the interrupt handler's responsibility.
+pub(crate) fn stop_local_timer() -> Result<(), &'static str> {
+    stop_timer(bsp_local()?)
+}
+
+/// Start the BSP's divide-by-16 periodic timer on vector241 with IF=0.
+/// The IDT and selected-source policy must be ready before interrupts resume.
+/// Any error requires successful `stop_local_timer` cleanup before fallback.
+pub(crate) fn start_periodic_timer(count: u32) -> Result<(), &'static str> {
+    if count == 0 {
+        return Err("lapic_timer_zero_count");
+    }
+    let local = bsp_local()?;
+    stop_timer(local)?;
+    local.write(TIMER_DIVIDE, TIMER_DIVIDE_16);
+    local.write(TIMER_LVT, timer_lvt(true, true));
+    timer_configuration(local.read(TIMER_LVT), local.read(TIMER_DIVIDE), true, true)?;
+    local.write(TIMER_LVT, timer_lvt(true, false));
+    timer_configuration(local.read(TIMER_LVT), local.read(TIMER_DIVIDE), true, false)?;
+    // Writing initial count starts the timer; changing its mode alone does not.
+    local.write(TIMER_INITIAL, count);
+    if local.read(TIMER_INITIAL) != count {
+        return Err("lapic_timer_initial_readback");
+    }
+    Ok(())
 }
 
 pub fn enable_irq(irq: u8) {
     let controller = controller();
+    assert_eq!(controller.local.read(ID) >> 24, u32::from(controller.bsp));
     let route = controller
         .routes
         .iter()
@@ -479,8 +740,17 @@ pub fn eoi() {
 }
 
 #[cfg(feature = "boot-smoke")]
-pub fn timer_in_service() -> bool {
-    controller().local.read(0x110) & 1 != 0
+pub fn timer_in_service(vector: u8) -> bool {
+    assert!(matches!(vector, 32 | 241));
+    let controller = controller();
+    assert_eq!(controller.local.read(ID) >> 24, u32::from(controller.bsp));
+    let (offset, mask) = isr_location(vector);
+    controller.local.read(offset) & mask != 0
+}
+
+#[cfg(feature = "boot-smoke")]
+fn isr_location(vector: u8) -> (u32, u32) {
+    (0x100 + u32::from(vector / 32) * 0x10, 1 << (vector % 32))
 }
 
 /// Exercise the decisions that precede any controller mutation. These fixtures
@@ -488,6 +758,84 @@ pub fn timer_in_service() -> bool {
 #[cfg(feature = "boot-smoke")]
 pub fn self_test() {
     assert!(!arch::interrupts_enabled());
+    for maximum in 3..=6 {
+        assert_eq!(local_max_lvt((maximum << 16) | 0x14), Ok(maximum));
+    }
+    for version in [0x0003_000f, 0x0003_00ff, 0x0002_0014, 0x0007_0014] {
+        assert_eq!(local_max_lvt(version), Err("unsupported_lapic"));
+    }
+    let base = 0xfee0_0000;
+    assert_eq!(validate_base(base | 1 << 11, base), Ok(()));
+    assert_eq!(validate_base(base | 1 << 11 | 1 << 8, base), Ok(()));
+    assert_eq!(validate_base(base, base), Err("lapic_disabled"));
+    assert_eq!(
+        validate_base(base | 1 << 11 | 1 << 10, base),
+        Err("x2apic_active")
+    );
+    assert_eq!(
+        validate_base(base | 1 << 11, base + PAGE_SIZE),
+        Err("lapic_base_mismatch")
+    );
+    for id in [0, 1, 127, 254] {
+        assert_eq!(ipi_command(id, 240), Ok((id << 24, 0x40f0)));
+    }
+    for id in [255, 256, u32::MAX] {
+        assert_eq!(ipi_command(id, 240), Err("invalid_ipi_destination"));
+    }
+    for vector in [0, 31, 32, 128, 239, 241, 254, 255] {
+        assert_eq!(ipi_command(1, vector), Err("unsupported_ipi_vector"));
+    }
+    assert!(!wait_for_delivery(|| panic!("zero poll budget"), 0));
+    assert!(wait_for_delivery(|| 0x40f0, 1));
+    let mut polls = 0;
+    assert!(!wait_for_delivery(
+        || {
+            polls += 1;
+            SEND_PENDING
+        },
+        4
+    ));
+    assert_eq!(polls, 4);
+    polls = 0;
+    assert!(wait_for_delivery(
+        || {
+            polls += 1;
+            if polls == 4 { 0 } else { SEND_PENDING }
+        },
+        4
+    ));
+    assert_eq!(polls, 4);
+
+    for periodic in [false, true] {
+        for masked in [false, true] {
+            let expected = timer_lvt(periodic, masked);
+            for status in [0, SEND_PENDING] {
+                assert_eq!(
+                    timer_configuration(expected | status, TIMER_DIVIDE_16, periodic, masked),
+                    Ok(())
+                );
+            }
+            // A wrong vector, mask, mode, or reserved delivery bit is unsafe.
+            for changed in [1, MASKED, TIMER_PERIODIC, 1 << 18, 1 << 8] {
+                assert_eq!(
+                    timer_configuration(expected ^ changed, TIMER_DIVIDE_16, periodic, masked),
+                    Err("lapic_timer_lvt_readback")
+                );
+            }
+            for divider in [0, 1, 2, 8, 9, 10, 11] {
+                assert_eq!(
+                    timer_configuration(expected, divider, periodic, masked),
+                    Err("lapic_timer_divide_readback")
+                );
+            }
+        }
+    }
+    assert_eq!(isr_location(32), (0x110, 1));
+    assert_eq!(isr_location(240), (0x170, 1 << 16));
+    assert_eq!(isr_location(241), (0x170, 1 << 17));
+    assert_eq!(isr_location(255), (0x170, 1 << 31));
+    assert_eq!(start_periodic_timer(0), Err("lapic_timer_zero_count"));
+
     assert_eq!(ioapic_inputs(0x10), Ok(1));
     assert_eq!(ioapic_inputs(0x0017_0011), Ok(24));
     assert_eq!(ioapic_inputs(0x0077_0020), Ok(120));
@@ -574,6 +922,18 @@ pub fn self_test() {
     for bank in 0..8 {
         assert!(!isr_clear(|offset| u32::from(
             offset == 0x100 + bank * 0x10
+        )));
+    }
+    banks = 0;
+    assert!(irr_clear(|offset| {
+        assert_eq!(offset, 0x200 + banks * 0x10);
+        banks += 1;
+        0
+    }));
+    assert_eq!(banks, 8);
+    for bank in 0..8 {
+        assert!(!irr_clear(|offset| u32::from(
+            offset == 0x200 + bank * 0x10
         )));
     }
 

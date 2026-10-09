@@ -1,4 +1,4 @@
-//! BSP exception, APIC/PIC IRQ, and synchronous ring-3 entry/return delivery.
+//! Per-CPU exception descriptors and BSP synchronous ring-3 entry/return delivery.
 //!
 //! Descriptors, TLS bases and frames follow Intel SDM vol. 3A, §§3.4.4, 6.14, 7.7:
 //! https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
@@ -41,6 +41,9 @@ const USER_CODE_SELECTOR: u16 = 0x33;
 const USER_RFLAGS_MASK: u64 = 0x25_0dd5;
 const DOUBLE_FAULT_IST: u8 = 1;
 const DOUBLE_FAULT_STACK_SIZE: usize = 16 * 1024;
+const MAX_CPUS: usize = 64;
+const IPI_VECTOR: usize = 240;
+const LOCAL_TIMER_VECTOR: usize = 241;
 const APIC_SPURIOUS_VECTOR: usize = 255;
 
 #[repr(C, packed)]
@@ -172,11 +175,22 @@ static mut DOUBLE_FAULT_STACK: ExceptionStack = ExceptionStack([0; DOUBLE_FAULT_
 static mut GDT: [u64; 7] = [0; 7];
 static mut IDT: [IdtEntry; 256] = [IdtEntry::MISSING; 256];
 
+// Each secondary owns one element exclusively after claiming its slot. The
+// writable GDT cannot be shared: LTR marks the local TSS descriptor busy. Only
+// the IDT is shared, and it is immutable after INITIALIZED publishes it.
+static SECONDARY_CLAIMED: [AtomicBool; MAX_CPUS - 1] =
+    [const { AtomicBool::new(false) }; MAX_CPUS - 1];
+static mut SECONDARY_TSS: [TaskStateSegment; MAX_CPUS - 1] =
+    [const { TaskStateSegment::EMPTY }; MAX_CPUS - 1];
+static mut SECONDARY_GDT: [[u64; 7]; MAX_CPUS - 1] = [[0; 7]; MAX_CPUS - 1];
+static mut SECONDARY_DOUBLE_FAULT_STACKS: [ExceptionStack; MAX_CPUS - 1] =
+    [const { ExceptionStack([0; DOUBLE_FAULT_STACK_SIZE]) }; MAX_CPUS - 1];
+
 static USER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 // Assembly saves the BSP's suspended kernel stack here, with IF clear. User
-// pages cannot access this supervisor-only kernel object. SMP will need a
-// per-CPU context. The BSP scheduler resumes after each yield or preemption;
+// pages cannot access this supervisor-only kernel object. APs do not execute
+// userspace yet. The BSP scheduler resumes after each yield or preemption;
 // it retains user trap frames rather than suspended Rust handler stacks.
 #[unsafe(no_mangle)]
 static mut MIRROR_USER_KERNEL_RSP: u64 = 0;
@@ -195,6 +209,8 @@ static APIC_SPURIOUS_COUNT: AtomicUsize = AtomicUsize::new(0);
 unsafe extern "C" {
     static mirror_exception_entries: [u64; 48];
     fn mirror_exception_128();
+    fn mirror_exception_240();
+    fn mirror_exception_241();
     fn mirror_exception_255();
     fn mirror_resume_user(frame: *const TrapFrame, extended: *mut fpu::State);
     fn mirror_resume_kernel();
@@ -244,6 +260,10 @@ pub(crate) fn valid_user_tls(frame: &TrapFrame) -> bool {
 /// Kernel Rust must never inherit user TLS. Reading the actual MSRs also
 /// catches selector loads that changed a base without a TLS syscall.
 fn assert_kernel_tls_clean() {
+    assert!(kernel_tls_clean(), "kernel FS/GS state is not clean");
+}
+
+fn kernel_tls_clean() -> bool {
     let fs_selector: u16;
     let gs_selector: u16;
     let fs_low: u32;
@@ -264,30 +284,18 @@ fn assert_kernel_tls_clean() {
             out("eax") gs_low, out("edx") gs_high,
             options(nomem, nostack, preserves_flags));
     }
-    assert_eq!(fs_selector, 0, "kernel FS selector is not clean");
-    assert_eq!(gs_selector, 0, "kernel GS selector is not clean");
-    assert_eq!(fs_low | fs_high, 0, "kernel FS base is not clean");
-    assert_eq!(gs_low | gs_high, 0, "kernel GS base is not clean");
+    fs_selector == 0 && gs_selector == 0 && (fs_low | fs_high | gs_low | gs_high) == 0
 }
 
 /// Install the boot CPU's GDT, TSS and exception/IRQ IDT once at CPL0.
 /// All descriptor storage and the double-fault stack must remain mapped.
-/// This bring-up kernel has one CPU; later SMP needs per-CPU TSS/IST storage.
+/// Secondary CPUs load this shared IDT only after initialization is published.
 pub fn init() {
     arch::disable_interrupts();
-    assert!(
-        !INITIALIZED.swap(true, Ordering::SeqCst),
-        "IDT already loaded"
-    );
+    assert!(!is_initialized(), "IDT already loaded");
 
     let tss_address = addr_of!(TSS) as u64;
     let stack_top = addr_of!(DOUBLE_FAULT_STACK) as u64 + DOUBLE_FAULT_STACK_SIZE as u64;
-    let tss_limit = (size_of::<TaskStateSegment>() - 1) as u64;
-    let tss_low = tss_limit
-        | ((tss_address & 0xffff) << 16)
-        | (((tss_address >> 16) & 0xff) << 32)
-        | (0x89_u64 << 40) // Present, available 64-bit TSS.
-        | (((tss_address >> 24) & 0xff) << 56);
 
     // SAFETY: Only the boot CPU runs, IF is clear, and init is single-use. These
     // static objects have not been installed yet and no references alias writes.
@@ -296,15 +304,7 @@ pub fn init() {
             interrupt_stacks: [stack_top, 0, 0, 0, 0, 0, 0],
             ..TaskStateSegment::EMPTY
         });
-        addr_of_mut!(GDT).write([
-            0,
-            0x00af_9b00_0000_ffff, // Accessed, executable/readable 64-bit code.
-            0x00cf_9300_0000_ffff, // Accessed, writable data; L bit clear.
-            tss_low,
-            tss_address >> 32,
-            0x00cf_f300_0000_ffff, // DPL3 accessed, writable data.
-            0x00af_fb00_0000_ffff, // DPL3 accessed, 64-bit code.
-        ]);
+        addr_of_mut!(GDT).write(gdt_entries(tss_address));
         let handlers = addr_of!(mirror_exception_entries).cast::<u64>();
         let entries = addr_of_mut!(IDT).cast::<IdtEntry>();
         for vector in 0..48 {
@@ -316,6 +316,16 @@ pub fn init() {
         let mut syscall = IdtEntry::interrupt(mirror_exception_128 as *const () as u64, 0);
         syscall.attributes |= 3 << 5; // CPL3 may invoke INT 0x80.
         entries.add(0x80).write(syscall);
+        entries.add(IPI_VECTOR).write(IdtEntry::interrupt(
+            mirror_exception_240 as *const () as u64,
+            0,
+        ));
+        // Hardware may interrupt CPL3, but INT 241 must remain privileged so
+        // userspace cannot manufacture scheduler ticks or LAPIC EOIs.
+        entries.add(LOCAL_TIMER_VECTOR).write(IdtEntry::interrupt(
+            mirror_exception_241 as *const () as u64,
+            0,
+        ));
         // Hardware may deliver a spurious LAPIC interrupt at either CPL, but
         // userspace must not invoke this vector with the INT instruction.
         entries.add(APIC_SPURIOUS_VECTOR).write(IdtEntry::interrupt(
@@ -333,6 +343,34 @@ pub fn init() {
         base: addr_of!(IDT) as u64,
     };
 
+    // SAFETY: The BSP exclusively initialized these permanently mapped tables
+    // with IF clear, and no secondary may load the IDT until publication below.
+    unsafe { load_descriptors(&gdtr, &idtr) };
+    INITIALIZED.store(true, Ordering::Release);
+    serial::println!("MIRROR_IDT_READY exceptions=32 double_fault_ist=1 irqs=16");
+}
+
+fn gdt_entries(tss_address: u64) -> [u64; 7] {
+    let tss_limit = (size_of::<TaskStateSegment>() - 1) as u64;
+    let tss_low = tss_limit
+        | ((tss_address & 0xffff) << 16)
+        | (((tss_address >> 16) & 0xff) << 32)
+        | (0x89_u64 << 40) // Present, available 64-bit TSS.
+        | (((tss_address >> 24) & 0xff) << 56);
+    [
+        0,
+        0x00af_9b00_0000_ffff, // Accessed, executable/readable 64-bit code.
+        0x00cf_9300_0000_ffff, // Accessed, writable data; L bit clear.
+        tss_low,
+        tss_address >> 32,
+        0x00cf_f300_0000_ffff, // DPL3 accessed, writable data.
+        0x00af_fb00_0000_ffff, // DPL3 accessed, 64-bit code.
+    ]
+}
+
+/// The caller owns this CPU's writable GDT/TSS with IF clear, and both tables
+/// remain mapped. CS/data/TSS selectors must use the layout from gdt_entries.
+unsafe fn load_descriptors(gdtr: &DescriptorPointer, idtr: &DescriptorPointer) {
     // SAFETY: CPL0, interrupts disabled, persistent valid descriptors. The far
     // return reloads CS with balanced stack use; data selectors are replaced
     // before LTR. Kernel Rust uses zero FS/GS bases and selectors. LTR marks
@@ -362,8 +400,8 @@ pub fn init() {
             "mov ax, {tss}",
             "ltr ax",
             "lidt [{idt}]",
-            gdt = in(reg) &gdtr,
-            idt = in(reg) &idtr,
+            gdt = in(reg) gdtr,
+            idt = in(reg) idtr,
             code = const CODE_SELECTOR,
             data = const DATA_SELECTOR,
             tss = const TSS_SELECTOR,
@@ -372,7 +410,130 @@ pub fn init() {
             out("rdx") _,
         );
     }
-    serial::println!("MIRROR_IDT_READY exceptions=32 double_fault_ist=1 irqs=16");
+}
+
+/// Install and verify a secondary CPU's private GDT, TSS and double-fault IST.
+/// Failures are returned without logging or entering the BSP panic path.
+///
+/// # Safety
+/// The caller runs at CPL0 on the identified secondary with IF clear, exactly
+/// once for a slot in 1..64. The BSP has completed init. `kernel_stack_top` is
+/// immediately above this CPU's future private supervisor-writable stack. This
+/// routine only stores that address in RSP0; it may run on Limine's reserved AP
+/// bootstrap stack before the private stack is mapped and entered. The current
+/// stack and all descriptor storage must remain mapped throughout this call.
+/// Before setting IF or entering CPL3, map and switch to the permanent private
+/// stack. The bootstrap stack remains reserved until its last use has ended.
+/// The secondary must not enter userspace or call BSP-only interrupt routines.
+pub(crate) unsafe fn init_secondary(slot: usize, kernel_stack_top: u64) -> bool {
+    if !(1..MAX_CPUS).contains(&slot)
+        || !INITIALIZED.load(Ordering::Acquire)
+        || arch::interrupts_enabled()
+        || kernel_stack_top == 0
+        || !kernel_stack_top.is_multiple_of(16)
+        || ((1_u64 << 47)..0xffff_8000_0000_0000).contains(&kernel_stack_top)
+    {
+        return false;
+    }
+    let index = slot - 1;
+    if SECONDARY_CLAIMED[index].swap(true, Ordering::AcqRel) {
+        return false;
+    }
+
+    // SAFETY: The checked slot's atomic claim grants exclusive access to these
+    // distinct objects, including while other CPUs load their own descriptors.
+    // No whole-array reference is formed. All arrays have permanent mappings.
+    let (tss, gdt, double_fault_top) = unsafe {
+        (
+            addr_of_mut!(SECONDARY_TSS)
+                .cast::<TaskStateSegment>()
+                .add(index),
+            addr_of_mut!(SECONDARY_GDT).cast::<[u64; 7]>().add(index),
+            addr_of!(SECONDARY_DOUBLE_FAULT_STACKS)
+                .cast::<ExceptionStack>()
+                .add(index) as u64
+                + DOUBLE_FAULT_STACK_SIZE as u64,
+        )
+    };
+    let expected_gdt = gdt_entries(tss as u64);
+    // SAFETY: This CPU exclusively owns these uninstalled descriptor objects.
+    // The caller supplies a valid private kernel stack; the IST is a distinct
+    // statically allocated supervisor stack, never the BSP's emergency stack.
+    unsafe {
+        tss.write(TaskStateSegment {
+            privilege_stacks: [kernel_stack_top, 0, 0],
+            interrupt_stacks: [double_fault_top, 0, 0, 0, 0, 0, 0],
+            ..TaskStateSegment::EMPTY
+        });
+        gdt.write(expected_gdt);
+    }
+    let gdtr = DescriptorPointer {
+        limit: (size_of::<[u64; 7]>() - 1) as u16,
+        base: gdt as u64,
+    };
+    let idtr = DescriptorPointer {
+        limit: (size_of::<[IdtEntry; 256]>() - 1) as u16,
+        base: addr_of!(IDT) as u64,
+    };
+    // SAFETY: The private GDT/TSS are initialized and writable, the shared IDT
+    // was acquired after BSP publication, and IF remains clear on this CPU.
+    unsafe { load_descriptors(&gdtr, &idtr) };
+
+    let mut actual_gdt = DescriptorPointer { limit: 0, base: 0 };
+    let mut actual_idt = DescriptorPointer { limit: 0, base: 0 };
+    let task: u16;
+    let code: u16;
+    let data: u16;
+    let extra: u16;
+    let stack: u16;
+    // SAFETY: CPL0 readback of the installed CPU-local architectural state.
+    // These instructions do not change tables or selectors. Pointer operands
+    // refer to writable local storage and the outputs are independent registers.
+    unsafe {
+        asm!(
+            "sgdt [{gdt}]",
+            "sidt [{idt}]",
+            "str {task:x}",
+            "mov {code:x}, cs",
+            "mov {data:x}, ds",
+            "mov {extra:x}, es",
+            "mov {stack:x}, ss",
+            gdt = in(reg) &mut actual_gdt,
+            idt = in(reg) &mut actual_idt,
+            task = out(reg) task,
+            code = out(reg) code,
+            data = out(reg) data,
+            extra = out(reg) extra,
+            stack = out(reg) stack,
+            options(nostack, preserves_flags),
+        );
+    }
+    // SAFETY: The current CPU owns these objects, and hardware only changed
+    // the TSS descriptor's busy bit during LTR. Packed TSS fields need unaligned
+    // accesses; volatile GDT reads observe the processor's descriptor update.
+    let storage_valid = unsafe {
+        gdt.cast::<u64>().add(3).read_volatile() == (expected_gdt[3] | (1 << 41))
+            && gdt.cast::<u64>().add(4).read_volatile() == expected_gdt[4]
+            && addr_of!((*tss).privilege_stacks)
+                .cast::<u64>()
+                .read_unaligned()
+                == kernel_stack_top
+            && addr_of!((*tss).interrupt_stacks)
+                .cast::<u64>()
+                .read_unaligned()
+                == double_fault_top
+    };
+    actual_gdt.limit == gdtr.limit
+        && actual_gdt.base == gdtr.base
+        && actual_idt.limit == idtr.limit
+        && actual_idt.base == idtr.base
+        && task == TSS_SELECTOR
+        && code == CODE_SELECTOR
+        && data == DATA_SELECTOR
+        && extra == DATA_SELECTOR
+        && stack == DATA_SELECTOR
+        && storage_valid
+        && kernel_tls_clean()
 }
 
 /// Set the dedicated kernel stack used by hardware on CPL3 -> CPL0 entry.
@@ -658,6 +819,24 @@ pub fn arm_expected_page_fault(address: u64) {
 
 #[unsafe(no_mangle)]
 extern "C" fn mirror_exception_dispatch(frame: &mut TrapFrame) {
+    if crate::smp::is_secondary() {
+        // APs have no userspace or device-IRQ responsibilities yet. Keep their
+        // exceptions out of BSP-only tests, scheduler state, logging and locks.
+        if frame.vector == IPI_VECTOR as u64 {
+            crate::smp::handle_ipi();
+            return;
+        }
+        if frame.vector == APIC_SPURIOUS_VECTOR as u64 {
+            return;
+        }
+        // Secondary local timers stay masked and stopped. An unexpected timer
+        // must fail this CPU instead of entering the BSP's clock or scheduler.
+        let cr2: u64;
+        // SAFETY: Every installed gate enters at CPL0. The failure recorder
+        // uses only atomics before halting this CPU, without serial output.
+        unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
+        crate::smp::secondary_fault(frame.vector, frame.error, frame.rip, cr2);
+    }
     #[cfg(feature = "boot-smoke")]
     assert_kernel_tls_clean();
     dispatch(frame);
@@ -670,11 +849,23 @@ extern "C" fn mirror_exception_dispatch(frame: &mut TrapFrame) {
 }
 
 fn dispatch(frame: &mut TrapFrame) {
+    if frame.vector == IPI_VECTOR as u64 {
+        crate::smp::handle_ipi();
+        return;
+    }
     if frame.vector == APIC_SPURIOUS_VECTOR as u64 {
         // A spurious LAPIC request has no in-service bit. An EOI could retire
         // another interrupt, so it must return without acknowledging anything.
         #[cfg(feature = "boot-smoke")]
         APIC_SPURIOUS_COUNT.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if frame.vector == LOCAL_TIMER_VECTOR as u64 {
+        // The timer driver acknowledges before permitting a scheduler tick.
+        // Kernel interrupts advance time without charging a suspended user.
+        if timer::handle_local_timer() && frame.cs & 3 == 3 {
+            crate::userspace::timer_tick(frame);
+        }
         return;
     }
     // IRQs must never consume an armed synchronous-exception expectation.
@@ -685,10 +876,11 @@ fn dispatch(frame: &mut TrapFrame) {
             // IRQ fired. Drain before the controller acknowledges IRQ1 or IRQ12.
             crate::ps2::handle_irq(frame.vector as u8);
         }
-        timer::handle_irq(frame.vector as u8);
-        if frame.vector == 32 && frame.cs & 3 == 3 {
-            // Acknowledge IRQ0 before scheduling. timer_tick must validate the
-            // return frame before saving it, and unwind before switching roots.
+        let tick = timer::handle_irq(frame.vector as u8);
+        if tick && frame.cs & 3 == 3 {
+            // Only the selected clock source may charge a user; a stale PIT
+            // IRQ after switching to LAPIC is acknowledged without scheduling.
+            // Validate before saving and unwind before switching roots.
             crate::userspace::timer_tick(frame);
         }
         return;

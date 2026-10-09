@@ -3,6 +3,7 @@ param(
     [switch]$NoBuild,
     [switch]$Release,
     [switch]$AgentDemo,
+    [ValidateRange(1, 64)][int]$CpuCount = 1,
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -46,6 +47,72 @@ function Read-MirrorSerial {
     $reader = [System.IO.StreamReader]::new($stream)
     try { return $reader.ReadToEnd() }
     finally { $reader.Dispose() }
+}
+
+function Assert-MirrorCaptureSmp {
+    param([string]$Serial, [int]$RequestedCpus)
+    Assert-MirrorTimer -Serial $Serial -Smoke $false -UseLegacyPic $false -ForcePit $false
+    Assert-MirrorHeapGrowth -Serial $Serial -RequestedCpus $RequestedCpus -Smoke $false -UseLegacyPic $false
+    if ($Serial -match '(?m)^MIRROR_(?:SMP_SKIPPED|SMP_CPU_FAILED|SMP_GUARD_OK|SMP_UNMAP_OK|SMP_TLB_TIMEOUT_ARMED|SHARED_TIMEOUT_\w+|SHARED_VM_SKIPPED|SHARED_OFFLINE_OK)(?:\s|$)') {
+        throw 'Normal capture skipped SMP, lost a CPU, or ran an injected guard fault.'
+    }
+    $readyPattern = '(?m)^MIRROR_SMP_READY discovered={0} online={0} bsp=(\d+) aps={1} userspace_cpus=1\r?$' -f $RequestedCpus, ($RequestedCpus - 1)
+    $ready = [regex]::Matches($Serial, $readyPattern)
+    if ($ready.Count -ne 1 -or [regex]::Matches($Serial, '(?m)^MIRROR_SMP_READY(?:\s|$)').Count -ne 1) {
+        throw "Normal capture must report all $RequestedCpus CPUs online exactly once."
+    }
+    if ([uint64]$ready[0].Groups[1].Value -ge 255) { throw 'Normal capture reported an invalid BSP APIC ID.' }
+    $cpuRecords = [regex]::Matches($Serial, '(?m)^MIRROR_SMP_CPU slot=(\d+) apic=(\d+) stack=(0x[0-9a-f]+) cr3=(0x[0-9a-f]+)\r?$')
+    if ($cpuRecords.Count -ne ($RequestedCpus - 1) -or
+        [regex]::Matches($Serial, '(?m)^MIRROR_SMP_CPU(?:\s|$)').Count -ne ($RequestedCpus - 1)) {
+        throw 'Normal capture must validate every secondary CPU context exactly once.'
+    }
+    $slots = [System.Collections.Generic.HashSet[int]]::new()
+    $apicIds = [System.Collections.Generic.HashSet[uint32]]::new()
+    $stacks = [System.Collections.Generic.HashSet[uint64]]::new()
+    [void]$apicIds.Add([uint32]$ready[0].Groups[1].Value)
+    $secondaryRoot = [uint64]0
+    foreach ($cpuRecord in $cpuRecords) {
+        $slot = [int]$cpuRecord.Groups[1].Value
+        $apicIdentity = [uint32]$cpuRecord.Groups[2].Value
+        $stackTop = [Convert]::ToUInt64($cpuRecord.Groups[3].Value.Substring(2), 16)
+        $rootAddress = [Convert]::ToUInt64($cpuRecord.Groups[4].Value.Substring(2), 16)
+        if ($slot -lt 1 -or $slot -ge $RequestedCpus -or -not $slots.Add($slot) -or
+            $apicIdentity -ge 255 -or -not $apicIds.Add($apicIdentity) -or
+            $stackTop -eq 0 -or ($stackTop % 16) -ne 0 -or -not $stacks.Add($stackTop) -or
+            $rootAddress -eq 0 -or ($rootAddress % 4096) -ne 0) {
+            throw 'Normal capture requires unique AP slots, IDs and aligned private stacks with valid roots.'
+        }
+        if ($secondaryRoot -eq 0) { $secondaryRoot = $rootAddress }
+        elseif ($rootAddress -ne $secondaryRoot) { throw 'Normal capture APs must share the kernel root.' }
+    }
+    $phases = @(
+        @{ Name = 'boot'; Rounds = 8 },
+        @{ Name = 'after_userspace'; Rounds = 4 },
+        @{ Name = 'after_desktop'; Rounds = 4 }
+    )
+    if ([regex]::Matches($Serial, '(?m)^MIRROR_SMP_IPI_OK(?:\s|$)').Count -ne $phases.Count) {
+        throw 'Normal capture must complete exactly three SMP rendezvous phases.'
+    }
+    $previous = $ready[0].Index
+    $sharedPattern = '(?m)^MIRROR_SHARED_VM_READY pages=512 cpus={0} rounds=1 reclaimed=3 borrowed_root=1\r?$' -f $RequestedCpus
+    $shared = [regex]::Matches($Serial, $sharedPattern)
+    if ($shared.Count -ne 1 -or
+        [regex]::Matches($Serial, '(?m)^MIRROR_SHARED_VM_READY(?:\s|$)').Count -ne 1) {
+        throw 'Normal capture must verify runtime shared mappings and complete frame reclamation on every CPU.'
+    }
+    foreach ($phase in $phases) {
+        $pattern = '(?m)^MIRROR_SMP_IPI_OK phase={0} cpus={1} rounds={2}\r?$' -f $phase.Name, $RequestedCpus, $phase.Rounds
+        $records = [regex]::Matches($Serial, $pattern)
+        if ($records.Count -ne 1 -or $records[0].Index -le $previous) {
+            throw "Normal capture has missing, incorrect, duplicate, or out-of-order SMP phase $($phase.Name)."
+        }
+        if (($phase.Name -eq 'boot' -and $shared[0].Index -le $records[0].Index) -or
+            ($phase.Name -eq 'after_userspace' -and $shared[0].Index -ge $records[0].Index)) {
+            throw 'Normal shared mapping checks must follow startup and precede the userspace rendezvous.'
+        }
+        $previous = $records[0].Index
+    }
 }
 
 function Read-MirrorQmp {
@@ -195,7 +262,7 @@ function Wait-MirrorPointer {
 . (Join-Path $PSScriptRoot 'capture-shell.ps1')
 
 $qemuArguments = @(
-    '-machine', 'q35,accel=tcg', '-cpu', 'qemu64', '-m', '256', '-smp', '1',
+    '-machine', 'q35,accel=tcg', '-cpu', 'qemu64', '-m', '256', '-smp', "$CpuCount",
     '-display', 'none', '-vga', 'std', '-monitor', 'none', '-qmp', 'stdio',
     '-nic', 'none', '-no-reboot', '-no-shutdown',
     '-drive', "if=pflash,unit=0,format=raw,readonly=on,file=$(ConvertTo-QemuOptionValue $codePath)",
@@ -438,10 +505,13 @@ try {
     if (-not $process.WaitForExit(5000)) { throw 'QEMU did not exit after the capture.' }
     $process.WaitForExit()
     if ($process.ExitCode -ne 0) { throw "QEMU capture exited with code $($process.ExitCode)." }
+    # Read the complete log after exit, so later input cannot hide an AP failure.
+    # These are normal builds; smoke-only self-tests and injected faults are absent.
+    Assert-MirrorCaptureSmp -Serial (Read-MirrorSerial) -RequestedCpus $CpuCount
     if ((Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash -ne $testDiskHash) {
         throw 'The read-only block fixture was modified during the capture.'
     }
-    Write-Host "Native desktop and fallback console captures passed (agent-demo=$AgentDemo). Images: $buildDirectory"
+    Write-Host "Native desktop and fallback console captures passed (agent-demo=$AgentDemo, cpus=$CpuCount). Images: $buildDirectory"
 }
 finally {
     if ($started) {

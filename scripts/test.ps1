@@ -23,7 +23,11 @@ try {
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
     foreach ($release in @($false, $true)) {
         $profile = if ($release) { 'release' } else { 'debug' }
-        $memoryMiB = if ($release) { 256 } else { 128 }
+        # Keep firmware and full debug ELF loading out of the kernel memory
+        # regression budget. At 128 MiB Limine can exhaust its high-memory
+        # allocator while reading the ELF, before any kernel code executes.
+        $memoryMiB = 256
+        $smpMemoryMiB = 256
         & (Join-Path $PSScriptRoot 'build.ps1') -Smoke -Release:$release -AgentDemo:$AgentDemo
         # UserSimd remains a strict manual #XM probe: current QEMU TCG does not
         # deliver that unmasked SSE arithmetic exception (QEMU issue 215).
@@ -39,17 +43,40 @@ try {
             Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-ExtendedCpu-$fault.serial.log") -Force
             Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-ExtendedCpu-$fault.stderr.log") -Force
         }
-        # Parse all four enabled CPUs and route device IRQs to the BSP. This
-        # validates topology discovery; secondary processors remain offline.
-        & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+        # Bring all configured CPUs online with private stacks/descriptors and
+        # verify IPI rendezvous before and after the BSP's userspace workloads.
+        & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
         Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-CpuCount4.serial.log") -Force
         Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-CpuCount4.stderr.log") -Force
+        foreach ($cpuCount in @(2, 8)) {
+            & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -ExtendedCpu -CpuCount $cpuCount -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-ExtendedCpu-CpuCount$cpuCount.serial.log") -Force
+            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-ExtendedCpu-CpuCount$cpuCount.stderr.log") -Force
+        }
+        # A removed shared alias must fault on an AP, and a missing shootdown
+        # ACK must stop unmap before returning a frame for allocator reuse.
+        foreach ($fault in @('SmpUnmap', 'SmpTlbTimeout')) {
+            & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -CpuCount 4 -Fault $fault -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-$fault.serial.log") -Force
+            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-$fault.stderr.log") -Force
+        }
+        # Both PIT selection paths retain the APIC/SMP backend and must still
+        # preempt userspace after explicit policy or a rejected calibration.
+        & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -PitTimer -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-PitTimer-CpuCount4.serial.log") -Force
+        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-PitTimer-CpuCount4.stderr.log") -Force
+        & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Fault TimerCalibration -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-TimerCalibration-CpuCount4.serial.log") -Force
+        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-TimerCalibration-CpuCount4.stderr.log") -Force
         # Explicit boot policy must keep the legacy PIC/PIT backend functional,
         # including userspace preemption and PS/2 input. OVMF still needs APIC
         # hardware during firmware startup, so retain the CPU's APIC feature.
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -LegacyPic -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
         Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-LegacyPic.serial.log") -Force
         Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-LegacyPic.stderr.log") -Force
+        & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -LegacyPic -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-LegacyPic-CpuCount4.serial.log") -Force
+        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-LegacyPic-CpuCount4.stderr.log") -Force
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -NoDisplayDevice -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
         Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-NoDisplayDevice.serial.log") -Force
         Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-NoDisplayDevice.stderr.log") -Force
@@ -61,7 +88,7 @@ try {
         Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-NoKeyboard.stderr.log") -Force
 
         & (Join-Path $PSScriptRoot 'build.ps1') -Release:$release -AgentDemo:$AgentDemo
-        & (Join-Path $PSScriptRoot 'capture.ps1') -NoBuild -Release:$release -AgentDemo:$AgentDemo -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+        & (Join-Path $PSScriptRoot 'capture.ps1') -NoBuild -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
         foreach ($artifact in @('serial.log', 'stderr.log', 'png')) {
             Copy-Item -LiteralPath (Join-Path $repositoryRoot "build/normal-boot.$artifact") -Destination (Join-Path $logDirectory "$profile-console.$artifact") -Force
         }
@@ -79,7 +106,7 @@ try {
 
     # Leave the boot tree ready for a normal run after the test cases finish.
     & (Join-Path $PSScriptRoot 'build.ps1')
-    Write-Host "All 62 kernel/userspace/device smoke cases and debug/release desktop/console captures passed. Logs: $logDirectory"
+    Write-Host "All 76 kernel/userspace/device smoke cases and debug/release desktop/console captures passed. Logs: $logDirectory"
 }
 finally {
     Pop-Location

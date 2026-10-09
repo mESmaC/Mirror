@@ -1,4 +1,4 @@
-//! Boot-CPU operations, interrupt-state guards, and idle/fatal halt paths.
+//! CPU-local operations, interrupt-state guards, and idle/fatal halt paths.
 
 use core::arch::asm;
 
@@ -15,7 +15,8 @@ pub fn interrupts_enabled() -> bool {
     flags & (1 << 9) != 0
 }
 
-/// Save the caller's IF state and disable maskable interrupts on the boot CPU.
+/// Save this CPU's IF state and disable its maskable interrupts. This does not
+/// serialize access from another CPU; callers still need shared-state ownership.
 pub fn save_and_disable_interrupts() -> bool {
     let flags: u64;
     // SAFETY: CPL0, balanced stack use. Do not use `nomem`: this is also the
@@ -56,6 +57,20 @@ pub fn halt() -> ! {
         // SAFETY: CPL0; fatal halt must not resume ordinary IRQ processing.
         unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
     }
+}
+
+/// Invalidate one page on this CPU, including any matching global translation.
+/// This is not a remote shootdown: callers must coordinate other processors.
+///
+/// # Safety
+/// Run at CPL0 with IF clear and a canonical page-aligned address. Page-table
+/// writes must precede this call; retain removed frames until every CPU using
+/// the mapping has completed its own invalidation. All current roots use PCID0.
+pub(crate) unsafe fn invalidate_tlb_page(address: u64) {
+    // SAFETY: The caller validates the address (noncanonical INVLPG is a no-op)
+    // and lifetime protocol. No nomem: publication must precede invalidation,
+    // and a completion ACK must not move ahead of it. Intel SDM vol3 §5.10.4.1.
+    unsafe { asm!("invlpg [{}]", in(reg) address, options(nostack, preserves_flags)) };
 }
 
 /// # Safety

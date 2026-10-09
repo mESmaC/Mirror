@@ -4,8 +4,8 @@
 use limine::{
     BaseRevision,
     request::{
-        FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest, RequestsEndMarker,
-        RequestsStartMarker, RsdpRequest, StackSizeRequest,
+        FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest, MpRequest,
+        RequestsEndMarker, RequestsStartMarker, RsdpRequest, StackSizeRequest,
     },
     response::MemoryMapResponse,
 };
@@ -29,6 +29,10 @@ static HHDM: HhdmRequest = HhdmRequest::new();
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static RSDP: RsdpRequest = RsdpRequest::new();
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static MP: MpRequest = MpRequest::new(); // Keep xAPIC mode; do not request x2APIC.
 
 #[used]
 #[unsafe(link_section = ".limine_requests")]
@@ -56,6 +60,7 @@ pub struct BootInfo {
     pub direct_map_offset: u64,
     /// Limine base revision 3 returns a physical address, not an HHDM pointer.
     pub rsdp_physical: Option<u64>,
+    pub processors: Option<&'static limine::response::MpResponse>,
     pub init: &'static [u8],
     pub desktop: &'static [u8],
     pub agent: &'static [u8],
@@ -103,6 +108,7 @@ pub fn info() -> BootInfo {
         rsdp_physical: RSDP
             .get_response()
             .map(|response| response.address() as u64),
+        processors: MP.get_response(),
         init: init.expect("missing native init"),
         desktop: desktop.expect("missing native desktop"),
         agent: agent.expect("missing native agent"),
@@ -121,6 +127,13 @@ pub fn legacy_pic() -> bool {
         .any(|token| token == b"mirror.irq=pic")
 }
 
+/// Keep the PIT time source while retaining APIC device routing and SMP.
+pub fn pit_timer() -> bool {
+    command_line()
+        .split(|byte| byte.is_ascii_whitespace())
+        .any(|token| token == b"mirror.timer=pit")
+}
+
 fn command_line() -> &'static [u8] {
     CMDLINE
         .get_response()
@@ -135,6 +148,9 @@ pub enum SmokeMode {
     PageFault,
     InvalidOpcode,
     BlockIoError,
+    SmpUnmap,
+    SmpTlbTimeout,
+    TimerCalibration,
     User(u64),
 }
 
@@ -145,7 +161,9 @@ pub fn smoke_mode() -> SmokeMode {
     // multiple fault selectors must retain the strict smoke-test rejection.
     let mut tokens = command_line()
         .split(|byte| byte.is_ascii_whitespace())
-        .filter(|token| !token.is_empty() && *token != b"mirror.irq=pic");
+        .filter(|token| {
+            !token.is_empty() && *token != b"mirror.irq=pic" && *token != b"mirror.timer=pit"
+        });
     let mode = match tokens.next().unwrap_or(b"") {
         b"" => SmokeMode::Normal,
         b"mirror.test=page-fault" => SmokeMode::PageFault,
@@ -171,6 +189,9 @@ pub fn smoke_mode() -> SmokeMode {
         b"mirror.test=thread-process-exit" => SmokeMode::User(19),
         b"mirror.test=thread-fault" => SmokeMode::User(20),
         b"mirror.test=block-io-error" => SmokeMode::BlockIoError,
+        b"mirror.test=smp-unmap" => SmokeMode::SmpUnmap,
+        b"mirror.test=smp-tlb-timeout" => SmokeMode::SmpTlbTimeout,
+        b"mirror.test=timer-calibration" => SmokeMode::TimerCalibration,
         _ => panic!("unknown smoke-test command line"),
     };
     assert!(tokens.next().is_none(), "multiple smoke-test arguments");

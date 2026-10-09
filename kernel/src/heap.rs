@@ -1,8 +1,10 @@
-//! Fixed bootstrap heap over owned, supervisor-only, non-executable RAM pages.
+//! Growable BSP heap over owned, supervisor-only, non-executable RAM pages.
 //!
-//! Adjacent guard pages stay absent. The free-list allocator reuses and coalesces
-//! released blocks; the mapped capacity is retained for the kernel's lifetime.
-//! This is a bootstrap heap, not a growable or latency-bounded kernel allocator.
+//! One MiB is initially backed inside a reserved 16 MiB arena. Explicit growth
+//! adds at most one MiB per call and publishes free space only after every CPU
+//! acknowledges its new mappings. The free-list allocator reuses and coalesces
+//! released blocks; committed capacity remains mapped for the kernel's lifetime.
+//! Allocation never implicitly grows the heap or borrows the frame allocator.
 //! Interrupt/exception handlers must not allocate. The lock saves/restores IF so
 //! later task-context allocation cannot deadlock a maskable interrupt on this CPU.
 
@@ -25,14 +27,22 @@ use crate::{
 
 pub const HEAP_START: u64 = 0xffff_d000_0000_0000;
 pub const HEAP_SIZE: usize = 1024 * 1024;
+pub const HEAP_MAX_SIZE: usize = 16 * 1024 * 1024;
+pub const MAX_GROW_PAGES: usize = 256;
 const HEAP_PAGES: usize = HEAP_SIZE / PAGE_SIZE as usize;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum HeapError {
     AlreadyInitialized,
-    RegionInUse,
+    NotInitialized,
+    InvalidGrowth,
+    LimitExceeded,
+    InvalidContext,
+    Busy,
     OutOfFrames,
     Paging(PagingError),
+    #[cfg(feature = "boot-smoke")]
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +59,8 @@ struct KernelAllocator {
 
 // SAFETY: Every access to the heap is protected by the acquire/release lock.
 // Maskable interrupts are disabled before acquisition. Handler paths do not
-// allocate, including non-maskable exceptions. Only one CPU currently runs.
+// allocate, including non-maskable exceptions. Only the BSP currently uses the
+// allocator; AP startup, idle and interrupt paths never allocate.
 unsafe impl Sync for KernelAllocator {}
 
 impl KernelAllocator {
@@ -117,10 +128,10 @@ unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // Bound inputs before the free list rounds sizes and higher-half
         // pointers upward. A valid Layout can still request near-usize-limit
-        // sizes/alignments; our fixed heap cannot service those requests.
-        // The bootstrap allocator deliberately supports alignments up to its
+        // sizes/alignments; our bounded arena cannot service those requests.
+        // The allocator deliberately supports alignments up to the arena's
         // capacity even when HEAP_START happens to satisfy a larger alignment.
-        if layout.size() > HEAP_SIZE || layout.align() > HEAP_SIZE {
+        if layout.size() > HEAP_MAX_SIZE || layout.align() > HEAP_MAX_SIZE {
             return core::ptr::null_mut();
         }
         self.lock()
@@ -141,6 +152,30 @@ unsafe impl GlobalAlloc for KernelAllocator {
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator::empty();
 
+// Mapping waits briefly enable IRQs. Serialize growth independently of the
+// allocator lock, which must never be held across a shootdown barrier.
+static GROWING: AtomicBool = AtomicBool::new(false);
+
+struct GrowthGuard(PhantomData<*mut ()>);
+
+impl GrowthGuard {
+    fn acquire() -> Result<Self, HeapError> {
+        if arch::interrupts_enabled() || crate::smp::is_secondary() {
+            return Err(HeapError::InvalidContext);
+        }
+        GROWING
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| HeapError::Busy)?;
+        Ok(Self(PhantomData))
+    }
+}
+
+impl Drop for GrowthGuard {
+    fn drop(&mut self) {
+        GROWING.store(false, Ordering::Release);
+    }
+}
+
 pub fn stats() -> HeapStats {
     let heap = ALLOCATOR.lock();
     HeapStats {
@@ -150,83 +185,490 @@ pub fn stats() -> HeapStats {
     }
 }
 
-/// Map and initialize the fixed bootstrap heap once.
+/// Reserve the maximum arena and initialize its first MiB once.
 ///
-/// Failures before initialization unmap and recycle every data frame acquired
-/// here. Any empty parent tables created by the mapper remain owned by it.
+/// Frame acquisition and mapping-preflight errors recycle every data frame
+/// acquired here. Parent tables remain pinned. Once mapping publication starts,
+/// a failed shootdown never returns; backing cannot escape before acknowledgement.
 ///
 /// # Safety
 /// Run on the sole boot CPU with interrupts disabled, the given page hierarchy
 /// active, and its unique frame allocator configured for recycling. No other
-/// subsystem may access the reserved heap range or its adjacent guard pages.
-/// Preserve these mappings for the remainder of the kernel's lifetime.
+/// subsystem may access the reserved maximum arena or its adjacent guard pages.
+/// `offset` is the retained writable HHDM for every allocated frame. Prepare
+/// before any AP or retained userspace root exists. Preserve committed mappings
+/// for the remainder of the kernel's lifetime.
 pub unsafe fn init(
     tables: &mut PageTables,
     frames: &mut FrameAllocator<'_>,
+    offset: u64,
 ) -> Result<(), HeapError> {
-    let mut heap = ALLOCATOR.lock();
-    if heap.size() != 0 {
+    let _growth = GrowthGuard::acquire()?;
+    if stats().size != 0 {
         return Err(HeapError::AlreadyInitialized);
     }
-
-    // Preflight every leaf plus both guard pages before acquiring data frames.
-    for page in 0..HEAP_PAGES + 2 {
-        let address = HEAP_START - PAGE_SIZE + page as u64 * PAGE_SIZE;
-        if tables
-            .translate(address)
-            .map_err(HeapError::Paging)?
-            .is_some()
-        {
-            return Err(HeapError::RegionInUse);
-        }
+    // SAFETY: Bootstrap-only exclusive hierarchy and untouched maximum arena.
+    unsafe { tables.prepare_heap_window(frames) }.map_err(HeapError::Paging)?;
+    let mut physical = [0; MAX_GROW_PAGES];
+    // SAFETY: Unique allocator and retained HHDM; no pointer into these fresh
+    // frames escapes. There is no heap allocation while acquiring backing.
+    unsafe { acquire_frames(frames, offset, &mut physical, HEAP_PAGES, usize::MAX) }?;
+    // SAFETY: Every frame is unique, zeroed, and owned. No consumer sees the
+    // reserved alias before initialization; every parent was prepared above.
+    if let Err(error) = unsafe { tables.map_heap_pages(HEAP_START, &physical[..HEAP_PAGES]) } {
+        // SAFETY: Batch mapping errors precede every PTE publication.
+        unsafe { recycle_frames(frames, &physical[..HEAP_PAGES]) };
+        return Err(HeapError::Paging(error));
     }
-
-    for page in 0..HEAP_PAGES {
-        let Some(physical) = frames.allocate() else {
-            // SAFETY: Exactly the preceding pages were mapped here and have not
-            // been exposed to the allocator or any other memory consumer.
-            unsafe { rollback(tables, frames, page) };
-            return Err(HeapError::OutOfFrames);
-        };
-        let address = HEAP_START + page as u64 * PAGE_SIZE;
-        // SAFETY: This is fresh owned RAM, an absent reserved address, and the
-        // unique active hierarchy. No references to the data frame exist.
-        if let Err(error) = unsafe { tables.map_page(address, physical, frames) } {
-            // SAFETY: map_page does not install a leaf on failure. This fresh
-            // frame and the preceding heap mappings have no live users.
-            unsafe {
-                frames
-                    .deallocate(physical)
-                    .expect("recycle unmapped heap frame");
-                rollback(tables, frames, page);
-            }
-            return Err(HeapError::Paging(error));
-        }
-    }
-
-    // SAFETY: All contiguous heap pages are now owned and writable. Initialization
-    // is exclusive, once-only, and no later code removes these mappings. Clearing
-    // them avoids exposing stale physical-page contents to the first allocations.
+    let mut heap = ALLOCATOR.lock();
+    assert_eq!(
+        heap.size(),
+        0,
+        "heap initialized during backing acquisition"
+    );
+    // SAFETY: Every contiguous page is zeroed, owned, and fully published. This
+    // once-only initialization cannot race an allocator user. Backing is permanent.
     unsafe {
-        (HEAP_START as *mut u8).write_bytes(0, HEAP_SIZE);
         heap.init(HEAP_START as *mut u8, HEAP_SIZE);
     }
     Ok(())
 }
 
+/// Append 1..=MAX_GROW_PAGES pages without moving any live allocation.
+///
+/// Errors before mapping publication preserve heap capacity and frame ownership.
+/// Successful pages become permanent heap backing only after the shootdown.
+/// This is an explicit task-context operation; GlobalAlloc never calls it.
+///
 /// # Safety
-/// The first `pages` heap pages must be exclusively owned mappings created by
-/// this initialization attempt, with no surviving reference to any data frame.
-unsafe fn rollback(tables: &mut PageTables, frames: &mut FrameAllocator<'_>, pages: usize) {
-    for page in (0..pages).rev() {
-        let address = HEAP_START + page as u64 * PAGE_SIZE;
-        // SAFETY: These mappings are unpublished. Unmapping invalidates the TLB
-        // before their physical memory is returned to the unique frame allocator.
+/// Run on the BSP with IF=0 and this kernel root active, exclusively borrowing
+/// the original frame allocator. `offset` preserves its complete writable HHDM.
+/// Other CPUs, DMA, and interrupt handlers must not access the uncommitted tail;
+/// handlers never allocate or acquire the heap lock. Hold no IRQ-needed lock.
+/// Existing heap allocations stay live; never unmap or recycle committed backing.
+pub unsafe fn grow(
+    tables: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    offset: u64,
+    pages: usize,
+) -> Result<HeapStats, HeapError> {
+    // SAFETY: The caller establishes BSP ownership and retained mappings.
+    unsafe { grow_inner(tables, frames, offset, pages, GrowthMode::Normal) }
+}
+
+enum GrowthMode {
+    Normal,
+    #[cfg(feature = "boot-smoke")]
+    FailFramesAfter(usize),
+    #[cfg(feature = "boot-smoke")]
+    CancelBeforeCommit,
+}
+
+unsafe fn grow_inner(
+    tables: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    offset: u64,
+    pages: usize,
+    mode: GrowthMode,
+) -> Result<HeapStats, HeapError> {
+    let _growth = GrowthGuard::acquire()?;
+    let before = stats();
+    let bytes = growth_bytes(before.size, pages)?;
+    let address = HEAP_START + before.size as u64;
+    #[cfg(feature = "boot-smoke")]
+    let frame_limit = match mode {
+        GrowthMode::FailFramesAfter(limit) => limit,
+        _ => usize::MAX,
+    };
+    #[cfg(not(feature = "boot-smoke"))]
+    let frame_limit = {
+        let _ = mode;
+        usize::MAX
+    };
+    let mut physical = [0; MAX_GROW_PAGES];
+    // SAFETY: All fresh pages remain private and every failure recycles its
+    // complete acquired prefix before any mapping becomes visible.
+    unsafe { acquire_frames(frames, offset, &mut physical, pages, frame_limit) }?;
+    // SAFETY: The new tail is absent and private, backed by unique zeroed frames.
+    // No heap guard is held while this operation waits for remote invalidations.
+    if let Err(error) = unsafe { tables.map_heap_pages(address, &physical[..pages]) } {
+        // SAFETY: An error guarantees that no mapping was published.
+        unsafe { recycle_frames(frames, &physical[..pages]) };
+        return Err(HeapError::Paging(error));
+    }
+    #[cfg(feature = "boot-smoke")]
+    {
+        // SAFETY: The complete new tail is still private, zeroed and stable;
+        // no free-list node or allocation has been published there yet. Probe
+        // both ends with no allocator lock held to warm remote translations.
+        let first_cpus = unsafe { crate::smp::probe_shared_page(address, 0) };
+        let last = address + (pages as u64 - 1) * PAGE_SIZE;
+        assert_eq!(
+            // SAFETY: The final page has the same private, stable backing.
+            unsafe { crate::smp::probe_shared_page(last, 0) },
+            first_cpus
+        );
+        assert!(first_cpus > 0);
+    }
+    #[cfg(feature = "boot-smoke")]
+    if matches!(mode, GrowthMode::CancelBeforeCommit) {
+        // SAFETY: The new tail was never exposed to Heap or any consumer. Exact
+        // shootdown completion precedes reclamation. A failed withdrawal panics
+        // and cannot free a page whose translation may survive on another CPU.
         unsafe {
-            let physical = tables.unmap_page(address).expect("rollback heap mapping");
-            frames.deallocate(physical).expect("recycle heap frame");
+            tables
+                .unmap_heap_pages(address, &physical[..pages])
+                .expect("cancel unpublished heap growth");
+            recycle_frames(frames, &physical[..pages]);
+        }
+        return Err(HeapError::Cancelled);
+    }
+    let mut heap = ALLOCATOR.lock();
+    assert_eq!(heap.size(), before.size, "concurrent heap extension");
+    assert_eq!(heap.top() as u64, address, "heap tail mismatch");
+    // SAFETY: This page-aligned zeroed tail is contiguous with all prior heap
+    // memory, acknowledged on every CPU, and retained permanently. Exclusive
+    // heap access publishes free-list nodes only after mapping completion.
+    unsafe { heap.extend(bytes) };
+    Ok(HeapStats {
+        size: heap.size(),
+        used: heap.used(),
+        free: heap.free(),
+    })
+}
+
+fn growth_bytes(size: usize, pages: usize) -> Result<usize, HeapError> {
+    if size == 0 {
+        return Err(HeapError::NotInitialized);
+    }
+    if pages == 0 || pages > MAX_GROW_PAGES {
+        return Err(HeapError::InvalidGrowth);
+    }
+    let bytes = pages * PAGE_SIZE as usize;
+    if size > HEAP_MAX_SIZE || bytes > HEAP_MAX_SIZE - size {
+        return Err(HeapError::LimitExceeded);
+    }
+    Ok(bytes)
+}
+
+/// Acquire and initialize a complete private batch, recycling its prefix on error.
+unsafe fn acquire_frames(
+    frames: &mut FrameAllocator<'_>,
+    offset: u64,
+    physical: &mut [u64; MAX_GROW_PAGES],
+    pages: usize,
+    limit: usize,
+) -> Result<(), HeapError> {
+    for index in 0..pages {
+        let frame = if index < limit {
+            frames.allocate()
+        } else {
+            None
+        };
+        let Some(frame) = frame else {
+            // SAFETY: These pages have only dormant direct-map aliases.
+            unsafe { recycle_frames(frames, &physical[..index]) };
+            return Err(HeapError::OutOfFrames);
+        };
+        physical[index] = frame;
+        let Some(address) = offset.checked_add(frame) else {
+            // SAFETY: The entire prefix, including this frame, stays unmapped.
+            unsafe { recycle_frames(frames, &physical[..=index]) };
+            return Err(HeapError::Paging(PagingError::DirectMapOverflow));
+        };
+        // SAFETY: Fresh complete RAM frame, valid writable HHDM, no live alias
+        // or reference. Clear before any page walker can reach the heap alias.
+        unsafe { (address as *mut u8).write_bytes(0, PAGE_SIZE as usize) };
+    }
+    Ok(())
+}
+
+/// The caller proves every frame is private and every published alias withdrawn.
+unsafe fn recycle_frames(frames: &mut FrameAllocator<'_>, physical: &[u64]) {
+    for &frame in physical.iter().rev() {
+        // SAFETY: This batch owns each frame once, with no surviving mappings
+        // except its dormant HHDM alias, references, DMA, or table use.
+        unsafe { frames.deallocate(frame) }.expect("recycle uncommitted heap frame");
+    }
+}
+
+/// Grow once by MAX_GROW_PAGES, retaining a live allocation and an older user root.
+///
+/// # Safety
+/// Inherits grow's BSP/root/allocator/HHDM contract. Run after SMP startup and
+/// before deliberate AP failures, with enough free heap for a >old-capacity
+/// allocation after growth. No unrelated task may mutate heap state during tests.
+#[cfg(feature = "boot-smoke")]
+pub unsafe fn growth_self_test(
+    tables: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    offset: u64,
+    phase: &str,
+) -> HeapStats {
+    use crate::paging::UserAddressSpace;
+
+    let before = stats();
+    let frame_baseline = frames
+        .stats()
+        .expect("heap growth frame accounting")
+        .allocated_frames;
+    let old_end = HEAP_START + before.size as u64;
+    assert!(before.size + MAX_GROW_PAGES * PAGE_SIZE as usize <= HEAP_MAX_SIZE);
+    assert_heap_guards(tables, before.size);
+
+    assert_eq!(growth_bytes(0, 1), Err(HeapError::NotInitialized));
+    assert_eq!(
+        growth_bytes(HEAP_MAX_SIZE, 1),
+        Err(HeapError::LimitExceeded)
+    );
+    assert_eq!(
+        growth_bytes(HEAP_MAX_SIZE - PAGE_SIZE as usize, 1),
+        Ok(PAGE_SIZE as usize)
+    );
+    for pages in [0, MAX_GROW_PAGES + 1, usize::MAX] {
+        assert_eq!(
+            // SAFETY: Bad sizes reject before frame or mapping changes.
+            unsafe { grow(tables, frames, offset, pages) },
+            Err(HeapError::InvalidGrowth)
+        );
+    }
+    let guard = GrowthGuard::acquire().expect("heap growth guard test");
+    assert_eq!(
+        // SAFETY: Reentry fails before touching the allocator or tables.
+        unsafe { grow(tables, frames, offset, 1) },
+        Err(HeapError::Busy)
+    );
+    drop(guard);
+    assert_eq!(stats(), before);
+    assert_eq!(frames.stats().unwrap().allocated_frames, frame_baseline);
+
+    let live_layout = Layout::from_size_align(257, 64).unwrap();
+    // SAFETY: Valid nonzero layout. Check ownership before initializing bytes.
+    let live = unsafe { ALLOCATOR.alloc(live_layout) };
+    assert!(!live.is_null(), "live growth canary allocation");
+    // SAFETY: The successful allocation owns every byte being initialized.
+    unsafe { live.write_bytes(0xa5, live_layout.size()) };
+    let with_live = stats();
+    // SAFETY: BSP/IF0 and active kernel root. Prepared heap parents precede this
+    // borrowed root, which remains inactive during every mapping operation.
+    let mut borrowed =
+        unsafe { UserAddressSpace::new(tables, frames) }.expect("heap growth borrowed root");
+    let frame_with_root = frames.stats().unwrap().allocated_frames;
+    assert_eq!(frame_with_root, frame_baseline + 1);
+
+    for limit in [0, 3] {
+        assert_eq!(
+            // SAFETY: Injection leaves backing unexposed and recycles every
+            // acquired frame before returning OutOfFrames.
+            unsafe {
+                grow_inner(
+                    tables,
+                    frames,
+                    offset,
+                    8,
+                    GrowthMode::FailFramesAfter(limit),
+                )
+            },
+            Err(HeapError::OutOfFrames)
+        );
+        assert_eq!(stats(), with_live);
+        assert_eq!(frames.stats().unwrap().allocated_frames, frame_with_root);
+        for page in 0..8 {
+            assert_eq!(tables.translate(old_end + page * PAGE_SIZE), Ok(None));
         }
     }
+    assert_eq!(
+        // SAFETY: The private tail is read by each CPU, then withdrawn with
+        // exact acknowledgements before its frames are recycled.
+        unsafe { grow_inner(tables, frames, offset, 8, GrowthMode::CancelBeforeCommit) },
+        Err(HeapError::Cancelled)
+    );
+    assert_eq!(stats(), with_live);
+    assert_eq!(frames.stats().unwrap().allocated_frames, frame_with_root);
+    for page in 0..8 {
+        assert_eq!(tables.translate(old_end + page * PAGE_SIZE), Ok(None));
+    }
+
+    // SAFETY: The permanent growth has the same exclusive tail/allocator
+    // ownership; the live canary and borrowed upper hierarchy remain valid.
+    let grown =
+        unsafe { grow(tables, frames, offset, MAX_GROW_PAGES) }.expect("heap growth commit");
+    let added = MAX_GROW_PAGES * PAGE_SIZE as usize;
+    assert_eq!(grown.size, before.size + added);
+    assert_eq!(grown.used, with_live.used);
+    assert_eq!(grown.free, with_live.free + added);
+    assert_eq!(
+        frames.stats().unwrap().allocated_frames,
+        frame_with_root + MAX_GROW_PAGES
+    );
+    assert_heap_guards(tables, grown.size);
+    for index in 0..live_layout.size() {
+        // SAFETY: This allocation remained live and unchanged through growth.
+        assert_eq!(unsafe { live.add(index).read() }, 0xa5);
+    }
+
+    // Larger than the entire prior heap: success requires free space to
+    // coalesce across the former boundary, and its last page is new backing.
+    let large_layout =
+        Layout::from_size_align(before.size + PAGE_SIZE as usize, PAGE_SIZE as usize).unwrap();
+    // SAFETY: This bounded valid layout is within the newly committed capacity.
+    let large = unsafe { ALLOCATOR.alloc(large_layout) };
+    assert!(!large.is_null(), "grown heap large allocation");
+    assert_eq!(large as usize % large_layout.align(), 0);
+    // SAFETY: Unique allocation, no other CPU has access while initializing it.
+    unsafe { large.write_bytes(0x6b, large_layout.size()) };
+    let probe = large as u64 + (large_layout.size() - PAGE_SIZE as usize) as u64;
+    assert!(probe >= old_end && probe + PAGE_SIZE <= HEAP_START + grown.size as u64);
+    let expected = u64::from_ne_bytes([0x6b; 8]);
+    // SAFETY: This owned allocation stays immutable until every read ACK; no
+    // Rust reference or allocator lock spans the remote read operation.
+    assert!(unsafe { crate::smp::probe_shared_page(probe, expected) } > 0);
+    // SAFETY: The pre-existing root shares the pinned kernel hierarchy. There
+    // is no ring3 entry; restore before assertions, allocation, or table changes.
+    let observed = unsafe {
+        borrowed.activate().expect("activate older heap borrower");
+        let value = (probe as *const u64).read_volatile();
+        tables.activate().expect("restore kernel after heap probe");
+        value
+    };
+    assert_eq!(observed, expected, "new heap leaf absent in older root");
+    for index in 0..live_layout.size() {
+        // SAFETY: The disjoint canary remained allocated while the large block
+        // was filled and read on every CPU and through the older user root.
+        assert_eq!(unsafe { live.add(index).read() }, 0xa5);
+    }
+    // SAFETY: All remote reads completed. Each allocation is freed once with
+    // its exact layout; reacquisition verifies the merged free region is reused.
+    unsafe { ALLOCATOR.dealloc(large, large_layout) };
+    // SAFETY: Reuse the same bounded valid layout after the prior release.
+    let reused = unsafe { ALLOCATOR.alloc(large_layout) };
+    assert_eq!(reused, large, "grown heap coalescing reuse");
+    // SAFETY: Both allocations remain owned with the indicated layouts; all
+    // reads ended and the borrowed root is inactive and exclusively owned.
+    unsafe {
+        ALLOCATOR.dealloc(reused, large_layout);
+        ALLOCATOR.dealloc(live, live_layout);
+        borrowed.destroy(frames).expect("release heap test root");
+    }
+    let after = stats();
+    assert_eq!(after.size, before.size + added);
+    assert_eq!(after.used, before.used);
+    assert_eq!(after.free, before.free + added);
+    assert_eq!(
+        frames.stats().unwrap().allocated_frames,
+        frame_baseline + MAX_GROW_PAGES
+    );
+    assert_heap_guards(tables, after.size);
+    assert!(!arch::interrupts_enabled());
+    crate::serial::println!(
+        "MIRROR_HEAP_GROW_TESTS_OK phase={} acquisition_rollback=1 mapped_rollback=1 live=1 large=1 guards=1 borrowed_root=1",
+        phase
+    );
+    after
+}
+
+#[cfg(feature = "boot-smoke")]
+fn assert_heap_guards(tables: &PageTables, size: usize) {
+    for address in [
+        HEAP_START - PAGE_SIZE,
+        HEAP_START + size as u64,
+        HEAP_START + HEAP_MAX_SIZE as u64,
+    ] {
+        assert_eq!(tables.translate(address), Ok(None), "heap guard mapped");
+    }
+}
+
+/// Exercise every reserved PT and the real maximum without releasing backing.
+///
+/// # Safety
+/// Inherits grow's ownership and execution contract. Run after native clients
+/// have released every heap allocation, before deliberately failing an AP.
+#[cfg(feature = "boot-smoke")]
+pub unsafe fn capacity_self_test(
+    tables: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    offset: u64,
+) {
+    let before = stats();
+    assert_eq!(before.used, 0, "heap limit test requires an empty heap");
+    assert!(before.size > 0 && before.size <= HEAP_MAX_SIZE);
+    let frame_baseline = frames
+        .stats()
+        .expect("heap limit frame accounting")
+        .allocated_frames;
+    let mut current = before;
+    while current.size < HEAP_MAX_SIZE {
+        let pages = ((HEAP_MAX_SIZE - current.size) / PAGE_SIZE as usize).min(MAX_GROW_PAGES);
+        // SAFETY: The next uncommitted tail is owned and absent. Every batch
+        // completes all shootdowns before permanent capacity is exposed.
+        current = unsafe { grow(tables, frames, offset, pages) }.expect("grow heap to capacity");
+        assert_eq!(current.used, 0);
+        assert_eq!(current.free, current.size);
+        assert_eq!(
+            frames.stats().unwrap().allocated_frames,
+            frame_baseline + (current.size - before.size) / PAGE_SIZE as usize
+        );
+        assert_heap_guards(tables, current.size);
+    }
+    let full = stats();
+    assert_eq!(full.size, HEAP_MAX_SIZE);
+    let full_frames = frames.stats().unwrap().allocated_frames;
+    assert_eq!(
+        // SAFETY: Capacity rejection precedes backing or mapping changes,
+        // leaving both permanent guards absent.
+        unsafe { grow(tables, frames, offset, 1) },
+        Err(HeapError::LimitExceeded)
+    );
+    assert_eq!(stats(), full);
+    assert_eq!(frames.stats().unwrap().allocated_frames, full_frames);
+    assert_heap_guards(tables, HEAP_MAX_SIZE);
+
+    let layout = Layout::from_size_align(HEAP_MAX_SIZE, PAGE_SIZE as usize).unwrap();
+    // SAFETY: Valid bounded allocation of the complete empty heap. This can
+    // succeed only if every committed tail coalesced with previous free space.
+    let allocation = unsafe { ALLOCATOR.alloc(layout) };
+    assert_eq!(allocation as u64, HEAP_START, "maximum heap coalescing");
+    assert_eq!(stats().free, 0);
+    let pages = HEAP_MAX_SIZE / PAGE_SIZE as usize;
+    for page in 0..pages {
+        let pattern = 0x4d49_5252_4845_4150_u64 ^ page as u64;
+        let byte = page * PAGE_SIZE as usize;
+        // SAFETY: The complete arena is one exclusively owned allocation.
+        // Distinct first/last words prove every mapped page is writable and
+        // detect accidental physical aliases when read after the full pass.
+        unsafe {
+            allocation.add(byte).cast::<u64>().write_volatile(pattern);
+            allocation
+                .add(byte + PAGE_SIZE as usize - core::mem::size_of::<u64>())
+                .cast::<u64>()
+                .write_volatile(!pattern);
+        }
+    }
+    for page in (0..pages).rev() {
+        let pattern = 0x4d49_5252_4845_4150_u64 ^ page as u64;
+        let byte = page * PAGE_SIZE as usize;
+        // SAFETY: The initialized allocation remains owned and unmodified.
+        unsafe {
+            assert_eq!(allocation.add(byte).cast::<u64>().read_volatile(), pattern);
+            assert_eq!(
+                allocation
+                    .add(byte + PAGE_SIZE as usize - core::mem::size_of::<u64>())
+                    .cast::<u64>()
+                    .read_volatile(),
+                !pattern
+            );
+        }
+    }
+    // SAFETY: Free the sole allocation once with its exact original layout.
+    // The backing frames remain permanent heap capacity.
+    unsafe { ALLOCATOR.dealloc(allocation, layout) };
+    assert_eq!(stats(), full);
+    assert_eq!(frames.stats().unwrap().allocated_frames, full_frames);
+    assert_heap_guards(tables, HEAP_MAX_SIZE);
+    crate::serial::println!(
+        "MIRROR_HEAP_LIMIT_OK size={} limit_rejected=1 guards=1 reclaimed_allocations=1",
+        HEAP_MAX_SIZE
+    );
 }
 
 /// Exercise the real global allocator while the freshly initialized heap is empty.

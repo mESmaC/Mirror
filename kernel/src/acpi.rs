@@ -11,7 +11,11 @@ use mirror_acpi::{Header, Root, Rsdp, SDT_HEADER_SIZE, Topology};
 
 use crate::{boot::BootInfo, memory::FrameAllocator, paging::PageTables, serial};
 
-const FIRMWARE_WINDOW: u64 = 0xffff_d000_0040_0000;
+// Keep firmware scratch mappings outside the full reserved heap arena.
+const FIRMWARE_WINDOW: u64 = 0xffff_d300_0020_0000;
+const _: () = assert!(
+    FIRMWARE_WINDOW >= crate::heap::HEAP_START + crate::heap::HEAP_MAX_SIZE as u64 + PAGE_SIZE
+);
 const PAGE_SIZE: u64 = crate::memory::PAGE_SIZE;
 
 #[derive(Debug)]

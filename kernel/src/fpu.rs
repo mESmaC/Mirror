@@ -1,4 +1,4 @@
-//! Eager BSP ownership of the x87/MMX and legacy 128-bit SIMD register state.
+//! CPU-local setup and BSP ownership of x87/MMX and legacy SIMD register state.
 //!
 //! Kernel Rust remains soft-float. Every scheduled user context owns one full
 //! FXSAVE64 image; the user entry/return assembly restores/saves it with IF=0.
@@ -72,18 +72,42 @@ pub(crate) fn init() {
     assert!(interrupts::is_initialized(), "FPU setup requires the IDT");
     assert!(!arch::interrupts_enabled(), "FPU setup requires IF=0");
     assert!(!is_initialized(), "FPU already initialized");
-    let basic_limit = cpuid(0).eax;
-    assert!(
-        basic_limit >= 1,
-        "CPU lacks architectural feature discovery"
+    let cpuid_avx = configure_current().expect("FPU CPU setup failed");
+    INITIALIZED.store(true, Ordering::Release);
+    serial::println!(
+        "MIRROR_FPU_READY format=fxsave64 bytes=512 xmm=16 eager=1 avx=0 cpuid_avx={} osxsave=0",
+        u8::from(cpuid_avx)
     );
+}
+
+/// Establish the same control and clean-register contract on this secondary.
+/// The caller has installed its private exception descriptors with IF clear.
+/// No global publication, logging, allocation or BSP panic path is used here.
+pub(crate) fn init_secondary() -> Result<(), &'static str> {
+    if !INITIALIZED.load(Ordering::Acquire) {
+        return Err("secondary FPU setup requires BSP initialization");
+    }
+    configure_current().map(|_| ())
+}
+
+/// Configure only the executing CPU. Return AVX hardware availability for the
+/// BSP's diagnostic; OSXSAVE remains disabled regardless of that capability.
+fn configure_current() -> Result<bool, &'static str> {
+    if !interrupts::is_initialized() {
+        return Err("FPU setup requires the IDT");
+    }
+    if arch::interrupts_enabled() {
+        return Err("FPU setup requires IF=0");
+    }
+    let basic_limit = cpuid(0).eax;
+    if basic_limit < 1 {
+        return Err("CPU lacks architectural feature discovery");
+    }
     let features = cpuid(1);
     let required = (1 << 0) | (1 << 24) | (1 << 25) | (1 << 26);
-    assert_eq!(
-        features.edx & required,
-        required,
-        "CPU requires x87, FXSR, SSE and SSE2"
-    );
+    if features.edx & required != required {
+        return Err("CPU requires x87, FXSR, SSE and SSE2");
+    }
 
     // A bootloader can leave AMD fast saves enabled. At CPL0 that mode skips
     // XMM0..15, so explicitly disable it whenever the CPU advertises the bit.
@@ -93,6 +117,8 @@ pub(crate) fn init() {
         if extended_features & (1 << 25) != 0 {
             let low: u32;
             let high: u32;
+            let observed_low: u32;
+            let observed_high: u32;
             // SAFETY: EFER exists at CPL0 on x86-64. The advertised FFXSR bit
             // is writable; every unrelated EFER bit remains unchanged.
             unsafe {
@@ -101,13 +127,21 @@ pub(crate) fn init() {
                 let efer = ((u64::from(high) << 32) | u64::from(low)) & !EFER_FFXSR;
                 asm!("wrmsr", in("ecx") EFER, in("eax") efer as u32,
                     in("edx") (efer >> 32) as u32, options(nostack, preserves_flags));
+                asm!("rdmsr", in("ecx") EFER,
+                    out("eax") observed_low, out("edx") observed_high,
+                    options(nomem, nostack, preserves_flags));
+            }
+            if ((u64::from(observed_high) << 32) | u64::from(observed_low)) & EFER_FFXSR != 0 {
+                return Err("CPU retained fast FXSAVE mode");
             }
         }
     }
 
     let cr0: u64;
     let cr4: u64;
-    // SAFETY: Single boot CPU at CPL0 with IF clear. Feature gates were checked;
+    let observed_cr0: u64;
+    let observed_cr4: u64;
+    // SAFETY: Executing CPU at CPL0 with IF clear. Feature gates were checked;
     // installed #MF/#XM handlers are ready before enabling native exceptions.
     // Soft-float Rust never uses the affected register files implicitly.
     unsafe {
@@ -128,12 +162,18 @@ pub(crate) fn init() {
         // state, so they too must remain compiled for the soft-float target.
         asm!("mov cr0, {}", in(reg) (enabled_cr0 | CR0_TS),
             options(nostack, preserves_flags));
+        asm!("mov {}, cr0", out(reg) observed_cr0,
+            options(nomem, nostack, preserves_flags));
+        asm!("mov {}, cr4", out(reg) observed_cr4,
+            options(nomem, nostack, preserves_flags));
     }
-    INITIALIZED.store(true, Ordering::SeqCst);
-    serial::println!(
-        "MIRROR_FPU_READY format=fxsave64 bytes=512 xmm=16 eager=1 avx=0 cpuid_avx={} osxsave=0",
-        u8::from(features.ecx & (1 << 28) != 0)
-    );
+    if observed_cr0 & (CR0_MP | CR0_NE | CR0_TS | CR0_EM) != (CR0_MP | CR0_NE | CR0_TS)
+        || observed_cr4 & (CR4_OSFXSR | CR4_OSXMMEXCPT | CR4_OSXSAVE | CR4_FSGSBASE)
+            != (CR4_OSFXSR | CR4_OSXMMEXCPT)
+    {
+        return Err("CPU retained unexpected FPU controls");
+    }
+    Ok(features.ecx & (1 << 28) != 0)
 }
 
 // Rust 1.88 declares this intrinsic unsafe; newer compilers declare it safe.

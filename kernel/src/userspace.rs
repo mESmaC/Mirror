@@ -698,11 +698,13 @@ fn run_pair(
     if let Some(session) = surface.take() {
         assert!(
             processes[0].surface_checks,
-            "owner surface checks did not complete"
+            "owner surface checks did not complete: {:?}",
+            processes[0].outcome
         );
         assert!(
             processes[1].surface_denied_checks,
-            "peer surface checks did not complete"
+            "peer surface checks did not complete: {:?}",
+            processes[1].outcome
         );
         let (tiles, pixels) = session.totals();
         let info = session.info();
@@ -3217,7 +3219,7 @@ fn dispatch_syscall(process: &mut Process<'_>, frame: &mut TrapFrame) -> Syscall
     }
 }
 
-/// Runs after IRQ0 acknowledgement, only for an interrupted CPL3 context.
+/// Runs after the selected timer's acknowledgement, only for interrupted CPL3.
 /// A tick charges the interrupted user only; kernel and sleeping time are not
 /// charged. This bounds delivered user IRQ ticks, not exact CPU or wall time.
 pub(crate) fn timer_tick(frame: &mut TrapFrame) {

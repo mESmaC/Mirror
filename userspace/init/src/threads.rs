@@ -104,13 +104,17 @@ fn yield_now() {
 }
 
 fn await_value(value: &AtomicU64, expected: u64) {
-    for _ in 0..4096 {
+    // BASIC workers sleep and await timer preemption. A count of yields can
+    // expire before even one timer tick when only the polling parents remain
+    // runnable. Every unsuccessful poll must allow at least one delivered tick
+    // without charging the waiting thread's CPU budget.
+    for _ in 0..100 {
         if load(value) == expected {
             return;
         }
-        yield_now();
+        require(syscall(SYS_SLEEP, 1, 0, 0) == 0, 574);
     }
-    exit(502);
+    require(load(value) == expected, 502);
 }
 
 fn id() -> u64 {

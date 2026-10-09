@@ -10,14 +10,180 @@ param(
     [switch]$NoKeyboard,
     [switch]$ExtendedCpu,
     [switch]$LegacyPic,
+    [switch]$PitTimer,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
-    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault')][string]$Fault = 'None',
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
     [ValidateRange(1, 300)][int]$TimeoutSeconds = 30,
     [ValidateRange(128, 32768)][int]$MemoryMiB = 256
 )
+
+function Assert-MirrorSmpMarkers {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [Parameter(Mandatory = $true)][int]$RequestedCpus,
+        [bool]$UseLegacyPic,
+        [string]$FaultMode = 'None'
+    )
+
+    if ($Serial -match '(?m)^MIRROR_SMP_CPU_FAILED(?:\s|$)') {
+        throw 'The SMP regression reported an unexpected CPU failure.'
+    }
+    if ([regex]::Matches($Serial, '(?m)^MIRROR_SMP_TESTS_OK\r?$').Count -ne 1 -or
+        [regex]::Matches($Serial, '(?m)^MIRROR_SMP_TESTS_OK(?:\s|$)').Count -ne 1) {
+        throw 'Mirror must complete the SMP policy and mailbox checks exactly once.'
+    }
+    $sharedCpus = if ($UseLegacyPic) { 1 } else { $RequestedCpus }
+    $sharedPattern = '(?m)^MIRROR_SHARED_VM_READY pages=512 cpus={0} rounds=4 reclaimed=3 borrowed_root=1\r?$' -f $sharedCpus
+    $shared = [regex]::Matches($Serial, $sharedPattern)
+    if ($shared.Count -ne 1 -or
+        [regex]::Matches($Serial, '(?m)^MIRROR_SHARED_VM_READY(?:\s|$)').Count -ne 1 -or
+        [regex]::Matches($Serial, '(?m)^MIRROR_SHARED_VM_TESTS_OK\r?$').Count -ne 1 -or
+        [regex]::Matches($Serial, '(?m)^MIRROR_SHARED_VM_TESTS_OK(?:\s|$)').Count -ne 1 -or
+        $Serial -match '(?m)^MIRROR_SHARED_VM_SKIPPED(?:\s|$)') {
+        throw 'Shared kernel mappings must complete exact cross-CPU and borrowed-root reuse checks.'
+    }
+    if ($FaultMode -ne 'SmpTlbTimeout' -and $Serial -match '(?m)^MIRROR_(?:SMP_TLB_TIMEOUT_ARMED|SHARED_TIMEOUT_\w+)(?:\s|$)') {
+        throw 'Unexpected TLB timeout injection.'
+    }
+    if ($UseLegacyPic) {
+        if ($FaultMode -in @('SmpUnmap', 'SmpTlbTimeout')) {
+            throw 'SMP memory fault probes require the APIC backend.'
+        }
+        if ([regex]::Matches($Serial, '(?m)^MIRROR_SMP_SKIPPED reason=legacy_pic online=1\r?$').Count -ne 1 -or
+            [regex]::Matches($Serial, '(?m)^MIRROR_SMP_SKIPPED(?:\s|$)').Count -ne 1) {
+            throw 'The legacy PIC policy must explicitly keep secondary CPUs offline.'
+        }
+        if ($Serial -match '(?m)^MIRROR_(?:SMP_(?:READY|CPU|IPI_OK|GUARD_OK|UNMAP_OK|TLB_TIMEOUT_ARMED)|SHARED_OFFLINE_OK)(?:\s|$)') {
+            throw 'The legacy PIC regression unexpectedly started the SMP backend.'
+        }
+        return
+    }
+
+    if ($Serial -match '(?m)^MIRROR_SMP_SKIPPED(?:\s|$)') {
+        throw 'The APIC regression unexpectedly skipped secondary-CPU startup.'
+    }
+    $readyPattern = '(?m)^MIRROR_SMP_READY discovered={0} online={0} bsp=(\d+) aps={1} userspace_cpus=1\r?$' -f $RequestedCpus, ($RequestedCpus - 1)
+    $ready = [regex]::Matches($Serial, $readyPattern)
+    if ($ready.Count -ne 1 -or [regex]::Matches($Serial, '(?m)^MIRROR_SMP_READY(?:\s|$)').Count -ne 1) {
+        throw "Mirror must bring exactly $RequestedCpus processors online while keeping userspace on the BSP."
+    }
+    if ([uint64]$ready[0].Groups[1].Value -ge 255) { throw 'Mirror reported an invalid BSP APIC ID.' }
+
+    $cpuRecords = [regex]::Matches($Serial, '(?m)^MIRROR_SMP_CPU slot=(\d+) apic=(\d+) stack=(0x[0-9a-f]+) cr3=(0x[0-9a-f]+)\r?$')
+    $expectedSecondaries = $RequestedCpus - 1
+    if ($cpuRecords.Count -ne $expectedSecondaries -or
+        [regex]::Matches($Serial, '(?m)^MIRROR_SMP_CPU(?:\s|$)').Count -ne $expectedSecondaries) {
+        throw "Mirror must validate exactly $expectedSecondaries secondary CPU contexts."
+    }
+    $slots = [System.Collections.Generic.HashSet[int]]::new()
+    $apicIds = [System.Collections.Generic.HashSet[uint32]]::new()
+    $stacks = [System.Collections.Generic.HashSet[uint64]]::new()
+    [void]$apicIds.Add([uint32]$ready[0].Groups[1].Value)
+    $secondaryRoot = [uint64]0
+    foreach ($cpuRecord in $cpuRecords) {
+        $slot = [int]$cpuRecord.Groups[1].Value
+        $apicIdentity = [uint32]$cpuRecord.Groups[2].Value
+        $stackTop = [Convert]::ToUInt64($cpuRecord.Groups[3].Value.Substring(2), 16)
+        $rootAddress = [Convert]::ToUInt64($cpuRecord.Groups[4].Value.Substring(2), 16)
+        if ($slot -lt 1 -or $slot -ge $RequestedCpus -or -not $slots.Add($slot) -or
+            $apicIdentity -ge 255 -or -not $apicIds.Add($apicIdentity) -or $stackTop -eq 0 -or ($stackTop % 16) -ne 0 -or
+            -not $stacks.Add($stackTop) -or $rootAddress -eq 0 -or ($rootAddress % 4096) -ne 0) {
+            throw 'Secondary CPU records must have unique slots, APIC IDs and aligned private stacks, with valid page-table roots.'
+        }
+        if ($secondaryRoot -eq 0) { $secondaryRoot = $rootAddress }
+        elseif ($rootAddress -ne $secondaryRoot) {
+            throw 'Secondary CPUs must use the same dedicated kernel page-table root.'
+        }
+    }
+
+    $phases = @(
+        @{ Name = 'boot'; Rounds = 8 },
+        @{ Name = 'after_userspace'; Rounds = 4 },
+        @{ Name = 'after_desktop'; Rounds = 4 }
+    )
+    if ([regex]::Matches($Serial, '(?m)^MIRROR_SMP_IPI_OK(?:\s|$)').Count -ne $phases.Count) {
+        throw 'Mirror must complete exactly three IPI rendezvous phases.'
+    }
+    $previousPhase = $ready[0].Index
+    foreach ($phase in $phases) {
+        $phasePattern = '(?m)^MIRROR_SMP_IPI_OK phase={0} cpus={1} rounds={2}\r?$' -f $phase.Name, $RequestedCpus, $phase.Rounds
+        $phaseRecords = [regex]::Matches($Serial, $phasePattern)
+        if ($phaseRecords.Count -ne 1 -or $phaseRecords[0].Index -le $previousPhase) {
+            throw "Mirror must verify $($phase.Rounds) ordered IPI rounds on all $RequestedCpus CPUs during $($phase.Name)."
+        }
+        if (($phase.Name -eq 'boot' -and $shared[0].Index -le $phaseRecords[0].Index) -or
+            ($phase.Name -eq 'after_userspace' -and $shared[0].Index -ge $phaseRecords[0].Index)) {
+            throw 'Shared mapping reuse checks must follow CPU startup and precede the completed userspace rendezvous.'
+        }
+        $previousPhase = $phaseRecords[0].Index
+    }
+    $guardRecords = [regex]::Matches($Serial, '(?m)^MIRROR_SMP_GUARD_OK(?:\s|$)')
+    $unmapRecords = [regex]::Matches($Serial, '(?m)^MIRROR_SMP_UNMAP_OK(?:\s|$)')
+    $offlineRecords = [regex]::Matches($Serial, '(?m)^MIRROR_SHARED_OFFLINE_OK unchanged=1\r?$')
+    if ([regex]::Matches($Serial, '(?m)^MIRROR_SHARED_OFFLINE_OK(?:\s|$)').Count -ne $offlineRecords.Count) {
+        throw 'Malformed shared-mapping offline rejection marker.'
+    }
+    if ($FaultMode -eq 'SmpTlbTimeout') {
+        if ($guardRecords.Count -ne 0 -or $unmapRecords.Count -ne 0 -or $offlineRecords.Count -ne 0) {
+            throw 'The timeout probe must fail inside unmap before destructive fault tests or reclamation.'
+        }
+        $target = $RequestedCpus - 1
+        $armedPattern = '(?m)^MIRROR_SMP_TLB_TIMEOUT_ARMED target={0}\r?$' -f $target
+        $armed = [regex]::Matches($Serial, $armedPattern)
+        $expected = [regex]::Matches($Serial, '(?m)^MIRROR_SHARED_TIMEOUT_EXPECT address=0xffffd20000000000 frame=(0x[0-9a-f]+)\r?$')
+        $panic = [regex]::Matches($Serial, '(?m)^MIRROR_PANIC:[^\r\n]*\r?\nkernel TLB shootdown acknowledgement timeout\r?$')
+        if ($RequestedCpus -le 1 -or $armed.Count -ne 1 -or $expected.Count -ne 1 -or $panic.Count -ne 1 -or
+            [regex]::Matches($Serial, '(?m)^MIRROR_SMP_TLB_TIMEOUT_ARMED(?:\s|$)').Count -ne 1 -or
+            [regex]::Matches($Serial, '(?m)^MIRROR_SHARED_TIMEOUT_\w+(?:\s|$)').Count -ne 1 -or
+            [regex]::Matches($Serial, '(?im)^(?:MIRROR_PANIC|PANIC|\[panic\])(?::|\s|$)').Count -ne 1 -or
+            [regex]::Matches($Serial, '(?m)^kernel TLB shootdown acknowledgement timeout\r?$').Count -ne 1 -or
+            $armed[0].Index -le $previousPhase -or $expected[0].Index -le $armed[0].Index -or
+            $panic[0].Index -le $expected[0].Index -or
+            $Serial -match '(?m)^MIRROR_(?:PAGE_FAULT_OK|BOOT_OK|EXCEPTION)(?:\s|$)') {
+            throw 'The missing-ACK test must panic inside shootdown after arming, before unmap returns or the frame is reclaimed.'
+        }
+        $retainedFrame = [Convert]::ToUInt64($expected[0].Groups[1].Value.Substring(2), 16)
+        if ($retainedFrame -eq 0 -or ($retainedFrame % 4096) -ne 0) {
+            throw 'The missing-ACK test must retain a valid allocated frame.'
+        }
+        return
+    }
+    if ($FaultMode -eq 'SmpUnmap') {
+        $pattern = '(?m)^MIRROR_SMP_UNMAP_OK slot={0} vector=14 remaining={0}\r?$' -f ($RequestedCpus - 1)
+        $records = [regex]::Matches($Serial, $pattern)
+        if ($RequestedCpus -le 1 -or $guardRecords.Count -ne 0 -or $unmapRecords.Count -ne 1 -or
+            $records.Count -ne 1 -or $records[0].Index -le $previousPhase -or $offlineRecords.Count -ne 1 -or
+            $offlineRecords[0].Index -le $records[0].Index) {
+            throw 'The released-alias probe must fault only its target and reject later shared mutations.'
+        }
+        return
+    }
+    if ($unmapRecords.Count -ne 0) { throw 'Unexpected released-alias fault injection.' }
+    if ($RequestedCpus -gt 1 -and $offlineRecords.Count -ne 1) {
+        throw 'A faulted secondary must prevent shared mapping mutations before PTE publication.'
+    }
+    if ($RequestedCpus -eq 1 -and $offlineRecords.Count -ne 0) {
+        throw 'A uniprocessor boot unexpectedly rejected a missing secondary.'
+    }
+    if ($RequestedCpus -eq 1) {
+        if ($guardRecords.Count -ne 0) {
+            throw 'A single-CPU boot must not run a secondary guard-fault probe.'
+        }
+    }
+    else {
+        $guardPattern = '(?m)^MIRROR_SMP_GUARD_OK slot={0} vector=14 remaining={0}\r?$' -f ($RequestedCpus - 1)
+        $guard = [regex]::Matches($Serial, $guardPattern)
+        if ($guardRecords.Count -ne 1 -or $guard.Count -ne 1 -or $guard[0].Index -le $previousPhase) {
+            throw 'A multicore boot must isolate one AP stack-guard fault after the ordinary IPI phases and verify every surviving CPU.'
+        }
+        if ($offlineRecords[0].Index -le $guard[0].Index) {
+            throw 'Shared mutation rejection must be checked after the AP guard fault.'
+        }
+    }
+}
 
 . (Join-Path $PSScriptRoot 'common.ps1')
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
@@ -29,6 +195,12 @@ if ($Graphical -and ($Smoke -or $NoDisplayDevice)) {
 }
 if ($NoTestDisk -and $Fault -eq 'BlockIoError') {
     throw '-Fault BlockIoError requires the test disk.'
+}
+if ($Fault -in @('SmpUnmap', 'SmpTlbTimeout') -and ($CpuCount -lt 2 -or $LegacyPic)) {
+    throw 'SMP memory fault probes require at least two CPUs and the APIC backend.'
+}
+if ($Fault -eq 'TimerCalibration' -and ($LegacyPic -or $PitTimer)) {
+    throw 'Timer calibration fault injection requires APIC with automatic timer selection.'
 }
 $qemu = Get-MirrorQemu -RequestedPath $QemuPath -RepositoryRoot $repositoryRoot
 $qemuDirectory = Split-Path -Parent $qemu
@@ -74,11 +246,15 @@ $testMode = switch ($Fault) {
     'ThreadLastExit' { 'thread-last-exit' }
     'ThreadProcessExit' { 'thread-process-exit' }
     'ThreadFault' { 'thread-fault' }
+    'SmpUnmap' { 'smp-unmap' }
+    'SmpTlbTimeout' { 'smp-tlb-timeout' }
+    'TimerCalibration' { 'timer-calibration' }
     default { $null }
 }
 $kernelArguments = @()
 if ($null -ne $testMode) { $kernelArguments += "mirror.test=$testMode" }
 if ($LegacyPic) { $kernelArguments += 'mirror.irq=pic' }
+if ($PitTimer) { $kernelArguments += 'mirror.timer=pit' }
 if ($kernelArguments.Count -gt 0) { $bootConfig += "`n    cmdline: $($kernelArguments -join ' ')`n" }
 [System.IO.File]::WriteAllText((Join-Path $espDirectory 'limine.conf'), $bootConfig)
 
@@ -180,11 +356,12 @@ try {
     if (-not $NoTestDisk -and (Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash -ne $testDiskHash) {
         throw 'The read-only block fixture was modified during the boot.'
     }
-    if ($serial -match '(?im)^(?:MIRROR_PANIC|PANIC|\[panic\])') {
+    $expectedTlbTimeout = $Fault -eq 'SmpTlbTimeout'
+    if (-not $expectedTlbTimeout -and $serial -match '(?im)^(?:MIRROR_PANIC|PANIC|\[panic\])') {
         throw "Mirror reported a panic. See $serialLog."
     }
     $fatalKernelFault = $Fault -in @('PageFault', 'InvalidOpcode')
-    $expectedExitCode = if ($fatalKernelFault) { 35 } else { 33 }
+    $expectedExitCode = if ($fatalKernelFault -or $expectedTlbTimeout) { 35 } else { 33 }
     if ($qemuExitCode -ne $expectedExitCode) {
         $qemuError = [System.IO.File]::ReadAllText($stderrLog)
         throw "Mirror smoke test expected QEMU exit $expectedExitCode; got $qemuExitCode. $qemuError See $serialLog."
@@ -201,16 +378,13 @@ try {
     $markers += @('MIRROR_FPU_READY', 'MIRROR_FPU_TESTS_OK', 'MIRROR_USER_FPU_OK')
     $markers += @('MIRROR_TLS_READY', 'MIRROR_TLS_KERNEL_OK', 'MIRROR_USER_TLS_OK')
     $markers += 'MIRROR_ACPI_READY'
-    # Firmware must describe every configured CPU, although only the BSP
-    # executes kernel code until secondary-processor startup is implemented.
+    # Firmware must describe every configured CPU. The APIC backend then starts
+    # each secondary with a private stack and verifies repeated IPI delivery.
     if ($serial -notmatch "(?m)^MIRROR_ACPI_READY [^\r\n]* cpus=$CpuCount enabled=$CpuCount(?:\s|$)") {
         throw "ACPI discovery must report exactly $CpuCount enabled processors."
     }
     if ($LegacyPic) {
         $markers += 'MIRROR_APIC_SKIPPED reason=boot_policy'
-        if ($serial -notmatch '(?m)^MIRROR_TIMER_READY source=pit irq=0 vector=32 [^\r\n]* controller=pic(?:\s|$)') {
-            throw 'The legacy PIC boot policy must deliver PIT interrupts through the PIC.'
-        }
         if ($serial -match '(?m)^MIRROR_APIC_(?:READY|SPURIOUS_OK)(?:\s|$)') {
             throw 'The legacy PIC regression unexpectedly enabled the APIC backend.'
         }
@@ -225,10 +399,10 @@ try {
         if ($serial -notmatch '(?m)^MIRROR_APIC_READY mode=xapic bsp=\d+ ioapics=[1-9]\d* routes=3(?:\s|$)') {
             throw 'Mirror must initialize xAPIC and the three ISA interrupt routes from firmware topology.'
         }
-        if ($serial -notmatch '(?m)^MIRROR_TIMER_READY source=pit irq=0 vector=32 [^\r\n]* controller=ioapic(?:\s|$)') {
-            throw 'The APIC regression must deliver PIT interrupts through the I/O APIC.'
-        }
     }
+    Assert-MirrorTimer -Serial $serial -Smoke $true -UseLegacyPic ([bool]$LegacyPic) -ForcePit ([bool]$PitTimer) -FaultMode $Fault
+    Assert-MirrorSmpMarkers -Serial $serial -RequestedCpus $CpuCount -UseLegacyPic ([bool]$LegacyPic) -FaultMode $Fault
+    Assert-MirrorHeapGrowth -Serial $serial -RequestedCpus $CpuCount -Smoke $true -UseLegacyPic ([bool]$LegacyPic)
     $markers += 'MIRROR_USER_SYNC_OK'
     if (@([regex]::Matches($serial, '(?m)^user: Mirror init: synchronization checks passed\\n\r?$')).Count -ne 4) {
         throw 'Both native processes must complete their synchronization checks before and after teardown/relaunch.'
@@ -484,13 +658,13 @@ try {
             throw "Mirror must report $threadMarker exactly $expectedCount time(s). See $serialLog."
         }
     }
-    if (-not $fatalKernelFault) {
+    if (-not $expectedTlbTimeout -and -not $fatalKernelFault) {
         $markers += @('MIRROR_PAGE_FAULT_OK', 'MIRROR_BOOT_OK')
         if ($serial -match '(?im)^(?:EXCEPTION|MIRROR_EXCEPTION)(?:\s|:|$)') {
             throw "Mirror reported an unexpected exception. See $serialLog."
         }
     }
-    else {
+    elseif ($fatalKernelFault) {
         $vector = if ($Fault -eq 'PageFault') { 14 } else { 6 }
         $diagnostic = "(?m)^MIRROR_EXCEPTION vector=$vector error=0x0 rip=0x[0-9a-f]+ cr2="
         if ($Fault -eq 'PageFault') { $diagnostic += '0xffffc00000000000(?:\s|$)' }
@@ -507,7 +681,7 @@ try {
             throw "Mirror smoke test did not report $marker. See $serialLog."
         }
     }
-    Write-Host "Mirror boot smoke test passed (fault=$Fault, no-display=$NoDisplayDevice, extended-cpu=$ExtendedCpu, cpus=$CpuCount, legacy-pic=$LegacyPic, QEMU exit $expectedExitCode). Serial log: $serialLog"
+    Write-Host "Mirror boot smoke test passed (fault=$Fault, no-display=$NoDisplayDevice, extended-cpu=$ExtendedCpu, cpus=$CpuCount, legacy-pic=$LegacyPic, pit-timer=$PitTimer, QEMU exit $expectedExitCode). Serial log: $serialLog"
     # Keep firmware's terminal control sequences in the raw log, not tool output.
     Write-Output (($serial -split '\r?\n' | Where-Object { $_ -match '^(MIRROR_|Memory map:|Direct map offset:|Page tables:)' }) -join [Environment]::NewLine)
 }

@@ -58,6 +58,14 @@ MIRROR_EXCEPTION 31
 .global mirror_exception_128
 MIRROR_EXCEPTION 128
 
+# Fixed delivery LAPIC IPIs use a kernel-only gate and the shared full frame.
+.global mirror_exception_240
+MIRROR_EXCEPTION 240
+
+# BSP local timer uses the same complete register/TLS frame as device IRQs.
+.global mirror_exception_241
+MIRROR_EXCEPTION 241
+
 # LAPIC spurious interrupts need no EOI and share the full TLS-preserving entry.
 .global mirror_exception_255
 MIRROR_EXCEPTION 255
