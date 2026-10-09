@@ -43,6 +43,176 @@ fn madt(records: &[u8]) -> Vec<u8> {
     sdt(b"APIC", &body)
 }
 
+fn hpet() -> Vec<u8> {
+    // Match QEMU's HPET descriptor, including zero GAS width/access size and
+    // the valid zero minimum periodic tick. It advertises three comparators.
+    let mut body = vec![0; HPET_TABLE_SIZE - SDT_HEADER_SIZE];
+    body[..4].copy_from_slice(&0x8086_a201_u32.to_le_bytes());
+    body[8..16].copy_from_slice(&0xfed0_0000_u64.to_le_bytes());
+    sdt(b"HPET", &body)
+}
+
+#[test]
+fn hpet_preserves_descriptor_and_driver_policy_fields() {
+    let mut bytes = hpet();
+    assert_eq!(
+        Hpet::parse(&bytes),
+        Ok(Hpet {
+            event_timer_block_id: 0x8086_a201,
+            address: 0xfed0_0000,
+            number: 0,
+            minimum_tick: 0,
+            page_protection: 0,
+            oem_attributes: 0,
+        })
+    );
+    // Keep a valid 32-bit descriptor: the 64-bit clock restriction belongs to
+    // the driver. The parser also does not impose a 32-bit address ceiling or
+    // the driver's stricter page alignment on the physical GAS address.
+    bytes[36..40].copy_from_slice(&0x1234_0102_u32.to_le_bytes());
+    bytes[44..52].copy_from_slice(&0x1_0000_0008_u64.to_le_bytes());
+    bytes[52] = 7;
+    bytes[53..55].copy_from_slice(&0xffff_u16.to_le_bytes());
+    bytes[55] = 0xa2;
+    repair_checksum(&mut bytes, 9);
+    assert_eq!(
+        Hpet::parse(&bytes),
+        Ok(Hpet {
+            event_timer_block_id: 0x1234_0102,
+            address: 0x1_0000_0008,
+            number: 7,
+            minimum_tick: u16::MAX,
+            page_protection: 2,
+            oem_attributes: 10,
+        })
+    );
+}
+
+#[test]
+fn hpet_bounds_declared_length_and_checksum() {
+    let bytes = hpet();
+    for length in 0..bytes.len() {
+        assert_eq!(Hpet::parse(&bytes[..length]), Err(Error::Truncated));
+    }
+    for length in SDT_HEADER_SIZE..HPET_TABLE_SIZE {
+        let mut short = bytes[..length].to_vec();
+        short[4..8].copy_from_slice(&(length as u32).to_le_bytes());
+        repair_checksum(&mut short, 9);
+        assert_eq!(Hpet::parse(&short), Err(Error::Truncated));
+    }
+    for length in [0, 35, MAX_TABLE_SIZE + 1] {
+        let mut invalid = bytes.clone();
+        invalid[4..8].copy_from_slice(&(length as u32).to_le_bytes());
+        assert_eq!(Hpet::parse(&invalid), Err(Error::Length));
+    }
+    // The whole declared table is checksummed, including extension bytes.
+    let mut extended = bytes.clone();
+    extended.extend_from_slice(&[0x23, 0x45]);
+    let length = extended.len() as u32;
+    extended[4..8].copy_from_slice(&length.to_le_bytes());
+    repair_checksum(&mut extended, 9);
+    assert_eq!(Hpet::parse(&extended), Hpet::parse(&bytes));
+    extended[HPET_TABLE_SIZE] ^= 1;
+    assert_eq!(Hpet::parse(&extended), Err(Error::Checksum));
+    // Bytes beyond the declared table do not change its checksum or fields.
+    let mut mapped = bytes.clone();
+    mapped.extend_from_slice(&[0xff; 16]);
+    assert_eq!(Hpet::parse(&mapped), Hpet::parse(&bytes));
+    let mut invalid = bytes;
+    invalid[9] ^= 1;
+    assert_eq!(Hpet::parse(&invalid), Err(Error::Checksum));
+}
+
+#[test]
+fn hpet_rejects_signature_revision_and_reserved_block_id() {
+    let mut bytes = hpet();
+    bytes[..4].copy_from_slice(b"APIC");
+    repair_checksum(&mut bytes, 9);
+    assert_eq!(Hpet::parse(&bytes), Err(Error::Signature));
+    for revision in [0, 2, 0xff] {
+        let mut bytes = hpet();
+        bytes[8] = revision;
+        repair_checksum(&mut bytes, 9);
+        assert_eq!(Hpet::parse(&bytes), Err(Error::Revision));
+    }
+    let mut bytes = hpet();
+    bytes[36] = 0;
+    repair_checksum(&mut bytes, 9);
+    assert_eq!(Hpet::parse(&bytes), Err(Error::Revision));
+    let mut bytes = hpet();
+    bytes[37] |= 1 << 6;
+    repair_checksum(&mut bytes, 9);
+    assert_eq!(Hpet::parse(&bytes), Err(Error::Reserved));
+}
+
+#[test]
+fn hpet_rejects_unsupported_gas_and_invalid_addresses() {
+    for space in [1, 2, 0x7f, 0xff] {
+        let mut bytes = hpet();
+        bytes[40] = space;
+        repair_checksum(&mut bytes, 9);
+        assert_eq!(Hpet::parse(&bytes), Err(Error::Address));
+    }
+    for offset in 41..44 {
+        for value in [1, 4, 32, 64, 0xff] {
+            let mut bytes = hpet();
+            bytes[offset] = value;
+            repair_checksum(&mut bytes, 9);
+            assert_eq!(Hpet::parse(&bytes), Err(Error::Reserved));
+        }
+    }
+    for address in [
+        0,
+        1,
+        0xfed0_0001,
+        0xfed0_0004,
+        u64::MAX - 7,
+        u64::MAX - 1023,
+    ] {
+        let mut bytes = hpet();
+        bytes[44..52].copy_from_slice(&address.to_le_bytes());
+        repair_checksum(&mut bytes, 9);
+        assert_eq!(Hpet::parse(&bytes), Err(Error::Address));
+    }
+}
+
+#[test]
+fn hpet_distinguishes_page_protection_from_oem_attributes() {
+    for oem in 0..16 {
+        for protection in 0..16 {
+            let mut bytes = hpet();
+            bytes[55] = (oem << 4) | protection;
+            repair_checksum(&mut bytes, 9);
+            let result = Hpet::parse(&bytes);
+            if protection <= 2 {
+                let value = result.unwrap();
+                assert_eq!(value.page_protection, protection);
+                assert_eq!(value.oem_attributes, oem);
+            } else {
+                assert_eq!(result, Err(Error::Reserved));
+            }
+        }
+    }
+}
+
+#[test]
+fn arbitrary_checksummed_hpet_payloads_remain_bounded() {
+    let mut state = 0x3141_5926_u32;
+    for length in SDT_HEADER_SIZE..128 {
+        for _ in 0..16 {
+            let mut bytes = sdt(b"HPET", &vec![0; length - SDT_HEADER_SIZE]);
+            for byte in &mut bytes[SDT_HEADER_SIZE..] {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                *byte = state as u8;
+            }
+            repair_checksum(&mut bytes, 9);
+            let _ = Hpet::parse(&bytes);
+        }
+    }
+}
+
 fn cpu(uid: u8, apic: u8, flags: u32) -> Vec<u8> {
     let mut bytes = vec![0, 8, uid, apic];
     bytes.extend_from_slice(&flags.to_le_bytes());

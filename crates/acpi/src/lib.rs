@@ -5,12 +5,15 @@
 //!
 //! Layouts follow ACPI 6.6 sections 5.2.5, 5.2.6, 5.2.7, 5.2.8 and 5.2.12:
 //! <https://uefi.org/specs/ACPI/6.6/05_ACPI_Software_Programming_Model.html>.
-//! This is an x86 APIC topology parser, not an AML interpreter. Capacity and
-//! table-size limits are kernel policy; exceeding them fails the whole parse.
+//! HPET layouts follow the IA-PC HPET Specification 1.0a, section 3.2.4:
+//! <https://www.intel.com/content/dam/www/public/us/en/documents/technical-specifications/software-developers-hpet-spec-1-0a.pdf>.
+//! These are x86 topology and optional timer descriptors, not an AML interpreter.
+//! Capacity and table-size limits are kernel policy and bound each table parse.
 
 pub const RSDP_V1_SIZE: usize = 20;
 pub const RSDP_V2_SIZE: usize = 36;
 pub const SDT_HEADER_SIZE: usize = 36;
+pub const HPET_TABLE_SIZE: usize = 56;
 pub const MAX_RSDP_SIZE: usize = 4096;
 pub const MAX_TABLE_SIZE: usize = 256 * 1024;
 pub const MAX_ROOT_ENTRIES: usize = 256;
@@ -143,6 +146,67 @@ impl<'a> Sdt<'a> {
 
     pub fn bytes(&self) -> &'a [u8] {
         self.bytes
+    }
+}
+
+/// Firmware's description of one HPET block, without any live MMIO access.
+/// The driver must validate the address against platform memory ownership and
+/// compare the reported block ID with hardware before using the counter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hpet {
+    pub event_timer_block_id: u32,
+    pub address: u64,
+    pub number: u8,
+    pub minimum_tick: u16,
+    /// 0: no page guarantee; 1: 4 KiB; 2: 64 KiB. Never grants user access.
+    pub page_protection: u8,
+    /// The upper attribute nibble is OEM-defined, not reserved-zero.
+    pub oem_attributes: u8,
+}
+
+impl Hpet {
+    pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let table = Sdt::parse(bytes)?;
+        if table.signature() != *b"HPET" {
+            return Err(Error::Signature);
+        }
+        if table.header.revision != 1 {
+            return Err(Error::Revision);
+        }
+        let bytes = table.bytes;
+        require(bytes, HPET_TABLE_SIZE)?;
+        let event_timer_block_id = u32_at(bytes, 36);
+        if event_timer_block_id & (1 << 14) != 0 {
+            return Err(Error::Reserved);
+        }
+        if event_timer_block_id & 0xff == 0 {
+            return Err(Error::Revision);
+        }
+        // This GAS addresses a register block, so width and offset are zero
+        // (ACPI 6.6 section 5.2.3.2). HPET 1.0a also reserves GAS byte3; retain
+        // its legacy zero access-size encoding. System I/O is unsupported.
+        if bytes[40] != 0 {
+            return Err(Error::Address);
+        }
+        reserved(&bytes[41..44])?;
+        let address = u64_at(bytes, 44);
+        if address == 0 || !address.is_multiple_of(8) || address.checked_add(1024).is_none() {
+            return Err(Error::Address);
+        }
+        let page_protection = bytes[55] & 0xf;
+        if page_protection > 2 {
+            return Err(Error::Reserved);
+        }
+        // A zero minimum periodic tick is used by QEMU. Counter width and
+        // comparator count remain hardware/driver policy, not table validity.
+        Ok(Self {
+            event_timer_block_id,
+            address,
+            number: bytes[52],
+            minimum_tick: u16::from_le_bytes([bytes[53], bytes[54]]),
+            page_protection,
+            oem_attributes: bytes[55] >> 4,
+        })
     }
 }
 

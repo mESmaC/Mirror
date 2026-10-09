@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 mirror-vm-protocol = { path = "../../crates/vm-protocol" }
 mirror-thread-protocol = { path = "../../crates/thread-protocol" }
+mirror-clock-protocol = { path = "../../crates/clock-protocol" }
 mirror-sync = { path = "../../crates/sync" }
 
 [[bin]]

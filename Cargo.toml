@@ -1,5 +1,5 @@
 [workspace]
-members = ["kernel", "userspace/init", "userspace/desktop", "userspace/agent", "userspace/app", "crates/desktop-protocol", "crates/window-protocol", "crates/vm-protocol", "crates/thread-protocol", "crates/sync", "crates/acpi"]
+members = ["kernel", "userspace/init", "userspace/desktop", "userspace/agent", "userspace/app", "crates/desktop-protocol", "crates/window-protocol", "crates/vm-protocol", "crates/thread-protocol", "crates/clock-protocol", "crates/sync", "crates/acpi"]
 default-members = ["kernel"]
 resolver = "3"
 

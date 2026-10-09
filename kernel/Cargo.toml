@@ -18,6 +18,7 @@ mirror-window-protocol = { path = "../crates/window-protocol" }
 mirror-vm-protocol = { path = "../crates/vm-protocol" }
 mirror-thread-protocol = { path = "../crates/thread-protocol" }
 mirror-acpi = { path = "../crates/acpi" }
+mirror-clock-protocol = { path = "../crates/clock-protocol" }
 
 [features]
 boot-smoke = []

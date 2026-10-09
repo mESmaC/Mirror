@@ -2,12 +2,13 @@
 //!
 //! Limine base revision 3 returns a physical RSDP and does not map ACPI RAM.
 //! Copy tables through one temporary RO/NX/WB page, validate owned bytes, and
-//! retain only parsed topology. No firmware pointer outlives its mapping.
+//! retain only parsed topology and HPET descriptors. Optional tables fail
+//! independently; no firmware pointer outlives its mapping.
 
 use alloc::vec::Vec;
 use core::fmt;
 use limine::memory_map::{Entry, EntryType};
-use mirror_acpi::{Header, Root, Rsdp, SDT_HEADER_SIZE, Topology};
+use mirror_acpi::{Header, Hpet, Root, Rsdp, SDT_HEADER_SIZE, Topology};
 
 use crate::{boot::BootInfo, memory::FrameAllocator, paging::PageTables, serial};
 
@@ -28,6 +29,7 @@ enum Error {
     Table(mirror_acpi::Error),
     MissingMadt,
     DuplicateMadt,
+    DuplicateHpet,
 }
 
 impl fmt::Display for Error {
@@ -40,12 +42,18 @@ impl fmt::Display for Error {
     }
 }
 
-/// Called once before private address spaces are created, on the sole CPU.
+/// Parsed platform resources with independent optional subsystem availability.
+pub struct Discovery {
+    pub topology: Option<Topology>,
+    pub hpet: Option<Hpet>,
+}
+
+/// Called once before AP release or private address-space creation on the BSP.
 pub fn discover(
     boot: &BootInfo,
     tables: &mut PageTables,
     frames: &mut FrameAllocator<'_>,
-) -> Option<Topology> {
+) -> Discovery {
     assert!(!crate::arch::interrupts_enabled());
     let mut reader = Reader {
         entries: boot.memory_map.entries(),
@@ -53,12 +61,30 @@ pub fn discover(
         frames,
     };
     match reader.discover(boot.rsdp_physical) {
-        Ok(topology) => Some(topology),
+        Ok(discovery) => discovery,
         Err(error) => {
             serial::println!("MIRROR_ACPI_SKIPPED reason={}", error);
-            None
+            serial::println!("MIRROR_ACPI_HPET_SKIPPED reason=acpi_unavailable");
+            Discovery {
+                topology: None,
+                hpet: None,
+            }
         }
     }
+}
+
+// A second description is ambiguous even when either entry is malformed.
+// Keep that rejection sticky instead of accepting the last well-formed table.
+fn unique_table<T>(
+    slot: &mut Option<Result<T, Error>>,
+    candidate: Result<T, Error>,
+    duplicate: Error,
+) {
+    *slot = Some(if slot.is_some() {
+        Err(duplicate)
+    } else {
+        candidate
+    });
 }
 
 struct Reader<'a, 'b> {
@@ -68,7 +94,7 @@ struct Reader<'a, 'b> {
 }
 
 impl Reader<'_, '_> {
-    fn discover(&mut self, physical: Option<u64>) -> Result<Topology, Error> {
+    fn discover(&mut self, physical: Option<u64>) -> Result<Discovery, Error> {
         let physical = physical.ok_or(Error::MissingRsdp)?;
         let mut prefix = [0; 24];
         self.read(physical, &mut prefix[..20])?;
@@ -81,40 +107,86 @@ impl Reader<'_, '_> {
         let root_bytes = self.table(rsdp.root_address)?;
         let root = Root::parse(&root_bytes, rsdp.root_kind).map_err(Error::Table)?;
         let mut topology = None;
+        let mut hpet = None;
         for address in root.addresses() {
-            let mut header = [0; SDT_HEADER_SIZE];
-            self.read(address, &mut header)?;
-            let header = Header::parse(&header).map_err(Error::Table)?;
-            if header.signature == *b"APIC" {
-                if topology.is_some() {
-                    return Err(Error::DuplicateMadt);
+            // Identify known optional tables before validating their length or
+            // copying their body: one malformed descriptor must not discard a
+            // different valid subsystem. Unreadable signatures and malformed
+            // unknown-table headers retain the root discovery's fail-closed
+            // behavior because the table's identity cannot be established.
+            let mut signature = [0; 4];
+            self.read(address, &mut signature)?;
+            match &signature {
+                b"APIC" => {
+                    let candidate = self
+                        .table(address)
+                        .and_then(|bytes| Topology::parse(&bytes).map_err(Error::Table));
+                    unique_table(&mut topology, candidate, Error::DuplicateMadt);
                 }
-                let bytes = self.copy(address, header.length)?;
-                topology = Some(Topology::parse(&bytes).map_err(Error::Table)?);
+                b"HPET" => {
+                    let candidate = self
+                        .table(address)
+                        .and_then(|bytes| Hpet::parse(&bytes).map_err(Error::Table));
+                    unique_table(&mut hpet, candidate, Error::DuplicateHpet);
+                }
+                _ => {
+                    let mut header = [0; SDT_HEADER_SIZE];
+                    self.read(address, &mut header)?;
+                    Header::parse(&header).map_err(Error::Table)?;
+                }
             }
         }
-        let topology = topology.ok_or(Error::MissingMadt)?;
-        serial::println!(
-            "MIRROR_ACPI_READY revision={} root={:?} cpus={} enabled={} ioapics={} overrides={} lapic={:#x}",
-            rsdp.revision,
-            rsdp.root_kind,
-            topology.cpus().len(),
-            topology.cpus().iter().filter(|cpu| cpu.enabled).count(),
-            topology.io_apics().len(),
-            topology.overrides().len(),
-            topology.lapic_address
-        );
-        for cpu in topology.cpus() {
-            serial::println!(
-                "MIRROR_ACPI_CPU uid={} apic={} enabled={} online_capable={} x2apic={}",
-                cpu.uid,
-                cpu.apic_id,
-                u8::from(cpu.enabled),
-                u8::from(cpu.online_capable),
-                u8::from(cpu.x2apic)
-            );
-        }
-        Ok(topology)
+        let topology = match topology.unwrap_or(Err(Error::MissingMadt)) {
+            Ok(topology) => {
+                serial::println!(
+                    "MIRROR_ACPI_READY revision={} root={:?} cpus={} enabled={} ioapics={} overrides={} lapic={:#x}",
+                    rsdp.revision,
+                    rsdp.root_kind,
+                    topology.cpus().len(),
+                    topology.cpus().iter().filter(|cpu| cpu.enabled).count(),
+                    topology.io_apics().len(),
+                    topology.overrides().len(),
+                    topology.lapic_address
+                );
+                for cpu in topology.cpus() {
+                    serial::println!(
+                        "MIRROR_ACPI_CPU uid={} apic={} enabled={} online_capable={} x2apic={}",
+                        cpu.uid,
+                        cpu.apic_id,
+                        u8::from(cpu.enabled),
+                        u8::from(cpu.online_capable),
+                        u8::from(cpu.x2apic)
+                    );
+                }
+                Some(topology)
+            }
+            Err(error) => {
+                serial::println!("MIRROR_ACPI_SKIPPED reason={}", error);
+                None
+            }
+        };
+        let hpet = match hpet {
+            Some(Ok(hpet)) => {
+                serial::println!(
+                    "MIRROR_ACPI_HPET_READY address={:#x} block_id={:#x} number={} minimum_tick={} protection={}",
+                    hpet.address,
+                    hpet.event_timer_block_id,
+                    hpet.number,
+                    hpet.minimum_tick,
+                    hpet.page_protection
+                );
+                Some(hpet)
+            }
+            Some(Err(error)) => {
+                serial::println!("MIRROR_ACPI_HPET_SKIPPED reason={}", error);
+                None
+            }
+            None => {
+                serial::println!("MIRROR_ACPI_HPET_SKIPPED reason=missing");
+                None
+            }
+        };
+        Ok(Discovery { topology, hpet })
     }
 
     fn table(&mut self, physical: u64) -> Result<Vec<u8>, Error> {
@@ -208,6 +280,43 @@ fn firmware_range(entries: &[&Entry], start: u64, end: u64) -> bool {
 
 #[cfg(feature = "boot-smoke")]
 pub fn self_test() {
+    // Selection policy is independent of mapping: an invalid optional table
+    // cannot erase another subsystem, and duplicates never resurrect a value.
+    let mut madt = None;
+    let mut hpet = None;
+    unique_table(&mut madt, Ok(1_u8), Error::DuplicateMadt);
+    unique_table(
+        &mut hpet,
+        Err::<u8, _>(Error::Table(mirror_acpi::Error::Checksum)),
+        Error::DuplicateHpet,
+    );
+    assert!(matches!(madt, Some(Ok(1))));
+    assert!(matches!(hpet, Some(Err(Error::Table(_)))));
+    unique_table(&mut hpet, Ok(2), Error::DuplicateHpet);
+    assert!(matches!(hpet, Some(Err(Error::DuplicateHpet))));
+    unique_table(&mut hpet, Ok(3), Error::DuplicateHpet);
+    assert!(matches!(hpet, Some(Err(Error::DuplicateHpet))));
+    assert!(matches!(madt, Some(Ok(1))));
+    let mut madt = None;
+    let mut hpet = None;
+    unique_table(&mut hpet, Ok(2_u8), Error::DuplicateHpet);
+    unique_table(
+        &mut madt,
+        Err::<u8, _>(Error::Table(mirror_acpi::Error::Truncated)),
+        Error::DuplicateMadt,
+    );
+    assert!(matches!(madt, Some(Err(Error::Table(_)))));
+    assert!(matches!(hpet, Some(Ok(2))));
+    unique_table(&mut madt, Ok(1), Error::DuplicateMadt);
+    assert!(matches!(madt, Some(Err(Error::DuplicateMadt))));
+    assert!(matches!(hpet, Some(Ok(2))));
+    unique_table(
+        &mut hpet,
+        Err(Error::Table(mirror_acpi::Error::Length)),
+        Error::DuplicateHpet,
+    );
+    assert!(matches!(hpet, Some(Err(Error::DuplicateHpet))));
+
     let region = |base, length, entry_type| Entry {
         base,
         length,

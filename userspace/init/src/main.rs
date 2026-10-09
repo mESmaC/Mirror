@@ -9,6 +9,7 @@ use mirror_vm_protocol::{
     SYS_VM_STATS,
 };
 
+mod clock;
 mod fpu;
 mod sync;
 mod threads;
@@ -1113,6 +1114,7 @@ extern "C" fn init_main(launch: u64) -> ! {
     tls::start(pid as u64);
     fpu::check(console, pid as u64);
     tls::finish(console, pid as u64);
+    clock::check(console);
     threads::check(console, pid as u64);
     sync::check(console);
 

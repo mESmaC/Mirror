@@ -151,6 +151,7 @@ pub enum SmokeMode {
     SmpUnmap,
     SmpTlbTimeout,
     TimerCalibration,
+    ClockActivation,
     User(u64),
 }
 
@@ -192,6 +193,7 @@ pub fn smoke_mode() -> SmokeMode {
         b"mirror.test=smp-unmap" => SmokeMode::SmpUnmap,
         b"mirror.test=smp-tlb-timeout" => SmokeMode::SmpTlbTimeout,
         b"mirror.test=timer-calibration" => SmokeMode::TimerCalibration,
+        b"mirror.test=clock-activation" => SmokeMode::ClockActivation,
         _ => panic!("unknown smoke-test command line"),
     };
     assert!(tokens.next().is_none(), "multiple smoke-test arguments");

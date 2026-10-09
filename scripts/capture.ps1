@@ -52,6 +52,7 @@ function Read-MirrorSerial {
 function Assert-MirrorCaptureSmp {
     param([string]$Serial, [int]$RequestedCpus)
     Assert-MirrorTimer -Serial $Serial -Smoke $false -UseLegacyPic $false -ForcePit $false
+    Assert-MirrorClock -Serial $Serial -Smoke $false -WithoutHpet $false
     Assert-MirrorHeapGrowth -Serial $Serial -RequestedCpus $RequestedCpus -Smoke $false -UseLegacyPic $false
     if ($Serial -match '(?m)^MIRROR_(?:SMP_SKIPPED|SMP_CPU_FAILED|SMP_GUARD_OK|SMP_UNMAP_OK|SMP_TLB_TIMEOUT_ARMED|SHARED_TIMEOUT_\w+|SHARED_VM_SKIPPED|SHARED_OFFLINE_OK)(?:\s|$)') {
         throw 'Normal capture skipped SMP, lost a CPU, or ran an injected guard fault.'

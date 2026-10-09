@@ -904,8 +904,22 @@ pub fn handle_ipi() {
 
 fn wait_until(mut done: impl FnMut() -> bool) -> bool {
     let start = timer::ticks();
+    let elapsed_start = crate::clock::snapshot().map(|clock| clock.monotonic_ns);
     while !done() {
-        if timer::ticks().wrapping_sub(start) >= WAIT_TICKS {
+        // Prefer hardware elapsed time so time spent with IF clear still counts
+        // toward a failed CPU's deadline. Platforms without HPET retain the
+        // existing delivered-tick fallback; timer IRQs supply the HLT wakeups.
+        let expired = match elapsed_start {
+            Some(start_ns) => {
+                crate::clock::snapshot()
+                    .expect("published clock disappeared")
+                    .monotonic_ns
+                    .saturating_sub(start_ns)
+                    >= WAIT_TICKS * 10_000_000
+            }
+            None => timer::ticks().wrapping_sub(start) >= WAIT_TICKS,
+        };
+        if expired {
             return false;
         }
         // SAFETY: BSP IDT, selected timer and initialized input routes are active.

@@ -15,6 +15,7 @@ use crate::{
     paging::{PageTables, PagingError, UserAddressSpace, UserPermissions},
     ps2, serial, surface, timer, vm, windows,
 };
+use mirror_clock_protocol as clock_abi;
 use mirror_thread_protocol as thread_abi;
 use mirror_vm_protocol as vm_abi;
 
@@ -236,6 +237,8 @@ struct Process<'kernel> {
     sync_invalidations: u64,
     sync_cancelled: u64,
     tls_checks: bool,
+    clock_checks: bool,
+    clock_unavailable: bool,
     fpu_checks: bool,
     fpu_preemption_start: Option<usize>,
     fpu_preemptions: usize,
@@ -460,6 +463,8 @@ fn create_process<'kernel>(
         sync_invalidations: 0,
         sync_cancelled: 0,
         tls_checks: false,
+        clock_checks: false,
+        clock_unavailable: false,
         fpu_checks: false,
         fpu_preemption_start: None,
         fpu_preemptions: 0,
@@ -1051,6 +1056,12 @@ fn syscall_buffer(process: &Process<'_>, frame: &TrapFrame) -> Option<(u64, usiz
         }
         thread_abi::SYS_TLS_GET
             if frame.rsi == thread_abi::TLS_BASES_SIZE as u64 && frame.rdx == 0 =>
+        {
+            (frame.rdi, frame.rsi, true)
+        }
+        clock_abi::SYS_CLOCK_GET
+            if clock_abi::clock_arguments_valid(frame.rsi, frame.rdx)
+                && crate::clock::is_available() =>
         {
             (frame.rdi, frame.rsi, true)
         }
@@ -2075,6 +2086,21 @@ fn release_finished_handles(processes: &mut [Process<'_>], ipc: &mut Ipc) {
 }
 
 fn validate_process(process: &Process<'_>, scenario: u64) {
+    let available = crate::clock::is_available();
+    assert!(
+        if available {
+            process.clock_checks && !process.clock_unavailable
+        } else {
+            process.clock_unavailable && !process.clock_checks
+        },
+        "clock syscall checks did not complete: {:?}",
+        process.outcome
+    );
+    serial::println!(
+        "MIRROR_USER_CLOCK_OK pid={} available={}",
+        process.pid,
+        u8::from(available)
+    );
     assert!(
         process.sync_checks
             && process.sync_waits > 0
@@ -2928,6 +2954,10 @@ fn dispatch_syscall(process: &mut Process<'_>, frame: &mut TrapFrame) -> Syscall
                     process.checks_passed |= &buffer[..length] == CHECKS_PASSED;
                     process.vm_checks |= &buffer[..length] == b"Mirror init: VM checks passed\n";
                     process.tls_checks |= &buffer[..length] == b"Mirror init: TLS checks passed\n";
+                    process.clock_checks |=
+                        &buffer[..length] == b"Mirror init: clock checks passed\n";
+                    process.clock_unavailable |=
+                        &buffer[..length] == b"Mirror init: clock unavailable\n";
                     process.thread_checks |=
                         &buffer[..length] == b"Mirror init: thread checks passed\n";
                     process.sync_checks |=
@@ -2951,6 +2981,23 @@ fn dispatch_syscall(process: &mut Process<'_>, frame: &mut TrapFrame) -> Syscall
                 }
             }
             2 => result = timer::ticks() as i64,
+            clock_abi::SYS_CLOCK_GET => {
+                if !clock_abi::clock_arguments_valid(frame.rsi, frame.rdx) {
+                    result = -22;
+                } else if let Some(snapshot) = crate::clock::snapshot() {
+                    let bytes = snapshot.encode();
+                    // SAFETY: The suspended process owns its mappings. The full
+                    // checked destination is writable before any byte is copied;
+                    // demand-zero destinations were materialized by the scheduler.
+                    result = match unsafe { process.space.copy_to_user(frame.rdi, &bytes) } {
+                        Ok(()) => bytes.len() as i64,
+                        Err(_) => -14,
+                    };
+                } else {
+                    // Source availability is checked before touching user memory.
+                    result = -19;
+                }
+            }
             3 => {
                 process.finish(Outcome::Exit(frame.rdi));
                 finished = true;

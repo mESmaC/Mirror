@@ -1,6 +1,124 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Assert-MirrorClock {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [bool]$Smoke,
+        [bool]$WithoutHpet,
+        [string]$FaultMode = 'None'
+    )
+
+    $injected = $FaultMode -eq 'ClockActivation'
+    if ($injected -and (-not $Smoke -or $WithoutHpet)) {
+        throw 'Clock activation fault injection requires smoke with HPET present.'
+    }
+    $available = -not $WithoutHpet -and -not $injected
+    $userCount = if ($Smoke) { 4 } else { 2 }
+    $expected = @{
+        MIRROR_ACPI_HPET_READY = [int](-not $WithoutHpet)
+        MIRROR_ACPI_HPET_SKIPPED = [int]$WithoutHpet
+        MIRROR_CLOCK_POLICY_OK = [int]$Smoke
+        MIRROR_CLOCK_COUNTER_OK = [int]($Smoke -and $available)
+        MIRROR_CLOCK_READY = [int]$available
+        MIRROR_CLOCK_SKIPPED = [int](-not $available)
+        MIRROR_CLOCK_INJECTED = [int]$injected
+        MIRROR_CLOCK_OK = [int]($Smoke -and $available)
+        MIRROR_CLOCK_TEST_SKIPPED = [int]($Smoke -and -not $available)
+        MIRROR_USER_CLOCK_OK = $userCount
+    }
+    # Count raw names as well as complete records, so malformed duplicates or
+    # a different clock source cannot silently satisfy a positive substring.
+    foreach ($record in [regex]::Matches($Serial, '(?m)^(MIRROR_(?:CLOCK|ACPI_HPET|USER_CLOCK)_[^\s]*)[^\r\n]*')) {
+        if (-not $expected.ContainsKey($record.Groups[1].Value)) { throw 'Unexpected clock marker.' }
+    }
+    foreach ($name in $expected.Keys) {
+        if ([regex]::Matches($Serial, ('(?m)^{0}(?:\s|$)' -f $name)).Count -ne $expected[$name]) {
+            throw "Clock marker count mismatch: $name."
+        }
+    }
+    $timers = [uint64]0
+    if ($WithoutHpet) {
+        $discovery = [regex]::Matches($Serial, '(?m)^MIRROR_ACPI_HPET_SKIPPED reason=missing\r?$')
+        if ($discovery.Count -ne 1) { throw 'Missing HPET must be reported by ACPI discovery.' }
+    }
+    else {
+        $discovery = [regex]::Matches($Serial, '(?m)^MIRROR_ACPI_HPET_READY address=0x([0-9a-f]+) block_id=0x([0-9a-f]+) number=([0-9]+) minimum_tick=([0-9]+) protection=([0-9]+)\r?$')
+        if ($discovery.Count -ne 1) { throw 'Missing or malformed ACPI HPET descriptor.' }
+        $address = [Convert]::ToUInt64($discovery[0].Groups[1].Value, 16)
+        $identity = [Convert]::ToUInt32($discovery[0].Groups[2].Value, 16)
+        if ($address -eq 0 -or $address % 4096 -ne 0 -or $address -gt ([uint64]::MaxValue - 4096) -or
+            ($identity -band 255) -eq 0 -or ($identity -band 8192) -eq 0 -or ($identity -band 16384) -ne 0 -or
+            [uint64]$discovery[0].Groups[3].Value -gt 255 -or [uint64]$discovery[0].Groups[4].Value -gt 65535 -or
+            [uint64]$discovery[0].Groups[5].Value -gt 2) {
+            throw 'ACPI HPET address, identity, or descriptor fields are invalid.'
+        }
+        $timers = (($identity -shr 8) -band 31) + 1
+    }
+    $previous = $discovery[0].Index
+    if ($Smoke) {
+        $policy = [regex]::Matches($Serial, '(?m)^MIRROR_CLOCK_POLICY_OK\r?$')
+        if ($policy.Count -ne 1 -or $policy[0].Index -le $previous) { throw 'Clock policy checks must follow discovery and precede selection.' }
+        $previous = $policy[0].Index
+    }
+    if ($injected) {
+        $injection = [regex]::Matches($Serial, '(?m)^MIRROR_CLOCK_INJECTED active=1 cleanup=1\r?$')
+        if ($injection.Count -ne 1 -or $injection[0].Index -le $previous) { throw 'Clock activation injection must prove active-counter cleanup.' }
+        $previous = $injection[0].Index
+    }
+    if ($Smoke -and $available) {
+        $counter = [regex]::Matches($Serial, '(?m)^MIRROR_CLOCK_COUNTER_OK width=64 rollover=1 reset=1\r?$')
+        if ($counter.Count -ne 1 -or $counter[0].Index -le $previous) { throw 'Clock smoke must prove64-bit counter rollover and reset before publication.' }
+        $previous = $counter[0].Index
+    }
+    if ($available) {
+        $selection = [regex]::Matches($Serial, '(?m)^MIRROR_CLOCK_READY source=hpet width=64 period_fs=([0-9]+) resolution_ns=([0-9]+) timers=([0-9]+) interrupts=0 legacy=0\r?$')
+        if ($selection.Count -ne 1) { throw 'Missing or malformed HPET clock readiness.' }
+        $period = [uint64]$selection[0].Groups[1].Value
+        $resolution = [uint64]$selection[0].Groups[2].Value
+        if ($period -lt 1000000 -or $period -gt 100000000 -or
+            $resolution -ne [uint64][decimal]::Ceiling([decimal]$period / 1000000) -or
+            [uint64]$selection[0].Groups[3].Value -ne $timers) {
+            throw 'HPET period, rounded resolution, and comparator count must match the validated descriptor.'
+        }
+    }
+    else {
+        $reason = if ($injected) { 'injected_clock_failure' } else { 'no_hpet' }
+        $selection = [regex]::Matches($Serial, ('(?m)^MIRROR_CLOCK_SKIPPED reason={0}\r?$' -f $reason))
+        if ($selection.Count -ne 1) { throw 'Clock absence or activation cleanup requires its exact fallback reason.' }
+    }
+    if ($selection[0].Index -le $previous) { throw 'Clock selection precedes discovery, policy, or required cleanup.' }
+    $previous = $selection[0].Index
+    if ($Smoke) {
+        if ($available) {
+            $test = [regex]::Matches($Serial, '(?m)^MIRROR_CLOCK_OK elapsed_ns=([0-9]+) irq_ticks=0 if_restored=0\r?$')
+            if ($test.Count -ne 1 -or [uint64]$test[0].Groups[1].Value -lt 20000000) { throw 'Clock must advance at least 20 ms with IRQs disabled and ticks unchanged.' }
+        }
+        else {
+            $test = [regex]::Matches($Serial, '(?m)^MIRROR_CLOCK_TEST_SKIPPED reason=unavailable\r?$')
+            if ($test.Count -ne 1) { throw 'Unavailable clock must explicitly skip hardware elapsed-time testing.' }
+        }
+        if ($test[0].Index -le $previous) { throw 'Clock hardware check precedes backend selection.' }
+        $previous = $test[0].Index
+    }
+    $state = [int]$available
+    $users = [regex]::Matches($Serial, ('(?m)^MIRROR_USER_CLOCK_OK pid=([0-9]+) available={0}\r?$' -f $state))
+    $message = if ($available) { 'checks passed' } else { 'unavailable' }
+    $messages = [regex]::Matches($Serial, ('(?m)^user: Mirror init: clock {0}\\n\r?$' -f $message))
+    if ($users.Count -ne $userCount -or $messages.Count -ne $userCount -or
+        [regex]::Matches($Serial, '(?m)^user: Mirror init: clock(?:\s|$)').Count -ne $userCount) {
+        throw 'Every init process must report the expected clock ABI path exactly once.'
+    }
+    $pids = [System.Collections.Generic.HashSet[uint64]]::new()
+    for ($index = 0; $index -lt $userCount; $index++) {
+        $pidValue = [uint64]$users[$index].Groups[1].Value
+        if ($pidValue -eq 0 -or -not $pids.Add($pidValue) -or
+            $messages[$index].Index -le $previous -or $users[$index].Index -le $messages[$index].Index) {
+            throw 'Clock ABI evidence must follow initialization and use distinct positive process IDs.'
+        }
+    }
+}
+
 function Assert-MirrorTimer {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,

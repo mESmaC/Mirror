@@ -8,11 +8,12 @@ param(
     [switch]$NoDisplayDevice,
     [switch]$NoTestDisk,
     [switch]$NoKeyboard,
+    [switch]$NoHpet,
     [switch]$ExtendedCpu,
     [switch]$LegacyPic,
     [switch]$PitTimer,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
-    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration')][string]$Fault = 'None',
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -202,6 +203,9 @@ if ($Fault -in @('SmpUnmap', 'SmpTlbTimeout') -and ($CpuCount -lt 2 -or $LegacyP
 if ($Fault -eq 'TimerCalibration' -and ($LegacyPic -or $PitTimer)) {
     throw 'Timer calibration fault injection requires APIC with automatic timer selection.'
 }
+if ($Fault -eq 'ClockActivation' -and $NoHpet) {
+    throw 'Clock activation fault injection requires HPET hardware.'
+}
 $qemu = Get-MirrorQemu -RequestedPath $QemuPath -RepositoryRoot $repositoryRoot
 $qemuDirectory = Split-Path -Parent $qemu
 $codePath = Get-MirrorFirmware -RequestedPath $FirmwareCode -QemuDirectory $qemuDirectory -Names @('edk2-x86_64-code.fd', 'OVMF_CODE.fd', 'OVMF_CODE.4m.fd') -ParameterName 'FirmwareCode'
@@ -249,6 +253,7 @@ $testMode = switch ($Fault) {
     'SmpUnmap' { 'smp-unmap' }
     'SmpTlbTimeout' { 'smp-tlb-timeout' }
     'TimerCalibration' { 'timer-calibration' }
+    'ClockActivation' { 'clock-activation' }
     default { $null }
 }
 $kernelArguments = @()
@@ -267,8 +272,11 @@ $stdoutLog = Join-Path $buildDirectory 'qemu.stdout.log'
 $stderrLog = Join-Path $buildDirectory 'qemu.stderr.log'
 
 $cpuModel = if ($ExtendedCpu) { 'max' } else { 'qemu64' }
+$machine = 'q35,accel=tcg'
+if ($NoKeyboard) { $machine += ',i8042=off,vmport=off' }
+if ($NoHpet) { $machine += ',hpet=off' }
 $qemuArguments = @(
-    '-machine', $(if ($NoKeyboard) { 'q35,accel=tcg,i8042=off,vmport=off' } else { 'q35,accel=tcg' }),
+    '-machine', $machine,
     '-cpu', $cpuModel,
     '-m', "$MemoryMiB",
     '-smp', "$CpuCount",
@@ -401,6 +409,7 @@ try {
         }
     }
     Assert-MirrorTimer -Serial $serial -Smoke $true -UseLegacyPic ([bool]$LegacyPic) -ForcePit ([bool]$PitTimer) -FaultMode $Fault
+    Assert-MirrorClock -Serial $serial -Smoke $true -WithoutHpet ([bool]$NoHpet) -FaultMode $Fault
     Assert-MirrorSmpMarkers -Serial $serial -RequestedCpus $CpuCount -UseLegacyPic ([bool]$LegacyPic) -FaultMode $Fault
     Assert-MirrorHeapGrowth -Serial $serial -RequestedCpus $CpuCount -Smoke $true -UseLegacyPic ([bool]$LegacyPic)
     $markers += 'MIRROR_USER_SYNC_OK'
@@ -681,7 +690,7 @@ try {
             throw "Mirror smoke test did not report $marker. See $serialLog."
         }
     }
-    Write-Host "Mirror boot smoke test passed (fault=$Fault, no-display=$NoDisplayDevice, extended-cpu=$ExtendedCpu, cpus=$CpuCount, legacy-pic=$LegacyPic, pit-timer=$PitTimer, QEMU exit $expectedExitCode). Serial log: $serialLog"
+    Write-Host "Mirror boot smoke test passed (fault=$Fault, no-display=$NoDisplayDevice, extended-cpu=$ExtendedCpu, cpus=$CpuCount, legacy-pic=$LegacyPic, pit-timer=$PitTimer, no-hpet=$NoHpet, QEMU exit $expectedExitCode). Serial log: $serialLog"
     # Keep firmware's terminal control sequences in the raw log, not tool output.
     Write-Output (($serial -split '\r?\n' | Where-Object { $_ -match '^(MIRROR_|Memory map:|Direct map offset:|Page tables:)' }) -join [Environment]::NewLine)
 }

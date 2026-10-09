@@ -42,6 +42,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mirror-clock-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "mirror-desktop"
 version = "0.1.0"
 dependencies = [
@@ -57,6 +61,7 @@ version = "0.1.0"
 name = "mirror-init"
 version = "0.1.0"
 dependencies = [
+ "mirror-clock-protocol",
  "mirror-sync",
  "mirror-thread-protocol",
  "mirror-vm-protocol",
@@ -69,6 +74,7 @@ dependencies = [
  "limine",
  "linked_list_allocator",
  "mirror-acpi",
+ "mirror-clock-protocol",
  "mirror-thread-protocol",
  "mirror-vm-protocol",
  "mirror-window-protocol",

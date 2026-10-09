@@ -12,7 +12,7 @@ Push-Location -LiteralPath $repositoryRoot
 try {
     & cargo fmt --all -- --check
     if ($LASTEXITCODE -ne 0) { throw 'Rust formatting check failed.' }
-    & cargo test --locked -p mirror-desktop-protocol -p mirror-window-protocol -p mirror-vm-protocol -p mirror-thread-protocol -p mirror-sync -p mirror-acpi --target x86_64-pc-windows-msvc
+    & cargo test --locked -p mirror-desktop-protocol -p mirror-window-protocol -p mirror-vm-protocol -p mirror-thread-protocol -p mirror-clock-protocol -p mirror-sync -p mirror-acpi --target x86_64-pc-windows-msvc
     if ($LASTEXITCODE -ne 0) { throw 'Native protocol, synchronization, and ACPI parser tests failed.' }
     & cargo clippy --locked --workspace -- -D warnings
     if ($LASTEXITCODE -ne 0) { throw 'Normal kernel Clippy check failed.' }
@@ -68,6 +68,17 @@ try {
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Fault TimerCalibration -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
         Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-TimerCalibration-CpuCount4.serial.log") -Force
         Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-TimerCalibration-CpuCount4.stderr.log") -Force
+        # An optional elapsed-time clock must not change IRQ timer behavior.
+        # Cover absent hardware with both controllers and active-device cleanup.
+        & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -NoHpet -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-NoHpet-CpuCount4.serial.log") -Force
+        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-NoHpet-CpuCount4.stderr.log") -Force
+        & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -NoHpet -LegacyPic -CpuCount 1 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-NoHpet-LegacyPic.serial.log") -Force
+        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-NoHpet-LegacyPic.stderr.log") -Force
+        & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Fault ClockActivation -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-ClockActivation-CpuCount4.serial.log") -Force
+        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-ClockActivation-CpuCount4.stderr.log") -Force
         # Explicit boot policy must keep the legacy PIC/PIT backend functional,
         # including userspace preemption and PS/2 input. OVMF still needs APIC
         # hardware during firmware startup, so retain the CPU's APIC feature.
@@ -106,7 +117,7 @@ try {
 
     # Leave the boot tree ready for a normal run after the test cases finish.
     & (Join-Path $PSScriptRoot 'build.ps1')
-    Write-Host "All 76 kernel/userspace/device smoke cases and debug/release desktop/console captures passed. Logs: $logDirectory"
+    Write-Host "All 82 kernel/userspace/device smoke cases and debug/release desktop/console captures passed. Logs: $logDirectory"
 }
 finally {
     Pop-Location

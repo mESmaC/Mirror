@@ -9,6 +9,7 @@ mod arch;
 mod block;
 mod boot;
 mod capability;
+mod clock;
 mod console;
 mod context;
 mod dma;
@@ -125,8 +126,16 @@ pub extern "C" fn _start() -> ! {
         frame_stats.metadata_frames,
         frame_stats.recycled_frames + frame_stats.never_allocated_frames
     );
-    let topology = acpi::discover(&boot, &mut tables, &mut frames);
+    let discovered = acpi::discover(&boot, &mut tables, &mut frames);
+    let topology = discovered.topology;
     apic::init(topology.as_ref(), &boot, &mut tables, &mut frames);
+    clock::init(
+        discovered.hpet.as_ref(),
+        topology.as_ref(),
+        &boot,
+        &mut tables,
+        &mut frames,
+    );
     timer::init();
 
     let devices = pci::probe();
@@ -191,6 +200,7 @@ pub extern "C" fn _start() -> ! {
         unsafe { paging::self_test(&mut tables, &mut frames) };
         heap::self_test();
         timer::self_test();
+        clock::self_test();
         test_heap_with_interrupts();
         elf::self_test();
     }
@@ -338,6 +348,7 @@ pub extern "C" fn _start() -> ! {
             | boot::SmokeMode::BlockIoError
             | boot::SmokeMode::SmpUnmap
             | boot::SmokeMode::TimerCalibration
+            | boot::SmokeMode::ClockActivation
             | boot::SmokeMode::SmpTlbTimeout => {
                 interrupts::arm_expected_page_fault(paging::TEST_ADDRESS)
             }
