@@ -47,17 +47,22 @@ try {
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -AhciDisk -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
         Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-AhciDisk-CpuCount4.serial.log") -Force
         Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-AhciDisk-CpuCount4.stderr.log") -Force
-        # Bring up a USB host controller without attached endpoints. Complete
-        # enough no-op commands to wrap both rings, and check activation cleanup
-        # and operation with the optional elapsed-time clock absent. A connected
-        # keyboard must prevent takeover; it does not exercise HID support.
+        # Verify controller ring wrapping and bounded USB2 enumeration through
+        # endpoint zero. Include addressed-slot failure cleanup and refusal of
+        # multiple devices or missing reset timing; HID report input is separate.
         foreach ($case in @(
-                @{ Name = 'None'; Fault = 'None'; NoHpet = $false; Keyboard = $false; Cpus = 1 },
-                @{ Name = 'InitFailure'; Fault = 'XhciInitFailure'; NoHpet = $false; Keyboard = $false; Cpus = 1 },
-                @{ Name = 'NoHpet'; Fault = 'None'; NoHpet = $true; Keyboard = $false; Cpus = 1 },
-                @{ Name = 'CpuCount4'; Fault = 'None'; NoHpet = $false; Keyboard = $false; Cpus = 4 },
-                @{ Name = 'ConnectedKeyboard'; Fault = 'None'; NoHpet = $false; Keyboard = $true; Cpus = 1 })) {
-            & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Xhci -XhciKeyboard:$case.Keyboard -NoHpet:$case.NoHpet -CpuCount $case.Cpus -Release:$release -AgentDemo:$AgentDemo -Fault $case.Fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+                @{ Name = 'None'; Fault = 'None'; NoHpet = $false; Device = 'None'; FullSpeed = $false; Cpus = 1 },
+                @{ Name = 'InitFailure'; Fault = 'XhciInitFailure'; NoHpet = $false; Device = 'None'; FullSpeed = $false; Cpus = 1 },
+                @{ Name = 'NoHpet'; Fault = 'None'; NoHpet = $true; Device = 'None'; FullSpeed = $false; Cpus = 1 },
+                @{ Name = 'CpuCount4'; Fault = 'None'; NoHpet = $false; Device = 'None'; FullSpeed = $false; Cpus = 4 },
+                @{ Name = 'Keyboard'; Fault = 'None'; NoHpet = $false; Device = 'Keyboard'; FullSpeed = $false; Cpus = 1 },
+                @{ Name = 'Mouse'; Fault = 'None'; NoHpet = $false; Device = 'Mouse'; FullSpeed = $false; Cpus = 1 },
+                @{ Name = 'Keyboard-FullSpeed'; Fault = 'None'; NoHpet = $false; Device = 'Keyboard'; FullSpeed = $true; Cpus = 1 },
+                @{ Name = 'Keyboard-CpuCount4'; Fault = 'None'; NoHpet = $false; Device = 'Keyboard'; FullSpeed = $false; Cpus = 4 },
+                @{ Name = 'Keyboard-NoHpet'; Fault = 'None'; NoHpet = $true; Device = 'Keyboard'; FullSpeed = $false; Cpus = 1 },
+                @{ Name = 'Keyboard-DeviceFailure'; Fault = 'XhciDeviceFailure'; NoHpet = $false; Device = 'Keyboard'; FullSpeed = $false; Cpus = 1 },
+                @{ Name = 'Pair'; Fault = 'None'; NoHpet = $false; Device = 'Pair'; FullSpeed = $false; Cpus = 1 })) {
+            & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Xhci -XhciKeyboard:($case.Device -eq 'Keyboard') -XhciMouse:($case.Device -eq 'Mouse') -XhciPair:($case.Device -eq 'Pair') -XhciFullSpeed:$case.FullSpeed -NoHpet:$case.NoHpet -CpuCount $case.Cpus -Release:$release -AgentDemo:$AgentDemo -Fault $case.Fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
             Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-Xhci-$($case.Name).serial.log") -Force
             Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-Xhci-$($case.Name).stderr.log") -Force
         }
@@ -142,7 +147,7 @@ try {
 
     # Leave the boot tree ready for a normal run after the test cases finish.
     & (Join-Path $PSScriptRoot 'build.ps1')
-    Write-Host "All 108 kernel/userspace/device smoke cases and debug/release desktop/console captures passed. Logs: $logDirectory"
+    Write-Host "All 120 kernel/userspace/device smoke cases and debug/release desktop/console captures passed. Logs: $logDirectory"
 }
 finally {
     Pop-Location

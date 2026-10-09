@@ -10,13 +10,16 @@ param(
     [switch]$AhciDisk,
     [switch]$Xhci,
     [switch]$XhciKeyboard,
+    [switch]$XhciMouse,
+    [switch]$XhciPair,
+    [switch]$XhciFullSpeed,
     [switch]$NoKeyboard,
     [switch]$NoHpet,
     [switch]$ExtendedCpu,
     [switch]$LegacyPic,
     [switch]$PitTimer,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
-    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation')][string]$Fault = 'None',
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -210,12 +213,23 @@ if ($Fault -in @('AhciIoError', 'AhciInitFailure') -and -not $AhciDisk) {
 if ($Fault -eq 'XhciInitFailure' -and -not $Xhci) {
     throw '-Fault XhciInitFailure requires -Xhci.'
 }
-if ($XhciKeyboard -and -not $Xhci) {
-    throw '-XhciKeyboard requires -Xhci.'
+$usbFixtureCount = [int]$XhciKeyboard.IsPresent + [int]$XhciMouse.IsPresent + [int]$XhciPair.IsPresent
+if ($usbFixtureCount -gt 1) {
+    throw '-XhciKeyboard, -XhciMouse, and -XhciPair are mutually exclusive fixtures.'
 }
-if ($XhciKeyboard -and $Fault -eq 'XhciInitFailure') {
-    throw '-XhciKeyboard tests safe controller refusal and cannot inject xHCI initialization failure.'
+if ($usbFixtureCount -ne 0 -and -not $Xhci) {
+    throw 'USB fixtures require -Xhci.'
 }
+if ($XhciFullSpeed -and -not ($XhciKeyboard -or $XhciMouse)) {
+    throw '-XhciFullSpeed requires one USB keyboard or mouse fixture.'
+}
+if ($usbFixtureCount -ne 0 -and $Fault -eq 'XhciInitFailure') {
+    throw '-Fault XhciInitFailure requires an empty xHCI controller.'
+}
+if ($Fault -eq 'XhciDeviceFailure' -and (-not ($XhciKeyboard -or $XhciMouse) -or $NoHpet)) {
+    throw '-Fault XhciDeviceFailure requires one USB keyboard or mouse and HPET.'
+}
+$usbFixture = if ($XhciKeyboard) { 'Keyboard' } elseif ($XhciMouse) { 'Mouse' } elseif ($XhciPair) { 'Pair' } else { 'None' }
 if ($NoTestDisk -and ($Fault -eq 'BlockIoError' -or $writableBlock)) {
     throw "-Fault $Fault requires the test disk."
 }
@@ -268,6 +282,7 @@ $testMode = switch ($Fault) {
     'AhciIoError' { 'ahci-io-error' }
     'AhciInitFailure' { 'ahci-init-failure' }
     'XhciInitFailure' { 'xhci-init-failure' }
+    'XhciDeviceFailure' { 'xhci-device-failure' }
     'VmReadOnly' { 'vm-read-only' }
     'VmNx' { 'vm-nx' }
     'VmReleased' { 'vm-released' }
@@ -319,7 +334,17 @@ $qemuArguments = @(
     '-device', 'virtio-blk-pci,drive=mirror-esp,disable-legacy=on,bootindex=0'
 )
 if ($Xhci) { $qemuArguments += @('-device', 'qemu-xhci,id=mirror-xhci') }
-if ($XhciKeyboard) { $qemuArguments += @('-device', 'usb-kbd,bus=mirror-xhci.0') }
+# Pin the USB descriptor version and physical port assignment. Both HID models
+# expose one configuration/interface; their interface protocols distinguish them.
+# https://raw.githubusercontent.com/qemu/qemu/v10.1.0/hw/usb/dev-hid.c
+$usbVersion = if ($XhciFullSpeed) { 1 } else { 2 }
+if ($XhciKeyboard -or $XhciPair) {
+    $qemuArguments += @('-device', "usb-kbd,bus=mirror-xhci.0,port=1,usb_version=$usbVersion")
+}
+if ($XhciMouse -or $XhciPair) {
+    $mousePort = if ($XhciPair) { 2 } else { 1 }
+    $qemuArguments += @('-device', "usb-mouse,bus=mirror-xhci.0,port=$mousePort,usb_version=$usbVersion")
+}
 if (-not $NoTestDisk) {
     $testDisk = Get-MirrorTestDisk -RepositoryRoot $repositoryRoot
     $testDiskHash = (Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash
@@ -493,7 +518,8 @@ try {
     Assert-MirrorHeapGrowth -Serial $serial -RequestedCpus $CpuCount -Smoke $true -UseLegacyPic ([bool]$LegacyPic)
     Assert-MirrorDriverCatalog -Serial $serial -Smoke $true -LegacyDisk (-not $NoTestDisk -and -not $AhciDisk) -XhciAttached ([bool]$Xhci)
     Assert-MirrorAhciMarkers -Serial $serial -Attached ([bool]$AhciDisk) -Smoke $true -FaultMode $Fault
-    Assert-MirrorXhciMarkers -Serial $serial -Attached ([bool]$Xhci) -ConnectedDevice ([bool]$XhciKeyboard) -Smoke $true -FaultMode $Fault
+    Assert-MirrorXhciMarkers -Serial $serial -Attached ([bool]$Xhci) -UsbDevice $usbFixture -WithoutHpet ([bool]$NoHpet) -Smoke $true -FaultMode $Fault
+    Assert-MirrorUsbMarkers -Serial $serial -Attached ([bool]$Xhci) -UsbDevice $usbFixture -FullSpeed ([bool]$XhciFullSpeed) -WithoutHpet ([bool]$NoHpet) -Smoke $true -FaultMode $Fault
     $markers += 'MIRROR_USER_SYNC_OK'
     if (@([regex]::Matches($serial, '(?m)^user: Mirror init: synchronization checks passed\\n\r?$')).Count -ne 4) {
         throw 'Both native processes must complete their synchronization checks before and after teardown/relaunch.'
@@ -778,7 +804,7 @@ try {
             throw "Mirror smoke test did not report $marker. See $serialLog."
         }
     }
-    Write-Host "Mirror boot smoke test passed (fault=$Fault, ahci-disk=$AhciDisk, xhci=$Xhci, xhci-keyboard=$XhciKeyboard, no-display=$NoDisplayDevice, extended-cpu=$ExtendedCpu, cpus=$CpuCount, legacy-pic=$LegacyPic, pit-timer=$PitTimer, no-hpet=$NoHpet, QEMU exit $expectedExitCode). Serial log: $serialLog"
+    Write-Host "Mirror boot smoke test passed (fault=$Fault, ahci-disk=$AhciDisk, xhci=$Xhci, usb=$usbFixture, usb-full-speed=$XhciFullSpeed, no-display=$NoDisplayDevice, extended-cpu=$ExtendedCpu, cpus=$CpuCount, legacy-pic=$LegacyPic, pit-timer=$PitTimer, no-hpet=$NoHpet, QEMU exit $expectedExitCode). Serial log: $serialLog"
     # Keep firmware's terminal control sequences in the raw log, not tool output.
     Write-Output (($serial -split '\r?\n' | Where-Object { $_ -match '^(MIRROR_|Memory map:|Direct map offset:|Page tables:)' }) -join [Environment]::NewLine)
 }

@@ -85,18 +85,24 @@ function Assert-MirrorXhciMarkers {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,
         [bool]$Attached,
-        [bool]$ConnectedDevice,
+        [ValidateSet('None', 'Keyboard', 'Mouse', 'Pair')][string]$UsbDevice = 'None',
+        [bool]$WithoutHpet,
         [bool]$Smoke,
         [string]$FaultMode = 'None'
     )
 
-    if ($ConnectedDevice -and -not $Attached) {
+    if ($UsbDevice -ne 'None' -and -not $Attached) {
         throw 'A connected USB device requires an attached xHCI controller.'
     }
-    if ($FaultMode -eq 'XhciInitFailure' -and (-not $Attached -or -not $Smoke -or $ConnectedDevice)) {
-        throw 'xHCI initialization failure requires smoke with an attached controller.'
+    if ($FaultMode -eq 'XhciInitFailure' -and (-not $Attached -or -not $Smoke -or $UsbDevice -ne 'None')) {
+        throw 'xHCI initialization failure requires smoke with an attached empty controller.'
     }
-    $active = $Attached -and -not $ConnectedDevice
+    $clockAvailable = -not $WithoutHpet -and $FaultMode -ne 'ClockActivation'
+    $singleDevice = $UsbDevice -in @('Keyboard', 'Mouse')
+    if ($FaultMode -eq 'XhciDeviceFailure' -and (-not $Attached -or -not $Smoke -or -not $singleDevice -or -not $clockAvailable)) {
+        throw 'USB device failure requires smoke with one attached device and an available reset clock.'
+    }
+    $active = $Attached -and $UsbDevice -ne 'Pair' -and (-not $singleDevice -or $clockAvailable)
     $expected = @{}
     if ($Smoke) { $expected.MIRROR_XHCI_TESTS_OK = '' }
     if ($active) {
@@ -108,7 +114,8 @@ function Assert-MirrorXhciMarkers {
         }
     }
     else {
-        $expected.MIRROR_XHCI_SKIPPED = if ($ConnectedDevice) { 'reason=connected_ports' } else { 'reason=no_controller' }
+        $expected.MIRROR_XHCI_SKIPPED = if (-not $Attached) { 'reason=no_controller' }
+            elseif ($UsbDevice -eq 'Pair') { 'reason=connected_ports' } else { 'reason=clock_required' }
     }
     foreach ($record in [regex]::Matches($Serial, '(?m)^(MIRROR_XHCI_[^\s]*)[^\r\n]*')) {
         if (-not $expected.ContainsKey($record.Groups[1].Value)) {
@@ -146,6 +153,94 @@ function Assert-MirrorXhciMarkers {
         $selection = [regex]::Match($Serial, '(?m)^MIRROR_XHCI_(?:INIT_ERROR_OK|READY|SKIPPED)(?:\s|$)').Index
         if ($tests -ge $selection) {
             throw 'xHCI policy tests must precede controller selection or injected initialization failure.'
+        }
+    }
+}
+
+function Assert-MirrorUsbMarkers {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [bool]$Attached,
+        [ValidateSet('None', 'Keyboard', 'Mouse', 'Pair')][string]$UsbDevice = 'None',
+        [bool]$FullSpeed,
+        [bool]$WithoutHpet,
+        [bool]$Smoke,
+        [string]$FaultMode = 'None'
+    )
+
+    $clockAvailable = -not $WithoutHpet -and $FaultMode -ne 'ClockActivation'
+    $enumerated = $Attached -and $UsbDevice -in @('Keyboard', 'Mouse') -and $clockAvailable
+    $expected = @{}
+    if ($Smoke) { $expected.MIRROR_USB_TESTS_OK = '' }
+    if ($enumerated) {
+        # QEMU USB2 HID fixtures share an identity. The interface protocol and
+        # endpoint packet size must distinguish keyboard from mouse.
+        $protocol = if ($UsbDevice -eq 'Keyboard') { 1 } else { 2 }
+        $packet = if ($UsbDevice -eq 'Keyboard') { 8 } else { 4 }
+        $speed = if ($FullSpeed) { 'full' } else { 'high' }
+        $ep0 = if ($FullSpeed) { 8 } else { 64 }
+        $interval = if ($FullSpeed) { 10 } else { 7 }
+        $expected.MIRROR_USB_DEVICE = "port=([1-9][0-9]*) slot=([1-9][0-9]*) address=([1-9][0-9]*) speed=$speed vid=0627 pid=0001 ep0=$ep0 configs=1"
+        $expected.MIRROR_USB_CONFIGURATION = 'value=1 interfaces=1 bytes=34'
+        $expected.MIRROR_USB_HID_CANDIDATE = "protocol=$protocol interface=0 endpoint=81 packet=$packet interval=$interval"
+        $expected.MIRROR_USB_ENUMERATION_OK = if ($Smoke) { 'transfers=176 short_packets=172 control_wraps=2 slot_released=1' }
+            else { 'transfers=4 short_packets=0 control_wraps=0 slot_released=1' }
+        if ($FaultMode -eq 'XhciDeviceFailure') {
+            $expected.MIRROR_USB_DEVICE_ERROR_OK = 'dma_reclaimed=1'
+        }
+    }
+    elseif ($Attached -and $UsbDevice -eq 'None') {
+        $expected.MIRROR_USB_SKIPPED = 'reason=no_device'
+    }
+    foreach ($record in [regex]::Matches($Serial, '(?m)^(MIRROR_USB_[^\s]*)[^\r\n]*')) {
+        if (-not $expected.ContainsKey($record.Groups[1].Value)) {
+            throw "Unexpected USB marker: $($record.Groups[1].Value)."
+        }
+    }
+    $records = @{}
+    foreach ($marker in $expected.Keys) {
+        $suffix = if ($expected[$marker].Length -gt 0) { ' ' + $expected[$marker] } else { '' }
+        $matchedRecords = [regex]::Matches($Serial, ('(?m)^{0}{1}\r?$' -f $marker, $suffix))
+        if ([regex]::Matches($Serial, "(?m)^$marker(?:\s|$)").Count -ne 1 -or $matchedRecords.Count -ne 1) {
+            throw "USB scenario requires exactly one complete $marker record."
+        }
+        $records[$marker] = $matchedRecords[0]
+    }
+    if ($Smoke) {
+        $selection = [regex]::Match($Serial, '(?m)^MIRROR_XHCI_(?:INIT_ERROR_OK|READY|SKIPPED)(?:\s|$)')
+        if (-not $selection.Success -or $records.MIRROR_USB_TESTS_OK.Index -ge $selection.Index) {
+            throw 'USB parser tests must precede controller selection.'
+        }
+    }
+    if ($enumerated -or ($Attached -and $UsbDevice -eq 'None')) {
+        $commands = [regex]::Match($Serial, '(?m)^MIRROR_XHCI_COMMAND_OK(?:\s|$)')
+        $cleanup = [regex]::Match($Serial, '(?m)^MIRROR_XHCI_CLEANUP_OK(?:\s|$)')
+        if (-not $commands.Success -or -not $cleanup.Success) {
+            throw 'USB discovery requires completed controller commands and final DMA cleanup.'
+        }
+        $previous = $commands.Index
+        $sequence = if ($enumerated) {
+            if ($FaultMode -eq 'XhciDeviceFailure') { 'MIRROR_USB_DEVICE_ERROR_OK' }
+            'MIRROR_USB_DEVICE'
+            'MIRROR_USB_CONFIGURATION'
+            'MIRROR_USB_HID_CANDIDATE'
+            'MIRROR_USB_ENUMERATION_OK'
+        }
+        else { 'MIRROR_USB_SKIPPED' }
+        foreach ($marker in $sequence) {
+            if ($records[$marker].Index -le $previous -or $records[$marker].Index -ge $cleanup.Index) {
+                throw 'USB discovery and recovery records must follow controller commands and precede final DMA cleanup in order.'
+            }
+            $previous = $records[$marker].Index
+        }
+    }
+    if ($enumerated) {
+        $ready = [regex]::Match($Serial, '(?m)^MIRROR_XHCI_READY ports=([1-9][0-9]*) slots=([1-9][0-9]*)\r?$')
+        if (-not $ready.Success -or
+            [uint64]$records.MIRROR_USB_DEVICE.Groups[1].Value -gt [uint64]$ready.Groups[1].Value -or
+            [uint64]$records.MIRROR_USB_DEVICE.Groups[2].Value -gt [uint64]$ready.Groups[2].Value -or
+            [uint64]$records.MIRROR_USB_DEVICE.Groups[3].Value -gt 127) {
+            throw 'USB port and slot must belong to the controller, with a valid assigned USB address.'
         }
     }
 }

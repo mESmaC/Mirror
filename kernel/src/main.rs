@@ -34,6 +34,7 @@ mod serial;
 mod smp;
 mod surface;
 mod timer;
+mod usb;
 mod userspace;
 mod vm;
 mod windows;
@@ -189,6 +190,7 @@ pub extern "C" fn _start() -> ! {
         block::self_test();
         ahci::self_test();
         xhci::self_test();
+        usb::self_test();
         drivers::self_test();
         keyboard::self_test();
         mouse::self_test();
@@ -379,6 +381,7 @@ pub extern "C" fn _start() -> ! {
             | boot::SmokeMode::AhciIoError
             | boot::SmokeMode::AhciInitFailure
             | boot::SmokeMode::XhciInitFailure
+            | boot::SmokeMode::XhciDeviceFailure
             | boot::SmokeMode::SmpUnmap
             | boot::SmokeMode::TimerCalibration
             | boot::SmokeMode::ClockActivation
@@ -596,8 +599,8 @@ fn run_console(
     }
 }
 
-/// Bring up the USB host command transport before sharing kernel page tables.
-/// No USB device slots or transfers are created by this controller probe.
+/// Probe USB host commands and bounded device descriptors before publishing
+/// kernel page tables. Device slots and DMA end before native userspace starts.
 fn probe_xhci_controller(
     devices: &pci::Inventory,
     boot: &boot::BootInfo,
@@ -649,6 +652,15 @@ fn probe_xhci_controller(
             serial::println!("MIRROR_XHCI_SKIPPED reason=connected_ports");
             return;
         }
+        Err(xhci::XhciError::ClockRequired) => {
+            assert_eq!(
+                frames.stats().unwrap().allocated_frames,
+                baseline + tables.owned_table_count() - table_baseline,
+                "missing-clock xHCI refusal leaked DMA"
+            );
+            serial::println!("MIRROR_XHCI_SKIPPED reason=clock_required");
+            return;
+        }
         Err(error) => {
             serial::println!("MIRROR_XHCI_FAILED phase=open error={:?}", error);
             return;
@@ -677,6 +689,40 @@ fn probe_xhci_controller(
             driver.command_wraps(),
             driver.event_wraps()
         );
+        let enumerated = driver.enumerate();
+        #[cfg(feature = "boot-smoke")]
+        let enumerated = if matches!(boot::smoke_mode(), boot::SmokeMode::XhciDeviceFailure) {
+            assert!(
+                matches!(enumerated, Err(xhci::XhciError::InjectedDeviceFailure)),
+                "USB addressed-device failure was not exercised"
+            );
+            // SAFETY: This caller owns the failed slot and all its DMA. Full
+            // controller reset must retire every device access before reuse.
+            unsafe { driver.shutdown(tables, frames) }.expect("USB device failure cleanup");
+            assert_eq!(
+                frames.stats().unwrap().allocated_frames,
+                baseline + tables.owned_table_count() - table_baseline,
+                "USB device failure leaked DMA"
+            );
+            serial::println!("MIRROR_USB_DEVICE_ERROR_OK dma_reclaimed=1");
+            // SAFETY: Shutdown revoked every old slot/ring and released the
+            // controller claim; the same BSP/root/allocator remains exclusive.
+            driver = unsafe { xhci::Driver::open(devices, boot, topology, hpet, tables, frames) }
+                .expect("USB device failure reopen")
+                .expect("USB controller disappeared after reset");
+            driver.enumerate()
+        } else {
+            enumerated
+        };
+        match enumerated {
+            Ok(Some(descriptors)) => {
+                if let Err(error) = report_usb_device(&descriptors) {
+                    serial::println!("MIRROR_USB_FAILED phase=descriptor error={:?}", error);
+                }
+            }
+            Ok(None) => serial::println!("MIRROR_USB_SKIPPED reason=no_device"),
+            Err(error) => serial::println!("MIRROR_USB_FAILED phase=enumerate error={:?}", error),
+        }
     }
     // SAFETY: This caller owns every command and DMA alias. Shutdown must
     // quiesce the controller before releasing any device-visible allocation.
@@ -690,6 +736,59 @@ fn probe_xhci_controller(
         "xHCI shutdown leaked DMA"
     );
     serial::println!("MIRROR_XHCI_CLEANUP_OK dma_reclaimed=1");
+}
+
+fn report_usb_device(descriptors: &xhci::UsbDescriptors) -> Result<(), usb::DescriptorError> {
+    let device = usb::parse_device(&descriptors.device, descriptors.speed)?;
+    if u16::from(device.max_packet0) != descriptors.max_packet0 {
+        return Err(usb::DescriptorError::PacketSize);
+    }
+    let bytes = descriptors
+        .configuration
+        .get(..descriptors.configuration_len)
+        .ok_or(usb::DescriptorError::Length)?;
+    let header = usb::configuration_header(bytes.get(..9).ok_or(usb::DescriptorError::Length)?)?;
+    let configuration = usb::parse_configuration(bytes, header.total_length, descriptors.speed)?;
+    let speed = match descriptors.speed {
+        usb::UsbSpeed::Low => "low",
+        usb::UsbSpeed::Full => "full",
+        usb::UsbSpeed::High => "high",
+    };
+    serial::println!(
+        "MIRROR_USB_DEVICE port={} slot={} address={} speed={} vid={:04x} pid={:04x} ep0={} configs={}",
+        descriptors.port,
+        descriptors.slot,
+        descriptors.address,
+        speed,
+        device.vendor,
+        device.product,
+        device.max_packet0,
+        device.num_configurations
+    );
+    serial::println!(
+        "MIRROR_USB_CONFIGURATION value={} interfaces={} bytes={}",
+        configuration.value,
+        configuration.interfaces,
+        configuration.total_length
+    );
+    match device.boot_hid(&configuration) {
+        Ok(interface) => serial::println!(
+            "MIRROR_USB_HID_CANDIDATE protocol={} interface={} endpoint={:02x} packet={} interval={}",
+            interface.protocol,
+            interface.interface,
+            interface.endpoint,
+            interface.max_packet,
+            interface.interval
+        ),
+        Err(reason) => serial::println!("MIRROR_USB_UNSUPPORTED reason={:?}", reason),
+    }
+    serial::println!(
+        "MIRROR_USB_ENUMERATION_OK transfers={} short_packets={} control_wraps={} slot_released=1",
+        descriptors.control_transfers,
+        descriptors.short_packets,
+        descriptors.control_wraps
+    );
+    Ok(())
 }
 
 /// Probe the standard SATA interface before sharing the kernel page tables.

@@ -59,6 +59,7 @@ function Assert-MirrorCaptureSmp {
     Assert-MirrorDriverCatalog -Serial $Serial -Smoke $false -LegacyDisk $true
     Assert-MirrorAhciMarkers -Serial $Serial -Attached $false -Smoke $false
     Assert-MirrorXhciMarkers -Serial $Serial -Attached $false -Smoke $false
+    Assert-MirrorUsbMarkers -Serial $Serial -Attached $false -Smoke $false
     if ($Serial -match '(?m)^MIRROR_(?:SMP_SKIPPED|SMP_CPU_FAILED|SMP_GUARD_OK|SMP_UNMAP_OK|SMP_TLB_TIMEOUT_ARMED|SHARED_TIMEOUT_\w+|SHARED_VM_SKIPPED|SHARED_OFFLINE_OK)(?:\s|$)') {
         throw 'Normal capture skipped SMP, lost a CPU, or ran an injected guard fault.'
     }
