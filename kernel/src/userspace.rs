@@ -29,9 +29,11 @@ const SURFACE_CHECKS_PASSED: &[u8] = b"Mirror init: surface checks passed\n";
 const SURFACE_DENIED_CHECKS: &[u8] = b"Mirror init: surface denied\n";
 const PROCESS_COUNT: usize = 2;
 const QUANTUM_TICKS: u64 = 2;
-// Finite init probes include several deliberate register/preemption loops.
-// This lifetime allowance belongs to the process, shared by all its threads.
-const USER_TICK_BUDGET: u64 = 64;
+// Finite init probes include register/preemption loops and 21 thread creations.
+// Leave headroom for the complete debug workload, including IRQs delivered on
+// syscall return. This finite lifetime allowance is shared by all its threads;
+// it does not change the independent recurring budgets of ordinary services.
+const USER_TICK_BUDGET: u64 = 128;
 const MAX_SLEEP_TICKS: u64 = 1000;
 const RECEIVE_TIMEOUT: u64 = 100;
 const SERVICE_ALLOWANCE: u64 = 32;
