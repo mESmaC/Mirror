@@ -1,0 +1,124 @@
+# 0011: Toolchain pin and workspace lints
+
+Status: confirmed (2026-10-09)
+Depends on: 0012 (lands first in the M0 order; this spec updates the AGENTS.md lines it changes). 0016b, which lands later, also edits `userspace/init/src/main.rs` (see Coordination).
+Ledger: P5a (related: P3, P5b, P7, P8)
+
+## Goal
+
+Every build and test uses Rust 1.96.0. The scripts refuse a different compiler, and a toolchain change happens only through a deliberate bump commit. One `[workspace.lints]` table holds the unsafe-code lint policy, and all 12 workspace members inherit it. As a result, `mirror-init` and `mirror-sync` follow the same documented-unsafe rule as the kernel, and the existing violations in `mirror-init` are fixed. `scripts/test.ps1` starts each run with an empty log directory.
+
+## Non-goals
+
+- CI (deferred, ledger P3). Running host tests on non-Windows hosts (the MSVC triple is hard-coded at `scripts/test.ps1:15`).
+- Lints beyond the two the kernel already denies, such as `clippy::pedantic` or `clippy::multiple_unsafe_ops_per_block`.
+- Linting `#[cfg(test)]` code. Clippy runs without `--tests` (`scripts/test.ps1:17-19`).
+- Pinning QEMU or OVMF versions, adding a build-identity banner, and fixing the `-Tkernel/linker.ld` rustflags trap in `.cargo/config.toml:4-8`.
+- Testing an MSRV older than the pinned toolchain.
+
+## Decisions
+
+| ID | Decision | Status |
+| --- | --- | --- |
+| 0011-D1 | `rust-toolchain.toml` sets `channel = "1.96.0"`. The profile (minimal), the components (rustfmt, clippy) and the target (`x86_64-unknown-none`) stay as they are. | confirmed (ledger P5a) |
+| 0011-D2 | Bumps (elaborating P5a's "bump it deliberately") happen when there is a reason: a needed language or library feature, a compiler fix, or a lint worth adopting. There is no fixed cadence. Each bump is its own commit and must pass both `scripts/test.ps1` and `scripts/test.ps1 -AgentDemo`. Rationale: lint churn stays out of feature commits, and each bump costs two full suite runs. Rejected alternative: follow every stable release on the six-week cycle. | confirmed (2026-10-09) |
+| 0011-D3 | The workspace `rust-version` in `Cargo.toml` equals the pinned major.minor (`"1.96"`) and changes in the same commit as each bump. Rationale: a one-line edit that keeps Cargo's clear error on older compilers and keeps clippy's MSRV-gated lints in step with the compiler actually used. Rejected alternative: remove `rust-version` from the workspace and from all 12 manifests (each has `rust-version.workspace = true` at line 5). | confirmed (2026-10-09) |
+| 0011-D4 | `scripts/build.ps1` and `scripts/test.ps1` run a preflight that fails unless `rustc --version` reports the pinned channel and `rust-version` matches its major.minor. Rationale: a `RUSTUP_TOOLCHAIN` variable, a `rustup override set` directory override, or a non-rustup `rustc` on PATH each silently replace the toolchain file. Rejected alternative: rely on rustup alone. | confirmed (2026-10-09) |
+| 0011-D5 | The root `[workspace.lints]` table denies `unsafe_op_in_unsafe_fn` (rustc) and `clippy::undocumented_unsafe_blocks`. All 12 members set `[lints] workspace = true` and have no package-level lint tables. Code never uses `allow` or `expect` on these two lints. Rejected alternative: keep per-crate tables and add the missing entries to init and sync. | confirmed (2026-10-09) |
+| 0011-D6 | The six unsafe-free crates (acpi, clock-, desktop-, thread-, vm- and window-protocol) keep their guarantee as `#![forbid(unsafe_code)]` in `src/lib.rs`, because Cargo rejects package lint entries next to `workspace = true`. None of them has doctests or a `tests/` directory, so the crate attribute covers everything the manifest entry covered. Rejected alternative: leave those six crates out of workspace inheritance and keep their current `[lints.rust]` tables. | confirmed (2026-10-09) |
+| 0011-D7 | `scripts/test.ps1` empties its log directory (`build/test-logs`, or `build/test-agent-logs` with `-AgentDemo`) before the first check runs. Chosen explicitly over creating a new timestamped directory for each run. | confirmed (2026-10-09) |
+
+## Interfaces
+
+**Current state (verified at HEAD 4614249).**
+- `rust-toolchain.toml:2` is `channel = "stable"`, and `scripts/test.ps1:17-19` runs clippy with `-D warnings`.
+- `readme.md:13` says "declared minimum 1.88; latest validation uses 1.96.0". `Cargo.toml:8` declares `rust-version = "1.88"`, and nothing tests it.
+- The only installed toolchain is `stable-x86_64-pc-windows-msvc`, which is `rustc 1.96.0 (ac68faa20 2026-05-25)`.
+- There is no `[workspace.lints]` table and no `clippy.toml`, so clippy's default comment-placement rules apply.
+- The lint tables differ by crate:
+  - Both lints are denied in `kernel/Cargo.toml:27-31`, `userspace/agent/Cargo.toml:17-21`, `userspace/app/Cargo.toml:17-21` and `userspace/desktop/Cargo.toml:18-22`.
+  - `crates/sync/Cargo.toml:11-12` denies only `unsafe_op_in_unsafe_fn`.
+  - `userspace/init/Cargo.toml` has no `[lints]` table.
+  - The six protocol and ACPI crates set `unsafe_code = "forbid"` at lines 8-9 of their manifests.
+- No crate root has a lint attribute; each `lib.rs` starts with `#![no_std]` on line 1. No source file suppresses either lint.
+
+**Files changed.**
+- `rust-toolchain.toml:2`: set `channel = "1.96.0"`.
+- `Cargo.toml:8`: set `rust-version = "1.96"`. Add the shared lint table:
+  ```toml
+  [workspace.lints.rust]
+  unsafe_op_in_unsafe_fn = "deny"
+
+  [workspace.lints.clippy]
+  undocumented_unsafe_blocks = "deny"
+  ```
+- The 12 member manifests: replace the existing `[lints.*]` tables with `[lints]` / `workspace = true`. For `userspace/init/Cargo.toml`, add that table.
+- The six unsafe-free crates: add `#![forbid(unsafe_code)]` after `#![no_std]` in `src/lib.rs`.
+- `scripts/common.ps1`: add `Assert-MirrorToolchain [-RustcVersion <string>]`, next to the existing `Assert-Mirror*` helpers.
+  - It reads the channel from `rust-toolchain.toml` with `(?m)^channel\s*=\s*"(\d+\.\d+\.\d+)"` and throws if that does not match (for example `"stable"`). It reads `rust-version` from `Cargo.toml`.
+  - It runs `rustc --version` from the repository root unless `-RustcVersion` is supplied.
+  - It throws unless the output starts with `rustc <channel> ` and `rust-version` equals the channel's major.minor.
+  - The error message names the expected and actual versions and mentions `RUSTUP_TOOLCHAIN` and `rustup override`.
+- `scripts/build.ps1` and `scripts/test.ps1` call the preflight first, right after `Push-Location` (`build.ps1:12`, `test.ps1:11`). Every cargo invocation in the scripts goes through one of these two files (`run.ps1:251` and `capture.ps1:15` call `build.ps1`). 0018's new `scripts/perf.ps1` calls the same preflight before it builds its host tool.
+- `scripts/test.ps1:22-23`: move the log-directory setup to just after the preflight and ahead of `cargo fmt` (line 13). If the directory exists, remove it recursively, then recreate it.
+- `readme.md:13`: replace the version clause with "Rust 1.96.0, pinned in `rust-toolchain.toml`".
+- `AGENTS.md` (written by 0012, which lands first): the unsafe rule says clippy enforces it in every crate, dropping the "not on yet" clause for `mirror-init` and `mirror-sync`, and the test-log line says `test.ps1` clears its log directory at start (D7) instead of "never cleared".
+
+**Violations the uniform policy surfaces.** These counts come from reading each `unsafe` site. Clippy was not run.
+- `mirror-sync`: 0. All four sites have `SAFETY` comments (`crates/sync/src/lib.rs:108, 156, 254, 262`).
+- `mirror-init`: 55 `unsafe` tokens against 28 `SAFETY` comments. Seven tokens are `#[unsafe(no_mangle)]` or `unsafe extern` blocks, which the lint does not check; the kernel already passes with undocumented ones at `kernel/src/interrupts.rs:209` and `:820`. That leaves 48 linted sites and an expected **20 undocumented blocks**:
+  - `main.rs:127`, `:958` and `:1123`: these have comments, but the comments do not start with `SAFETY:`.
+  - `main.rs:1238-1279`: 13 fault-probe match arms. Each arm needs its own `// SAFETY:` line, because the comment at `:1234-1235` sits above the `match`, not above the arms.
+  - `threads.rs:317` and `:321`.
+  - `tls.rs:163` and `:183`.
+- A likely 21st: `clock.rs:107`. Its `SAFETY` comment (`:105`) sits above the enclosing `require(` call, not above the line holding the block. Move it inside the call, directly above `unsafe`, if clippy flags it.
+- `unsafe_op_in_unsafe_fn`: 0 violations in init, which has no `unsafe fn` bodies.
+- Fixes rewrite or add `// SAFETY:` comments that justify each block. Code does not change.
+- Raising `rust-version` from 1.88 to 1.96 can also enable MSRV-gated clippy lints in any crate. Those are fixed in the same change.
+
+**Coordination.** The M0 order (README) builds this spec right after 0012 and before 0014, 0010, 0016a and 0016b, so the `userspace/init` lines cited above still hold when it is built.
+- 0016b (SMEP/SMAP/UMIP, EFER.SCE, CPU probes) edits `userspace/init/src/main.rs`: it makes the register-preservation probe (`:958-990`) set and check RFLAGS.AC, adds user probe arms 21 and 22 next to `:1278-1281`, and raises the probe bound at `:1097`. Because it lands after this spec, it writes those blocks under the workspace lint: the `:958` comment this spec rewrites keeps its `SAFETY:` prefix, and each new match arm gets its own `// SAFETY:` line.
+- 0016a (guarded stacks, NMI/#MC stacks, stack-overflow probe) does not edit `userspace/init`. Its probes are kernel smoke modes, which the kernel lints already cover.
+- 0010 does not edit `userspace/init`. It adds a `--features test-trace` clippy run, which the workspace lint table also covers.
+
+**Bump procedure (0011-D2).**
+1. Use one commit, titled "Bump Rust toolchain to X.Y.Z", made from a clean tree on its own branch (P7).
+2. Change `channel` and `rust-version` (X.Y) together.
+3. Run `cargo fmt --all`, then fix the clippy findings for both feature sets. Large fixes that also pass on the old toolchain land first, as separate commits.
+4. Run `scripts/test.ps1` and `scripts/test.ps1 -AgentDemo` to completion. A compiler change touches every crate, agent-demo code included, so both full runs apply under P8. `kernel/src/main.rs:1345` prints core's `PanicInfo` Display, and `scripts/run.ps1:144` matches its two-line layout, so the `SmpTlbTimeout` cases (`scripts/test.ps1:88`) catch a format change.
+5. Update `readme.md:13`, and any version that `AGENTS.md` names, with the new version.
+
+## Acceptance tests
+
+1. **Pin.** From the repository root, `rustup show active-toolchain` prints `1.96.0-x86_64-pc-windows-msvc (overridden by '...\rust-toolchain.toml')`.
+2. **Preflight (host only).**
+   - From the repository root, `. scripts/common.ps1; Assert-MirrorToolchain` returns without error.
+   - `Assert-MirrorToolchain -RustcVersion 'rustc 1.95.0 (0000000 2026-04-01)'` throws, and the message names 1.96.0.
+   - With `Cargo.toml` temporarily set to `rust-version = "1.88"`, `Assert-MirrorToolchain` throws. Revert the edit.
+3. **Inheritance (static checks).**
+   - `Select-String -Path kernel/Cargo.toml,userspace/*/Cargo.toml,crates/*/Cargo.toml -Pattern '^\[lints\.'` returns nothing.
+   - The same `Select-String` with `-Pattern '^\[lints\]$' -Context 0,1` returns 12 matches, each followed by `workspace = true`.
+   - `Select-String -Path crates/*/src/lib.rs -Pattern '^#!\[forbid\(unsafe_code\)\]'` matches exactly the six unsafe-free crates (not sync).
+4. **No suppressions.** `Get-ChildItem kernel,userspace,crates -Recurse -Filter *.rs | Select-String '(allow|expect)\((clippy::)?(undocumented_unsafe_blocks|unsafe_op_in_unsafe_fn)'` returns nothing.
+5. **Clean lint.** `cargo clippy --locked --workspace -- -D warnings` and the `--all-features` variant pass (`scripts/test.ps1:17-20`).
+6. **The policy reaches init, sync and the unsafe-free crates.** Make each change below by hand, confirm the failure, then revert it.
+   - Delete the `// SAFETY:` line at `userspace/init/src/clock.rs:24`: clippy fails with `undocumented_unsafe_blocks` in `mirror-init`.
+   - Delete the comment at `crates/sync/src/lib.rs:252-253`: clippy fails with `undocumented_unsafe_blocks` in `mirror-sync`.
+   - Add an `unsafe {}` block to a function in `crates/vm-protocol/src/lib.rs`: `cargo check -p mirror-vm-protocol` fails with the `unsafe_code` lint at forbid level.
+7. **Full suite.** `scripts/test.ps1` ends with its summary line, "All 120 kernel/userspace/device smoke cases and debug/release desktop/console captures passed." at HEAD 4614249 (`scripts/test.ps1:150`). The count is whatever the suite runs when this spec lands; 0014, which lands later, makes it computed. `scripts/test.ps1 -AgentDemo` ends with the same line.
+8. **Log hygiene.**
+   - Create `build/test-logs/stale.serial.log` and add a trailing space to any `.rs` line. `scripts/test.ps1` fails at the formatting check, and `stale.serial.log` is gone. Revert the edit.
+   - After a full default pass, no file under `build/test-logs` has a `LastWriteTime` earlier than the run's start. The file count equals what the script copies (276 at the time of writing: 2 profiles x (60 cases x 2 logs + 18 capture files)).
+   - The eight stale files present today are gone: `debug-small-*` (four files, Oct 8) and `{debug,release}-Xhci-ConnectedKeyboard.*` (four files, Oct 9).
+9. **Docs.** `readme.md:13` names 1.96.0 as pinned and no longer mentions 1.88. `AGENTS.md` no longer says the log directories are never cleared or that the unsafe lint is off in `mirror-init` and `mirror-sync`.
+
+## Dependencies
+
+No crates. Tool: the Rust 1.96.0 toolchain through rustup (rustc, cargo, rustfmt, clippy; MIT OR Apache-2.0). It is the version already validated locally, but only `stable` is installed today, so the first build after the pin downloads `1.96.0-x86_64-pc-windows-msvc` once (minimal profile plus the components and target from `rust-toolchain.toml`). This needs network access once.
+
+## Open questions
+
+Follow-ups outside this spec's scope; each would be its own owner decision and none blocks this spec:
+- Should a later spec lint test code (`clippy --tests`) on the host target? Today the `#[cfg(test)]` modules in the protocol, ACPI and sync crates are not linted.
+- Should the workspace table grow later, for example with `clippy::multiple_unsafe_ops_per_block` or `clippy::unnecessary_safety_comment`?
+- Suggested follow-up spec: record and check the QEMU and OVMF versions, and print a build-identity line (git hash, profile, features) that `run.ps1 -NoBuild` verifies. Both are infra review findings. 0012 suggests the same follow-up; write it once.
