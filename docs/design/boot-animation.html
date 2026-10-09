@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mirror Boot — animation concept</title>
+<style>
+/* ============================================================
+   Mirror boot animation — concept sample
+   "Assemble → trace → orbit → settle". Dark stage, one accent.
+   Single file, no external assets.
+   ============================================================ */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #0B0F16;
+  --border: #26314A;
+  --text: #ECF1F9;
+  --muted: #71809A;
+  --accent: #4FD8C2;
+  --accent-2: #71E3D1;
+  --accent-3: #38BFA9;
+  --accent-dim: rgba(79, 216, 194, .13);
+  --font-ui: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+}
+
+html, body { height: 100%; }
+body { background: var(--bg); color: var(--text); font-family: var(--font-ui); overflow: hidden; }
+
+/* ---------- Stage ---------- */
+.stage {
+  position: fixed; inset: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  background:
+    radial-gradient(900px 520px at 50% 42%, rgba(23, 38, 58, .55) 0%, rgba(23, 38, 58, 0) 62%),
+    var(--bg);
+}
+.stage::before {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background-image: radial-gradient(circle, rgba(140, 160, 190, .045) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+.scene { position: relative; display: flex; flex-direction: column; align-items: center; transition: opacity .65s ease, transform .65s ease; }
+.stage.done .scene { opacity: 0; transform: translateY(-12px) scale(.985); pointer-events: none; }
+
+/* ---------- Logo mark ---------- */
+.mark-wrap { position: relative; width: 96px; height: 96px; }
+.mark { width: 96px; height: 96px; color: var(--accent);
+  animation: breathe 3.4s ease-in-out 1.7s infinite alternate,
+             glow 3.4s ease-in-out 1.7s infinite alternate; }
+@keyframes breathe { from { transform: scale(1); } to { transform: scale(1.016); } }
+@keyframes glow { from { filter: drop-shadow(0 0 0 rgba(79,216,194,0)); } to { filter: drop-shadow(0 0 14px rgba(79,216,194,.30)); } }
+
+.frame { stroke-dasharray: 100; stroke-dashoffset: 100; animation: draw 1.15s cubic-bezier(.4,0,.2,1) .15s forwards; }
+.diag  { stroke-dasharray: 100; stroke-dashoffset: 100; animation: draw .7s cubic-bezier(.4,0,.2,1) .6s forwards; }
+@keyframes draw { to { stroke-dashoffset: 0; } }
+
+.tri { opacity: 0; transform-box: fill-box; transform-origin: center; animation: tri-in .5s cubic-bezier(.2,.8,.2,1) forwards; }
+.tri.t1 { animation-delay: .85s; }
+.tri.t2 { animation-delay: 1s; }
+@keyframes tri-in { from { opacity: 0; transform: scale(.35); } to { opacity: 1; transform: scale(1); } }
+
+/* Comet + trail ride the frame perimeter (path = 96px pixel space). */
+.comet, .trail {
+  position: absolute; top: 0; left: 0; border-radius: 50%;
+  offset-path: path("M 32 10 H 64 A 22 22 0 0 1 86 32 V 64 A 22 22 0 0 1 64 86 H 32 A 22 22 0 0 1 10 64 V 32 A 22 22 0 0 1 32 10 Z");
+  offset-rotate: 0deg;
+  opacity: 0;
+}
+.comet { width: 6px; height: 6px; margin: -3px 0 0 -3px; background: var(--accent-2);
+  box-shadow: 0 0 10px 2px rgba(79,216,194,.55);
+  animation: comet-in .5s ease 1.3s forwards, orbit 3.4s linear 1.3s infinite; }
+.trail { width: 3px; height: 3px; margin: -1.5px 0 0 -1.5px; background: var(--accent);
+  animation: comet-in .5s ease 1.5s forwards, orbit 3.4s linear 1.44s infinite; }
+@keyframes comet-in { to { opacity: 1; } }
+@keyframes orbit { to { offset-distance: 100%; } }
+
+/* Scan shimmer sweeping the mark every ~5 s */
+.scan { position: absolute; left: -10%; right: -10%; height: 24%; top: -32%; pointer-events: none;
+  background: linear-gradient(180deg, transparent, var(--accent-dim), transparent);
+  animation: scan 5.2s ease-in-out 2.2s infinite; }
+@keyframes scan { 0% { top: -32%; } 16% { top: 112%; } 100% { top: 112%; } }
+
+/* Converging particles (one-shot) */
+.p { position: absolute; top: 50%; left: 50%; width: 3px; height: 3px; border-radius: 50%;
+  background: var(--accent); opacity: 0;
+  animation: conv 1.05s cubic-bezier(.3,.7,.3,1) forwards; }
+@keyframes conv {
+  0% { transform: translate(var(--sx), var(--sy)); opacity: 0; }
+  30% { opacity: .9; }
+  100% { transform: translate(var(--ex), var(--ey)); opacity: 0; }
+}
+
+/* Ambient floaters (infinite, subtle) */
+.f { position: absolute; width: 2px; height: 2px; border-radius: 50%; background: var(--accent);
+  opacity: 0; animation: fadein 1s ease 2.4s forwards, bob 5.5s ease-in-out infinite alternate; }
+@keyframes fadein { to { opacity: .32; } }
+@keyframes bob { from { transform: translateY(-5px); } to { transform: translateY(6px); } }
+
+/* ---------- Wordmark ---------- */
+.mk { margin-top: 26px; font-size: 21px; font-weight: 650; letter-spacing: .34em; padding-left: .34em; color: var(--text); }
+.mk span { display: inline-block; opacity: 0; animation: rise .55s cubic-bezier(.2,.8,.2,1) forwards; }
+@keyframes rise { from { opacity: 0; transform: translateY(7px); filter: blur(4px); } to { opacity: 1; transform: none; filter: blur(0); } }
+
+/* ---------- Status + progress ---------- */
+.status { margin-top: 15px; height: 16px; font-family: var(--font-mono); font-size: 11px; letter-spacing: .12em; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.status .txt { transition: opacity .18s ease, transform .18s ease; }
+.status .txt.out { opacity: 0; transform: translateY(3px); }
+.cursor { display: inline-block; width: 7px; height: 12px; background: var(--accent); animation: blink 1.05s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+
+.ptrack { margin-top: 18px; width: 132px; height: 2px; border-radius: 1px; background: var(--border); overflow: hidden; }
+.pfill { height: 100%; width: 0; border-radius: 1px;
+  background: linear-gradient(90deg, var(--accent-3), var(--accent), var(--accent-2), var(--accent));
+  background-size: 200% 100%;
+  animation: fill 5.4s cubic-bezier(.3,.6,.3,1) 1.15s forwards, shimmer 1.9s linear infinite; }
+@keyframes fill { to { width: 86%; } }
+@keyframes shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+
+/* Settle pulse when boot completes */
+.mark-wrap.settle { animation: settle .62s cubic-bezier(.3,.7,.3,1); }
+@keyframes settle { 0% { transform: scale(1); } 38% { transform: scale(1.055); } 100% { transform: scale(1); } }
+
+/* ---------- Aftermath (handoff line) ---------- */
+.aftermath { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px;
+  opacity: 0; pointer-events: none; transition: opacity .6s ease .25s; }
+.stage.done .aftermath { opacity: 1; }
+.aftermath .mini { width: 34px; height: 34px; color: var(--accent); }
+.aftermath .ok { font-family: var(--font-mono); font-size: 11px; letter-spacing: .16em; color: var(--muted); }
+.aftermath .ok b { color: var(--accent); font-weight: 600; }
+
+/* ---------- Review chrome ---------- */
+.meta { position: fixed; left: 18px; bottom: 16px; font-family: var(--font-mono); font-size: 10px; letter-spacing: .12em; color: var(--muted); text-transform: uppercase; z-index: 5; }
+.meta b { color: var(--accent); font-weight: 600; }
+.controls { position: fixed; right: 18px; bottom: 14px; display: flex; gap: 8px; z-index: 5; }
+.btn { height: 30px; padding: 0 12px; border-radius: 6px; border: 1px solid var(--border); background: transparent;
+  color: var(--text); font-family: var(--font-mono); font-size: 11px; letter-spacing: .08em; cursor: pointer;
+  transition: background .12s ease, border-color .12s ease; }
+.btn:hover { background: #131B2A; border-color: #3B4A6B; }
+.btn:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
+.btn.acc { border-color: #1E4B44; color: var(--accent); }
+.btn.acc:hover { background: #10231F; }
+
+/* ---------- Reduced motion: static mark, honest progress ---------- */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+  .frame, .diag { stroke-dashoffset: 0; }
+  .tri, .mk span { opacity: 1; }
+  .pfill { width: 86%; }
+  .comet, .trail, .p, .f, .scan { display: none; }
+}
+</style>
+</head>
+<body>
+<div class="stage" id="stage">
+  <div class="scene" id="scene">
+    <div class="mark-wrap" id="mark">
+      <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path class="frame" pathLength="100" stroke-width="0.7" d="M 8 2.5 H 16 A 5.5 5.5 0 0 1 21.5 8 V 16 A 5.5 5.5 0 0 1 16 21.5 H 8 A 5.5 5.5 0 0 1 2.5 16 V 8 A 5.5 5.5 0 0 1 8 2.5 Z"/>
+        <path class="diag" pathLength="100" stroke-width="0.5" opacity="0.55" d="M 6 18 L 18 6"/>
+        <path class="tri t1" d="M7.5 12V7.5H12z" fill="currentColor" stroke="none"/>
+        <path class="tri t2" d="M16.5 12v4.5H12z" fill="currentColor" stroke="none"/>
+      </svg>
+      <span class="scan"></span>
+      <span class="comet"></span>
+      <span class="trail"></span>
+      <!-- one-shot converging particles -->
+      <span class="p" style="--sx:-190px;--sy:-120px;--ex:0px;--ey:-64px;animation-delay:0s"></span>
+      <span class="p" style="--sx:210px;--sy:-140px;--ex:55px;--ey:-32px;animation-delay:.08s"></span>
+      <span class="p" style="--sx:-235px;--sy:95px;--ex:-55px;--ey:32px;animation-delay:.16s"></span>
+      <span class="p" style="--sx:245px;--sy:115px;--ex:55px;--ey:32px;animation-delay:.22s"></span>
+      <span class="p" style="--sx:-120px;--sy:-215px;--ex:-55px;--ey:-32px;animation-delay:.12s"></span>
+      <span class="p" style="--sx:150px;--sy:205px;--ex:0px;--ey:64px;animation-delay:.18s"></span>
+      <span class="p" style="--sx:-60px;--sy:235px;--ex:0px;--ey:0px;animation-delay:.26s"></span>
+      <!-- ambient floaters -->
+      <span class="f" style="left:-150px;top:-96px;animation-delay:2.4s,0s"></span>
+      <span class="f" style="left:170px;top:-60px;animation-delay:2.6s,-2.1s"></span>
+      <span class="f" style="left:128px;top:118px;animation-delay:2.8s,-3.7s"></span>
+      <span class="f" style="left:-176px;top:84px;animation-delay:3s,-1.3s"></span>
+    </div>
+    <div class="mk" aria-label="MIRROR">
+      <span style="animation-delay:.55s">M</span><span style="animation-delay:.62s">I</span><span style="animation-delay:.69s">R</span><span style="animation-delay:.76s">R</span><span style="animation-delay:.83s">O</span><span style="animation-delay:.9s">R</span>
+    </div>
+    <div class="status"><span class="txt" id="statusText">loading kernel image</span><span class="cursor"></span></div>
+    <div class="ptrack"><div class="pfill" id="pfill"></div></div>
+  </div>
+  <div class="aftermath">
+    <svg class="mini" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M 8 2.5 H 16 A 5.5 5.5 0 0 1 21.5 8 V 16 A 5.5 5.5 0 0 1 16 21.5 H 8 A 5.5 5.5 0 0 1 2.5 16 V 8 A 5.5 5.5 0 0 1 8 2.5 Z"/>
+      <path d="M 6 18 L 18 6" opacity="0.55"/>
+      <path d="M7.5 12V7.5H12z" fill="currentColor" stroke="none"/>
+      <path d="M16.5 12v4.5H12z" fill="currentColor" stroke="none"/>
+    </svg>
+    <div class="ok"><b>MIRROR_BOOT_OK</b> · handoff to shell</div>
+  </div>
+</div>
+
+<div class="meta">mirror boot · concept 01 · <b>#4FD8C2</b> · sweep 5.2s · orbit 3.4s · status 1.35s/step</div>
+<div class="controls">
+  <button class="btn" id="replay">&#10227; replay</button>
+  <button class="btn acc" id="finish">finish boot &rarr;</button>
+</div>
+
+<script>
+const LINES = [
+  "loading kernel image",
+  "claiming memory map",
+  "routing interrupts",
+  "enumerating devices",
+  "starting desktop services",
+];
+let statusTimer = null;
+let timers = [];
+
+function startStatus() {
+  const el = document.getElementById("statusText");
+  let i = 0;
+  el.textContent = LINES[0];
+  statusTimer = setInterval(() => {
+    if (i >= LINES.length - 1) { clearInterval(statusTimer); statusTimer = null; return; }
+    el.classList.add("out");
+    const swap = setTimeout(() => {
+      i += 1;
+      el.textContent = LINES[i];
+      el.classList.remove("out");
+    }, 190);
+    timers.push(swap);
+  }, 1350);
+}
+
+function clearTimers() {
+  if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+  timers.forEach((t) => clearTimeout(t));
+  timers = [];
+}
+
+startStatus();
+
+document.getElementById("finish").addEventListener("click", () => {
+  const el = document.getElementById("statusText");
+  const pf = document.getElementById("pfill");
+  const mk = document.getElementById("mark");
+  if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+  el.textContent = "ready — starting shell";
+  // Finish the progress bar from its held position without a visual snap.
+  pf.style.animation = "none";
+  pf.style.width = "86%";
+  void pf.offsetWidth;
+  pf.style.transition = "width .5s cubic-bezier(.3,.7,.3,1)";
+  pf.style.width = "100%";
+  mk.classList.add("settle");
+  timers.push(setTimeout(() => document.getElementById("stage").classList.add("done"), 780));
+});
+
+document.getElementById("replay").addEventListener("click", () => {
+  clearTimers();
+  const stage = document.getElementById("stage");
+  stage.classList.remove("done");
+  const scene = document.getElementById("scene");
+  scene.replaceWith(scene.cloneNode(true)); // restarts every CSS animation cleanly
+  startStatus();
+});
+</script>
+</body>
+</html>
