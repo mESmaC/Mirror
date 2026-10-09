@@ -5,7 +5,8 @@ function Assert-MirrorDriverCatalog {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,
         [bool]$Smoke,
-        [bool]$LegacyDisk
+        [bool]$LegacyDisk,
+        [bool]$XhciAttached
     )
 
     foreach ($record in [regex]::Matches($Serial, '(?m)^(MIRROR_DRIVER_[^\s]*)[^\r\n]*')) {
@@ -32,13 +33,14 @@ function Assert-MirrorDriverCatalog {
         $retained + $omitted -ne [uint64]$pci[0].Groups[1].Value -or $catalog[0].Index -le $pci[0].Index) {
         throw 'Driver catalog counts must preserve the complete bounded PCI inventory.'
     }
-    $devices = [regex]::Matches($Serial, '(?m)^MIRROR_DRIVER_DEVICE bdf=([0-9a-f]{2}):([0-9a-f]{2})\.([0-7]) id=([0-9a-f]{4}):([0-9a-f]{4}) class=([0-9a-f]{2}):([0-9a-f]{2}):([0-9a-f]{2}) driver=(virtio-blk-legacy|ahci-sata|none) match=(exact|class|none)\r?$')
+    $devices = [regex]::Matches($Serial, '(?m)^MIRROR_DRIVER_DEVICE bdf=([0-9a-f]{2}):([0-9a-f]{2})\.([0-7]) id=([0-9a-f]{4}):([0-9a-f]{4}) class=([0-9a-f]{2}):([0-9a-f]{2}):([0-9a-f]{2}) driver=(virtio-blk-legacy|ahci-sata|xhci-host|none) match=(exact|class|none)\r?$')
     if ($devices.Count -ne $retained -or [regex]::Matches($Serial, '(?m)^MIRROR_DRIVER_DEVICE(?:\s|$)').Count -ne $retained) {
         throw 'Every retained PCI function must have exactly one complete driver catalog record.'
     }
     $previousBdf = -1
     $legacy = 0
     $ahci = 0
+    $xhci = 0
     $unknown = 0
     $modernBoot = 0
     foreach ($device in $devices) {
@@ -63,15 +65,88 @@ function Assert-MirrorDriverCatalog {
             if ($class -ne '01:06:01' -or $kind -ne 'class') { throw 'AHCI fallback must match the standard SATA programming interface.' }
             $ahci++
         }
+        elseif ($driver -eq 'xhci-host') {
+            if ($class -ne '0c:03:30' -or $kind -ne 'class') { throw 'xHCI fallback must match the standard USB host programming interface.' }
+            $xhci++
+        }
         else {
             if ($kind -ne 'none') { throw 'Unsupported hardware must remain explicitly unmatched.' }
             $unknown++
             if ($identity -eq '1af4:1042') { $modernBoot++ }
         }
     }
-    if ($legacy -ne [int]$LegacyDisk -or $ahci -ne 1 -or $modernBoot -ne 1 -or
-        $matched -ne $legacy + $ahci -or $unsupported -ne $unknown) {
+    if ($legacy -ne [int]$LegacyDisk -or $ahci -ne 1 -or $xhci -ne [int]$XhciAttached -or $modernBoot -ne 1 -or
+        $matched -ne $legacy + $ahci + $xhci -or $unsupported -ne $unknown) {
         throw 'The fixture must expose its expected fallback candidates and preserve the unsupported modern VirtIO boot device.'
+    }
+}
+
+function Assert-MirrorXhciMarkers {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [bool]$Attached,
+        [bool]$ConnectedDevice,
+        [bool]$Smoke,
+        [string]$FaultMode = 'None'
+    )
+
+    if ($ConnectedDevice -and -not $Attached) {
+        throw 'A connected USB device requires an attached xHCI controller.'
+    }
+    if ($FaultMode -eq 'XhciInitFailure' -and (-not $Attached -or -not $Smoke -or $ConnectedDevice)) {
+        throw 'xHCI initialization failure requires smoke with an attached controller.'
+    }
+    $active = $Attached -and -not $ConnectedDevice
+    $expected = @{}
+    if ($Smoke) { $expected.MIRROR_XHCI_TESTS_OK = '' }
+    if ($active) {
+        $expected.MIRROR_XHCI_READY = 'ports=([1-9][0-9]*) slots=([1-9][0-9]*)'
+        $expected.MIRROR_XHCI_COMMAND_OK = 'completed=520 command_wraps=2 event_wraps=2'
+        $expected.MIRROR_XHCI_CLEANUP_OK = 'dma_reclaimed=1'
+        if ($FaultMode -eq 'XhciInitFailure') {
+            $expected.MIRROR_XHCI_INIT_ERROR_OK = 'dma_reclaimed=1'
+        }
+    }
+    else {
+        $expected.MIRROR_XHCI_SKIPPED = if ($ConnectedDevice) { 'reason=connected_ports' } else { 'reason=no_controller' }
+    }
+    foreach ($record in [regex]::Matches($Serial, '(?m)^(MIRROR_XHCI_[^\s]*)[^\r\n]*')) {
+        if (-not $expected.ContainsKey($record.Groups[1].Value)) {
+            throw "Unexpected xHCI marker: $($record.Groups[1].Value)."
+        }
+    }
+    foreach ($marker in $expected.Keys) {
+        $suffix = if ($expected[$marker].Length -gt 0) { ' ' + $expected[$marker] } else { '' }
+        $pattern = '(?m)^{0}{1}\r?$' -f $marker, $suffix
+        $records = [regex]::Matches($Serial, $pattern)
+        if ([regex]::Matches($Serial, "(?m)^$marker(?:\s|$)").Count -ne 1 -or $records.Count -ne 1) {
+            throw "xHCI scenario requires exactly one complete $marker record."
+        }
+        if ($marker -eq 'MIRROR_XHCI_READY' -and
+            ([uint64]$records[0].Groups[1].Value -gt 32 -or [uint64]$records[0].Groups[2].Value -gt 255)) {
+            throw 'xHCI ports and device slots must fit the supported controller limits.'
+        }
+    }
+    if ($active) {
+        $ready = $Serial.IndexOf('MIRROR_XHCI_READY ', [StringComparison]::Ordinal)
+        $commands = $Serial.IndexOf('MIRROR_XHCI_COMMAND_OK ', [StringComparison]::Ordinal)
+        $cleanup = $Serial.IndexOf('MIRROR_XHCI_CLEANUP_OK ', [StringComparison]::Ordinal)
+        if ($commands -le $ready -or $cleanup -le $commands) {
+            throw 'xHCI command completion must follow controller readiness and precede DMA cleanup.'
+        }
+        if ($FaultMode -eq 'XhciInitFailure') {
+            $recovery = $Serial.IndexOf('MIRROR_XHCI_INIT_ERROR_OK ', [StringComparison]::Ordinal)
+            if ($recovery -ge $ready) {
+                throw 'xHCI initialization failure must reclaim DMA before a successful reopen.'
+            }
+        }
+    }
+    if ($Smoke) {
+        $tests = [regex]::Match($Serial, '(?m)^MIRROR_XHCI_TESTS_OK\r?$').Index
+        $selection = [regex]::Match($Serial, '(?m)^MIRROR_XHCI_(?:INIT_ERROR_OK|READY|SKIPPED)(?:\s|$)').Index
+        if ($tests -ge $selection) {
+            throw 'xHCI policy tests must precede controller selection or injected initialization failure.'
+        }
     }
 }
 

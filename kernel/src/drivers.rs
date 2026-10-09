@@ -11,6 +11,7 @@ use crate::{pci, serial};
 pub(crate) enum Candidate {
     LegacyVirtioBlock,
     AhciSata,
+    XhciHost,
 }
 
 impl Candidate {
@@ -18,13 +19,14 @@ impl Candidate {
         match self {
             Self::LegacyVirtioBlock => "virtio-blk-legacy",
             Self::AhciSata => "ahci-sata",
+            Self::XhciHost => "xhci-host",
         }
     }
 
     pub(crate) fn match_kind(self) -> &'static str {
         match self {
             Self::LegacyVirtioBlock => "exact",
-            Self::AhciSata => "class",
+            Self::AhciSata | Self::XhciHost => "class",
         }
     }
 }
@@ -37,6 +39,8 @@ pub(crate) fn candidate(device: &pci::Device) -> Option<Candidate> {
         Some(Candidate::LegacyVirtioBlock)
     } else if device.is_ahci() {
         Some(Candidate::AhciSata)
+    } else if device.is_xhci() {
+        Some(Candidate::XhciHost)
     } else {
         None
     }
@@ -179,6 +183,46 @@ pub(crate) fn self_test() {
     ] {
         assert_eq!(candidate(&device), None);
     }
+    let xhci = pci::Device {
+        class: 0x0c,
+        subclass: 3,
+        interface: 0x30,
+        ..unknown
+    };
+    assert_eq!(candidate(&xhci), Some(Candidate::XhciHost));
+    assert_eq!(Candidate::XhciHost.name(), "xhci-host");
+    assert_eq!(Candidate::XhciHost.match_kind(), "class");
+    assert_eq!(
+        candidate(&pci::Device {
+            vendor: 0x8086,
+            device: 0x1234,
+            header: 0x80,
+            ..xhci
+        }),
+        Some(Candidate::XhciHost)
+    );
+    for device in [
+        pci::Device { header: 1, ..xhci },
+        pci::Device { class: 2, ..xhci },
+        pci::Device {
+            subclass: 0,
+            ..xhci
+        },
+        pci::Device {
+            interface: 0,
+            ..xhci
+        },
+        pci::Device {
+            interface: 0x10,
+            ..xhci
+        },
+        pci::Device {
+            interface: 0x20,
+            ..xhci
+        },
+    ] {
+        assert_eq!(candidate(&device), None);
+    }
     let mut inventory = test_inventory();
     assert_eq!(
         summary(&inventory),
@@ -191,6 +235,9 @@ pub(crate) fn self_test() {
     );
     inventory.devices[5] = Some(legacy);
     assert_eq!(summary(&inventory).matched, 2, "ignore unretained entries");
+    inventory.devices[4] = Some(xhci);
+    assert_eq!(summary(&inventory).matched, 3);
+    assert_eq!(summary(&inventory).unsupported, 2);
     inventory.devices.fill(Some(unknown));
     inventory.retained = usize::MAX;
     assert_eq!(summary(&inventory).retained, inventory.devices.len());

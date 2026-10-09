@@ -47,6 +47,20 @@ try {
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -AhciDisk -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
         Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-AhciDisk-CpuCount4.serial.log") -Force
         Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-AhciDisk-CpuCount4.stderr.log") -Force
+        # Bring up a USB host controller without attached endpoints. Complete
+        # enough no-op commands to wrap both rings, and check activation cleanup
+        # and operation with the optional elapsed-time clock absent. A connected
+        # keyboard must prevent takeover; it does not exercise HID support.
+        foreach ($case in @(
+                @{ Name = 'None'; Fault = 'None'; NoHpet = $false; Keyboard = $false; Cpus = 1 },
+                @{ Name = 'InitFailure'; Fault = 'XhciInitFailure'; NoHpet = $false; Keyboard = $false; Cpus = 1 },
+                @{ Name = 'NoHpet'; Fault = 'None'; NoHpet = $true; Keyboard = $false; Cpus = 1 },
+                @{ Name = 'CpuCount4'; Fault = 'None'; NoHpet = $false; Keyboard = $false; Cpus = 4 },
+                @{ Name = 'ConnectedKeyboard'; Fault = 'None'; NoHpet = $false; Keyboard = $true; Cpus = 1 })) {
+            & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Xhci -XhciKeyboard:$case.Keyboard -NoHpet:$case.NoHpet -CpuCount $case.Cpus -Release:$release -AgentDemo:$AgentDemo -Fault $case.Fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-Xhci-$($case.Name).serial.log") -Force
+            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-Xhci-$($case.Name).stderr.log") -Force
+        }
         # Expose AVX and FSGSBASE through CPUID as well as exercising the
         # conservative CPU model. The kernel must keep both features disabled.
         foreach ($fault in @('None', 'UserAvx', 'UserFsgsbase')) {
@@ -128,7 +142,7 @@ try {
 
     # Leave the boot tree ready for a normal run after the test cases finish.
     & (Join-Path $PSScriptRoot 'build.ps1')
-    Write-Host "All 98 kernel/userspace/device smoke cases and debug/release desktop/console captures passed. Logs: $logDirectory"
+    Write-Host "All 108 kernel/userspace/device smoke cases and debug/release desktop/console captures passed. Logs: $logDirectory"
 }
 finally {
     Pop-Location

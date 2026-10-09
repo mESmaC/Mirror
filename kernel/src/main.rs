@@ -37,6 +37,7 @@ mod timer;
 mod userspace;
 mod vm;
 mod windows;
+mod xhci;
 
 use core::panic::PanicInfo;
 use limine::memory_map::EntryType;
@@ -187,6 +188,7 @@ pub extern "C" fn _start() -> ! {
         unsafe { dma::self_test(&mut frames, boot.direct_map_offset) };
         block::self_test();
         ahci::self_test();
+        xhci::self_test();
         drivers::self_test();
         keyboard::self_test();
         mouse::self_test();
@@ -211,6 +213,15 @@ pub extern "C" fn _start() -> ! {
     }
 
     probe_ahci_device(
+        &devices,
+        &boot,
+        topology.as_ref(),
+        discovered.hpet.as_ref(),
+        &mut tables,
+        &mut frames,
+    );
+
+    probe_xhci_controller(
         &devices,
         &boot,
         topology.as_ref(),
@@ -367,6 +378,7 @@ pub extern "C" fn _start() -> ! {
             | boot::SmokeMode::BlockNoFlush
             | boot::SmokeMode::AhciIoError
             | boot::SmokeMode::AhciInitFailure
+            | boot::SmokeMode::XhciInitFailure
             | boot::SmokeMode::SmpUnmap
             | boot::SmokeMode::TimerCalibration
             | boot::SmokeMode::ClockActivation
@@ -582,6 +594,102 @@ fn run_console(
         // or timer wakes us instead of being lost before sleep.
         unsafe { core::arch::asm!("sti", "hlt", "cli", options(nostack)) };
     }
+}
+
+/// Bring up the USB host command transport before sharing kernel page tables.
+/// No USB device slots or transfers are created by this controller probe.
+fn probe_xhci_controller(
+    devices: &pci::Inventory,
+    boot: &boot::BootInfo,
+    topology: Option<&mirror_acpi::Topology>,
+    hpet: Option<&mirror_acpi::Hpet>,
+    tables: &mut paging::PageTables,
+    frames: &mut memory::FrameAllocator<'_>,
+) {
+    let baseline = frames.stats().expect("frame accounting").allocated_frames;
+    let table_baseline = tables.owned_table_count();
+    // SAFETY: BSP, IF=0, active private kernel root and exclusive allocator.
+    // No AP, user root, IRQ handler, or other driver owns the xHCI controller.
+    let opened = unsafe { xhci::Driver::open(devices, boot, topology, hpet, tables, frames) };
+    #[cfg(feature = "boot-smoke")]
+    let opened = if matches!(boot::smoke_mode(), boot::SmokeMode::XhciInitFailure) {
+        assert!(
+            matches!(opened, Err(xhci::XhciError::InjectedInitialization)),
+            "xHCI initialization failure was not exercised"
+        );
+        assert_eq!(
+            frames.stats().unwrap().allocated_frames,
+            baseline + tables.owned_table_count() - table_baseline,
+            "xHCI initialization failure leaked DMA"
+        );
+        serial::println!("MIRROR_XHCI_INIT_ERROR_OK dma_reclaimed=1");
+        // SAFETY: Failed initialization halted/reset the controller, released
+        // its claim, and reclaimed DMA before this fresh, exclusive open.
+        unsafe { xhci::Driver::open(devices, boot, topology, hpet, tables, frames) }
+    } else {
+        opened
+    };
+    let mut driver = match opened {
+        Ok(Some(driver)) => driver,
+        Ok(None) => {
+            assert_eq!(
+                frames.stats().unwrap().allocated_frames,
+                baseline + tables.owned_table_count() - table_baseline,
+                "absent xHCI probe leaked DMA"
+            );
+            serial::println!("MIRROR_XHCI_SKIPPED reason=no_controller");
+            return;
+        }
+        Err(xhci::XhciError::ConnectedPorts) => {
+            assert_eq!(
+                frames.stats().unwrap().allocated_frames,
+                baseline + tables.owned_table_count() - table_baseline,
+                "connected-port xHCI refusal leaked DMA"
+            );
+            serial::println!("MIRROR_XHCI_SKIPPED reason=connected_ports");
+            return;
+        }
+        Err(error) => {
+            serial::println!("MIRROR_XHCI_FAILED phase=open error={:?}", error);
+            return;
+        }
+    };
+    serial::println!(
+        "MIRROR_XHCI_READY ports={} slots={}",
+        driver.max_ports(),
+        driver.max_slots()
+    );
+    // Each no-op must produce a matching successful hardware completion. This
+    // count crosses both ring boundaries twice, exercising both cycle values.
+    let mut completed = 0;
+    for _ in 0..520 {
+        match driver.noop() {
+            Ok(()) => completed += 1,
+            Err(error) => {
+                serial::println!("MIRROR_XHCI_FAILED phase=command error={:?}", error);
+                break;
+            }
+        }
+    }
+    if completed == 520 {
+        serial::println!(
+            "MIRROR_XHCI_COMMAND_OK completed=520 command_wraps={} event_wraps={}",
+            driver.command_wraps(),
+            driver.event_wraps()
+        );
+    }
+    // SAFETY: This caller owns every command and DMA alias. Shutdown must
+    // quiesce the controller before releasing any device-visible allocation.
+    if let Err(error) = unsafe { driver.shutdown(tables, frames) } {
+        serial::println!("MIRROR_XHCI_FAILED phase=shutdown error={:?}", error);
+        return;
+    }
+    assert_eq!(
+        frames.stats().unwrap().allocated_frames,
+        baseline + tables.owned_table_count() - table_baseline,
+        "xHCI shutdown leaked DMA"
+    );
+    serial::println!("MIRROR_XHCI_CLEANUP_OK dma_reclaimed=1");
 }
 
 /// Probe the standard SATA interface before sharing the kernel page tables.
