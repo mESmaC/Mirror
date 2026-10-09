@@ -83,7 +83,8 @@ Source interview: 2026-10-09.
 | --- | --- | --- |
 | S1 | The v1 drivers target the device set that VMware, VirtualBox and QEMU all emulate. VirtIO is not a v1 target. | confirmed |
 | S1a | The v1 device set is AHCI SATA storage (NVMe later), an Intel e1000-family NIC, PS/2 keyboard and mouse, and the UEFI boot framebuffer for display (VMware SVGA II later). The QEMU test profiles switch to this set. | confirmed |
-| S1b | Clarifies S1a: in QEMU tests the boot image may sit on a virtio-blk device that only firmware reads. Mirror never binds it, and Mirror's drivers see only the v1 device set. | confirmed |
+| S1b | Clarifies S1a: in QEMU tests the boot image may sit on a virtio-blk device that only firmware reads. Mirror never binds it, and in the V1 profile Mirror's drivers see only the v1 device set. The LegacyVirtio regression profile keeps binding a legacy virtio-blk fixture until 0062 (0014-D5). | confirmed |
+| S10 | A time source other than the HPET (calibrated TSC or ACPI PM timer), for VMs such as a default VirtualBox VM with the HPET off, belongs to spec 0055. Until then, the reference VM settings (0015a, docs/vm-settings.md) enable the HPET. | confirmed |
 | S2 | The filesystem is ext2 first, then ext3 journaling. A native filesystem comes later. | confirmed |
 | S2a | v1 does not write FAT32. The boot partition is produced by host tooling. | confirmed |
 | S3 | Dependencies are decided case by case, favoring native unless it badly hurts the schedule. Each spec lists its crates and their licenses. | confirmed |
@@ -115,6 +116,7 @@ Source interview: 2026-10-09.
 | P6 | References policy: the local reference trees (linux, nt5src, freebsd-src, colibri) are best-practice references only, and Mirror code is written independently against Mirror's own interfaces. They live on the development machine; exact paths vary by machine, so agents ask Cameron for a tree's location rather than assuming one. readme.md:694 ("reuse device-specific source where licensing permits") is reworded to match. | confirmed |
 | P7 | Each agent task runs on its own branch, and Cameron merges it. No force-pushes or rewriting of pushed history. Push only when asked. | confirmed |
 | P7a | Exception to P7: spec and documentation commits (`docs/specs/` and other docs-only changes) go directly to `main` and are pushed, with no task branch. | confirmed |
+| P9 | Permanent rule: every spec or change that alters something AGENTS.md describes updates those AGENTS.md lines in the same commit. | confirmed |
 | P8 | Each commit runs the targeted test cases for what it touches. The full `scripts/test.ps1` (and `-AgentDemo` when agent-demo code is touched) runs when a spec is complete, before its branch is merged. | confirmed |
 
 ## Milestones (M)
@@ -133,6 +135,23 @@ v1 order. The harness follows the process model (A15), and harness code is writt
 | M7 | Typed shell, native tools, assistant panel | confirmed |
 | M8 | AI: keyring broker, providers, Mirror's inference engine, built-in assistant | confirmed |
 | M9 | Performance gates pass, completing v1 | confirmed |
+
+## Pending (resume here)
+
+State at the end of the 2026-10-09 session.
+
+**Confirmed, but not yet written into the spec text:**
+- 0012: AGENTS.md names Kimi's UI branch with a placeholder ("name supplied by Cameron"). 0012 also rewords readme.md:700 to match P6, along with :694. The AGENTS.md update rule is permanent (P9). 0012-D8 (branch naming `<agent>/<spec>-<short-name>`) is already marked confirmed in the spec.
+
+**Still awaiting Cameron's decision (spec 0019, all proposed):**
+- 0019-D3: gate every perf line, milestones included, behind a valid `mirror.perf=` token. This narrows confirmed 0018-D9 and changes 0018's marker contract, so it needs re-confirmation together with them.
+- Whether to split 0019 into 0019a (perf markers) and 0019b (C3 telemetry), since it is about three pages.
+- 0019-D12: VMware token delivery through a perf copy of the disk image, or through a boot menu entry.
+- 0019-D9: M0 telemetry benchmarks of memory plus AHCI depth-1 reads, or memory only.
+- The rest of 0019 (D4 grammar, D5 TSC entry timing, D6 syscall-observed frame and shell_ready, D7 deferred input ring, D8 text telemetry records, D10 serial-only output, D11 the perf-protocol crate), each with the reviewer's recommendation in the spec.
+- Optional: an "unscheduled follow-ups" list in README.md so deferred items aren't lost. These include the KPTI/MDS spec (S9), an NX direct map and Limine lower-half audit, non-fatal NMI, build identity with QEMU/OVMF version checks, per-case work directories for a parallel test suite, VirtualBox baselines, a typed test-event channel, a default-build destination for user-program diagnostics, the live ISO root filesystem, the disk update path, and clippy --tests.
+
+**Owner actions before M0 manual checks:** install VMware Workstation and VirtualBox on the desktop, and set up `.tools/qemu` and OVMF there (they are gitignored).
 
 ## Open questions (O)
 

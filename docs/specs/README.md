@@ -57,7 +57,7 @@ M0 execution order (confirmed): commit `docs/specs`, then 0012 first. Then 0011,
 - 0052 Scheduler v2: work-conserving, priority classes, accounting (S4)
 - 0053 XSAVE/AVX2 user state (I6)
 - 0054 Large memory: frame allocator v2, per-frame metadata, dynamic limits (I6)
-- 0055 Interrupt robustness: catch-all vector handlers, boot-CPU-only external NMI, PCAT_COMPAT=0, HPET-based timer calibration, x2APIC handoff
+- 0055 Interrupt robustness: catch-all vector handlers, boot-CPU-only external NMI, PCAT_COMPAT=0, HPET-based timer calibration, x2APIC handoff, non-HPET time source (S10)
 
 **M5: Storage**
 - 0060 Runtime driver model: PCI device model, MMIO mapping, MSI, driver lifetime

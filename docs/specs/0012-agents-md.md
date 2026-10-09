@@ -1,6 +1,6 @@
 # 0012: AGENTS.md shared conventions
 
-Status: draft
+Status: draft (all decisions confirmed; three confirmed text changes pending, see decisions.md "Pending spec edits")
 Depends on: none. Precondition: `docs/specs/` is committed to `main` first (confirmed M0 order).
 Ledger: P5b, P1, P2, P3, P6, P7, P7a, P8 (the text also restates P4, P5a, P5c, S3, S7, S7a, S7b, O1, O6)
 
@@ -22,7 +22,7 @@ A root-level `AGENTS.md` exists, and every agent working on Mirror (Claude, GPT 
 | 0012-D5 | References policy: the local trees are best-practice references only, and Mirror code is written independently against Mirror's own interfaces. Their paths vary by machine, so agents ask Cameron for a tree's location rather than assuming one. This spec rewords readme.md:694 ("Reuse device-specific source where licensing permits") to match. | confirmed (2026-10-09, ledger P6) |
 | 0012-D6 | Each agent task runs on its own branch, and Cameron merges it. Agents never force-push or rewrite pushed history, and push only when asked. Exception: spec and documentation-only commits (`docs/specs/` and other docs-only changes) go directly to `main` and are pushed, with no task branch. | confirmed (2026-10-09, ledger P7, P7a) |
 | 0012-D7 | Each commit runs the targeted test cases for what it touches, chosen by the rule under "When to test" below. The full `scripts/test.ps1` (plus `-AgentDemo` when agent-demo code is touched) runs when a spec is complete, before its branch is merged. | confirmed (2026-10-09, ledger P8) |
-| 0012-D8 | Task branches start from the current `main` and are named `<agent>/<spec>-<short-name>`, where `<agent>` is `claude`, `astra` or `kimi` (for example `claude/0011-toolchain-and-lints`). A task without a spec uses `<agent>/<short-name>`. Kimi's existing UI branch keeps its name. Rationale: Cameron can tell who made a branch and which spec it implements without opening it, and a cold-start agent needs no extra instruction. Alternative: each dispatch prompt names the branch and its base. | proposed |
+| 0012-D8 | Task branches start from the current `main` and are named `<agent>/<spec>-<short-name>`, where `<agent>` is `claude`, `astra` or `kimi` (for example `claude/0011-toolchain-and-lints`). A task without a spec uses `<agent>/<short-name>`. Kimi's existing UI branch keeps its name. Rationale: Cameron can tell who made a branch and which spec it implements without opening it, and a cold-start agent needs no extra instruction. Alternative: each dispatch prompt names the branch and its base. | confirmed (2026-10-09) |
 
 ## Interfaces
 Files, all at the repository root:
