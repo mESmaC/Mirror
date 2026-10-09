@@ -31,6 +31,8 @@ $serialLog = Join-Path $buildDirectory 'normal-boot.serial.log'
 $screenshot = Join-Path $buildDirectory 'normal-boot.png'
 $consoleScreenshot = Join-Path $buildDirectory 'normal-console.png'
 $pointerScreenshot = Join-Path $buildDirectory 'normal-pointer.png'
+$devicesScreenshot = Join-Path $buildDirectory 'normal-devices.png'
+$devicesSecondScreenshot = Join-Path $buildDirectory 'normal-devices-page2.png'
 $cursorAwayScreenshot = Join-Path $buildDirectory 'cursor-away.png'
 $cursorRestoredScreenshot = Join-Path $buildDirectory 'cursor-restored.png'
 $desktopScreenshot = Join-Path $buildDirectory 'desktop.png'
@@ -54,6 +56,8 @@ function Assert-MirrorCaptureSmp {
     Assert-MirrorTimer -Serial $Serial -Smoke $false -UseLegacyPic $false -ForcePit $false
     Assert-MirrorClock -Serial $Serial -Smoke $false -WithoutHpet $false
     Assert-MirrorHeapGrowth -Serial $Serial -RequestedCpus $RequestedCpus -Smoke $false -UseLegacyPic $false
+    Assert-MirrorDriverCatalog -Serial $Serial -Smoke $false -LegacyDisk $true
+    Assert-MirrorAhciMarkers -Serial $Serial -Attached $false -Smoke $false
     if ($Serial -match '(?m)^MIRROR_(?:SMP_SKIPPED|SMP_CPU_FAILED|SMP_GUARD_OK|SMP_UNMAP_OK|SMP_TLB_TIMEOUT_ARMED|SHARED_TIMEOUT_\w+|SHARED_VM_SKIPPED|SHARED_OFFLINE_OK)(?:\s|$)') {
         throw 'Normal capture skipped SMP, lost a CPU, or ran an injected guard fault.'
     }
@@ -166,7 +170,7 @@ function Send-MirrorText {
     param([System.Diagnostics.Process]$Process, [string]$Text)
     foreach ($character in $Text.ToCharArray()) {
         $key = if ($character -eq ' ') { 'spc' } else { [string]$character }
-        if ($key -ne 'spc' -and $key -cnotmatch '^[a-z]$') { throw 'Input probe accepts lowercase letters and spaces only.' }
+        if ($key -ne 'spc' -and $key -cnotmatch '^[a-z0-9]$') { throw 'Input probe accepts lowercase letters, digits, and spaces only.' }
         Send-MirrorKey $Process $key
     }
 }
@@ -499,6 +503,22 @@ try {
     foreach ($key in @('x', 'end', 'ret')) { Send-MirrorKey $process $key }
     Wait-MirrorConsoleCommand $process 'operation=echo text=abxcd'
     Save-MirrorScreenshot $process $pointerScreenshot
+    # The installation fallback must expose the hardware catalog through real
+    # keyboard input as well as serial diagnostics, without a desktop service.
+    Send-MirrorText $process 'devices'
+    Send-MirrorKey $process 'ret'
+    Wait-MirrorConsoleCommand $process 'operation=devices text=page=1'
+    Save-MirrorScreenshot $process $devicesScreenshot
+    if ((Get-FileHash -LiteralPath $pointerScreenshot).Hash -eq (Get-FileHash -LiteralPath $devicesScreenshot).Hash) {
+        throw 'The devices command did not change the visible fallback console.'
+    }
+    Send-MirrorText $process 'devices 2'
+    Send-MirrorKey $process 'ret'
+    Wait-MirrorConsoleCommand $process 'operation=devices text=page=2'
+    Save-MirrorScreenshot $process $devicesSecondScreenshot
+    if ((Get-FileHash -LiteralPath $devicesScreenshot).Hash -eq (Get-FileHash -LiteralPath $devicesSecondScreenshot).Hash) {
+        throw 'Device catalog pagination did not change the visible fallback console.'
+    }
     # QMP permits quit to terminate before returning a response. Require clean
     # process exit below rather than interpreting that allowed EOF as failure.
     $process.StandardInput.WriteLine('{"execute":"quit"}')

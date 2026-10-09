@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod acpi;
+mod ahci;
 mod apic;
 mod arch;
 mod block;
@@ -13,6 +14,7 @@ mod clock;
 mod console;
 mod context;
 mod dma;
+mod drivers;
 mod elf;
 mod fpu;
 mod framebuffer;
@@ -139,6 +141,7 @@ pub extern "C" fn _start() -> ! {
     timer::init();
 
     let devices = pci::probe();
+    drivers::report(&devices);
     if devices.functions == 0 {
         serial::println!("PCI: no functions discovered through configuration mechanism 1");
     }
@@ -183,6 +186,8 @@ pub extern "C" fn _start() -> ! {
         // exclusively own these test pages, which are never sent to a device.
         unsafe { dma::self_test(&mut frames, boot.direct_map_offset) };
         block::self_test();
+        ahci::self_test();
+        drivers::self_test();
         keyboard::self_test();
         mouse::self_test();
         ps2::self_test();
@@ -204,6 +209,15 @@ pub extern "C" fn _start() -> ! {
         test_heap_with_interrupts();
         elf::self_test();
     }
+
+    probe_ahci_device(
+        &devices,
+        &boot,
+        topology.as_ref(),
+        discovered.hpet.as_ref(),
+        &mut tables,
+        &mut frames,
+    );
 
     #[cfg(feature = "boot-smoke")]
     match boot::smoke_mode() {
@@ -351,6 +365,8 @@ pub extern "C" fn _start() -> ! {
             | boot::SmokeMode::BlockWriteError
             | boot::SmokeMode::BlockFlushError
             | boot::SmokeMode::BlockNoFlush
+            | boot::SmokeMode::AhciIoError
+            | boot::SmokeMode::AhciInitFailure
             | boot::SmokeMode::SmpUnmap
             | boot::SmokeMode::TimerCalibration
             | boot::SmokeMode::ClockActivation
@@ -381,7 +397,7 @@ pub extern "C" fn _start() -> ! {
     {
         serial::println!("Mirror idle: timer ticks={}", timer::ticks());
         if keyboard_ready || mouse_ready {
-            run_console(&mut display, mouse_ready, &mut input_consumer);
+            run_console(&mut display, mouse_ready, &mut input_consumer, &devices);
         }
         // SAFETY: Only initialized IRQ sources are unmasked; the heap and
         // descriptors are ready. Keep allocator/table state alive here.
@@ -427,6 +443,7 @@ fn run_console(
     display: &mut Option<framebuffer::Driver<'_>>,
     mouse_ready: bool,
     input_consumer: &mut ps2::Consumer,
+    devices: &pci::Inventory,
 ) -> ! {
     assert!(!arch::interrupts_enabled());
     // Discard the bounded queue left by boot. Limit work even if new bytes keep
@@ -436,7 +453,7 @@ fn run_console(
             break;
         }
     }
-    let mut console = console::Console::new();
+    let mut console = console::Console::with_devices(devices);
     let (width, height) = display.as_ref().map_or((1, 1), |display| {
         let info = display.info();
         (info.width, info.height)
@@ -565,6 +582,138 @@ fn run_console(
         // or timer wakes us instead of being lost before sleep.
         unsafe { core::arch::asm!("sti", "hlt", "cli", options(nostack)) };
     }
+}
+
+/// Probe the standard SATA interface before sharing the kernel page tables.
+/// Arbitrary media receive one identification read; only the known disposable
+/// fixture receives extended checks. The driver exposes no disk-write command.
+fn probe_ahci_device(
+    devices: &pci::Inventory,
+    boot: &boot::BootInfo,
+    topology: Option<&mirror_acpi::Topology>,
+    hpet: Option<&mirror_acpi::Hpet>,
+    tables: &mut paging::PageTables,
+    frames: &mut memory::FrameAllocator<'_>,
+) {
+    let baseline = frames.stats().expect("frame accounting").allocated_frames;
+    let table_baseline = tables.owned_table_count();
+    let inject_error = {
+        #[cfg(feature = "boot-smoke")]
+        {
+            matches!(boot::smoke_mode(), boot::SmokeMode::AhciIoError)
+        }
+        #[cfg(not(feature = "boot-smoke"))]
+        {
+            false
+        }
+    };
+    // SAFETY: BSP, IF=0, active private kernel root and exclusive allocator.
+    // No AP, user root, IRQ handler, or other driver owns this SATA controller.
+    let opened = unsafe { ahci::Driver::open(devices, boot, topology, hpet, tables, frames) };
+    #[cfg(feature = "boot-smoke")]
+    let opened = if matches!(boot::smoke_mode(), boot::SmokeMode::AhciInitFailure) {
+        assert!(
+            matches!(opened, Err(ahci::AhciError::InjectedInitialization)),
+            "AHCI initialization failure was not exercised"
+        );
+        assert_eq!(
+            frames.stats().unwrap().allocated_frames,
+            baseline + tables.owned_table_count() - table_baseline,
+            "AHCI initialization failure leaked DMA"
+        );
+        serial::println!("MIRROR_AHCI_INIT_ERROR_OK dma_reclaimed=1");
+        // SAFETY: The injected failure stopped every engine, released the
+        // exclusive claim, and reclaimed all DMA before this second open.
+        unsafe { ahci::Driver::open(devices, boot, topology, hpet, tables, frames) }
+    } else {
+        opened
+    };
+    let mut driver = match opened {
+        Ok(Some(driver)) => driver,
+        Ok(None) => {
+            assert!(!inject_error, "AHCI error test requires a disk");
+            assert_eq!(
+                frames.stats().unwrap().allocated_frames,
+                baseline + tables.owned_table_count() - table_baseline,
+                "empty AHCI probe leaked DMA"
+            );
+            serial::println!("MIRROR_AHCI_SKIPPED reason=no_disk");
+            return;
+        }
+        Err(error) => {
+            serial::println!("MIRROR_AHCI_FAILED phase=open error={:?}", error);
+            return;
+        }
+    };
+    let capacity = driver.capacity_sectors();
+    serial::println!(
+        "MIRROR_AHCI_READY sectors={} readonly=1 port={}",
+        capacity,
+        driver.port()
+    );
+    let result = check_ahci_data(&mut driver, inject_error);
+    match result {
+        Ok(true) => serial::println!(
+            "MIRROR_AHCI_READ_OK sectors={} reads=262 bounds_rejected=2",
+            capacity
+        ),
+        Ok(false) => serial::println!("MIRROR_AHCI_PROBE_OK fixture=0 reads=1"),
+        Err(error) => serial::println!("MIRROR_AHCI_FAILED phase=read error={:?}", error),
+    }
+    // SAFETY: No other caller retains controller or DMA access. Shutdown must
+    // stop every engine before releasing device-visible memory or MMIO aliases.
+    let cleanup = unsafe { driver.shutdown(tables, frames) };
+    if let Err(error) = cleanup {
+        serial::println!("MIRROR_AHCI_FAILED phase=shutdown error={:?}", error);
+        return;
+    }
+    assert_eq!(
+        frames.stats().unwrap().allocated_frames,
+        baseline + tables.owned_table_count() - table_baseline,
+        "AHCI shutdown leaked DMA"
+    );
+    serial::println!("MIRROR_AHCI_CLEANUP_OK dma_reclaimed=1");
+}
+
+fn check_ahci_data(driver: &mut ahci::Driver, inject_error: bool) -> Result<bool, ahci::AhciError> {
+    let mut bytes = [0_u8; 512];
+    driver.read_sector(0, &mut bytes)?;
+    if driver.capacity_sectors() != 2048 || &bytes[8..16] != b"MIRROR\0\x01" {
+        assert!(!inject_error, "unexpected AHCI error fixture");
+        return Ok(false);
+    }
+    check_fixture_sector(0, &bytes);
+    if inject_error {
+        bytes.fill(0xcc);
+        let result = driver.read_sector(1234, &mut bytes);
+        assert!(
+            matches!(result, Err(ahci::AhciError::IoError)),
+            "AHCI backend error was not reported: {:?}",
+            result
+        );
+        assert_eq!(bytes, [0xcc; 512], "failed AHCI read changed output");
+        driver.read_sector(1234, &mut bytes)?;
+        check_fixture_sector(1234, &bytes);
+        serial::println!("MIRROR_AHCI_IO_ERROR_OK retry=1 output_preserved=1");
+    }
+    for sector in [driver.capacity_sectors(), u64::MAX] {
+        bytes.fill(0x5a);
+        assert!(matches!(
+            driver.read_sector(sector, &mut bytes),
+            Err(ahci::AhciError::SectorOutOfRange)
+        ));
+        assert_eq!(bytes, [0x5a; 512]);
+    }
+    for sector in [1, 127, 255, 256, 2047] {
+        driver.read_sector(sector, &mut bytes)?;
+        check_fixture_sector(sector, &bytes);
+    }
+    for index in 0..256 {
+        let sector = (index * 37 + 11) % 2048;
+        driver.read_sector(sector, &mut bytes)?;
+        check_fixture_sector(sector, &bytes);
+    }
+    Ok(true)
 }
 
 fn probe_block_device(

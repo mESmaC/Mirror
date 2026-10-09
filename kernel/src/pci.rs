@@ -1,16 +1,18 @@
-//! Bounded PCI discovery and a legacy Virtio block claim through mechanism 1.
+//! Bounded PCI discovery, legacy Virtio and AHCI claims through mechanism 1.
 //!
 //! One BSP owns CF8/CFC; each address/data transaction preserves the caller's
 //! interrupt state. Only firmware-configured segment 0 is visible. No ECAM,
 //! extended configuration, ARI, hotplug synchronization, BAR sizing, resource
 //! assignment, or IRQ routing. Discovery never writes device configuration.
-//! A claimed legacy block function permits only 16-bit command changes; its
+//! A claimed storage function permits only 16-bit command changes; its
 //! transport driver owns device reset and DMA lifetime. No MSI/MSI-X enablement.
 //!
 //! PCI Local Bus Specification 2.1, sections 3.7.4.1 and 6.2 (PCI-SIG document):
 //! https://www.bitsavers.org/pdf/pciSIG/PCI_Local_Bus_Specification_2.1_199506.pdf
 //! Virtio 1.2, sections 4.1.2, 4.1.4.10, 4.1.5.1.1.1, 5.2.1, and 5.7.1:
 //! https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html
+//! AHCI 1.3.1 section 2 (class matching, ABAR and PCI power state):
+//! https://www.intel.com/content/dam/www/public/us/en/documents/technical-specifications/serial-ata-ahci-spec-rev1-3-1.pdf
 //! PCI capability IDs, command/status masks, and MSI/MSI-X control masks:
 //! https://github.com/torvalds/linux/blob/master/include/uapi/linux/pci_regs.h
 
@@ -29,6 +31,7 @@ const MAX_CONFIG_READS: u32 = MAX_FUNCTIONS * 4;
 const MAX_RETAINED: usize = 32;
 const VIRTIO_VENDOR: u16 = 0x1af4;
 const COMMAND_IO: u16 = 1;
+const COMMAND_MEMORY: u16 = 1 << 1;
 const COMMAND_MASTER: u16 = 1 << 2;
 const COMMAND_INTX_DISABLE: u16 = 1 << 10;
 const STATUS_CAPABILITIES: u32 = 1 << 20;
@@ -37,6 +40,7 @@ const MAX_CAPABILITIES: usize = (0x100 - 0x40) / 4;
 // Optional device-specific fields outside this window are not supported.
 const LEGACY_PORT_BYTES: u32 = 28;
 static LEGACY_CLAIMED: AtomicBool = AtomicBool::new(false);
+static AHCI_CLAIMED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Bdf {
@@ -68,6 +72,10 @@ pub(crate) struct Device {
 }
 
 impl Device {
+    pub(crate) fn is_ahci(self) -> bool {
+        (self.class, self.subclass, self.interface) == (1, 6, 1) && self.header & 0x7f == 0
+    }
+
     fn multifunction(self) -> bool {
         self.header & 0x80 != 0
     }
@@ -196,6 +204,170 @@ pub(crate) enum LegacyError {
     AlreadyClaimed,
     IoNotPrepared,
     CommandRejected,
+    MemoryBar,
+    MemoryNotEnabled,
+    PowerState,
+}
+
+/// Exclusive vendor-independent class 01/06/01 claim. As with LegacyBlock,
+/// dropping a claim never makes an uncertain DMA controller available again.
+pub(crate) struct AhciController {
+    pub abar: u64,
+    original_command: u16,
+    command_address: u32,
+    prepared: bool,
+}
+
+impl AhciController {
+    pub(crate) fn discover(inventory: &Inventory) -> Result<Option<Self>, LegacyError> {
+        let Some(device) = inventory
+            .devices
+            .iter()
+            .flatten()
+            .find(|device| device.is_ahci())
+        else {
+            return Ok(None);
+        };
+        let identity = u32::from(device.vendor) | (u32::from(device.device) << 16);
+        let (abar, original_command) =
+            ahci_configuration(identity, |register| read_config_u32(device.bdf, register))?;
+        let command_address = configuration_address(
+            u16::from(device.bdf.bus),
+            device.bdf.slot,
+            device.bdf.function,
+            4,
+        )
+        .map_err(|_| LegacyError::ConfigurationAddress)?;
+        AHCI_CLAIMED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| LegacyError::AlreadyClaimed)?;
+        Ok(Some(Self {
+            abar,
+            original_command,
+            command_address,
+            prepared: false,
+        }))
+    }
+
+    /// Enable register decoding with DMA and INTx inhibited. The caller owns
+    /// the whole controller and keeps inherited DMA memory reserved.
+    pub(crate) unsafe fn prepare(&mut self) -> Result<(), LegacyError> {
+        // Even rejected readback may have changed the function. Keep the claim
+        // held until transport cleanup proves that it can safely be released.
+        self.prepared = true;
+        // SAFETY: The exclusive claim and caller own this function.
+        unsafe { self.write_command(memory_command(self.original_command, false))? };
+        Ok(())
+    }
+
+    /// All implemented ports must be stopped, with inherited DMA addresses
+    /// retired, before enabling this controller-wide bus-master permission.
+    pub(crate) unsafe fn enable(&mut self) -> Result<(), LegacyError> {
+        if !self.prepared {
+            return Err(LegacyError::IoNotPrepared);
+        }
+        // SAFETY: Caller has installed only owned DMA in quiesced ports.
+        unsafe { self.write_command(memory_command(self.original_command, true)) }
+    }
+
+    /// This inhibits new DMA but alone never permits reclaiming existing DMA.
+    pub(crate) unsafe fn disable_bus_master(&mut self) -> Result<(), LegacyError> {
+        // SAFETY: Sole claimed function; preserve all unrelated command bits.
+        unsafe { self.write_command(memory_command(self.original_command, false)) }
+    }
+
+    /// Release after all implemented engines stopped and all owned DMA pointers
+    /// were cleared, or before prepare has ever touched configuration. Never
+    /// restore inherited bus mastering or IRQs after taking hardware ownership.
+    pub(crate) unsafe fn release(self) -> Result<(), LegacyError> {
+        if self.prepared {
+            let command = (self.original_command | COMMAND_INTX_DISABLE) & !COMMAND_MASTER;
+            // SAFETY: Caller has retired every engine and device reference.
+            unsafe { self.write_command(command)? };
+        }
+        AHCI_CLAIMED.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn is_prepared(&self) -> bool {
+        self.prepared
+    }
+
+    unsafe fn write_command(&self, command: u16) -> Result<(), LegacyError> {
+        let enabled = arch::save_and_disable_interrupts();
+        // SAFETY: WORD access at Command leaves adjacent W1C Status untouched.
+        let observed = unsafe {
+            arch::out32(CONFIG_ADDRESS, self.command_address);
+            arch::out16(CONFIG_DATA, command);
+            let observed = arch::in16(CONFIG_DATA);
+            arch::restore_interrupts(enabled);
+            observed
+        };
+        if observed == command {
+            Ok(())
+        } else {
+            Err(LegacyError::CommandRejected)
+        }
+    }
+}
+
+fn memory_command(original: u16, master: bool) -> u16 {
+    let command = (original | COMMAND_MEMORY | COMMAND_INTX_DISABLE) & !COMMAND_MASTER;
+    command | if master { COMMAND_MASTER } else { 0 }
+}
+
+fn ahci_configuration(
+    identity: u32,
+    mut read: impl FnMut(u16) -> Result<u32, LegacyError>,
+) -> Result<(u64, u16), LegacyError> {
+    if read(0)? != identity || read(8)? >> 8 != 0x01_06_01 || (read(0x0c)? >> 16) & 0x7f != 0 {
+        return Err(LegacyError::DeviceChanged);
+    }
+    let command_status = read(4)?;
+    // Read-only firmware-ownership checks require decoding before any command
+    // mutation. First fallback deliberately refuses unassigned/inactive HBAs.
+    if command_status & u32::from(COMMAND_MEMORY) == 0 {
+        return Err(LegacyError::MemoryNotEnabled);
+    }
+    let previous = read(0x20)?;
+    let bar = read(0x24)?;
+    // ABAR is a non-prefetchable 32-bit memory BAR. BAR4 must not consume BAR5
+    // as its upper half. Firmware has assigned resources; no sizing writes.
+    if previous & 7 == 4 || bar & 0xf != 0 || bar & !0x3ff == 0 || bar & 0x3ff != 0 {
+        return Err(LegacyError::MemoryBar);
+    }
+    if command_status & STATUS_CAPABILITIES != 0 {
+        let mut next = read(0x34)? as u8;
+        let mut visited = 0_u64;
+        for _ in 0..MAX_CAPABILITIES {
+            if next == 0 {
+                return Ok((u64::from(bar), command_status as u16));
+            }
+            if next < 0x40 || !next.is_multiple_of(4) {
+                return Err(LegacyError::CapabilityList);
+            }
+            let bit = 1_u64 << (next / 4);
+            if visited & bit != 0 {
+                return Err(LegacyError::CapabilityList);
+            }
+            visited |= bit;
+            let cap = read(u16::from(next))?;
+            let control = (cap >> 16) as u16;
+            match cap as u8 {
+                0x05 if control & 1 != 0 => return Err(LegacyError::MsiEnabled),
+                0x11 if control & 0x8000 != 0 => return Err(LegacyError::MsixEnabled),
+                0x01 if next > 0xf8 || read(u16::from(next) + 4)? & 3 != 0 => {
+                    return Err(LegacyError::PowerState);
+                }
+                _ => {}
+            }
+            next = (cap >> 8) as u8;
+        }
+        if next != 0 {
+            return Err(LegacyError::CapabilityList);
+        }
+    }
+    Ok((u64::from(bar), command_status as u16))
 }
 
 /// Exclusive claim to the first retained legacy block function. It is neither
@@ -620,7 +792,59 @@ pub(crate) fn self_test() {
     assert_eq!(crowded.omitted, 8192 - MAX_RETAINED as u32);
     assert_eq!(crowded.config_reads, 8192 * 3);
     legacy_self_test();
+    ahci_self_test();
     serial::println!("MIRROR_PCI_TESTS_OK");
+}
+
+#[cfg(feature = "boot-smoke")]
+fn ahci_self_test() {
+    let inspect = |snapshot: &[u32; 64]| {
+        ahci_configuration(0x4321_1234, |register| {
+            assert!(register <= 0xfc && register.is_multiple_of(4));
+            Ok(snapshot[usize::from(register / 4)])
+        })
+    };
+    let mut snapshot = [0_u32; 64];
+    snapshot[0] = 0x4321_1234; // No vendor/device allowlist.
+    snapshot[1] = 0xa000_0007;
+    snapshot[2] = 0x0106_0199;
+    snapshot[9] = 0xfedc_0400; // Legal 1KiB-aligned BAR within a page.
+    assert_eq!(inspect(&snapshot), Ok((0xfedc_0400, 7)));
+    assert_eq!(memory_command(7, false), 0x403);
+    assert_eq!(memory_command(7, true), 0x407);
+    for bar in [0, 0x4001, 0x4004, 0x4008, 0x4020, 0xffff_ffff] {
+        snapshot[9] = bar;
+        assert_eq!(inspect(&snapshot), Err(LegacyError::MemoryBar));
+    }
+    snapshot[9] = 0xffff_fc00; // Mapping later checks the entire port span.
+    assert_eq!(inspect(&snapshot), Ok((0xffff_fc00, 7)));
+    snapshot[8] = 4; // ABAR must not be the upper half of a 64-bit BAR4.
+    assert_eq!(inspect(&snapshot), Err(LegacyError::MemoryBar));
+    snapshot[8] = 0;
+    snapshot[2] = 0x0104_0000; // RAID mode is not AHCI.
+    assert_eq!(inspect(&snapshot), Err(LegacyError::DeviceChanged));
+    snapshot[2] = 0x0106_0100;
+    snapshot[1] |= STATUS_CAPABILITIES;
+    snapshot[0x34 / 4] = 0x40;
+    snapshot[0x40 / 4] = 0x4401; // D0 PM capability followed by disabled MSI.
+    snapshot[0x44 / 4] = 0x4805;
+    // A PMCSR overlaps the next header here; its low two bits are 1. Reject it.
+    assert_eq!(inspect(&snapshot), Err(LegacyError::PowerState));
+    snapshot[0x40 / 4] = 0x4801;
+    snapshot[0x44 / 4] = 0;
+    snapshot[0x48 / 4] = 0x05;
+    assert_eq!(inspect(&snapshot), Ok((0xffff_fc00, 7)));
+    snapshot[0x44 / 4] = 3;
+    assert_eq!(inspect(&snapshot), Err(LegacyError::PowerState));
+    snapshot[0x44 / 4] = 0;
+    snapshot[0x48 / 4] = 0x1_0005;
+    assert_eq!(inspect(&snapshot), Err(LegacyError::MsiEnabled));
+    snapshot[0x48 / 4] = 0x8000_0011;
+    assert_eq!(inspect(&snapshot), Err(LegacyError::MsixEnabled));
+    snapshot[0x48 / 4] = 0x4000;
+    assert_eq!(inspect(&snapshot), Err(LegacyError::CapabilityList));
+    snapshot[0x34 / 4] = 0xff;
+    assert_eq!(inspect(&snapshot), Err(LegacyError::CapabilityList));
 }
 
 #[cfg(feature = "boot-smoke")]

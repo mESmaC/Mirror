@@ -1,6 +1,139 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Assert-MirrorDriverCatalog {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [bool]$Smoke,
+        [bool]$LegacyDisk
+    )
+
+    foreach ($record in [regex]::Matches($Serial, '(?m)^(MIRROR_DRIVER_[^\s]*)[^\r\n]*')) {
+        if ($record.Groups[1].Value -notin @('MIRROR_DRIVER_DEVICE', 'MIRROR_DRIVER_CATALOG', 'MIRROR_DRIVER_TESTS_OK')) {
+            throw 'Unexpected driver catalog marker.'
+        }
+    }
+    if ([regex]::Matches($Serial, '(?m)^MIRROR_DRIVER_TESTS_OK(?:\s|$)').Count -ne [int]$Smoke -or
+        [regex]::Matches($Serial, '(?m)^MIRROR_DRIVER_TESTS_OK\r?$').Count -ne [int]$Smoke) {
+        throw 'Driver matching self-tests must run exactly once in smoke builds only.'
+    }
+    $catalog = [regex]::Matches($Serial, '(?m)^MIRROR_DRIVER_CATALOG retained=([0-9]+) matched=([0-9]+) unsupported=([0-9]+) omitted=([0-9]+)\r?$')
+    $pci = [regex]::Matches($Serial, '(?m)^MIRROR_PCI_READY functions=([0-9]+) bridges=([0-9]+) virtio_block=([0-9]+) display=([0-9]+) virtio_gpu=([0-9]+) retained=([0-9]+) omitted=([0-9]+) reads=([0-9]+)\r?$')
+    if ($catalog.Count -ne 1 -or [regex]::Matches($Serial, '(?m)^MIRROR_DRIVER_CATALOG(?:\s|$)').Count -ne 1 -or
+        $pci.Count -ne 1 -or [regex]::Matches($Serial, '(?m)^MIRROR_PCI_READY(?:\s|$)').Count -ne 1) {
+        throw 'Driver diagnostics require exactly one complete PCI discovery and catalog summary.'
+    }
+    $retained = [uint64]$catalog[0].Groups[1].Value
+    $matched = [uint64]$catalog[0].Groups[2].Value
+    $unsupported = [uint64]$catalog[0].Groups[3].Value
+    $omitted = [uint64]$catalog[0].Groups[4].Value
+    if ($retained -eq 0 -or $retained -gt 32 -or $matched -gt $retained -or $unsupported -ne $retained - $matched -or
+        $retained -ne [uint64]$pci[0].Groups[6].Value -or $omitted -ne [uint64]$pci[0].Groups[7].Value -or
+        $retained + $omitted -ne [uint64]$pci[0].Groups[1].Value -or $catalog[0].Index -le $pci[0].Index) {
+        throw 'Driver catalog counts must preserve the complete bounded PCI inventory.'
+    }
+    $devices = [regex]::Matches($Serial, '(?m)^MIRROR_DRIVER_DEVICE bdf=([0-9a-f]{2}):([0-9a-f]{2})\.([0-7]) id=([0-9a-f]{4}):([0-9a-f]{4}) class=([0-9a-f]{2}):([0-9a-f]{2}):([0-9a-f]{2}) driver=(virtio-blk-legacy|ahci-sata|none) match=(exact|class|none)\r?$')
+    if ($devices.Count -ne $retained -or [regex]::Matches($Serial, '(?m)^MIRROR_DRIVER_DEVICE(?:\s|$)').Count -ne $retained) {
+        throw 'Every retained PCI function must have exactly one complete driver catalog record.'
+    }
+    $previousBdf = -1
+    $legacy = 0
+    $ahci = 0
+    $unknown = 0
+    $modernBoot = 0
+    foreach ($device in $devices) {
+        $bus = [Convert]::ToInt32($device.Groups[1].Value, 16)
+        $slot = [Convert]::ToInt32($device.Groups[2].Value, 16)
+        $function = [int]$device.Groups[3].Value
+        $bdf = $bus * 256 + $slot * 8 + $function
+        if ($slot -gt 31 -or $bdf -le $previousBdf -or
+            $device.Index -le $pci[0].Index -or $device.Index -ge $catalog[0].Index) {
+            throw 'Driver device records must preserve unique PCI discovery order before the summary.'
+        }
+        $previousBdf = $bdf
+        $identity = $device.Groups[4].Value + ':' + $device.Groups[5].Value
+        $class = $device.Groups[6].Value + ':' + $device.Groups[7].Value + ':' + $device.Groups[8].Value
+        $driver = $device.Groups[9].Value
+        $kind = $device.Groups[10].Value
+        if ($driver -eq 'virtio-blk-legacy') {
+            if ($identity -ne '1af4:1001' -or $kind -ne 'exact') { throw 'Legacy VirtIO must match its exact supported identity.' }
+            $legacy++
+        }
+        elseif ($driver -eq 'ahci-sata') {
+            if ($class -ne '01:06:01' -or $kind -ne 'class') { throw 'AHCI fallback must match the standard SATA programming interface.' }
+            $ahci++
+        }
+        else {
+            if ($kind -ne 'none') { throw 'Unsupported hardware must remain explicitly unmatched.' }
+            $unknown++
+            if ($identity -eq '1af4:1042') { $modernBoot++ }
+        }
+    }
+    if ($legacy -ne [int]$LegacyDisk -or $ahci -ne 1 -or $modernBoot -ne 1 -or
+        $matched -ne $legacy + $ahci -or $unsupported -ne $unknown) {
+        throw 'The fixture must expose its expected fallback candidates and preserve the unsupported modern VirtIO boot device.'
+    }
+}
+
+function Assert-MirrorAhciMarkers {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [bool]$Attached,
+        [bool]$Smoke,
+        [string]$FaultMode = 'None'
+    )
+
+    $expected = @{}
+    if ($Smoke) { $expected.MIRROR_AHCI_TESTS_OK = '' }
+    if ($Attached) {
+        $expected.MIRROR_AHCI_READY = 'sectors=2048 readonly=1 port=0'
+        $expected.MIRROR_AHCI_READ_OK = 'sectors=2048 reads=262 bounds_rejected=2'
+        $expected.MIRROR_AHCI_CLEANUP_OK = 'dma_reclaimed=1'
+        if ($FaultMode -eq 'AhciIoError') {
+            $expected.MIRROR_AHCI_IO_ERROR_OK = 'retry=1 output_preserved=1'
+        }
+        if ($FaultMode -eq 'AhciInitFailure') {
+            $expected.MIRROR_AHCI_INIT_ERROR_OK = 'dma_reclaimed=1'
+        }
+    }
+    else {
+        $expected.MIRROR_AHCI_SKIPPED = 'reason=no_disk'
+    }
+    foreach ($record in [regex]::Matches($Serial, '(?m)^(MIRROR_AHCI_[^\s]*)[^\r\n]*')) {
+        if (-not $expected.ContainsKey($record.Groups[1].Value)) {
+            throw "Unexpected AHCI marker: $($record.Groups[1].Value)."
+        }
+    }
+    foreach ($marker in $expected.Keys) {
+        $suffix = if ($expected[$marker].Length -gt 0) { ' ' + [regex]::Escape($expected[$marker]) } else { '' }
+        $pattern = '(?m)^{0}{1}\r?$' -f $marker, $suffix
+        if ([regex]::Matches($Serial, "(?m)^$marker(?:\s|$)").Count -ne 1 -or
+            [regex]::Matches($Serial, $pattern).Count -ne 1) {
+            throw "AHCI scenario requires exactly one '$marker $($expected[$marker])'."
+        }
+    }
+    if ($Attached) {
+        $ready = $Serial.IndexOf('MIRROR_AHCI_READY ', [StringComparison]::Ordinal)
+        $reads = $Serial.IndexOf('MIRROR_AHCI_READ_OK ', [StringComparison]::Ordinal)
+        $cleanup = $Serial.IndexOf('MIRROR_AHCI_CLEANUP_OK ', [StringComparison]::Ordinal)
+        if ($reads -le $ready -or $cleanup -le $reads) {
+            throw 'AHCI reads must follow device readiness and precede DMA cleanup.'
+        }
+        if ($FaultMode -eq 'AhciIoError') {
+            $recovery = $Serial.IndexOf('MIRROR_AHCI_IO_ERROR_OK ', [StringComparison]::Ordinal)
+            if ($recovery -le $ready -or $recovery -ge $reads) {
+                throw 'AHCI error recovery must precede the successful read workload.'
+            }
+        }
+        if ($FaultMode -eq 'AhciInitFailure') {
+            $recovery = $Serial.IndexOf('MIRROR_AHCI_INIT_ERROR_OK ', [StringComparison]::Ordinal)
+            if ($recovery -ge $ready) {
+                throw 'AHCI initialization failure must reclaim DMA before a successful reopen.'
+            }
+        }
+    }
+}
+
 function Assert-MirrorClock {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,

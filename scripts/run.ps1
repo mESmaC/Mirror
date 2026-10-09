@@ -7,13 +7,14 @@ param(
     [switch]$AgentDemo,
     [switch]$NoDisplayDevice,
     [switch]$NoTestDisk,
+    [switch]$AhciDisk,
     [switch]$NoKeyboard,
     [switch]$NoHpet,
     [switch]$ExtendedCpu,
     [switch]$LegacyPic,
     [switch]$PitTimer,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
-    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation')][string]$Fault = 'None',
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -195,6 +196,15 @@ if ($Graphical -and ($Smoke -or $NoDisplayDevice)) {
     throw '-Graphical requires a normal boot with a display device.'
 }
 $writableBlock = $Fault -in @('BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush')
+if ($AhciDisk -and $NoTestDisk) {
+    throw '-AhciDisk requires the test disk; it cannot be combined with -NoTestDisk.'
+}
+if ($AhciDisk -and $Fault -like 'Block*') {
+    throw '-AhciDisk cannot exercise legacy VirtIO block fault modes.'
+}
+if ($Fault -in @('AhciIoError', 'AhciInitFailure') -and -not $AhciDisk) {
+    throw "-Fault $Fault requires -AhciDisk."
+}
 if ($NoTestDisk -and ($Fault -eq 'BlockIoError' -or $writableBlock)) {
     throw "-Fault $Fault requires the test disk."
 }
@@ -244,6 +254,8 @@ $testMode = switch ($Fault) {
     'BlockWriteError' { 'block-write-error' }
     'BlockFlushError' { 'block-flush-error' }
     'BlockNoFlush' { 'block-no-flush' }
+    'AhciIoError' { 'ahci-io-error' }
+    'AhciInitFailure' { 'ahci-init-failure' }
     'VmReadOnly' { 'vm-read-only' }
     'VmNx' { 'vm-nx' }
     'VmReleased' { 'vm-released' }
@@ -297,7 +309,17 @@ $qemuArguments = @(
 if (-not $NoTestDisk) {
     $testDisk = Get-MirrorTestDisk -RepositoryRoot $repositoryRoot
     $testDiskHash = (Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash
-    $testDevice = 'virtio-blk-pci,drive=mirror-test,disable-modern=on,disable-legacy=off'
+    $attachedDisk = $testDisk
+    if ($AhciDisk) {
+        # QEMU ide_init_drive requires a writable backend for ATA hard disks:
+        # https://raw.githubusercontent.com/qemu/qemu/v10.1.0/hw/ide/core.c
+        # Mirror exposes only IDENTIFY/reads. Use a reset disposable copy and
+        # verify its entire image afterward instead of trusting ATA write protect.
+        $attachedDisk = Join-Path $buildDirectory 'ahci-test.img'
+        Copy-Item -LiteralPath $testDisk -Destination $attachedDisk -Force
+    }
+    $testDevice = if ($AhciDisk) { 'ide-hd,drive=mirror-test,bus=ide.0,rerror=report' }
+        else { 'virtio-blk-pci,drive=mirror-test,disable-modern=on,disable-legacy=off' }
     if ($writableBlock) {
         $writableDisk = New-MirrorWritableTestDisk -RepositoryRoot $repositoryRoot
         $fileNode = @{ driver = 'file'; filename = $writableDisk; cache = @{ 'no-flush' = $false } }
@@ -327,21 +349,22 @@ if (-not $NoTestDisk) {
         }
         else { $testDevice += ',write-cache=on' }
     }
-    elseif ($Fault -eq 'BlockIoError') {
+    elseif ($Fault -in @('BlockIoError', 'AhciIoError')) {
         # Inject into a data sector used by the kernel probe, away from firmware
         # partition discovery. JSON preserves paths without blkdebug URL colons.
         $testNode = @{
-            driver = 'raw'; 'node-name' = 'mirror-test'; 'read-only' = $true
+            driver = 'raw'; 'node-name' = 'mirror-test'; 'read-only' = (-not $AhciDisk)
             file = @{
                 driver = 'blkdebug'
-                image = @{ driver = 'file'; filename = $testDisk }
+                image = @{ driver = 'file'; filename = $attachedDisk }
                 'inject-error' = @(@{ event = 'read_aio'; errno = 5; sector = 1234; once = $true })
             }
         } | ConvertTo-Json -Compress -Depth 6
         $qemuArguments += @('-blockdev', $testNode)
     }
     else {
-        $qemuArguments += @('-drive', "if=none,id=mirror-test,format=raw,readonly=on,file=$(ConvertTo-QemuOptionValue $testDisk)")
+        $readOnlyOption = if ($AhciDisk) { 'off' } else { 'on' }
+        $qemuArguments += @('-drive', "if=none,id=mirror-test,format=raw,readonly=$readOnlyOption,file=$(ConvertTo-QemuOptionValue $attachedDisk)")
     }
     $qemuArguments += @('-device', $testDevice)
 }
@@ -399,6 +422,10 @@ try {
     if (-not $NoTestDisk -and (Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash -ne $testDiskHash) {
         throw 'The read-only block fixture was modified during the boot.'
     }
+    if ($AhciDisk -and ((Get-Item -LiteralPath $attachedDisk).Length -ne 1048576 -or
+            (Get-FileHash -LiteralPath $attachedDisk -Algorithm SHA256).Hash -ne $testDiskHash)) {
+        throw 'The AHCI read-only probe modified its disposable disk image.'
+    }
     $expectedTlbTimeout = $Fault -eq 'SmpTlbTimeout'
     if (-not $expectedTlbTimeout -and $serial -match '(?im)^(?:MIRROR_PANIC|PANIC|\[panic\])') {
         throw "Mirror reported a panic. See $serialLog."
@@ -413,7 +440,7 @@ try {
         Assert-MirrorWritableTestDisk -OriginalPath $testDisk -WritablePath $writableDisk -WritesExpected ($Fault -ne 'BlockNoFlush')
     }
     $markers = @('MIRROR_FRAMES_OK', 'MIRROR_ALLOCATOR_TESTS_OK', 'MIRROR_FRAME_REUSE_OK', 'MIRROR_EXCEPTIONS_OK', 'MIRROR_PAGING_OK', 'MIRROR_HEAP_OK', 'MIRROR_TIMER_OK', 'MIRROR_HEAP_IRQ_OK', 'MIRROR_USER_PAGING_OK', 'MIRROR_ELF_TESTS_OK', 'MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_USER_LOAD_ROLLBACK_OK', 'MIRROR_SCHEDULER_OK', 'MIRROR_CAPABILITY_TESTS_OK', 'MIRROR_IPC_TESTS_OK', 'MIRROR_IPC_OK')
-    $markers += @('MIRROR_PCI_TESTS_OK', 'MIRROR_PCI_READY', 'MIRROR_FRAMEBUFFER_TESTS_OK')
+    $markers += @('MIRROR_PCI_TESTS_OK', 'MIRROR_PCI_READY', 'MIRROR_DRIVER_TESTS_OK', 'MIRROR_FRAMEBUFFER_TESTS_OK')
     $markers += @('MIRROR_ACPI_MAPPING_TESTS_OK', 'MIRROR_APIC_PREFLIGHT_TESTS_OK')
     $markers += @('MIRROR_SURFACE_TESTS_OK', 'MIRROR_USER_SURFACE_CLEANUP_OK')
     $markers += @('MIRROR_CONTIGUOUS_TESTS_OK', 'MIRROR_DMA_TESTS_OK', 'MIRROR_BLOCK_TESTS_OK')
@@ -450,6 +477,8 @@ try {
     Assert-MirrorClock -Serial $serial -Smoke $true -WithoutHpet ([bool]$NoHpet) -FaultMode $Fault
     Assert-MirrorSmpMarkers -Serial $serial -RequestedCpus $CpuCount -UseLegacyPic ([bool]$LegacyPic) -FaultMode $Fault
     Assert-MirrorHeapGrowth -Serial $serial -RequestedCpus $CpuCount -Smoke $true -UseLegacyPic ([bool]$LegacyPic)
+    Assert-MirrorDriverCatalog -Serial $serial -Smoke $true -LegacyDisk (-not $NoTestDisk -and -not $AhciDisk)
+    Assert-MirrorAhciMarkers -Serial $serial -Attached ([bool]$AhciDisk) -Smoke $true -FaultMode $Fault
     $markers += 'MIRROR_USER_SYNC_OK'
     if (@([regex]::Matches($serial, '(?m)^user: Mirror init: synchronization checks passed\\n\r?$')).Count -ne 4) {
         throw 'Both native processes must complete their synchronization checks before and after teardown/relaunch.'
@@ -556,7 +585,7 @@ try {
     if ($writableBlock) {
         Assert-MirrorWritableBlockMarkers -Serial $serial -FaultMode $Fault
     }
-    elseif ($NoTestDisk) {
+    elseif ($NoTestDisk -or $AhciDisk) {
         $markers += 'MIRROR_BLOCK_SKIPPED'
         if ($serial -match '(?m)^MIRROR_BLOCK_(?:READY|READ_OK|IO_ERROR_OK)(?:\s|$)') {
             throw "Mirror unexpectedly bound a block device. See $serialLog."
@@ -734,7 +763,7 @@ try {
             throw "Mirror smoke test did not report $marker. See $serialLog."
         }
     }
-    Write-Host "Mirror boot smoke test passed (fault=$Fault, no-display=$NoDisplayDevice, extended-cpu=$ExtendedCpu, cpus=$CpuCount, legacy-pic=$LegacyPic, pit-timer=$PitTimer, no-hpet=$NoHpet, QEMU exit $expectedExitCode). Serial log: $serialLog"
+    Write-Host "Mirror boot smoke test passed (fault=$Fault, ahci-disk=$AhciDisk, no-display=$NoDisplayDevice, extended-cpu=$ExtendedCpu, cpus=$CpuCount, legacy-pic=$LegacyPic, pit-timer=$PitTimer, no-hpet=$NoHpet, QEMU exit $expectedExitCode). Serial log: $serialLog"
     # Keep firmware's terminal control sequences in the raw log, not tool output.
     Write-Output (($serial -split '\r?\n' | Where-Object { $_ -match '^(MIRROR_|Memory map:|Direct map offset:|Page tables:)' }) -join [Environment]::NewLine)
 }

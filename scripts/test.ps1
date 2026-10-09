@@ -36,6 +36,17 @@ try {
             Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-$fault.serial.log") -Force
             Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-$fault.stderr.log") -Force
         }
+        # Exercise the class-standard SATA path instead of the legacy VirtIO
+        # fixture, including a completed ATA error and failed initialization
+        # after engine activation, followed by safe DMA reuse and a reopen.
+        foreach ($fault in @('None', 'AhciIoError', 'AhciInitFailure')) {
+            & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -AhciDisk -Release:$release -AgentDemo:$AgentDemo -Fault $fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-AhciDisk-$fault.serial.log") -Force
+            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-AhciDisk-$fault.stderr.log") -Force
+        }
+        & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -AhciDisk -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-AhciDisk-CpuCount4.serial.log") -Force
+        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-AhciDisk-CpuCount4.stderr.log") -Force
         # Expose AVX and FSGSBASE through CPUID as well as exercising the
         # conservative CPU model. The kernel must keep both features disabled.
         foreach ($fault in @('None', 'UserAvx', 'UserFsgsbase')) {
@@ -104,7 +115,7 @@ try {
             Copy-Item -LiteralPath (Join-Path $repositoryRoot "build/normal-boot.$artifact") -Destination (Join-Path $logDirectory "$profile-console.$artifact") -Force
         }
         Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/normal-console.png') -Destination (Join-Path $logDirectory "$profile-console-input.png") -Force
-        foreach ($artifact in @('normal-pointer.png', 'cursor-away.png', 'cursor-restored.png', 'desktop.png', 'desktop-input.png', 'desktop-cursor-away.png', 'desktop-cursor-restored.png')) {
+        foreach ($artifact in @('normal-pointer.png', 'normal-devices.png', 'normal-devices-page2.png', 'cursor-away.png', 'cursor-restored.png', 'desktop.png', 'desktop-input.png', 'desktop-cursor-away.png', 'desktop-cursor-restored.png')) {
             Copy-Item -LiteralPath (Join-Path $repositoryRoot "build/$artifact") -Destination (Join-Path $logDirectory "$profile-$artifact") -Force
         }
         $applicationArtifacts = if ($AgentDemo) { @('desktop-agent.png') } else {
@@ -117,7 +128,7 @@ try {
 
     # Leave the boot tree ready for a normal run after the test cases finish.
     & (Join-Path $PSScriptRoot 'build.ps1')
-    Write-Host "All 90 kernel/userspace/device smoke cases and debug/release desktop/console captures passed. Logs: $logDirectory"
+    Write-Host "All 98 kernel/userspace/device smoke cases and debug/release desktop/console captures passed. Logs: $logDirectory"
 }
 finally {
     Pop-Location

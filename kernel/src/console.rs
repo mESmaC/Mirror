@@ -4,10 +4,17 @@
 //! These commands inspect counters or change console text; they do not execute
 //! programs, interpret shell syntax, or access files/storage.
 
-use crate::keyboard::{Key, KeyEvent};
+use core::fmt::{self, Write};
+
+use crate::{
+    drivers,
+    keyboard::{Key, KeyEvent},
+    pci,
+};
 
 pub const LINE_CAPACITY: usize = 96;
 const HISTORY_ROWS: usize = 12;
+const DEVICES_PER_PAGE: usize = 4;
 const EDIT_NOTICE: &str =
     "Enter runs a command. Escape clears input. Click or arrow keys move the caret.";
 const LOST_NOTICE: &str = "Input lost. Current line discarded; type the command again.";
@@ -58,12 +65,34 @@ impl Text {
         result.length = end;
         result
     }
+
+    fn formatted(arguments: fmt::Arguments<'_>) -> Self {
+        let mut text = Self::EMPTY;
+        text.write_fmt(arguments).expect("bounded console format");
+        text
+    }
+}
+
+impl Write for Text {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        if text.len() > LINE_CAPACITY - self.length
+            || !text.bytes().all(|byte| (32..=126).contains(&byte))
+        {
+            return Err(fmt::Error);
+        }
+        let end = self.length + text.len();
+        self.bytes[self.length..end].copy_from_slice(text.as_bytes());
+        self.length = end;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {
     Help,
     Status,
+    /// Zero-based page. The textual command presents pages starting at one.
+    Devices(u8),
     Echo(Text),
     Clear,
     Unknown(Text),
@@ -103,15 +132,16 @@ impl HistoryLine {
     };
 }
 
-pub struct Console {
+pub struct Console<'a> {
     input: Text,
     cursor: usize,
     history: [HistoryLine; HISTORY_ROWS],
     history_length: usize,
     notice: &'static str,
+    devices: Option<&'a pci::Inventory>,
 }
 
-impl Console {
+impl<'a> Console<'a> {
     pub fn new() -> Self {
         let mut console = Self {
             input: Text::EMPTY,
@@ -119,9 +149,16 @@ impl Console {
             history: [HistoryLine::EMPTY; HISTORY_ROWS],
             history_length: 0,
             notice: EDIT_NOTICE,
+            devices: None,
         };
         console.output("Mirror kernel diagnostic console.");
         console.output("Type help for commands. No programs or file operations run here.");
+        console
+    }
+
+    pub(crate) fn with_devices(devices: &'a pci::Inventory) -> Self {
+        let mut console = Self::new();
+        console.devices = Some(devices);
         console
     }
 
@@ -255,6 +292,7 @@ impl Console {
             Operation::Help => {
                 self.output("help       Show these commands.");
                 self.output("status     Show live timer and keyboard IRQ counters.");
+                self.output("devices N  Show PCI IDs and driver candidates; first page is devices or devices 1.");
                 self.output("echo TEXT  Print text without interpreting it.");
                 self.output("clear      Clear console history and current input.");
                 ("help", Text::EMPTY)
@@ -277,6 +315,10 @@ impl Console {
                 });
                 ("echo", text)
             }
+            Operation::Devices(page) => {
+                self.device_page(page);
+                ("devices", Text::counter("page=", u64::from(page) + 1))
+            }
             Operation::Clear => {
                 self.history.fill(HistoryLine::EMPTY);
                 self.history_length = 0;
@@ -298,6 +340,66 @@ impl Console {
         self.input = Text::EMPTY;
         self.cursor = 0;
         self.notice = EDIT_NOTICE;
+    }
+
+    fn device_page(&mut self, page: u8) {
+        let Some(inventory) = self.devices else {
+            self.output("PCI inventory unavailable in this console.");
+            return;
+        };
+        let summary = drivers::summary(inventory);
+        let pages = summary.retained.div_ceil(DEVICES_PER_PAGE).max(1);
+        if usize::from(page) >= pages {
+            self.output_formatted(format_args!(
+                "Device page out of range. Use devices 1 through devices {}.",
+                pages
+            ));
+            return;
+        }
+        self.output_formatted(format_args!(
+            "PCI devices: page {}/{}; candidates are matches, not active drivers.",
+            usize::from(page) + 1,
+            pages
+        ));
+        self.output_formatted(format_args!(
+            "Retained: {}  Matched: {}  Unsupported: {}  Omitted: {}",
+            summary.retained, summary.matched, summary.unsupported, summary.omitted
+        ));
+        for device in drivers::devices(inventory)
+            .skip(usize::from(page) * DEVICES_PER_PAGE)
+            .take(DEVICES_PER_PAGE)
+        {
+            self.output_formatted(format_args!(
+                "{:02x}:{:02x}.{} id={:04x}:{:04x} class={:02x}:{:02x}:{:02x}",
+                device.bdf.bus,
+                device.bdf.slot,
+                device.bdf.function,
+                device.vendor,
+                device.device,
+                device.class,
+                device.subclass,
+                device.interface
+            ));
+            match drivers::candidate(device) {
+                Some(candidate) => self.output_formatted(format_args!(
+                    "  Candidate: {} ({} match)",
+                    candidate.name(),
+                    candidate.match_kind()
+                )),
+                None => self.output("  Unsupported: no native driver candidate."),
+            }
+        }
+        if summary.retained == 0 {
+            self.output("No retained PCI devices.");
+        }
+        self.output("Use devices N for page N. IDs remain visible when no driver matches.");
+    }
+
+    fn output_formatted(&mut self, arguments: fmt::Arguments<'_>) {
+        self.push(HistoryLine {
+            prompt: false,
+            text: Text::formatted(arguments),
+        });
     }
 
     fn output(&mut self, text: &str) {
@@ -323,13 +425,27 @@ fn parse(line: Text) -> Option<Operation> {
         "" => return None,
         "help" => Operation::Help,
         "status" => Operation::Status,
+        "devices" => Operation::Devices(0),
         "clear" => Operation::Clear,
         "echo" => Operation::Echo(Text::EMPTY),
         _ => match text.strip_prefix("echo ") {
             Some(argument) => Operation::Echo(
                 Text::new(argument.trim_start_matches(' ')).expect("bounded ASCII substring"),
             ),
-            None => Operation::Unknown(line),
+            None => match text.strip_prefix("devices ") {
+                Some(argument) => {
+                    let page = argument.trim_start_matches(' ');
+                    page.bytes()
+                        .all(|byte| byte.is_ascii_digit())
+                        .then(|| page.parse::<u8>().ok())
+                        .flatten()
+                        .filter(|page| *page > 0)
+                        .map_or(Operation::Unknown(line), |page| {
+                            Operation::Devices(page - 1)
+                        })
+                }
+                None => Operation::Unknown(line),
+            },
         },
     })
 }
@@ -358,6 +474,14 @@ pub fn self_test() {
     assert!(Text::new("\u{e9}").is_none());
     assert!(Text::new(core::str::from_utf8(&[b'x'; LINE_CAPACITY + 1]).unwrap()).is_none());
     assert_eq!(Text::counter("", u64::MAX).as_str(), "18446744073709551615");
+    let mut bounded = Text::new("unchanged").unwrap();
+    assert_eq!(bounded.write_str("\n"), Err(fmt::Error));
+    assert_eq!(bounded.as_str(), "unchanged");
+    assert_eq!(
+        bounded.write_str(core::str::from_utf8(&[b'x'; LINE_CAPACITY]).unwrap()),
+        Err(fmt::Error)
+    );
+    assert_eq!(bounded.as_str(), "unchanged");
 
     type_text(&mut console, "echo MirXor");
     console.process(key(Key::Home));
@@ -448,6 +572,122 @@ pub fn self_test() {
         parse(Text::new("echoes help").unwrap()),
         Some(Operation::Unknown(_))
     ));
+    for (command, page) in [
+        ("devices", 0),
+        ("devices 1", 0),
+        ("  devices  2  ", 1),
+        ("devices 255", 254),
+    ] {
+        assert_eq!(
+            parse(Text::new(command).unwrap()),
+            Some(Operation::Devices(page))
+        );
+    }
+    for command in [
+        "devices 0",
+        "devices 256",
+        "devices +1",
+        "devices -1",
+        "devices 1 2",
+        "devices one",
+        "devices1",
+        "devices 9999999999999999999999999999999",
+    ] {
+        assert!(matches!(
+            parse(Text::new(command).unwrap()),
+            Some(Operation::Unknown(_))
+        ));
+    }
+    console.dispatch(Operation::Devices(0));
+    assert_eq!(
+        console.history().last().unwrap().text.as_str(),
+        "PCI inventory unavailable in this console."
+    );
+    let inventory = drivers::test_inventory();
+    let mut device_console = Console::with_devices(&inventory);
+    device_console.dispatch(Operation::Clear);
+    assert_eq!(
+        device_console.dispatch(Operation::Devices(0)),
+        Action::Submitted {
+            operation: "devices",
+            text: Text::new("page=1").unwrap(),
+        }
+    );
+    assert_eq!(device_console.history().len(), 11);
+    assert!(
+        device_console.history()[0]
+            .text
+            .as_str()
+            .contains("page 1/2")
+    );
+    assert_eq!(
+        device_console.history()[1].text.as_str(),
+        "Retained: 5  Matched: 2  Unsupported: 3  Omitted: 3"
+    );
+    assert!(
+        device_console
+            .history()
+            .iter()
+            .any(|line| { line.text.as_str() == "  Candidate: virtio-blk-legacy (exact match)" })
+    );
+    assert!(
+        device_console
+            .history()
+            .iter()
+            .any(|line| { line.text.as_str() == "  Candidate: ahci-sata (class match)" })
+    );
+    assert!(
+        device_console
+            .history()
+            .iter()
+            .any(|line| { line.text.as_str().contains("id=1af4:1042") })
+    );
+    assert_eq!(
+        device_console
+            .history()
+            .iter()
+            .filter(|line| { line.text.as_str() == "  Unsupported: no native driver candidate." })
+            .count(),
+        2
+    );
+    device_console.dispatch(Operation::Clear);
+    device_console.dispatch(Operation::Devices(1));
+    assert_eq!(device_console.history().len(), 5);
+    assert!(
+        device_console.history()[0]
+            .text
+            .as_str()
+            .contains("page 2/2")
+    );
+    assert!(
+        device_console.history()[2]
+            .text
+            .as_str()
+            .contains("id=abcd:9876")
+    );
+    assert_eq!(
+        device_console.history()[3].text.as_str(),
+        "  Unsupported: no native driver candidate."
+    );
+    for page in [2, u8::MAX] {
+        device_console.dispatch(Operation::Devices(page));
+        assert_eq!(
+            device_console.history().last().unwrap().text.as_str(),
+            "Device page out of range. Use devices 1 through devices 2."
+        );
+    }
+    let mut empty = drivers::test_inventory();
+    empty.devices.fill(None);
+    empty.retained = 0;
+    empty.omitted = 0;
+    let mut empty_console = Console::with_devices(&empty);
+    empty_console.dispatch(Operation::Devices(0));
+    assert!(
+        empty_console
+            .history()
+            .iter()
+            .any(|line| { line.text.as_str() == "No retained PCI devices." })
+    );
     console.dispatch(Operation::Help);
     console.dispatch(Operation::Status);
     assert!(
