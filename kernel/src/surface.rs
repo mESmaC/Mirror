@@ -66,7 +66,7 @@ impl<'borrow, 'fb> Session<'borrow, 'fb> {
         let (width, height) = self.region.dimensions();
         let fields = [1, width as u32, height as u32, 1, MAX_TILE as u32, 0];
         let mut bytes = [0u8; INFO_SIZE];
-        for (destination, field) in bytes.chunks_exact_mut(4).zip(fields) {
+        for (destination, field) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(fields) {
             destination.copy_from_slice(&field.to_le_bytes());
         }
         bytes
@@ -145,8 +145,8 @@ pub fn self_test() {
             let mut desktop = Session::desktop(&mut driver).unwrap();
             let info = desktop.info();
             let fields = [1, owned_width as u32, owned_height as u32, 1, 16, 0];
-            for (actual, expected) in info.chunks_exact(4).zip(fields) {
-                assert_eq!(actual, expected.to_le_bytes());
+            for (actual, expected) in info.as_chunks::<4>().0.iter().zip(fields) {
+                assert_eq!(*actual, expected.to_le_bytes());
             }
             let mut packet = [0u8; 20];
             packet[8..12].copy_from_slice(&1u32.to_le_bytes());

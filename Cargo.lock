@@ -24,12 +24,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b23ac50abb8261cb38c6e2a7192d3302e0836dac1628f6a93b82b4fad185897"
 
 [[package]]
+name = "mirror-acpi"
+version = "0.1.0"
+
+[[package]]
+name = "mirror-agent"
+version = "0.1.0"
+dependencies = [
+ "mirror-desktop-protocol",
+]
+
+[[package]]
+name = "mirror-app"
+version = "0.1.0"
+dependencies = [
+ "mirror-window-protocol",
+]
+
+[[package]]
 name = "mirror-desktop"
+version = "0.1.0"
+dependencies = [
+ "mirror-desktop-protocol",
+ "mirror-window-protocol",
+]
+
+[[package]]
+name = "mirror-desktop-protocol"
 version = "0.1.0"
 
 [[package]]
 name = "mirror-init"
 version = "0.1.0"
+dependencies = [
+ "mirror-sync",
+ "mirror-thread-protocol",
+ "mirror-vm-protocol",
+]
 
 [[package]]
 name = "mirror-kernel"
@@ -37,4 +68,27 @@ version = "0.1.0"
 dependencies = [
  "limine",
  "linked_list_allocator",
+ "mirror-acpi",
+ "mirror-thread-protocol",
+ "mirror-vm-protocol",
+ "mirror-window-protocol",
 ]
+
+[[package]]
+name = "mirror-sync"
+version = "0.1.0"
+dependencies = [
+ "mirror-thread-protocol",
+]
+
+[[package]]
+name = "mirror-thread-protocol"
+version = "0.1.0"
+
+[[package]]
+name = "mirror-vm-protocol"
+version = "0.1.0"
+
+[[package]]
+name = "mirror-window-protocol"
+version = "0.1.0"

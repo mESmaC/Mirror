@@ -97,7 +97,7 @@ fn encode(event: ps2::InputEvent) -> [u8; EVENT_SIZE] {
         ps2::InputEvent::Lost => words[1] = KIND_LOST,
     }
     let mut record = [0u8; EVENT_SIZE];
-    for (destination, word) in record.chunks_exact_mut(4).zip(words) {
+    for (destination, word) in record.as_chunks_mut::<4>().0.iter_mut().zip(words) {
         destination.copy_from_slice(&word.to_le_bytes());
     }
     record
@@ -108,8 +108,8 @@ pub fn self_test() {
     use crate::keyboard::{KeyEvent, Modifiers};
     fn words(record: [u8; EVENT_SIZE]) -> [u32; 8] {
         let mut result = [0; 8];
-        for (word, bytes) in result.iter_mut().zip(record.chunks_exact(4)) {
-            *word = u32::from_le_bytes(bytes.try_into().unwrap());
+        for (word, bytes) in result.iter_mut().zip(record.as_chunks::<4>().0) {
+            *word = u32::from_le_bytes(*bytes);
         }
         result
     }

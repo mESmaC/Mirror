@@ -2,7 +2,8 @@
 //!
 //! This is deliberately a narrow ABI: little-endian x86-64 ET_EXEC images with
 //! page-aligned, readable, non-overlapping PT_LOAD segments. Section headers are
-//! not used to load a program. No interpreter, dynamic linker, or TLS is present.
+//! not used to load a program. No interpreter, dynamic linker, or ELF TLS
+//! template initialization is supported here.
 //! Layout definitions: https://refspecs.linuxfoundation.org/elf/gabi4+/ch4.eheader.html
 //! and https://refspecs.linuxfoundation.org/elf/gabi4+/ch5.pheader.html.
 
@@ -141,7 +142,7 @@ pub fn parse(bytes: &[u8]) -> Result<Image, ElfError> {
         count: 0,
     };
     let mut mapped_bytes = 0u64;
-    for header in table.chunks_exact(PROGRAM_HEADER_SIZE) {
+    for header in table.as_chunks::<PROGRAM_HEADER_SIZE>().0 {
         let segment_type = u32_at(header, 0)?;
         match segment_type {
             // PT_DYNAMIC, PT_INTERP, PT_TLS need runtime support we do not have.

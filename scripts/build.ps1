@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [switch]$Release,
-    [switch]$Smoke
+    [switch]$Smoke,
+    [switch]$AgentDemo
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
@@ -19,7 +20,7 @@ try {
         # prebuilt core uses the kernel model; do not merge their LLVM bitcode.
         # The kernel build below retains the workspace's release LTO setting.
         $env:CARGO_PROFILE_RELEASE_LTO = 'false'
-        foreach ($nativePackage in @('init', 'desktop')) {
+        foreach ($nativePackage in @('init', 'desktop', 'agent', 'app')) {
             $nativeLinker = Join-Path $repositoryRoot "userspace/$nativePackage/linker.ld"
             $env:CARGO_ENCODED_RUSTFLAGS = @('-C', 'relocation-model=static', '-C', 'code-model=small', '-C', "link-arg=-T$nativeLinker", '-C', 'link-arg=-zmax-page-size=0x1000') -join [char]31
             $nativeArguments = @('build', '--locked', '-p', "mirror-$nativePackage", '--target', 'x86_64-unknown-none')
@@ -35,6 +36,7 @@ try {
     $cargoArguments = @('build', '--locked', '-p', 'mirror-kernel', '--target', 'x86_64-unknown-none')
     if ($Release) { $cargoArguments += '--release' }
     if ($Smoke) { $cargoArguments += @('--features', 'boot-smoke') }
+    if ($AgentDemo) { $cargoArguments += @('--features', 'agent-demo') }
     & cargo @cargoArguments
     if ($LASTEXITCODE -ne 0) { throw "Kernel build failed with exit code $LASTEXITCODE." }
 
@@ -79,8 +81,10 @@ try {
     Copy-Item -LiteralPath $kernelPath -Destination (Join-Path $espDirectory 'kernel.elf') -Force
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "target/x86_64-unknown-none/$profile/mirror-init") -Destination (Join-Path $espDirectory 'init.elf') -Force
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "target/x86_64-unknown-none/$profile/mirror-desktop") -Destination (Join-Path $espDirectory 'desktop.elf') -Force
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "target/x86_64-unknown-none/$profile/mirror-agent") -Destination (Join-Path $espDirectory 'agent.elf') -Force
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "target/x86_64-unknown-none/$profile/mirror-app") -Destination (Join-Path $espDirectory 'app.elf') -Force
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'boot/limine.conf') -Destination (Join-Path $espDirectory 'limine.conf') -Force
-    Write-Host "Mirror $profile kernel, native init/desktop, and verified Limine $limineVersion staged in $espDirectory"
+    Write-Host "Mirror $profile kernel and native programs staged in $espDirectory (agent-demo=$AgentDemo)"
 }
 finally {
     Pop-Location

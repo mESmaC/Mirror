@@ -1,5 +1,7 @@
 # CPU exception/IRQ entry, x86_64-unknown-none: SysV ABI, no red zone, soft float.
-# Enabling SIMD in kernel Rust requires saving extended processor state here.
+# Same-process IRQ/syscall returns retain the live user x87/SIMD registers.
+# Scheduling saves/restores them in userspace_entry.S. Enabling SIMD in kernel
+# Rust would additionally require saving extended processor state here.
 .section .text.exceptions,"ax",@progbits
 
 .macro MIRROR_EXCEPTION vector, has_error=0
@@ -46,7 +48,8 @@ MIRROR_EXCEPTION 29, 1
 MIRROR_EXCEPTION 30, 1
 MIRROR_EXCEPTION 31
 
-# Remapped legacy PIC IRQ0..15 never push a hardware error code.
+# ISA IRQ0..15 use these vectors through either the I/O APIC or remapped PIC.
+# Neither interrupt controller pushes a hardware error code.
 .irp vector,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47
     MIRROR_EXCEPTION \vector
 .endr
@@ -54,6 +57,10 @@ MIRROR_EXCEPTION 31
 # Native syscall interrupt gate is the only software gate callable at CPL3.
 .global mirror_exception_128
 MIRROR_EXCEPTION 128
+
+# LAPIC spurious interrupts need no EOI and share the full TLS-preserving entry.
+.global mirror_exception_255
+MIRROR_EXCEPTION 255
 
 .type mirror_exception_common, @function
 mirror_exception_common:
@@ -72,6 +79,35 @@ mirror_exception_common:
     push r13
     push r14
     push r15
+    # Selector loads can change the hidden bases even with CR4.FSGSBASE clear.
+    # Capture the actual hardware state, including on CPL0 entries: an NMI or
+    # exception can interrupt the assembly that is restoring a user context.
+    sub rsp, {tls_prefix}
+    xor eax, eax
+    mov ax, fs
+    mov [rsp + {fs_selector}], rax
+    mov ax, gs
+    mov [rsp + {gs_selector}], rax
+    mov ecx, 0xc0000100
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    mov [rsp + {fs_base}], rax
+    inc ecx
+    rdmsr
+    shl rdx, 32
+    or rax, rdx
+    mov [rsp + {gs_base}], rax
+    # Rust never runs with a user's bases or selectors installed. Loading a
+    # null selector alone does not clear the hidden base on every x86 CPU.
+    xor eax, eax
+    mov fs, ax
+    mov gs, ax
+    xor edx, edx
+    mov ecx, 0xc0000100
+    wrmsr
+    inc ecx
+    wrmsr
     # Rust requires DF=0. IRET restores the interrupted RFLAGS, including DF.
     cld
     mov rdi, rsp
@@ -81,6 +117,31 @@ mirror_exception_common:
     and rsp, -16
     call mirror_exception_dispatch
     mov rsp, r12
+    jmp mirror_restore_frame
+.size mirror_exception_common, .-mirror_exception_common
+
+# Both interrupt return and scheduled user entry use this exact epilogue.
+# The supervisor-owned frame was validated by Rust for a CPL3 destination;
+# kernel entries preserve their captured state, including in-flight restores.
+.global mirror_restore_frame
+.type mirror_restore_frame, @function
+mirror_restore_frame:
+    # Reload selectors before bases: MOV to FS/GS may overwrite the base.
+    mov rax, [rsp + {fs_selector}]
+    mov fs, ax
+    mov rax, [rsp + {gs_selector}]
+    mov gs, ax
+    mov ecx, 0xc0000100
+    mov rax, [rsp + {fs_base}]
+    mov rdx, rax
+    shr rdx, 32
+    wrmsr
+    inc ecx
+    mov rax, [rsp + {gs_base}]
+    mov rdx, rax
+    shr rdx, 32
+    wrmsr
+    add rsp, {tls_prefix}
     pop r15
     pop r14
     pop r13
@@ -99,7 +160,7 @@ mirror_exception_common:
     # Remove vector plus hardware/synthetic error code, then the CPU frame.
     add rsp, 16
     iretq
-.size mirror_exception_common, .-mirror_exception_common
+.size mirror_restore_frame, .-mirror_restore_frame
 
 .section .rodata.exception_entries,"a",@progbits
 .balign 8

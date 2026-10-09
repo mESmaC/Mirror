@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[dependencies]
+mirror-vm-protocol = { path = "../../crates/vm-protocol" }
+mirror-thread-protocol = { path = "../../crates/thread-protocol" }
+mirror-sync = { path = "../../crates/sync" }
+
 [[bin]]
 name = "mirror-init"
 path = "src/main.rs"

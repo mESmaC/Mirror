@@ -2,6 +2,7 @@
 //! upload-time overlay, so moving it cannot damage the retained scene pixels.
 
 use crate::{SYS_SURFACE_PRESENT, font, require, syscall};
+use mirror_window_protocol::{FRAME_BYTES, HEIGHT, MAX_APPS, WIDTH};
 
 pub const MAX_WIDTH: usize = 1280;
 pub const MAX_HEIGHT: usize = 800;
@@ -46,6 +47,9 @@ const PALETTE: [[u8; 4]; 15] = [
 ];
 
 static mut PIXELS: [u8; MAX_PIXELS] = [0; MAX_PIXELS];
+// Two application snapshots plus the indexed scene stay below the 2 MiB ELF
+// mapping limit. Neither full-size RGBX scanout nor a stack framebuffer exists.
+static mut TEXTURES: [[u8; FRAME_BYTES]; MAX_APPS] = [[0; FRAME_BYTES]; MAX_APPS];
 static mut CLAIMED: bool = false;
 
 #[derive(Clone, Copy)]
@@ -73,12 +77,23 @@ impl Rect {
 
 pub struct Renderer {
     pixels: &'static mut [u8; MAX_PIXELS],
+    textures: &'static mut [[u8; FRAME_BYTES]; MAX_APPS],
     width: usize,
     height: usize,
     columns: usize,
     dirty: [u64; DIRTY_WORDS],
     cursor_x: usize,
     cursor_y: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct WindowView {
+    pub slot: usize,
+    /// Decoration and its offset shadow each occlude lower content.
+    pub outer: Rect,
+    pub shadow: Rect,
+    pub content: Rect,
+    pub ready: bool,
 }
 
 impl Renderer {
@@ -91,14 +106,16 @@ impl Renderer {
         );
         // SAFETY: The sole userspace thread is the only caller. CLAIMED guards
         // against a second mutable reference; no signal/interrupt code runs here.
-        let pixels = unsafe {
+        let (pixels, textures) = unsafe {
             require(!(&raw const CLAIMED).read(), 81);
             (&raw mut CLAIMED).write(true);
             let pointer = &raw mut PIXELS;
-            &mut *pointer
+            let textures = &raw mut TEXTURES;
+            (&mut *pointer, &mut *textures)
         };
         Self {
             pixels,
+            textures,
             width,
             height,
             columns: width.div_ceil(EDGE),
@@ -119,6 +136,34 @@ impl Renderer {
                 let index = row * self.columns + column;
                 self.dirty[index / 64] |= 1 << (index % 64);
             }
+        }
+    }
+
+    pub fn damage(&mut self, rect: Rect) {
+        self.mark(rect);
+    }
+
+    /// Rebuild inexpensive palette decoration without uploading the whole
+    /// screen. Existing cursor/texture damage survives the retained redraw.
+    pub fn update_scene(&mut self, draw: impl FnOnce(&mut Self)) {
+        let pending = self.dirty;
+        draw(self);
+        self.dirty = pending;
+    }
+
+    pub fn texture_tile(&mut self, slot: usize, rect: Rect, bytes: &[u8]) {
+        require(
+            slot < MAX_APPS
+                && rect.x + rect.width <= WIDTH
+                && rect.y + rect.height <= HEIGHT
+                && bytes.len() == rect.width * rect.height * 4,
+            86,
+        );
+        for row in 0..rect.height {
+            let destination = ((rect.y + row) * WIDTH + rect.x) * 4;
+            let source = row * rect.width * 4;
+            self.textures[slot][destination..destination + rect.width * 4]
+                .copy_from_slice(&bytes[source..source + rect.width * 4]);
         }
     }
 
@@ -191,6 +236,12 @@ impl Renderer {
     }
 
     pub fn flush(&mut self, surface: u64) -> bool {
+        self.flush_windows(surface, &[])
+    }
+
+    /// Views are ordered back to front. Every outer rectangle first restores
+    /// the palette decoration at that pixel, hiding lower app textures.
+    pub fn flush_windows(&mut self, surface: u64, windows: &[WindowView]) -> bool {
         let mut packet = [0u8; 16 + EDGE * EDGE * 4];
         let mut changed = false;
         for word in 0..DIRTY_WORDS {
@@ -209,14 +260,30 @@ impl Renderer {
                     for column in 0..width {
                         let px = x + column;
                         let py = y + row;
-                        let base = self.pixels[py * self.width + px];
-                        let color = if px >= self.cursor_x && py >= self.cursor_y {
-                            cursor_pixel(px - self.cursor_x, py - self.cursor_y).unwrap_or(base)
-                        } else {
-                            base
-                        };
+                        let base = PALETTE[usize::from(self.pixels[py * self.width + px])];
+                        let mut color = base;
+                        for window in windows {
+                            if window.outer.contains(px, py) || window.shadow.contains(px, py) {
+                                color = base;
+                                if window.ready && window.content.contains(px, py) {
+                                    let source = ((py - window.content.y) * WIDTH + px
+                                        - window.content.x)
+                                        * 4;
+                                    color.copy_from_slice(
+                                        &self.textures[window.slot][source..source + 4],
+                                    );
+                                }
+                            }
+                        }
+                        if px >= self.cursor_x
+                            && py >= self.cursor_y
+                            && let Some(cursor) =
+                                cursor_pixel(px - self.cursor_x, py - self.cursor_y)
+                        {
+                            color = PALETTE[usize::from(cursor)];
+                        }
                         let offset = 16 + (row * width + column) * 4;
-                        packet[offset..offset + 4].copy_from_slice(&PALETTE[usize::from(color)]);
+                        packet[offset..offset + 4].copy_from_slice(&color);
                     }
                 }
                 let length = 16 + width * height * 4;

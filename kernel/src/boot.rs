@@ -5,7 +5,7 @@ use limine::{
     BaseRevision,
     request::{
         FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest, RequestsEndMarker,
-        RequestsStartMarker, StackSizeRequest,
+        RequestsStartMarker, RsdpRequest, StackSizeRequest,
     },
     response::MemoryMapResponse,
 };
@@ -28,13 +28,16 @@ static HHDM: HhdmRequest = HhdmRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests")]
+static RSDP: RsdpRequest = RsdpRequest::new();
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
 static MODULES: ModuleRequest = ModuleRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static FRAMEBUFFER: FramebufferRequest = FramebufferRequest::new();
 
-#[cfg(feature = "boot-smoke")]
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static CMDLINE: limine::request::ExecutableCmdlineRequest =
@@ -51,8 +54,12 @@ static END: RequestsEndMarker = RequestsEndMarker::new();
 pub struct BootInfo {
     pub memory_map: &'static MemoryMapResponse,
     pub direct_map_offset: u64,
+    /// Limine base revision 3 returns a physical address, not an HHDM pointer.
+    pub rsdp_physical: Option<u64>,
     pub init: &'static [u8],
     pub desktop: &'static [u8],
+    pub agent: &'static [u8],
+    pub app: &'static [u8],
     pub framebuffer: Option<limine::framebuffer::Framebuffer<'static>>,
 }
 
@@ -62,13 +69,17 @@ pub fn info() -> BootInfo {
         .get_response()
         .expect("missing native modules")
         .modules();
-    assert_eq!(modules.len(), 2, "expected two native boot modules");
+    assert_eq!(modules.len(), 4, "expected four native boot modules");
     let mut init = None;
     let mut desktop = None;
+    let mut agent = None;
+    let mut app = None;
     for module in modules {
         let slot = match module.string().to_bytes() {
             b"mirror-init" => &mut init,
             b"mirror-desktop" => &mut desktop,
+            b"mirror-agent" => &mut agent,
+            b"mirror-app" => &mut app,
             _ => panic!("unexpected native boot module"),
         };
         assert!(slot.is_none(), "duplicate native boot module");
@@ -89,12 +100,33 @@ pub fn info() -> BootInfo {
     BootInfo {
         memory_map: MEMORY_MAP.get_response().expect("missing memory map"),
         direct_map_offset: HHDM.get_response().expect("missing direct map").offset(),
+        rsdp_physical: RSDP
+            .get_response()
+            .map(|response| response.address() as u64),
         init: init.expect("missing native init"),
         desktop: desktop.expect("missing native desktop"),
+        agent: agent.expect("missing native agent"),
+        app: app.expect("missing native application"),
         framebuffer: FRAMEBUFFER
             .get_response()
             .and_then(|response| response.framebuffers().next()),
     }
+}
+
+/// A normal boot policy as well as a regression path: keep firmware's APIC
+/// available during UEFI startup, then select Mirror's legacy PIC backend.
+pub fn legacy_pic() -> bool {
+    command_line()
+        .split(|byte| byte.is_ascii_whitespace())
+        .any(|token| token == b"mirror.irq=pic")
+}
+
+fn command_line() -> &'static [u8] {
+    CMDLINE
+        .get_response()
+        .expect("missing kernel command line")
+        .cmdline()
+        .to_bytes()
 }
 
 #[cfg(feature = "boot-smoke")]
@@ -108,11 +140,13 @@ pub enum SmokeMode {
 
 #[cfg(feature = "boot-smoke")]
 pub fn smoke_mode() -> SmokeMode {
-    let cmdline = CMDLINE
-        .get_response()
-        .expect("missing test command line")
-        .cmdline();
-    match cmdline.to_bytes() {
+    // Interrupt policy composes with exactly one optional smoke scenario.
+    // Ignore only the recognized policy token; other unknown arguments and
+    // multiple fault selectors must retain the strict smoke-test rejection.
+    let mut tokens = command_line()
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|token| !token.is_empty() && *token != b"mirror.irq=pic");
+    let mode = match tokens.next().unwrap_or(b"") {
         b"" => SmokeMode::Normal,
         b"mirror.test=page-fault" => SmokeMode::PageFault,
         b"mirror.test=invalid-opcode" => SmokeMode::InvalidOpcode,
@@ -125,7 +159,20 @@ pub fn smoke_mode() -> SmokeMode {
         b"mirror.test=user-budget" => SmokeMode::User(7),
         b"mirror.test=ipc-peer-exit" => SmokeMode::User(8),
         b"mirror.test=ipc-timeout" => SmokeMode::User(9),
+        b"mirror.test=vm-read-only" => SmokeMode::User(10),
+        b"mirror.test=vm-nx" => SmokeMode::User(11),
+        b"mirror.test=vm-released" => SmokeMode::User(12),
+        b"mirror.test=vm-guard" => SmokeMode::User(13),
+        b"mirror.test=user-x87" => SmokeMode::User(14),
+        b"mirror.test=user-simd" => SmokeMode::User(15),
+        b"mirror.test=user-avx" => SmokeMode::User(16),
+        b"mirror.test=user-fsgsbase" => SmokeMode::User(17),
+        b"mirror.test=thread-last-exit" => SmokeMode::User(18),
+        b"mirror.test=thread-process-exit" => SmokeMode::User(19),
+        b"mirror.test=thread-fault" => SmokeMode::User(20),
         b"mirror.test=block-io-error" => SmokeMode::BlockIoError,
         _ => panic!("unknown smoke-test command line"),
-    }
+    };
+    assert!(tokens.next().is_none(), "multiple smoke-test arguments");
+    mode
 }

@@ -23,6 +23,10 @@ pub(crate) enum Object {
     Surface,
     /// The desktop alone receives the borrowed, ordered input stream.
     Input,
+    Supervisor,
+    Application(u64),
+    AppSurface(u64),
+    AppInput(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,9 +63,13 @@ impl HandleTable {
 
     pub(crate) fn insert(&mut self, object: Object, rights: u64) -> Result<u64, CapError> {
         let permitted = match object {
-            Object::Console | Object::Surface => WRITE,
+            Object::Console
+            | Object::Surface
+            | Object::Supervisor
+            | Object::Application(_)
+            | Object::AppSurface(_) => WRITE,
             Object::Channel(_) => SEND | RECEIVE,
-            Object::Input => RECEIVE,
+            Object::Input | Object::AppInput(_) => RECEIVE,
         };
         if rights & !permitted != 0 {
             return Err(CapError::InvalidRights);
@@ -135,11 +143,23 @@ impl HandleTable {
         self.entries.iter().all(Option::is_none)
     }
 
+    /// Revoke every duplicate when a supervisor closes a particular instance.
+    /// Application controls own no channel references; PIDs are never reused.
+    pub(crate) fn revoke_application(&mut self, pid: u64) {
+        for entry in &mut self.entries {
+            if entry.is_some_and(|entry| entry.capability.object == Object::Application(pid)) {
+                *entry = None;
+            }
+        }
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.entries.iter().flatten().count()
     }
 }
 
+// Keep Rust 1.88 support: the replacement try_update API is newer than our MSRV.
+#[allow(deprecated)]
 fn allocate_token(next: &AtomicU64) -> Result<u64, CapError> {
     // Relaxed ordering supplies uniqueness without implying publication of a
     // table entry. Table access itself requires the caller's synchronization.

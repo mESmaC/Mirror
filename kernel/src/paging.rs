@@ -21,6 +21,8 @@ use crate::memory::{FrameAllocator, PAGE_SIZE};
 const PRESENT: u64 = 1;
 const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
+const WRITE_THROUGH: u64 = 1 << 3;
+const CACHE_DISABLE: u64 = 1 << 4;
 const HUGE: u64 = 1 << 7;
 const NO_EXECUTE: u64 = 1 << 63;
 const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
@@ -59,6 +61,7 @@ pub enum PagingError {
     StillActive,
     RecyclingRequired,
     FrameReleaseFailed,
+    UnsupportedCacheLayout,
 }
 
 pub struct PageTables {
@@ -134,6 +137,70 @@ impl PageTables {
         physical: u64,
         frames: &mut FrameAllocator<'_>,
     ) -> Result<(), PagingError> {
+        // SAFETY: The caller owns this RAM page and its aliases.
+        unsafe { self.map_kernel_page(address, physical, WRITABLE, frames) }
+    }
+
+    /// Temporarily map reserved firmware RAM read-only, supervisor-only and NX.
+    ///
+    /// # Safety
+    /// The caller verifies the whole physical page belongs to firmware RAM,
+    /// with no incompatible cache aliases, and excludes mutation/interrupts on
+    /// the BSP. This root is active and the allocator is exclusively owned.
+    pub unsafe fn map_firmware_page(
+        &mut self,
+        address: u64,
+        physical: u64,
+        frames: &mut FrameAllocator<'_>,
+    ) -> Result<(), PagingError> {
+        // SAFETY: The caller supplies reserved RAM; no writable alias is added.
+        unsafe { self.map_kernel_page(address, physical, 0, frames) }
+    }
+
+    /// Map one device page supervisor-only, writable, NX and strongly uncached.
+    /// Uses Limine's PAT3=UC (PCD|PWT), without changing global cache policy.
+    ///
+    /// # Safety
+    /// As for map_page, but physical is an exclusively owned MMIO page, never
+    /// allocator RAM. The caller must exclude every conflicting cached alias.
+    /// Create shared kernel mappings before creating private userspace roots.
+    pub unsafe fn map_device_page(
+        &mut self,
+        address: u64,
+        physical: u64,
+        frames: &mut FrameAllocator<'_>,
+    ) -> Result<(), PagingError> {
+        if cpuid(1).edx & (1 << 16) == 0 {
+            return Err(PagingError::UnsupportedCacheLayout);
+        }
+        let low: u32;
+        // SAFETY: CPUID reports PAT. At CPL0 IA32_PAT is readable and Limine
+        // initialized it. Verify entry 3 rather than assuming a reset value.
+        unsafe {
+            asm!("rdmsr", in("ecx") 0x277_u32, out("eax") low,
+                out("edx") _, options(nomem, nostack, preserves_flags));
+        }
+        if low >> 24 != 0 {
+            return Err(PagingError::UnsupportedCacheLayout);
+        }
+        // SAFETY: Ownership and alias constraints are inherited from the caller.
+        unsafe {
+            self.map_kernel_page(
+                address,
+                physical,
+                WRITABLE | WRITE_THROUGH | CACHE_DISABLE,
+                frames,
+            )
+        }
+    }
+
+    unsafe fn map_kernel_page(
+        &mut self,
+        address: u64,
+        physical: u64,
+        attributes: u64,
+        frames: &mut FrameAllocator<'_>,
+    ) -> Result<(), PagingError> {
         check_page_address(address)?;
         self.check_physical(physical)?;
         self.check_active()?;
@@ -174,7 +241,7 @@ impl PageTables {
         }
         // SAFETY: The caller owns the mapped memory and has excluded other
         // software writers. NXE is enabled before PageTables is returned.
-        unsafe { slot.write_volatile(physical | PRESENT | WRITABLE | NO_EXECUTE) };
+        unsafe { slot.write_volatile(physical | PRESENT | attributes | NO_EXECUTE) };
         invalidate_page(address);
         Ok(())
     }
@@ -327,6 +394,13 @@ pub struct UserAddressSpace<'kernel> {
     owned_pages: usize,
 }
 
+struct OwnedPath {
+    frames: [u64; 4],
+    entries: [u64; 4],
+    slots: [*mut u64; 4],
+    depth: usize,
+}
+
 impl<'kernel> UserAddressSpace<'kernel> {
     /// Allocate an empty lower half and borrow the kernel's upper hierarchy.
     /// The upper PML4 entries always have U/S clear, irrespective of permissions
@@ -447,6 +521,216 @@ impl<'kernel> UserAddressSpace<'kernel> {
         unsafe { slot.write_volatile(physical | flags) };
         self.owned_pages += 1;
         Ok(())
+    }
+
+    /// Find the first owned present lower-half leaf in an aligned half-open
+    /// range, including inaccessible leaves retained by protect_page(None).
+    /// Missing entries skip their entire subtree; a sparse reservation does
+    /// not require visiting every absent 4 KiB page. No mapping is modified.
+    pub fn next_owned_page(&self, start: u64, end: u64) -> Result<Option<u64>, PagingError> {
+        check_user_address(start)?;
+        check_page_address(start)?;
+        if end > USER_END {
+            return Err(PagingError::InvalidUserAddress);
+        }
+        if end & (PAGE_SIZE - 1) != 0 {
+            return Err(PagingError::UnalignedAddress);
+        }
+        if end < start {
+            return Err(PagingError::AddressRangeOverflow);
+        }
+        self.check_live()?;
+        let mut address = start;
+        while address < end {
+            let mut physical = self.root;
+            for level in (1..=4).rev() {
+                let table = self.kernel.table_pointer(physical)?;
+                // SAFETY: The live owned hierarchy provides a full initialized
+                // table, and each index is within its 512 aligned entries.
+                let entry = unsafe { table.add(index(address, level)).read_volatile() };
+                if entry & PRESENT == 0 {
+                    let span = 1_u64 << (12 + 9 * (level - 1));
+                    // Lower-half addresses and level<=4 keep this boundary
+                    // within USER_END, including the final PML4 subtree.
+                    address = ((address & !(span - 1)) + span).min(end);
+                    break;
+                }
+                if level == 1 {
+                    // A supervisor-only leaf is still owned physical memory.
+                    self.kernel
+                        .table_pointer(entry & self.kernel.physical_mask)?;
+                    return Ok(Some(address));
+                }
+                if entry & HUGE != 0 {
+                    return Err(PagingError::InvalidTable);
+                }
+                if entry & USER == 0 {
+                    return Err(PagingError::UserAccessDenied);
+                }
+                physical = entry & self.kernel.physical_mask;
+            }
+        }
+        Ok(None)
+    }
+
+    /// Remove an owned leaf and reclaim each empty lower table on its path.
+    /// A missing page returns false and prunes any empty tables left by a
+    /// failed map_page. The user root and borrowed upper mappings are never
+    /// freed. Supervisor-only leaves
+    /// installed by protect_page(None) remain owned and can be removed here.
+    /// Failed releases restore that entry; earlier successful releases remain
+    /// reflected in the tree and ownership counts, so teardown can be retried.
+    ///
+    /// # Safety
+    /// Run on the sole CPU with interrupts disabled and this root inactive,
+    /// using the original unique allocator. Restore the kernel root before
+    /// calling to flush stale user translations. No live reference or DMA may
+    /// access this page or any table that becomes empty after its removal.
+    pub unsafe fn unmap_page(
+        &mut self,
+        address: u64,
+        frames: &mut FrameAllocator<'_>,
+    ) -> Result<bool, PagingError> {
+        check_user_address(address)?;
+        check_page_address(address)?;
+        self.check_inactive()?;
+        let path = self.owned_path(address)?;
+        let present = path.depth == 4 && path.entries[3] & PRESENT != 0;
+
+        // Validate the complete path and determine which lower tables become
+        // empty before withdrawing anything. Each table's child on this path
+        // is ignored because that child is about to be removed.
+        let mut first_reclaimed_table = path.depth;
+        for depth in (1..path.depth).rev() {
+            let table = self.kernel.table_pointer(path.frames[depth])?;
+            let removed_index = index(address, 4 - depth as u32);
+            let has_neighbor = (0..ENTRIES).any(|entry_index| {
+                // SAFETY: This is a full, initialized, exclusively owned table.
+                entry_index != removed_index
+                    && unsafe { table.add(entry_index).read_volatile() } & PRESENT != 0
+            });
+            if has_neighbor {
+                break;
+            }
+            first_reclaimed_table = depth;
+        }
+
+        if present {
+            // SAFETY: The entire inactive path is validated. Withdraw its owned
+            // leaf before releasing the frame; no stale translation remains live.
+            unsafe { path.slots[3].write_volatile(0) };
+            // SAFETY: This exclusively owned leaf has no remaining active alias.
+            if unsafe { frames.deallocate(path.entries[3] & self.kernel.physical_mask) }.is_err() {
+                // SAFETY: A rejected free retains the allocation and ownership.
+                unsafe { path.slots[3].write_volatile(path.entries[3]) };
+                return Err(PagingError::FrameReleaseFailed);
+            }
+            self.owned_pages -= 1;
+        }
+        for depth in (first_reclaimed_table..path.depth).rev() {
+            // SAFETY: This child table is empty after successful descendant
+            // removal, and the parent remains live until its own later turn.
+            unsafe { path.slots[depth - 1].write_volatile(0) };
+            // SAFETY: The table is inactive, empty and no longer reachable.
+            if unsafe { frames.deallocate(path.frames[depth]) }.is_err() {
+                // SAFETY: Preserve ownership of the still-allocated table.
+                unsafe { path.slots[depth - 1].write_volatile(path.entries[depth - 1]) };
+                return Err(PagingError::FrameReleaseFailed);
+            }
+            self.owned_tables -= 1;
+        }
+        Ok(present)
+    }
+
+    /// Change permissions without replacing or clearing an owned data frame.
+    /// None keeps an owned present supervisor-only, non-executable leaf, so
+    /// restoring user access preserves its contents. Physical address, access
+    /// and dirty bits, and unrelated leaf attributes survive every transition.
+    ///
+    /// # Safety
+    /// Run on the sole CPU with interrupts disabled and this root inactive.
+    /// Restore the kernel root before calling to flush stale user permissions.
+    /// No live reference or DMA may depend on the old access permissions.
+    pub unsafe fn protect_page(
+        &mut self,
+        address: u64,
+        permissions: Option<UserPermissions>,
+    ) -> Result<(), PagingError> {
+        check_user_address(address)?;
+        check_page_address(address)?;
+        self.check_inactive()?;
+        if permissions.is_some_and(|permissions| permissions.writable && permissions.executable) {
+            return Err(PagingError::InvalidUserPermissions);
+        }
+        let path = self.owned_path(address)?;
+        if path.depth != 4 || path.entries[3] & PRESENT == 0 {
+            return Err(PagingError::NotMapped);
+        }
+        if let Some(permissions) = permissions {
+            for &entry in &path.entries[..3] {
+                if (permissions.writable && entry & WRITABLE == 0)
+                    || (permissions.executable && entry & NO_EXECUTE != 0)
+                {
+                    return Err(PagingError::InvalidUserPermissions);
+                }
+            }
+        }
+        let mut entry = path.entries[3] & !(USER | WRITABLE | NO_EXECUTE);
+        match permissions {
+            Some(permissions) => {
+                entry |= USER;
+                if permissions.writable {
+                    entry |= WRITABLE;
+                }
+                if !permissions.executable {
+                    entry |= NO_EXECUTE;
+                }
+            }
+            None => entry |= NO_EXECUTE,
+        }
+        // SAFETY: The full path belongs to the inactive root; only the desired
+        // leaf permission bits change. Activation will flush prior permissions.
+        unsafe { path.slots[3].write_volatile(entry) };
+        Ok(())
+    }
+
+    /// Walk an owned lower-half path without requiring user access on its leaf.
+    /// Parents always retain USER, including above inaccessible owned pages.
+    fn owned_path(&self, address: u64) -> Result<OwnedPath, PagingError> {
+        let mut path = OwnedPath {
+            frames: [0; 4],
+            entries: [0; 4],
+            slots: [core::ptr::null_mut(); 4],
+            depth: 0,
+        };
+        let mut physical = self.root;
+        for depth in 0..4 {
+            let level = 4 - depth as u32;
+            let table = self.kernel.table_pointer(physical)?;
+            // SAFETY: The live owned table has exactly ENTRIES entries.
+            let slot = unsafe { table.add(index(address, level)) };
+            // SAFETY: The slot is initialized and no concurrent writer exists.
+            let entry = unsafe { slot.read_volatile() };
+            path.frames[depth] = physical;
+            path.entries[depth] = entry;
+            path.slots[depth] = slot;
+            path.depth = depth + 1;
+            if entry & PRESENT == 0 {
+                return Ok(path);
+            }
+            if level > 1 {
+                if entry & HUGE != 0 {
+                    return Err(PagingError::InvalidTable);
+                }
+                if entry & USER == 0 {
+                    return Err(PagingError::UserAccessDenied);
+                }
+            }
+            physical = entry & self.kernel.physical_mask;
+        }
+        // Preflight the leaf's HHDM representation too, before any mutation.
+        self.kernel.table_pointer(physical)?;
+        Ok(path)
     }
 
     /// Resolve a user byte and calculate permissions across every table level.
@@ -957,7 +1241,322 @@ pub unsafe fn self_test(tables: &mut PageTables, frames: &mut FrameAllocator<'_>
     unsafe { frames.deallocate(physical) }.expect("recycle unmapped scratch frame");
     crate::serial::println!("MIRROR_PAGING_OK");
     // SAFETY: The same sole-CPU, disabled-IRQ and HHDM contracts remain valid.
-    unsafe { self_test_userspace(tables, frames) };
+    unsafe {
+        self_test_userspace(tables, frames);
+        self_test_user_mutation(tables, frames);
+    }
+}
+
+#[cfg(feature = "boot-smoke")]
+unsafe fn self_test_user_mutation(kernel: &PageTables, frames: &mut FrameAllocator<'_>) {
+    const DATA: u64 = 0x5000_0000;
+    const NEIGHBOR: u64 = DATA + PAGE_SIZE;
+    const OTHER_TABLE: u64 = DATA + (1 << 21);
+    const ACCESSED_DIRTY: u64 = (1 << 5) | (1 << 6);
+    let before = frames.stats().expect("mutation test frame tracking");
+    // SAFETY: The kernel root is active on the sole CPU with IF clear. The
+    // unique allocator and shared supervisor mappings outlive this test root.
+    let mut user = unsafe { UserAddressSpace::new(kernel, frames) }.unwrap();
+    for (address, value) in [(DATA, 0x6a), (NEIGHBOR, 0x7b), (OTHER_TABLE, 0x8c)] {
+        let physical = frames.allocate().expect("mutation test data page");
+        let pointer = kernel.table_pointer(physical).unwrap().cast::<u8>();
+        // SAFETY: Initialize this exclusively owned full frame before handing
+        // it to an inactive user. No live aliases survive the raw writes.
+        unsafe {
+            pointer.write_bytes(value, PAGE_SIZE as usize);
+            user.map_page(address, physical, UserPermissions::READ_WRITE, frames)
+                .unwrap();
+        }
+    }
+    assert_eq!(user.owned_page_count(), 3);
+    assert_eq!(user.owned_table_count(), 5);
+    let original_translation = user.translate(DATA).unwrap().unwrap();
+    let path = user.owned_path(DATA).unwrap();
+    // SAFETY: Simulate hardware-maintained leaf bits in an inactive owned PTE.
+    unsafe { path.slots[3].write_volatile(path.entries[3] | ACCESSED_DIRTY) };
+    let preserved = (path.entries[3] | ACCESSED_DIRTY) & !(USER | WRITABLE | NO_EXECUTE);
+    for permissions in [
+        Some(UserPermissions::READ_ONLY),
+        None,
+        Some(UserPermissions::READ_EXECUTE),
+        Some(UserPermissions::READ_WRITE),
+    ] {
+        // SAFETY: No userspace execution or DMA can race this inactive root.
+        unsafe { user.protect_page(DATA, permissions) }.unwrap();
+        let leaf = user.owned_path(DATA).unwrap().entries[3];
+        assert_eq!(leaf & !(USER | WRITABLE | NO_EXECUTE), preserved);
+        let mut contents = [0_u8; 16];
+        if let Some(permissions) = permissions {
+            assert_eq!(
+                user.translate(DATA),
+                Ok(Some(UserTranslation {
+                    physical: original_translation.physical,
+                    writable: permissions.writable,
+                    executable: permissions.executable,
+                }))
+            );
+            // SAFETY: Disjoint kernel buffer and inactive initialized user data.
+            unsafe { user.copy_from_user(DATA, &mut contents) }.unwrap();
+            assert_eq!(contents, [0x6a; 16]);
+        } else {
+            assert_eq!(user.translate(DATA), Err(PagingError::UserAccessDenied));
+            assert_eq!(user.next_owned_page(DATA, DATA + PAGE_SIZE), Ok(Some(DATA)));
+            // SAFETY: Full validation must reject the inaccessible page before
+            // touching this separate kernel destination or the owned user data.
+            unsafe {
+                assert_eq!(
+                    user.copy_from_user(DATA, &mut contents),
+                    Err(PagingError::UserAccessDenied)
+                );
+                assert_eq!(
+                    user.copy_to_user(DATA, &[0xff]),
+                    Err(PagingError::UserAccessDenied)
+                );
+            }
+            assert_eq!(contents, [0; 16]);
+            assert_eq!(leaf & (USER | WRITABLE), 0);
+            assert_ne!(leaf & NO_EXECUTE, 0);
+        }
+    }
+    for depth in 0..3 {
+        let parent = path.entries[depth];
+        for (altered, expected) in [
+            (parent & !USER, PagingError::UserAccessDenied),
+            (parent | HUGE, PagingError::InvalidTable),
+        ] {
+            // SAFETY: Temporarily corrupt/restrict one inactive parent to
+            // exercise complete-path validation before either operation writes.
+            unsafe {
+                path.slots[depth].write_volatile(altered);
+                assert_eq!(user.protect_page(DATA, None).unwrap_err(), expected);
+                assert_eq!(user.unmap_page(DATA, frames).unwrap_err(), expected);
+                assert_eq!(
+                    user.next_owned_page(DATA, DATA + PAGE_SIZE).unwrap_err(),
+                    expected
+                );
+                path.slots[depth].write_volatile(parent);
+            }
+            assert_eq!(user.owned_page_count(), 3);
+            assert_eq!(user.owned_table_count(), 5);
+            assert_eq!(user.translate(DATA), Ok(Some(original_translation)));
+        }
+        for (altered, permissions) in [
+            (parent & !WRITABLE, UserPermissions::READ_WRITE),
+            (parent | NO_EXECUTE, UserPermissions::READ_EXECUTE),
+        ] {
+            // SAFETY: This parent and target leaf are inactive and exclusive.
+            unsafe {
+                path.slots[depth].write_volatile(altered);
+                assert_eq!(
+                    user.protect_page(DATA, Some(permissions)),
+                    Err(PagingError::InvalidUserPermissions)
+                );
+                path.slots[depth].write_volatile(parent);
+            }
+            assert_eq!(user.translate(DATA), Ok(Some(original_translation)));
+        }
+    }
+    for address in [0, USER_END, TEST_ADDRESS] {
+        // SAFETY: Invalid user page addresses must be rejected before mutation.
+        unsafe {
+            assert_eq!(
+                user.unmap_page(address, frames),
+                Err(PagingError::InvalidUserAddress)
+            );
+            assert_eq!(
+                user.protect_page(address, None),
+                Err(PagingError::InvalidUserAddress)
+            );
+        }
+    }
+    // SAFETY: Every mutation uses an inactive owned tree except the explicit
+    // active-root rejections; kernel code and stack stay in the shared upper half.
+    unsafe {
+        assert_eq!(
+            user.unmap_page(DATA + 1, frames),
+            Err(PagingError::UnalignedAddress)
+        );
+        assert_eq!(
+            user.protect_page(DATA + 1, None),
+            Err(PagingError::UnalignedAddress)
+        );
+        assert_eq!(
+            user.protect_page(
+                DATA,
+                Some(UserPermissions {
+                    writable: true,
+                    executable: true
+                })
+            ),
+            Err(PagingError::InvalidUserPermissions)
+        );
+        assert_eq!(
+            user.protect_page(DATA + 2 * PAGE_SIZE, None),
+            Err(PagingError::NotMapped)
+        );
+        user.activate().unwrap();
+        assert_eq!(user.unmap_page(DATA, frames), Err(PagingError::StillActive));
+        assert_eq!(user.protect_page(DATA, None), Err(PagingError::StillActive));
+        kernel.activate().unwrap();
+        user.protect_page(DATA, None).unwrap();
+        assert_eq!(user.unmap_page(DATA, frames), Ok(true));
+        assert_eq!(user.unmap_page(DATA, frames), Ok(false));
+    }
+    assert_eq!(user.owned_page_count(), 2);
+    assert_eq!(user.owned_table_count(), 5);
+    let mut neighbor = [0; 16];
+    // SAFETY: Neighbor belongs to a distinct owned frame and survives removal.
+    unsafe { user.copy_from_user(NEIGHBOR, &mut neighbor) }.unwrap();
+    assert_eq!(neighbor, [0x7b; 16]);
+    // SAFETY: These inactive pages have no live aliases or users.
+    unsafe { assert_eq!(user.unmap_page(NEIGHBOR, frames), Ok(true)) };
+    assert_eq!(user.owned_table_count(), 4);
+    assert_eq!(user.owned_page_count(), 1);
+    // SAFETY: The last data leaf and its lower table chain can now be released.
+    unsafe { assert_eq!(user.unmap_page(OTHER_TABLE, frames), Ok(true)) };
+    assert_eq!(user.owned_table_count(), 1);
+    assert_eq!(user.owned_page_count(), 0);
+    assert_eq!(
+        frames.stats().unwrap().allocated_frames,
+        before.allocated_frames + 1
+    );
+
+    // A failed map can leave one, two, or three empty parent tables. Recreate
+    // those owned states and require absent-page unmap to reclaim all of them.
+    for count in 1..=3 {
+        let mut physical = user.root;
+        for level in (2..=4).rev().take(count) {
+            let table = kernel.table_pointer(physical).unwrap();
+            let child = user.allocate_table(frames).unwrap();
+            // SAFETY: A fresh zeroed child becomes reachable from one inactive
+            // owned parent. No leaf or other table uses this absent path.
+            unsafe {
+                table
+                    .add(index(DATA, level))
+                    .write_volatile(child | PRESENT | WRITABLE | USER);
+            }
+            physical = child;
+        }
+        assert_eq!(user.owned_table_count(), count + 1);
+        // SAFETY: All partial-path tables are inactive and exclusively owned.
+        unsafe { assert_eq!(user.unmap_page(DATA, frames), Ok(false)) };
+        assert_eq!(user.owned_table_count(), 1);
+        assert_eq!(
+            frames.stats().unwrap().allocated_frames,
+            before.allocated_frames + 1
+        );
+    }
+    for _ in 0..3 {
+        let physical = frames.allocate().unwrap();
+        let pointer = kernel.table_pointer(physical).unwrap().cast::<u8>();
+        // SAFETY: Frame recycling does not zero memory: the caller must do so
+        // before exposing reused RAM to userspace. The inactive root takes ownership.
+        unsafe {
+            pointer.write_bytes(0, PAGE_SIZE as usize);
+            user.map_page(DATA, physical, UserPermissions::READ_WRITE, frames)
+                .unwrap();
+        }
+        let mut contents = [0xff; PAGE_SIZE as usize];
+        // SAFETY: The separate stack buffer and inactive owned page do not alias.
+        unsafe {
+            user.copy_from_user(DATA, &mut contents).unwrap();
+            assert_eq!(contents, [0; PAGE_SIZE as usize]);
+            user.copy_to_user(DATA, &[0xa5; 32]).unwrap();
+            assert_eq!(user.unmap_page(DATA, frames), Ok(true));
+        }
+        assert_eq!(user.owned_table_count(), 1);
+        assert_eq!(user.owned_page_count(), 0);
+    }
+    // Traverse gaps at PTE, PDE, PDPTE and PML4 levels. In particular the last
+    // leaf is beyond a one-TiB hole, which must not be scanned page by page.
+    let sparse = [
+        DATA,
+        (1 << 34) + (1 << 21) + PAGE_SIZE,
+        (1 << 40) + PAGE_SIZE,
+    ];
+    for &address in &sparse {
+        let physical = frames.allocate().unwrap();
+        let pointer = kernel.table_pointer(physical).unwrap().cast::<u8>();
+        // SAFETY: Fresh initialized frame becomes exclusively owned by this
+        // inactive root, and the temporary HHDM initialization retains no alias.
+        unsafe {
+            pointer.write_bytes(0, PAGE_SIZE as usize);
+            user.map_page(address, physical, UserPermissions::READ_WRITE, frames)
+                .unwrap();
+        }
+    }
+    // SAFETY: Retaining the last leaf as inaccessible tests ownership traversal
+    // independently from user translation while no userspace context is active.
+    unsafe { user.protect_page(sparse[2], None) }.unwrap();
+    assert_eq!(
+        user.next_owned_page(PAGE_SIZE, USER_END),
+        Ok(Some(sparse[0]))
+    );
+    assert_eq!(user.next_owned_page(DATA, DATA), Ok(None));
+    for index in 0..sparse.len() - 1 {
+        assert_eq!(
+            user.next_owned_page(sparse[index] + PAGE_SIZE, sparse[index + 1]),
+            Ok(None)
+        );
+        assert_eq!(
+            user.next_owned_page(sparse[index] + PAGE_SIZE, sparse[index + 1] + PAGE_SIZE),
+            Ok(Some(sparse[index + 1]))
+        );
+    }
+    assert_eq!(
+        user.next_owned_page(sparse[2] + PAGE_SIZE, USER_END),
+        Ok(None)
+    );
+    assert_eq!(
+        user.next_owned_page(0, PAGE_SIZE),
+        Err(PagingError::InvalidUserAddress)
+    );
+    assert_eq!(
+        user.next_owned_page(DATA + 1, USER_END),
+        Err(PagingError::UnalignedAddress)
+    );
+    assert_eq!(
+        user.next_owned_page(DATA, DATA + 1),
+        Err(PagingError::UnalignedAddress)
+    );
+    assert_eq!(
+        user.next_owned_page(DATA, USER_END + PAGE_SIZE),
+        Err(PagingError::InvalidUserAddress)
+    );
+    assert_eq!(
+        user.next_owned_page(DATA, DATA - PAGE_SIZE),
+        Err(PagingError::AddressRangeOverflow)
+    );
+    for address in sparse {
+        // SAFETY: Each returned leaf remains exclusively owned and inactive,
+        // including the last supervisor-only leaf and its now-empty parents.
+        unsafe { assert_eq!(user.unmap_page(address, frames), Ok(true)) };
+    }
+    assert_eq!(user.owned_page_count(), 0);
+    assert_eq!(user.owned_table_count(), 1);
+    // SAFETY: Only the inactive empty root remains owned.
+    unsafe { user.destroy(frames) }.unwrap();
+    assert_eq!(user.owned_table_count(), 0);
+    assert_eq!(
+        user.next_owned_page(DATA, USER_END),
+        Err(PagingError::InvalidTable)
+    );
+    // SAFETY: The destroyed-root checks must return before touching a table.
+    unsafe {
+        assert_eq!(
+            user.unmap_page(DATA, frames),
+            Err(PagingError::InvalidTable)
+        );
+        assert_eq!(
+            user.protect_page(DATA, None),
+            Err(PagingError::InvalidTable)
+        );
+    }
+    assert_eq!(
+        frames.stats().unwrap().allocated_frames,
+        before.allocated_frames
+    );
+    crate::serial::println!("MIRROR_USER_VM_PAGING_OK");
 }
 
 #[cfg(feature = "boot-smoke")]

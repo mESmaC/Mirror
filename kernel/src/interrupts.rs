@@ -1,6 +1,6 @@
-//! BSP exception, legacy PIC IRQ, and synchronous ring-3 entry/return delivery.
+//! BSP exception, APIC/PIC IRQ, and synchronous ring-3 entry/return delivery.
 //!
-//! Descriptor and frame layouts follow Intel SDM vol. 3A, sections 6.14 and 7.7:
+//! Descriptors, TLS bases and frames follow Intel SDM vol. 3A, §§3.4.4, 6.14, 7.7:
 //! https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
 //! Newer error-code exceptions (#CP/#VC/#SX) also follow AMD APM vol. 2, chapter 8:
 //! https://docs.amd.com/v/u/en-US/24593_3.44_APM_Vol2
@@ -13,9 +13,16 @@ use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "boot-smoke")]
 use core::sync::atomic::{AtomicU64, AtomicUsize};
 
-use crate::{arch, serial, timer};
+use crate::{arch, fpu, serial, timer};
 
-global_asm!(include_str!("interrupts.S"));
+global_asm!(
+    include_str!("interrupts.S"),
+    tls_prefix = const offset_of!(TrapFrame, r15),
+    fs_base = const offset_of!(TrapFrame, fs_base),
+    gs_base = const offset_of!(TrapFrame, gs_base),
+    fs_selector = const offset_of!(TrapFrame, fs_selector),
+    gs_selector = const offset_of!(TrapFrame, gs_selector),
+);
 global_asm!(
     include_str!("userspace_entry.S"),
     kernel_data = const DATA_SELECTOR,
@@ -34,6 +41,7 @@ const USER_CODE_SELECTOR: u16 = 0x33;
 const USER_RFLAGS_MASK: u64 = 0x25_0dd5;
 const DOUBLE_FAULT_IST: u8 = 1;
 const DOUBLE_FAULT_STACK_SIZE: usize = 16 * 1024;
+const APIC_SPURIOUS_VECTOR: usize = 255;
 
 #[repr(C, packed)]
 struct DescriptorPointer {
@@ -106,10 +114,15 @@ impl IdtEntry {
 }
 
 // Match interrupts.S exactly. Long mode always saves SS:RSP, including CPL0
-// entries without an IST switch. The common stub saves every integer register.
+// entries without an IST switch. The common stub saves every integer register
+// and both visible selectors and actual hidden TLS bases before clearing them.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct TrapFrame {
+    pub fs_base: u64,
+    pub gs_base: u64,
+    pub fs_selector: u64,
+    pub gs_selector: u64,
     pub r15: u64,
     pub r14: u64,
     pub r13: u64,
@@ -139,11 +152,19 @@ const _: () = assert!(size_of::<TaskStateSegment>() == 104);
 const _: () = assert!(offset_of!(TaskStateSegment, interrupt_stacks) == 36);
 const _: () = assert!(offset_of!(TaskStateSegment, io_map_offset) == 102);
 const _: () = assert!(size_of::<IdtEntry>() == 16);
-const _: () = assert!(size_of::<TrapFrame>() == 22 * 8);
-const _: () = assert!(offset_of!(TrapFrame, vector) == 15 * 8);
-const _: () = assert!(offset_of!(TrapFrame, error) == 16 * 8);
-const _: () = assert!(offset_of!(TrapFrame, rip) == 17 * 8);
-const _: () = assert!(offset_of!(TrapFrame, rsp) == 20 * 8);
+const _: () = assert!(size_of::<TrapFrame>() == 26 * 8);
+const _: () = assert!(offset_of!(TrapFrame, fs_base) == 0);
+const _: () = assert!(offset_of!(TrapFrame, gs_base) == 8);
+const _: () = assert!(offset_of!(TrapFrame, fs_selector) == 16);
+const _: () = assert!(offset_of!(TrapFrame, gs_selector) == 24);
+const _: () = assert!(offset_of!(TrapFrame, r15) == 4 * 8);
+const _: () = assert!(offset_of!(TrapFrame, vector) == 19 * 8);
+const _: () = assert!(offset_of!(TrapFrame, error) == 20 * 8);
+const _: () = assert!(offset_of!(TrapFrame, rip) == 21 * 8);
+const _: () = assert!(offset_of!(TrapFrame, cs) == 22 * 8);
+const _: () = assert!(offset_of!(TrapFrame, rflags) == 23 * 8);
+const _: () = assert!(offset_of!(TrapFrame, rsp) == 24 * 8);
+const _: () = assert!(offset_of!(TrapFrame, ss) == 25 * 8);
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut TSS: TaskStateSegment = TaskStateSegment::EMPTY;
@@ -168,16 +189,85 @@ static BREAKPOINT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static EXPECTED_PAGE_FAULT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "boot-smoke")]
 static PAGE_FAULT_ARMED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "boot-smoke")]
+static APIC_SPURIOUS_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" {
     static mirror_exception_entries: [u64; 48];
     fn mirror_exception_128();
-    fn mirror_resume_user(frame: *const TrapFrame);
+    fn mirror_exception_255();
+    fn mirror_resume_user(frame: *const TrapFrame, extended: *mut fpu::State);
     fn mirror_resume_kernel();
 }
 
 pub(crate) fn is_initialized() -> bool {
     INITIALIZED.load(Ordering::SeqCst)
+}
+
+/// Report the TLS execution contract after fpu::init disabled FSGSBASE. Only
+/// the syscall ABI may install arbitrary bases; selector loads remain legal.
+#[allow(unused_unsafe)] // CPUID intrinsics were unsafe at the Rust 1.88 MSRV.
+pub(crate) fn tls_ready() {
+    assert!(fpu::is_initialized(), "TLS setup requires CPU state setup");
+    assert!(!arch::interrupts_enabled(), "TLS setup requires IF=0");
+    assert_kernel_tls_clean();
+    let cr4: u64;
+    // SAFETY: CPL0, and CPUID exists on x86-64. Check the maximum basic leaf
+    // before reading structured feature flags. No feature is enabled here.
+    let supports_fsgsbase = unsafe {
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+        core::arch::x86_64::__cpuid(0).eax >= 7
+            && core::arch::x86_64::__cpuid_count(7, 0).ebx & 1 != 0
+    };
+    assert_eq!(cr4 & (1 << 16), 0, "userspace FSGSBASE must stay disabled");
+    serial::println!(
+        "MIRROR_TLS_READY cpuid_fsgsbase={} fsgsbase=0 selectors=1",
+        u8::from(supports_fsgsbase)
+    );
+}
+
+/// Every user-accessible data/readable-code descriptor can be loaded with
+/// any RPL: CPL3 supplies the effective privilege check. Null selectors 0..3
+/// are also legal. Reject every other selector before the CPL0 restore MOV.
+pub(crate) fn valid_user_tls(frame: &TrapFrame) -> bool {
+    let valid_selector = |selector: u64| {
+        selector <= 3
+            || selector & !3 == u64::from(USER_DATA_SELECTOR & !3)
+            || selector & !3 == u64::from(USER_CODE_SELECTOR & !3)
+    };
+    frame.fs_base < (1_u64 << 47)
+        && frame.gs_base < (1_u64 << 47)
+        && valid_selector(frame.fs_selector)
+        && valid_selector(frame.gs_selector)
+}
+
+/// Kernel Rust must never inherit user TLS. Reading the actual MSRs also
+/// catches selector loads that changed a base without a TLS syscall.
+fn assert_kernel_tls_clean() {
+    let fs_selector: u16;
+    let gs_selector: u16;
+    let fs_low: u32;
+    let fs_high: u32;
+    let gs_low: u32;
+    let gs_high: u32;
+    // SAFETY: Called only at CPL0. These MSRs exist in x86-64 and reads do not
+    // alter processor state. No FS/GS-relative access is made by kernel Rust.
+    unsafe {
+        asm!("mov {:x}, fs", out(reg) fs_selector,
+            options(nomem, nostack, preserves_flags));
+        asm!("mov {:x}, gs", out(reg) gs_selector,
+            options(nomem, nostack, preserves_flags));
+        asm!("rdmsr", in("ecx") 0xc000_0100_u32,
+            out("eax") fs_low, out("edx") fs_high,
+            options(nomem, nostack, preserves_flags));
+        asm!("rdmsr", in("ecx") 0xc000_0101_u32,
+            out("eax") gs_low, out("edx") gs_high,
+            options(nomem, nostack, preserves_flags));
+    }
+    assert_eq!(fs_selector, 0, "kernel FS selector is not clean");
+    assert_eq!(gs_selector, 0, "kernel GS selector is not clean");
+    assert_eq!(fs_low | fs_high, 0, "kernel FS base is not clean");
+    assert_eq!(gs_low | gs_high, 0, "kernel GS base is not clean");
 }
 
 /// Install the boot CPU's GDT, TSS and exception/IRQ IDT once at CPL0.
@@ -226,6 +316,12 @@ pub fn init() {
         let mut syscall = IdtEntry::interrupt(mirror_exception_128 as *const () as u64, 0);
         syscall.attributes |= 3 << 5; // CPL3 may invoke INT 0x80.
         entries.add(0x80).write(syscall);
+        // Hardware may deliver a spurious LAPIC interrupt at either CPL, but
+        // userspace must not invoke this vector with the INT instruction.
+        entries.add(APIC_SPURIOUS_VECTOR).write(IdtEntry::interrupt(
+            mirror_exception_255 as *const () as u64,
+            0,
+        ));
     }
 
     let gdtr = DescriptorPointer {
@@ -239,9 +335,9 @@ pub fn init() {
 
     // SAFETY: CPL0, interrupts disabled, persistent valid descriptors. The far
     // return reloads CS with balanced stack use; data selectors are replaced
-    // before LTR. FS/GS have no TLS users in this single-CPU kernel. LTR marks
+    // before LTR. Kernel Rust uses zero FS/GS bases and selectors. LTR marks
     // our writable TSS descriptor busy. No ring3 transitions or IRQs are enabled
-    // here; timer::init configures the PIC/PIT before the caller may set IF.
+    // here; APIC/timer setup configures routing before the caller may set IF.
     unsafe {
         asm!(
             "lgdt [{gdt}]",
@@ -257,6 +353,12 @@ pub fn init() {
             "xor eax, eax",
             "mov fs, ax",
             "mov gs, ax",
+            // A null selector can retain the bootloader's hidden base.
+            "xor edx, edx",
+            "mov ecx, 0xc0000100",
+            "wrmsr",
+            "inc ecx",
+            "wrmsr",
             "mov ax, {tss}",
             "ltr ax",
             "lidt [{idt}]",
@@ -266,6 +368,8 @@ pub fn init() {
             data = const DATA_SELECTOR,
             tss = const TSS_SELECTOR,
             out("rax") _,
+            out("rcx") _,
+            out("rdx") _,
         );
     }
     serial::println!("MIRROR_IDT_READY exceptions=32 double_fault_ist=1 irqs=16");
@@ -295,11 +399,15 @@ pub(crate) unsafe fn set_kernel_stack(top: u64) {
     }
 }
 
-/// Construct a fresh integer-only context with no inherited general registers.
+/// Construct a fresh integer register context with no inherited registers.
 /// RDI contains the explicit argument, IF=1, and IOPL=0. The caller must map the
 /// image and stack; resume_user checks canonical addresses before CPU entry.
 pub(crate) fn user_frame(entry: u64, stack: u64, argument: u64) -> TrapFrame {
     TrapFrame {
+        fs_base: 0,
+        gs_base: 0,
+        fs_selector: 0,
+        gs_selector: 0,
         r15: 0,
         r14: 0,
         r13: 0,
@@ -325,10 +433,12 @@ pub(crate) fn user_frame(entry: u64, stack: u64, argument: u64) -> TrapFrame {
     }
 }
 
-/// Resume saved integer registers until a handler requests kernel return.
+/// Resume saved integer and x87/SIMD registers until a handler requests return.
 /// User status flags are preserved, IF is forced on, and privilege bits are
-/// cleared. FS/GS bases start at zero; TLS and x87/SIMD state are unsupported.
-/// Returns on the original kernel stack with IF=0 and callee-saved GPRs intact.
+/// cleared. FS/GS selectors and bases are restored independently; a fresh
+/// context starts with all four zero. XSAVE/AVX remain unsupported.
+/// Returns on the original kernel stack with IF=0, callee-saved GPRs intact,
+/// and the extended state saved before restoring clean kernel register state.
 ///
 /// # Safety
 /// Only the BSP may call; interrupts must be disabled. The active page tables
@@ -337,11 +447,22 @@ pub(crate) fn user_frame(entry: u64, stack: u64, argument: u64) -> TrapFrame {
 /// installed a mapped kernel stack. IRQ handlers and scheduling state must be
 /// initialized. No interrupt-disabling guard may span this call: user mode
 /// deliberately sets IF. The saved frame and kernel caller remain mapped.
-pub(crate) unsafe fn resume_user(frame: &TrapFrame) {
+/// `extended` must identify this user's aligned, initialized, supervisor-only
+/// State and remain writable/mapped until return. No other reference may access
+/// it while assembly restores/saves it. A raw pointer avoids retaining a Rust
+/// field borrow while handlers access the surrounding process independently.
+pub(crate) unsafe fn resume_user(frame: &TrapFrame, extended: *mut fpu::State) {
     assert!(is_initialized(), "IDT not initialized");
+    assert!(fpu::is_initialized(), "FPU not initialized");
     assert!(!arch::interrupts_enabled(), "user entry requires IF=0");
+    assert!(!extended.is_null(), "user entry requires extended state");
+    assert!(
+        (extended as usize).is_multiple_of(16),
+        "unaligned extended state"
+    );
     assert_eq!(frame.cs, u64::from(USER_CODE_SELECTOR), "invalid user CS");
     assert_eq!(frame.ss, u64::from(USER_DATA_SELECTOR), "invalid user SS");
+    assert!(valid_user_tls(frame), "invalid user TLS state");
     assert!(
         (4096..(1 << 47)).contains(&frame.rip),
         "invalid user instruction pointer"
@@ -366,9 +487,12 @@ pub(crate) unsafe fn resume_user(frame: &TrapFrame) {
     // SAFETY: Caller guarantees this context's address space and kernel stacks.
     // The validated copy has only CPL3 selectors and unprivileged flags. Assembly
     // copies it before restoring registers, preserves kernel callee-saved GPRs,
-    // and resumes here only through the trusted return trampoline.
-    unsafe { mirror_resume_user(&prepared) };
+    // and resumes here only through the trusted return trampoline. The caller
+    // provides a trusted, mapped state image with valid MXCSR reserved bits.
+    unsafe { mirror_resume_user(&prepared, extended) };
     assert!(!arch::interrupts_enabled(), "user return requires IF=0");
+    #[cfg(feature = "boot-smoke")]
+    assert_kernel_tls_clean();
     // SAFETY: Assembly has returned to the saved stack with IF clear.
     unsafe { addr_of_mut!(MIRROR_USER_KERNEL_RSP).write(0) };
     assert!(USER_ACTIVE.swap(false, Ordering::SeqCst));
@@ -389,6 +513,12 @@ pub(crate) fn return_from_user(frame: &mut TrapFrame) {
     frame.rflags = 2; // Reserved bit 1 only: IF/DF/TF/AC/IOPL/NT are all clear.
     frame.rsp = kernel_rsp;
     frame.ss = u64::from(DATA_SELECTOR);
+    // suspend() already copied the original user state, when it is resumable.
+    // The common epilogue must install clean bases before the kernel trampoline.
+    frame.fs_base = 0;
+    frame.gs_base = 0;
+    frame.fs_selector = 0;
+    frame.gs_selector = 0;
 }
 
 #[cfg(feature = "boot-smoke")]
@@ -399,13 +529,106 @@ pub fn self_test() {
     let restored_rax: u64;
     let restored_r10: u64;
     let restored_flags: u64;
+    let restored_fs_selector: u64;
+    let restored_gs_selector: u64;
+    let restored_fs_base: u64;
+    let restored_gs_base: u64;
     // SAFETY: Vector3 is installed and armed for a returning test. Assembly
-    // clears DF before Rust runs and IRET restores it. This block clears DF
-    // again before returning to Rust, while checking two volatile registers.
+    // installs valid selectors and canonical sentinel bases without using
+    // them for memory accesses. Entry clears DF/TLS before Rust; return must
+    // restore all four TLS fields even for CPL0. Capture the results and clear
+    // DF/TLS again before Rust resumes, while checking two volatile GPRs.
+    unsafe {
+        asm!(
+            "push rax",
+            "mov ax, {user_data}",
+            "mov fs, ax",
+            "mov ax, {user_code}",
+            "mov gs, ax",
+            "mov ecx, 0xc0000100",
+            "mov eax, 0x56789000",
+            "mov edx, 0x1234",
+            "wrmsr",
+            "inc ecx",
+            "mov eax, 0x6789a000",
+            "mov edx, 0x2345",
+            "wrmsr",
+            "pop rax",
+            "std",
+            "int3",
+            "pushfq",
+            "pop r11",
+            "cld",
+            "push rax",
+            "xor r9d, r9d",
+            "mov r9w, fs",
+            "xor r8d, r8d",
+            "mov r8w, gs",
+            "mov ecx, 0xc0000100",
+            "rdmsr",
+            "shl rdx, 32",
+            "or rax, rdx",
+            "mov rsi, rax",
+            "inc ecx",
+            "rdmsr",
+            "shl rdx, 32",
+            "or rax, rdx",
+            "mov rdi, rax",
+            "xor eax, eax",
+            "mov fs, ax",
+            "mov gs, ax",
+            "xor edx, edx",
+            "mov ecx, 0xc0000100",
+            "wrmsr",
+            "inc ecx",
+            "wrmsr",
+            "pop rax",
+            user_data = const USER_DATA_SELECTOR,
+            user_code = const USER_CODE_SELECTOR,
+            inout("rax") 0x1234_5678_9abc_def0_u64 => restored_rax,
+            inout("r10") 0xfedc_ba98_7654_3210_u64 => restored_r10,
+            lateout("r11") restored_flags,
+            lateout("r9") restored_fs_selector,
+            lateout("r8") restored_gs_selector,
+            lateout("rsi") restored_fs_base,
+            lateout("rdi") restored_gs_base,
+            out("rcx") _,
+            out("rdx") _,
+        );
+    }
+    assert_eq!(BREAKPOINT_COUNT.load(Ordering::SeqCst), before + 1);
+    assert!(!BREAKPOINT_ARMED.load(Ordering::SeqCst));
+    assert_eq!(restored_rax, 0x1234_5678_9abc_def0);
+    assert_eq!(restored_r10, 0xfedc_ba98_7654_3210);
+    assert_ne!(restored_flags & (1 << 10), 0, "IRET did not restore DF");
+    assert_eq!(restored_fs_selector, u64::from(USER_DATA_SELECTOR));
+    assert_eq!(restored_gs_selector, u64::from(USER_CODE_SELECTOR));
+    assert_eq!(restored_fs_base, 0x1234_5678_9000);
+    assert_eq!(restored_gs_base, 0x2345_6789_a000);
+    assert_kernel_tls_clean();
+    serial::println!("MIRROR_EXCEPTIONS_OK");
+    serial::println!("MIRROR_TLS_KERNEL_OK selectors=1 bases=1 clean=1");
+    if crate::apic::is_enabled() {
+        spurious_self_test();
+    }
+}
+
+/// The spurious gate uses the shared entry/return path, but consumes neither
+/// a synchronous-exception expectation nor an interrupt-controller EOI.
+#[cfg(feature = "boot-smoke")]
+fn spurious_self_test() {
+    assert!(!arch::interrupts_enabled());
+    let before = APIC_SPURIOUS_COUNT.load(Ordering::Relaxed);
+    let restored_rax: u64;
+    let restored_r10: u64;
+    let restored_flags: u64;
+    // SAFETY: The installed DPL0 vector returns without touching APIC state.
+    // The common entry clears DF before Rust and IRET must restore it. Clear
+    // DF again before returning to compiler-generated code; IF remains clear.
     unsafe {
         asm!(
             "std",
-            "int3",
+            "int 0xff",
             "pushfq",
             "pop r11",
             "cld",
@@ -414,12 +637,13 @@ pub fn self_test() {
             lateout("r11") restored_flags,
         );
     }
-    assert_eq!(BREAKPOINT_COUNT.load(Ordering::SeqCst), before + 1);
-    assert!(!BREAKPOINT_ARMED.load(Ordering::SeqCst));
+    assert_eq!(APIC_SPURIOUS_COUNT.load(Ordering::Relaxed), before + 1);
     assert_eq!(restored_rax, 0x1234_5678_9abc_def0);
     assert_eq!(restored_r10, 0xfedc_ba98_7654_3210);
-    assert_ne!(restored_flags & (1 << 10), 0, "IRET did not restore DF");
-    serial::println!("MIRROR_EXCEPTIONS_OK");
+    assert_ne!(restored_flags & (1 << 10), 0, "spurious return lost DF");
+    assert_eq!(restored_flags & (1 << 9), 0, "spurious return changed IF");
+    assert_kernel_tls_clean();
+    serial::println!("MIRROR_APIC_SPURIOUS_OK vector=255 registers=1 flags=1");
 }
 
 /// The next exception must be a CPL0 read from this unmapped address. Its
@@ -434,6 +658,8 @@ pub fn arm_expected_page_fault(address: u64) {
 
 #[unsafe(no_mangle)]
 extern "C" fn mirror_exception_dispatch(frame: &mut TrapFrame) {
+    #[cfg(feature = "boot-smoke")]
+    assert_kernel_tls_clean();
     dispatch(frame);
     // User RSP is arbitrary even when the interrupt came from a valid RIP.
     // Validate every user return, including IRQs, before assembly reaches IRETQ.
@@ -444,12 +670,19 @@ extern "C" fn mirror_exception_dispatch(frame: &mut TrapFrame) {
 }
 
 fn dispatch(frame: &mut TrapFrame) {
+    if frame.vector == APIC_SPURIOUS_VECTOR as u64 {
+        // A spurious LAPIC request has no in-service bit. An EOI could retire
+        // another interrupt, so it must return without acknowledging anything.
+        #[cfg(feature = "boot-smoke")]
+        APIC_SPURIOUS_COUNT.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     // IRQs must never consume an armed synchronous-exception expectation.
     // Device handlers do not allocate, print or take a lock.
     if (32..48).contains(&frame.vector) {
         if matches!(frame.vector, 33 | 44) {
             // The controller routes bytes by source, independent of which PS/2
-            // IRQ fired. Drain before the PIC owner acknowledges IRQ1 or IRQ12.
+            // IRQ fired. Drain before the controller acknowledges IRQ1 or IRQ12.
             crate::ps2::handle_irq(frame.vector as u8);
         }
         timer::handle_irq(frame.vector as u8);

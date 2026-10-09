@@ -2,6 +2,7 @@
 param(
     [switch]$NoBuild,
     [switch]$Release,
+    [switch]$AgentDemo,
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -10,14 +11,14 @@ param(
 
 . (Join-Path $PSScriptRoot 'common.ps1')
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
-if (-not $NoBuild) { & (Join-Path $PSScriptRoot 'build.ps1') -Release:$Release }
+if (-not $NoBuild) { & (Join-Path $PSScriptRoot 'build.ps1') -Release:$Release -AgentDemo:$AgentDemo }
 $qemu = Get-MirrorQemu -RequestedPath $QemuPath -RepositoryRoot $repositoryRoot
 $qemuDirectory = Split-Path -Parent $qemu
 $codePath = Get-MirrorFirmware -RequestedPath $FirmwareCode -QemuDirectory $qemuDirectory -Names @('edk2-x86_64-code.fd', 'OVMF_CODE.fd', 'OVMF_CODE.4m.fd') -ParameterName 'FirmwareCode'
 $varsTemplate = Get-MirrorFirmware -RequestedPath $FirmwareVars -QemuDirectory $qemuDirectory -Names @('edk2-i386-vars.fd', 'OVMF_VARS.fd', 'OVMF_VARS.4m.fd') -ParameterName 'FirmwareVars'
 $buildDirectory = Join-Path $repositoryRoot 'build'
 $espDirectory = Join-Path $buildDirectory 'esp'
-foreach ($relativePath in @('EFI/BOOT/BOOTX64.EFI', 'kernel.elf', 'init.elf', 'desktop.elf', 'limine.conf')) {
+foreach ($relativePath in @('EFI/BOOT/BOOTX64.EFI', 'kernel.elf', 'init.elf', 'desktop.elf', 'agent.elf', 'app.elf', 'limine.conf')) {
     if (-not (Test-Path -LiteralPath (Join-Path $espDirectory $relativePath) -PathType Leaf)) {
         throw "The boot tree is incomplete: $relativePath. Run scripts/build.ps1 first."
     }
@@ -35,6 +36,7 @@ $desktopScreenshot = Join-Path $buildDirectory 'desktop.png'
 $desktopInputScreenshot = Join-Path $buildDirectory 'desktop-input.png'
 $desktopAwayScreenshot = Join-Path $buildDirectory 'desktop-cursor-away.png'
 $desktopRestoredScreenshot = Join-Path $buildDirectory 'desktop-cursor-restored.png'
+$agentScreenshot = Join-Path $buildDirectory 'desktop-agent.png'
 [System.IO.File]::WriteAllText($serialLog, '')
 
 function Read-MirrorSerial {
@@ -190,6 +192,8 @@ function Wait-MirrorPointer {
     } while ($true)
 }
 
+. (Join-Path $PSScriptRoot 'capture-shell.ps1')
+
 $qemuArguments = @(
     '-machine', 'q35,accel=tcg', '-cpu', 'qemu64', '-m', '256', '-smp', '1',
     '-display', 'none', '-vga', 'std', '-monitor', 'none', '-qmp', 'stdio',
@@ -228,6 +232,9 @@ try {
     $greeting = Read-MirrorQmp $process
     if (-not $greeting.PSObject.Properties['QMP']) { throw 'Missing QMP greeting.' }
     Invoke-MirrorQmp $process 'qmp_capabilities'
+    if (-not $AgentDemo) {
+        Invoke-MirrorShellCapture $process
+    } else {
     Wait-MirrorDesktopMessage $process '(?m)^MIRROR_DESKTOP_READY(?:\s|$)'
     $desktopReady = [regex]::Match((Read-MirrorSerial), '(?m)^MIRROR_DESKTOP_READY .*width=(\d+) height=(\d+)(?:\s|$)')
     if (-not $desktopReady.Success) { throw 'Native desktop surface geometry is missing.' }
@@ -236,7 +243,7 @@ try {
     $desktopStartX = [int][Math]::Floor($desktopWidth / 2)
     $desktopStartY = [int][Math]::Floor($desktopHeight / 2)
     Save-MirrorScreenshot $process $desktopScreenshot
-    Wait-MirrorDesktopMessage $process '(?m)^MIRROR_DESKTOP_INPUT_TIMEOUT(?:\s|$)'
+    Wait-MirrorDesktopMessage $process '(?m)^MIRROR_AGENT_READY(?:\s|$)'
     $offset = (Read-MirrorSerial).Length
     Send-MirrorPointerMotion $process (-2 * $desktopWidth) (-2 * $desktopHeight)
     Wait-MirrorDesktopPointer $process 0 0 0 $offset
@@ -293,8 +300,40 @@ try {
     if ((Read-MirrorSerial) -notmatch '(?m)^MIRROR_DESKTOP_FRAME .*keyboard_irq=[1-9][0-9]* mouse_irq=[1-9][0-9]*(?:\s|$)') {
         throw 'Native desktop did not confirm a frame after real keyboard/mouse IRQs.'
     }
+    # Launch a native agent task through the visible button. It inspects state,
+    # edits and applies through IPC; no injected text or host automation API is
+    # used for the agent's note. Human keyboard editing must still work afterward.
+    $agentX = $desktopWidth - 102
+    $agentY = $desktopHeight - 29
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorPointerMotion $process ($agentX - $desktopStartX) ($agentY - $desktopStartY)
+    Wait-MirrorDesktopPointer $process $agentX $agentY 0 $offset
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorPointerButton $process 'left' $true
+    Wait-MirrorDesktopPointer $process $agentX $agentY 1 $offset
+    Send-MirrorPointerButton $process 'left' $false
+    Wait-MirrorDesktopMessage $process '(?m)^user: Mirror desktop: submit Hello from Mirror agent\\n\r?$' $offset
+    Wait-MirrorDesktopMessage $process '(?m)^user: Mirror desktop: agent complete\\n\r?$' $offset
+    Save-MirrorScreenshot $process $agentScreenshot
+    if ((Get-FileHash -LiteralPath $desktopInputScreenshot).Hash -eq (Get-FileHash -LiteralPath $agentScreenshot).Hash) {
+        throw 'Agent operation did not change the visible desktop.'
+    }
+    Send-MirrorKey $process 'tab'
+    Send-MirrorKey $process 'end'
+    Send-MirrorKey $process 'x'
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorKey $process 'ret'
+    Wait-MirrorDesktopMessage $process '(?m)^user: Mirror desktop: submit Hello from Mirror agentx\\n\r?$' $offset
+    # The same client remains available for another separately requested task.
+    Send-MirrorKey $process 'tab'
+    Send-MirrorKey $process 'tab'
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorKey $process 'ret'
+    Wait-MirrorDesktopMessage $process '(?m)^user: Mirror desktop: agent complete\\n\r?$' $offset
     Send-MirrorKey $process 'esc'
     Wait-MirrorDesktopMessage $process '(?m)^MIRROR_DESKTOP_CLEANUP_OK reason=exit handles_reclaimed=1 status=0\r?$'
+    Wait-MirrorDesktopMessage $process '(?m)^MIRROR_AGENT_CLEANUP_OK reason=session_ended handles_reclaimed=1\r?$'
+    }
     $elapsed = [System.Diagnostics.Stopwatch]::StartNew()
     do {
         if ($process.HasExited) { throw 'Normal kernel exited before reaching idle.' }
@@ -402,7 +441,7 @@ try {
     if ((Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash -ne $testDiskHash) {
         throw 'The read-only block fixture was modified during the capture.'
     }
-    Write-Host "Native desktop, input isolation, cursor restoration, and fallback console captures passed. Image: $desktopInputScreenshot"
+    Write-Host "Native desktop and fallback console captures passed (agent-demo=$AgentDemo). Images: $buildDirectory"
 }
 finally {
     if ($started) {

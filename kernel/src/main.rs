@@ -3,13 +3,17 @@
 
 extern crate alloc;
 
+mod acpi;
+mod apic;
 mod arch;
 mod block;
 mod boot;
 mod capability;
 mod console;
+mod context;
 mod dma;
 mod elf;
+mod fpu;
 mod framebuffer;
 mod heap;
 mod input;
@@ -26,6 +30,8 @@ mod serial;
 mod surface;
 mod timer;
 mod userspace;
+mod vm;
+mod windows;
 
 use core::panic::PanicInfo;
 use limine::memory_map::EntryType;
@@ -39,6 +45,10 @@ pub extern "C" fn _start() -> ! {
     serial::init();
     serial::println!("Mirror kernel 0.1.0 | x86_64");
     interrupts::init();
+    fpu::init();
+    interrupts::tls_ready();
+    #[cfg(feature = "boot-smoke")]
+    fpu::self_test();
 
     let boot = boot::info();
     let entries = boot.memory_map.entries();
@@ -112,6 +122,8 @@ pub extern "C" fn _start() -> ! {
         frame_stats.metadata_frames,
         frame_stats.recycled_frames + frame_stats.never_allocated_frames
     );
+    let topology = acpi::discover(&boot, &mut tables, &mut frames);
+    apic::init(topology.as_ref(), &boot, &mut tables, &mut frames);
     timer::init();
 
     let devices = pci::probe();
@@ -150,6 +162,8 @@ pub extern "C" fn _start() -> ! {
 
     #[cfg(feature = "boot-smoke")]
     {
+        acpi::self_test();
+        apic::self_test();
         pci::self_test();
         framebuffer::self_test();
         surface::self_test();
@@ -254,15 +268,27 @@ pub extern "C" fn _start() -> ! {
     serial::println!("MIRROR_BOOT_OK");
     let mut input_consumer = ps2::Consumer::claim().expect("exclusive input consumer");
     if let Some(display) = display.as_mut().filter(|_| keyboard_ready || mouse_ready) {
-        userspace::run_desktop(
-            &tables,
-            &mut frames,
-            boot.desktop,
-            boot.direct_map_offset,
-            display,
-            &mut input_consumer,
-            cfg!(feature = "boot-smoke"),
-        );
+        if cfg!(feature = "agent-demo") {
+            userspace::run_desktop(
+                &tables,
+                &mut frames,
+                [boot.desktop, boot.agent],
+                boot.direct_map_offset,
+                display,
+                &mut input_consumer,
+                cfg!(feature = "boot-smoke"),
+            );
+        } else {
+            userspace::run_shell(
+                &tables,
+                &mut frames,
+                [boot.desktop, boot.app],
+                boot.direct_map_offset,
+                display,
+                &mut input_consumer,
+                cfg!(feature = "boot-smoke"),
+            );
+        }
     } else {
         serial::println!("MIRROR_DESKTOP_SKIPPED reason=missing_display_or_input");
     }

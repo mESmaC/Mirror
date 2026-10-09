@@ -2,8 +2,9 @@
 
 use crate::render::{self, Rect, Renderer};
 use crate::{Event, require};
+use mirror_desktop_protocol::{Change, Editor, Operation, Request, Response, Snapshot};
 
-const CAPACITY: usize = 96;
+const CAPACITY: usize = mirror_desktop_protocol::CAPACITY;
 const CELL: usize = 12;
 pub const EDIT: u8 = 1;
 pub const OUTPUT: u8 = 2;
@@ -11,12 +12,25 @@ pub const POINTER: u8 = 4;
 pub const SUBMIT: u8 = 8;
 pub const EXIT: u8 = 16;
 const NOTICE: u8 = 32;
+pub const RUN_AGENT: u8 = 64;
+const AGENT: u8 = 128;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentStatus {
+    Ready,
+    Running,
+    Complete,
+    Conflict,
+    Failed,
+    Unavailable,
+}
 
 pub struct Layout {
     window: Rect,
     field: Rect,
     button: Rect,
     output: Rect,
+    agent: Rect,
     text_x: usize,
     text_y: usize,
     visible: usize,
@@ -35,6 +49,7 @@ impl Layout {
             field,
             button: Rect::new(x + window_width - 148, y + 104, 120, 44),
             output: Rect::new(x + 28, y + 196, window_width - 56, window_height - 244),
+            agent: Rect::new(width - 176, height - 44, 148, 30),
             text_x: field.x + 12,
             text_y: field.y + 15,
             visible: ((field.width - 24) / CELL).saturating_sub(1).max(1),
@@ -46,13 +61,10 @@ pub struct Ui {
     width: usize,
     height: usize,
     layout: Layout,
-    line: [u8; CAPACITY],
-    length: usize,
-    caret: usize,
-    submitted: [u8; CAPACITY],
-    submitted_length: usize,
-    has_submission: bool,
+    editor: Editor,
     input_focused: bool,
+    agent_focused: bool,
+    agent_status: AgentStatus,
     notice: bool,
     pointer_x: usize,
     pointer_y: usize,
@@ -67,13 +79,10 @@ impl Ui {
             width,
             height,
             layout: Layout::new(width, height),
-            line: [0; CAPACITY],
-            length: 0,
-            caret: 0,
-            submitted: [0; CAPACITY],
-            submitted_length: 0,
-            has_submission: false,
+            editor: Editor::new(),
             input_focused: true,
+            agent_focused: false,
+            agent_status: AgentStatus::Ready,
             notice: false,
             pointer_x: width / 2,
             pointer_y: height / 2,
@@ -87,27 +96,85 @@ impl Ui {
     }
 
     pub fn submitted(&self) -> &[u8] {
-        &self.submitted[..self.submitted_length]
+        self.editor.applied()
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        self.editor.snapshot()
+    }
+
+    /// Agent requests enter the same editor dispatcher as keyboard and mouse
+    /// operations. Transport authority and job lifetime belong to main.rs.
+    pub fn dispatch_request(&mut self, request: Request) -> (Response, u8) {
+        let (response, change) = self.editor.handle_request(request);
+        (response, self.editor_changes(change))
+    }
+
+    pub fn set_agent_running(&mut self, running: bool) -> u8 {
+        self.agent_status = if running {
+            AgentStatus::Running
+        } else {
+            AgentStatus::Ready
+        };
+        AGENT
+    }
+
+    pub fn set_agent_result(&mut self, status: u8) -> u8 {
+        self.agent_status = match status {
+            0 => AgentStatus::Complete,
+            1 => AgentStatus::Conflict,
+            _ => AgentStatus::Failed,
+        };
+        AGENT
+    }
+
+    pub fn set_agent_unavailable(&mut self) -> u8 {
+        self.agent_status = AgentStatus::Unavailable;
+        AGENT
+    }
+
+    fn run_agent(&mut self) -> u8 {
+        if matches!(
+            self.agent_status,
+            AgentStatus::Running | AgentStatus::Unavailable
+        ) {
+            return 0;
+        }
+        self.set_agent_running(true) | RUN_AGENT
+    }
+
+    fn editor_changes(&mut self, change: Change) -> u8 {
+        let mut flags = 0;
+        if change.edited {
+            flags |= EDIT | NOTICE;
+        }
+        if change.applied {
+            flags |= OUTPUT | SUBMIT | NOTICE;
+        }
+        if flags != 0 {
+            self.notice = false;
+        }
+        flags
+    }
+
+    fn dispatch_human(&mut self, operation: Operation<'_>) -> u8 {
+        let change = self.editor.dispatch(None, operation);
+        require(change.is_ok(), 85);
+        self.editor_changes(change.unwrap())
     }
 
     fn input_start(&self) -> usize {
-        self.caret.saturating_sub(self.layout.visible)
+        self.editor.caret().saturating_sub(self.layout.visible)
     }
 
     fn submit(&mut self) -> u8 {
-        self.submitted = self.line;
-        self.submitted_length = self.length;
-        self.has_submission = true;
-        self.notice = false;
-        OUTPUT | SUBMIT | NOTICE
+        self.dispatch_human(Operation::Apply)
     }
 
     pub fn process(&mut self, event: Event) -> u8 {
         match event {
             Event::Lost => {
-                self.line.fill(0);
-                self.length = 0;
-                self.caret = 0;
+                self.dispatch_human(Operation::ClearDraft);
                 self.buttons = 0;
                 self.clicks_armed = false;
                 self.notice = true;
@@ -121,52 +188,58 @@ impl Ui {
                     return EXIT;
                 }
                 if kind == 4 && flags & 2 == 0 {
-                    self.input_focused = !self.input_focused;
-                    return EDIT;
+                    if self.input_focused {
+                        self.input_focused = false;
+                    } else if self.agent_focused {
+                        self.agent_focused = false;
+                        self.input_focused = true;
+                    } else {
+                        self.agent_focused = true;
+                    }
+                    return EDIT | AGENT;
                 }
                 if kind == 2 && flags & 2 == 0 {
-                    return self.submit();
+                    return if self.agent_focused {
+                        self.run_agent()
+                    } else {
+                        self.submit()
+                    };
                 }
                 if !self.input_focused {
                     return if kind == 1 && ascii == b' ' && flags & 2 == 0 {
-                        self.submit()
+                        if self.agent_focused {
+                            self.run_agent()
+                        } else {
+                            self.submit()
+                        }
                     } else {
                         0
                     };
                 }
-                let before = (self.caret, self.length);
+                let caret = self.editor.caret();
+                let length = self.editor.draft().len();
                 match kind {
-                    1 if (b' '..=b'~').contains(&ascii) && self.length < CAPACITY => {
-                        self.line
-                            .copy_within(self.caret..self.length, self.caret + 1);
-                        self.line[self.caret] = ascii;
-                        self.caret += 1;
-                        self.length += 1;
-                    }
-                    3 if self.caret != 0 => {
-                        self.line
-                            .copy_within(self.caret..self.length, self.caret - 1);
-                        self.caret -= 1;
-                        self.length -= 1;
-                        self.line[self.length] = 0;
-                    }
-                    6 => self.caret = self.caret.saturating_sub(1),
-                    7 => self.caret = (self.caret + 1).min(self.length),
-                    8 => self.caret = 0,
-                    9 => self.caret = self.length,
-                    10 if self.caret < self.length => {
-                        self.line
-                            .copy_within(self.caret + 1..self.length, self.caret);
-                        self.length -= 1;
-                        self.line[self.length] = 0;
-                    }
-                    _ => {}
-                }
-                if before != (self.caret, self.length) {
-                    self.notice = false;
-                    EDIT | NOTICE
-                } else {
-                    0
+                    1 if (b' '..=b'~').contains(&ascii) && length < CAPACITY => self
+                        .dispatch_human(Operation::Replace {
+                            start: caret,
+                            end: caret,
+                            text: &[ascii],
+                        }),
+                    3 if caret != 0 => self.dispatch_human(Operation::Replace {
+                        start: caret - 1,
+                        end: caret,
+                        text: &[],
+                    }),
+                    6 => self.dispatch_human(Operation::SetCaret(caret.saturating_sub(1))),
+                    7 => self.dispatch_human(Operation::SetCaret((caret + 1).min(length))),
+                    8 => self.dispatch_human(Operation::SetCaret(0)),
+                    9 => self.dispatch_human(Operation::SetCaret(length)),
+                    10 if caret < length => self.dispatch_human(Operation::Replace {
+                        start: caret,
+                        end: caret + 1,
+                        text: &[],
+                    }),
+                    _ => 0,
                 }
             }
             Event::Mouse { dx, dy, buttons } => {
@@ -192,13 +265,20 @@ impl Ui {
                             .saturating_sub(self.layout.text_x)
                             .saturating_add(CELL / 2)
                             / CELL;
-                        self.caret =
-                            (self.input_start() + cell.min(self.layout.visible)).min(self.length);
+                        let caret = (self.input_start() + cell.min(self.layout.visible))
+                            .min(self.editor.draft().len());
+                        change |= self.dispatch_human(Operation::SetCaret(caret));
                         self.input_focused = true;
-                        change |= EDIT;
+                        self.agent_focused = false;
+                        change |= EDIT | AGENT;
                     } else if self.layout.button.contains(self.pointer_x, self.pointer_y) {
                         self.input_focused = false;
-                        change |= EDIT | self.submit();
+                        self.agent_focused = false;
+                        change |= EDIT | AGENT | self.submit();
+                    } else if self.layout.agent.contains(self.pointer_x, self.pointer_y) {
+                        self.input_focused = false;
+                        self.agent_focused = true;
+                        change |= EDIT | AGENT | self.run_agent();
                     }
                 }
                 change
@@ -248,6 +328,7 @@ impl Ui {
         self.paint_edit(renderer);
         self.paint_output(renderer);
         self.paint_notice(renderer);
+        self.paint_agent(renderer);
     }
 
     pub fn paint_changes(&self, renderer: &mut Renderer, changes: u8) {
@@ -263,6 +344,9 @@ impl Ui {
         if changes & POINTER != 0 {
             renderer.move_cursor(self.pointer_x, self.pointer_y);
         }
+        if changes & AGENT != 0 {
+            self.paint_agent(renderer);
+        }
     }
 
     fn paint_edit(&self, renderer: &mut Renderer) {
@@ -277,15 +361,15 @@ impl Ui {
             },
         );
         let start = self.input_start();
-        let end = self.length.min(start + self.layout.visible);
+        let end = self.editor.draft().len().min(start + self.layout.visible);
         renderer.text(
             self.layout.text_x,
             self.layout.text_y,
-            &self.line[start..end],
+            &self.editor.draft()[start..end],
             2,
             render::TEXT,
         );
-        if self.length == 0 && !self.input_focused {
+        if self.editor.draft().is_empty() && !self.input_focused {
             renderer.text(
                 self.layout.text_x,
                 self.layout.text_y,
@@ -297,7 +381,7 @@ impl Ui {
         if self.input_focused {
             renderer.fill(
                 Rect::new(
-                    self.layout.text_x + (self.caret - start) * CELL,
+                    self.layout.text_x + (self.editor.caret() - start) * CELL,
                     field.y + 12,
                     2,
                     20,
@@ -309,10 +393,10 @@ impl Ui {
         renderer.fill(button, render::BUTTON);
         renderer.border(
             button,
-            if self.input_focused {
-                render::BUTTON
-            } else {
+            if !self.input_focused && !self.agent_focused {
                 render::TEXT
+            } else {
+                render::BUTTON
             },
         );
         renderer.text(button.x + 30, button.y + 15, b"Apply", 2, render::DESKTOP);
@@ -325,7 +409,7 @@ impl Ui {
         let padding_y = if output.height < 38 { 3 } else { 12 };
         let columns = (output.width - 24) / CELL;
         let rows = output.height.saturating_sub(padding_y * 2) / 18;
-        let bytes = if self.has_submission {
+        let bytes = if self.snapshot().has_applied {
             self.submitted()
         } else {
             b"Your applied note will appear here."
@@ -336,7 +420,7 @@ impl Ui {
                 output.y + padding_y + row * 18,
                 line,
                 2,
-                if self.has_submission {
+                if self.snapshot().has_applied {
                     render::TEXT
                 } else {
                     render::MUTED
@@ -363,7 +447,7 @@ impl Ui {
             )
         } else {
             (
-                &b"This note stays in this session. Tab changes focus."[..],
+                &b"Session only. Run agent replaces your note. Tab changes focus."[..],
                 render::MUTED,
             )
         };
@@ -373,6 +457,49 @@ impl Ui {
             &notice[..notice.len().min((window.width - 56) / 6)],
             1,
             color,
+        );
+    }
+
+    fn paint_agent(&self, renderer: &mut Renderer) {
+        let button = self.layout.agent;
+        let disabled = matches!(
+            self.agent_status,
+            AgentStatus::Running | AgentStatus::Unavailable
+        );
+        let label: &[u8] = match self.agent_status {
+            AgentStatus::Ready => b"Run agent",
+            AgentStatus::Running => b"Running",
+            AgentStatus::Complete => b"Done - run",
+            AgentStatus::Conflict => b"Conflict",
+            AgentStatus::Failed => b"Failed",
+            AgentStatus::Unavailable => b"Unavailable",
+        };
+        renderer.fill(
+            button,
+            if disabled {
+                render::RAISED
+            } else {
+                render::BUTTON
+            },
+        );
+        renderer.border(
+            button,
+            if self.agent_focused {
+                render::TEXT
+            } else {
+                render::BORDER
+            },
+        );
+        renderer.text(
+            button.x + (button.width - label.len() * CELL) / 2,
+            button.y + 8,
+            label,
+            2,
+            if disabled {
+                render::MUTED
+            } else {
+                render::DESKTOP
+            },
         );
     }
 }
@@ -389,7 +516,7 @@ pub fn self_test() {
     for byte in b"abcd" {
         ui.process(key(1, *byte));
     }
-    require(ui.caret == 4 && &ui.line[..ui.length] == b"abcd", 90);
+    require(ui.editor.caret() == 4 && ui.editor.draft() == b"abcd", 90);
     ui.process(Event::Mouse {
         dx: -384,
         dy: -86,
@@ -400,9 +527,9 @@ pub fn self_test() {
         dy: 0,
         buttons: 1,
     });
-    require(ui.caret == 2, 91);
+    require(ui.editor.caret() == 2, 91);
     ui.process(key(1, b'x'));
-    require(&ui.line[..ui.length] == b"abxcd", 92);
+    require(ui.editor.draft() == b"abxcd", 92);
     ui.process(Event::Mouse {
         dx: 744,
         dy: 0,
@@ -425,7 +552,7 @@ pub fn self_test() {
     );
     ui.process(Event::Lost);
     require(
-        ui.length == 0 && !ui.clicks_armed && ui.submitted() == b"abxcd",
+        ui.editor.draft().is_empty() && !ui.clicks_armed && ui.submitted() == b"abxcd",
         95,
     );
     require(
@@ -438,17 +565,27 @@ pub fn self_test() {
         96,
     );
     ui.process(key(4, 0));
+    ui.process(key(4, 0));
     for _ in 0..CAPACITY + 4 {
         ui.process(key(1, b'a'));
     }
-    require(ui.length == CAPACITY && ui.caret == CAPACITY, 97);
+    require(
+        ui.editor.draft().len() == CAPACITY && ui.editor.caret() == CAPACITY,
+        97,
+    );
     ui.process(key(8, 0));
     ui.process(key(10, 0));
-    require(ui.length == CAPACITY - 1 && ui.caret == 0, 98);
+    require(
+        ui.editor.draft().len() == CAPACITY - 1 && ui.editor.caret() == 0,
+        98,
+    );
     ui.process(key(9, 0));
     ui.process(key(3, 0));
-    require(ui.length == CAPACITY - 2 && ui.caret == CAPACITY - 2, 99);
-    let old = ui.length;
+    require(
+        ui.editor.draft().len() == CAPACITY - 2 && ui.editor.caret() == CAPACITY - 2,
+        99,
+    );
+    let old = ui.editor.draft().len();
     ui.process(Event::Key {
         flags: 1 | 8,
         kind: 1,
@@ -459,7 +596,7 @@ pub fn self_test() {
         kind: 1,
         ascii: b'z',
     });
-    require(ui.length == old, 100);
+    require(ui.editor.draft().len() == old, 100);
     ui.process(Event::Mouse {
         dx: i32::MAX,
         dy: i32::MIN,
@@ -467,4 +604,57 @@ pub fn self_test() {
     });
     require(ui.pointer() == (1279, 0, 0), 101);
     require(ui.process(key(5, 0)) == EXIT, 102);
+
+    // Real keyboard policy and typed IPC converge on the same semantic state.
+    use mirror_desktop_protocol::{Chunk, Command, Status};
+    let mut human = Ui::new(1280, 800);
+    let mut agent = Ui::new(1280, 800);
+    for byte in b"same note" {
+        human.process(key(1, *byte));
+    }
+    human.process(key(2, 0));
+    let (response, change) = agent.dispatch_request(Request {
+        id: 1,
+        command: Command::Replace {
+            expected_revision: 0,
+            start: 0,
+            end: 0,
+            text: Chunk::new(b"same note").unwrap(),
+        },
+    });
+    require(response.status == Status::Ok && change & EDIT != 0, 103);
+    let (response, change) = agent.dispatch_request(Request {
+        id: 2,
+        command: Command::Apply {
+            expected_revision: response.snapshot.revision,
+        },
+    });
+    require(response.status == Status::Ok && change & SUBMIT != 0, 104);
+    require(
+        human.editor.draft() == agent.editor.draft()
+            && human.submitted() == agent.submitted()
+            && human.editor.caret() == agent.editor.caret(),
+        105,
+    );
+    let observed = agent.snapshot().revision;
+    agent.process(key(1, b'!'));
+    let before = agent.editor.clone();
+    let (response, change) = agent.dispatch_request(Request {
+        id: 3,
+        command: Command::Apply {
+            expected_revision: observed,
+        },
+    });
+    require(
+        response.status == Status::StaleRevision && change == 0 && agent.editor == before,
+        106,
+    );
+    human.process(key(4, 0));
+    human.process(key(4, 0));
+    require(human.process(key(2, 0)) & RUN_AGENT != 0, 107);
+    require(human.process(key(2, 0)) & RUN_AGENT == 0, 108);
+    human.set_agent_result(0);
+    require(human.process(key(1, b' ')) & RUN_AGENT != 0, 109);
+    human.set_agent_unavailable();
+    require(human.process(key(2, 0)) & RUN_AGENT == 0, 110);
 }

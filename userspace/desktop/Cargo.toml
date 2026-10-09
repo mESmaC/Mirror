@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[dependencies]
+mirror-desktop-protocol = { path = "../../crates/desktop-protocol" }
+mirror-window-protocol = { path = "../../crates/window-protocol" }
+
 [[bin]]
 name = "mirror-desktop"
 path = "src/main.rs"

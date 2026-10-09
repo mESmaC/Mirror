@@ -392,7 +392,7 @@ impl<'a> Driver<'a> {
         let origin_x = region.x + x;
         let origin_y = region.y + y;
         for (row, source) in pixels.chunks_exact(width * 4).enumerate() {
-            for (column, pixel) in source.chunks_exact(4).enumerate() {
+            for (column, pixel) in source.as_chunks::<4>().0.iter().enumerate() {
                 let written = self.pixel(
                     origin_x + column,
                     origin_y + row,
@@ -1028,14 +1028,14 @@ pub(crate) fn test_surface_upload() {
         }
     }
     fn header(packet: &mut [u8], values: [u32; 4]) {
-        for (destination, value) in packet[..16].chunks_exact_mut(4).zip(values) {
+        for (destination, value) in packet[..16].as_chunks_mut::<4>().0.iter_mut().zip(values) {
             destination.copy_from_slice(&value.to_le_bytes());
         }
     }
     fn info_fields(info: [u8; INFO_SIZE]) -> [u32; 6] {
         let mut fields = [0; 6];
-        for (value, bytes) in fields.iter_mut().zip(info.chunks_exact(4)) {
-            *value = u32::from_le_bytes(bytes.try_into().unwrap());
+        for (value, bytes) in fields.iter_mut().zip(info.as_chunks::<4>().0) {
+            *value = u32::from_le_bytes(*bytes);
         }
         fields
     }
@@ -1172,7 +1172,7 @@ pub(crate) fn test_surface_upload() {
         canvas.fill(0xa5);
         let mut packet = [0; MAX_PACKET];
         header(&mut packet, [2, 3, MAX_TILE as u32, MAX_TILE as u32]);
-        for pixel in packet[16..].chunks_exact_mut(4) {
+        for pixel in packet[16..].as_chunks_mut::<4>().0 {
             pixel.copy_from_slice(&[17, 34, 51, 0xff]);
         }
         {

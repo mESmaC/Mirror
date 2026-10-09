@@ -1,8 +1,9 @@
-//! Bootstrap-CPU timer using QEMU q35's PC-compatible 8259 PIC and 8254 PIT.
+//! Bootstrap-CPU PIT timer delivered through the I/O APIC or legacy 8259 PIC.
 //!
 //! This is an IRQ delivery foundation, not a scheduler or a calibrated clock.
 //! Ticks count delivered IRQs; long interrupt-disabled sections can lose ticks.
-//! APIC/IOAPIC routing, ACPI hardware discovery and SMP are not implemented.
+//! ACPI-discovered APIC routing is preferred; the PIC remains a fallback. The
+//! PIT still supplies the time base, and secondary processors remain offline.
 //!
 //! Register definitions: Intel ICH7 datasheet, legacy interrupt/timer chapters:
 //! https://www.intel.com/content/dam/doc/datasheet/i-o-controller-hub-7-datasheet.pdf
@@ -16,7 +17,7 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::{arch, interrupts, serial};
+use crate::{apic, arch, interrupts, serial};
 
 const MASTER_COMMAND: u16 = 0x20;
 const MASTER_DATA: u16 = 0x21;
@@ -37,8 +38,9 @@ const _: () = assert!(PIT_DIVISOR > 0 && PIT_DIVISOR <= u16::MAX as u32);
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
-/// Initialize the legacy PIC/PIT exactly once on the boot CPU with IF clear.
+/// Initialize the PIT and legacy PIC exactly once on the boot CPU with IF clear.
 /// The IRQ IDT must already be installed. Leaves IF clear and only IRQ0 unmasked.
+/// If APIC setup succeeded, keep both PICs masked and enable its IRQ0 route.
 /// This kernel owns these fixed PC I/O ports; no other PIC/PIT driver may run.
 pub fn init() {
     assert!(!arch::interrupts_enabled(), "timer init requires IF clear");
@@ -78,13 +80,19 @@ pub fn init() {
         write_delayed(PIT_CHANNEL_ZERO, PIT_DIVISOR as u8);
         write_delayed(PIT_CHANNEL_ZERO, (PIT_DIVISOR >> 8) as u8);
 
-        // Only the PIT is serviced. IRQ2 (cascade) remains masked as well.
-        write_delayed(MASTER_DATA, 0xfe);
+        if !apic::is_enabled() {
+            // Only the PIT is serviced. IRQ2 (cascade) remains masked as well.
+            write_delayed(MASTER_DATA, 0xfe);
+        }
+    }
+    if apic::is_enabled() {
+        apic::enable_irq(0);
     }
     serial::println!(
-        "MIRROR_TIMER_READY source=pit irq=0 vector=32 hz~{} divisor={}",
+        "MIRROR_TIMER_READY source=pit irq=0 vector=32 hz~{} divisor={} controller={}",
         TARGET_HZ,
-        PIT_DIVISOR
+        PIT_DIVISOR,
+        if apic::is_enabled() { "ioapic" } else { "pic" }
     );
 }
 
@@ -95,10 +103,14 @@ pub fn ticks() -> u64 {
 }
 
 /// Unmask IRQ1 after the keyboard driver has initialized its controller and
-/// queue. This boot CPU remains the sole PIC owner; leave all other masks intact.
+/// queue. The BSP owns both interrupt controllers; preserve all other routes.
 pub fn enable_keyboard_irq() {
-    assert!(INITIALIZED.load(Ordering::SeqCst), "PIC not initialized");
+    assert!(INITIALIZED.load(Ordering::SeqCst), "timer not initialized");
     assert!(!arch::interrupts_enabled(), "IRQ1 setup requires IF clear");
+    if apic::is_enabled() {
+        apic::enable_irq(1);
+        return;
+    }
     // SAFETY: The BSP owns these PIC registers, IF is clear, and the IRQ1 gate
     // and initialized device handler are installed before this call.
     unsafe {
@@ -108,11 +120,15 @@ pub fn enable_keyboard_irq() {
     }
 }
 
-/// Unmask mouse IRQ12 and the slave cascade only after the shared PS/2 driver
-/// has published initialized input state. Preserve every other PIC mask bit.
+/// Unmask mouse IRQ12 only after the shared PS/2 driver has published its input
+/// state. The PIC fallback also needs the slave cascade unmasked.
 pub fn enable_mouse_irq() {
-    assert!(INITIALIZED.load(Ordering::SeqCst), "PIC not initialized");
+    assert!(INITIALIZED.load(Ordering::SeqCst), "timer not initialized");
     assert!(!arch::interrupts_enabled(), "IRQ12 setup requires IF clear");
+    if apic::is_enabled() {
+        apic::enable_irq(12);
+        return;
+    }
     // SAFETY: Sole BSP ownership and IF exclusion serialize both PICs. IRQ12's
     // gate/controller handler are ready; enabling the cascade exposes only the
     // explicitly unmasked slave line. The existing IRQ1/IRQ0 masks are retained.
@@ -129,6 +145,15 @@ pub fn enable_mouse_irq() {
 /// Called only by installed IRQ gates for vectors 32..47, with IF clear.
 /// No allocation, locks, printing, scheduling or interrupt nesting here.
 pub(crate) fn handle_irq(vector: u8) {
+    if apic::is_enabled() {
+        if vector == MASTER_VECTOR {
+            TICKS.fetch_add(1, Ordering::Relaxed);
+        }
+        // The I/O APIC routes these vectors directly to the local APIC. The
+        // masked PICs did not service this interrupt and must not receive EOI.
+        apic::eoi();
+        return;
+    }
     // SAFETY: Only this BSP driver accesses the PICs; interrupt gates clear IF.
     // The caller already bounds the vector to the remapped legacy IRQ range.
     unsafe {
@@ -180,7 +205,7 @@ pub fn self_test() {
     assert!(!arch::interrupts_enabled(), "timer test requires IF clear");
     let before = ticks();
     while ticks().wrapping_sub(before) < 3 {
-        // SAFETY: IDT/PIC/PIT are ready and only IRQ0 is unmasked. IF remains
+        // SAFETY: The IDT, interrupt controller and PIT are ready. IF remains
         // clear from the counter check until STI. STI delays recognition until
         // after HLT, closing the lost-wakeup race. CLI after IRET leaves IF clear
         // for the next check and subsequent deliberate exception smoke tests.
@@ -188,9 +213,22 @@ pub fn self_test() {
     }
     let delivered = ticks().wrapping_sub(before);
     assert!(!arch::interrupts_enabled());
-    // SAFETY: IF is clear and the BSP owns both PICs. The returning IRQ0 handler
-    // must have acknowledged the interrupt before resuming this test.
-    let pending_service = unsafe { read_isr(MASTER_COMMAND) };
-    assert_eq!(pending_service & 1, 0, "IRQ0 EOI did not clear ISR");
+    if apic::is_enabled() {
+        assert!(
+            !apic::timer_in_service(),
+            "IRQ0 EOI did not clear LAPIC ISR"
+        );
+        // SAFETY: IF is clear and this BSP owns both PICs. APIC delivery must
+        // leave every legacy PIC line masked, including the slave cascade.
+        unsafe {
+            assert_eq!(arch::in8(MASTER_DATA), 0xff);
+            assert_eq!(arch::in8(SLAVE_DATA), 0xff);
+        }
+    } else {
+        // SAFETY: IF is clear and the BSP owns both PICs. The IRQ0 handler must
+        // have acknowledged the interrupt before resuming this test.
+        let pending_service = unsafe { read_isr(MASTER_COMMAND) };
+        assert_eq!(pending_service & 1, 0, "IRQ0 EOI did not clear PIC ISR");
+    }
     serial::println!("MIRROR_TIMER_OK ticks={} if_restored=0", delivered);
 }

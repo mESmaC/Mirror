@@ -14,9 +14,14 @@ bench = false
 [dependencies]
 limine = "=0.5.0"
 linked_list_allocator = { version = "=0.10.6", default-features = false }
+mirror-window-protocol = { path = "../crates/window-protocol" }
+mirror-vm-protocol = { path = "../crates/vm-protocol" }
+mirror-thread-protocol = { path = "../crates/thread-protocol" }
+mirror-acpi = { path = "../crates/acpi" }
 
 [features]
 boot-smoke = []
+agent-demo = []
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

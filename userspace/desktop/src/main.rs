@@ -3,6 +3,8 @@
 
 mod font;
 mod render;
+mod service;
+mod shell;
 mod ui;
 
 use core::arch::{asm, global_asm};
@@ -12,6 +14,7 @@ const _: &str = include_str!("../linker.ld");
 const SYS_WRITE: u64 = 1;
 const SYS_TICKS: u64 = 2;
 const SYS_EXIT: u64 = 3;
+const SYS_SLEEP: u64 = 5;
 const SYS_BOOT_HANDLE: u64 = 7;
 const SYS_CLOSE: u64 = 11;
 const SYS_DUP: u64 = 12;
@@ -91,8 +94,8 @@ enum Event {
 
 fn decode_event(bytes: &[u8; 32]) -> Event {
     let mut words = [0u32; 8];
-    for (word, bytes) in words.iter_mut().zip(bytes.chunks_exact(4)) {
-        *word = u32::from_le_bytes(bytes.try_into().unwrap());
+    for (word, bytes) in words.iter_mut().zip(bytes.as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*bytes);
     }
     require(words[0] == 1, 6);
     match words[1] {
@@ -143,8 +146,8 @@ fn next_input(number: u64, input: u64) -> Result<Event, i64> {
 fn check_input(console: u64, surface: u64, input: u64) {
     let mut buffer = [0xa5u8; 32];
     let pointer = buffer.as_mut_ptr() as u64;
-    require(syscall(SYS_BOOT_HANDLE, 1, 0, 0) == EBADF, 20);
-    require(syscall(SYS_BOOT_HANDLE, 2, 0, 0) == EBADF, 21);
+    require(syscall(SYS_BOOT_HANDLE, 1, 0, 0) > 0, 20);
+    require(syscall(SYS_BOOT_HANDLE, 2, 0, 0) > 0, 21);
     require(syscall(SYS_INPUT_POLL, u64::MAX, pointer, 32) == EBADF, 22);
     require(syscall(SYS_INPUT_WAIT, u64::MAX, 0, 0) == EBADF, 23);
     require(syscall(SYS_INPUT_POLL, console, pointer, 32) == EACCES, 24);
@@ -179,8 +182,8 @@ fn surface_dimensions(surface: u64) -> (usize, usize) {
         40,
     );
     let mut words = [0u32; 6];
-    for (word, bytes) in words.iter_mut().zip(bytes.chunks_exact(4)) {
-        *word = u32::from_le_bytes(bytes.try_into().unwrap());
+    for (word, bytes) in words.iter_mut().zip(bytes.as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*bytes);
     }
     require(words[0] == 1 && words[3..] == [1, 16, 0], 41);
     require(
@@ -191,8 +194,25 @@ fn surface_dimensions(surface: u64) -> (usize, usize) {
     (words[1] as usize, words[2] as usize)
 }
 
-fn smoke(console: u64, surface: u64, input: u64) -> ! {
+fn smoke(console: u64, surface: u64, input: u64, service: &mut service::Service) -> ! {
     ui::self_test();
+    let mut state = ui::Ui::new(1280, 800);
+    service.check_idle_authority(&mut state);
+    service.start(&mut state);
+    let start = syscall(SYS_TICKS, 0, 0, 0) as u64;
+    while service.available() {
+        service.poll(&mut state);
+        service.flush_reply(&mut state);
+        require(
+            (syscall(SYS_TICKS, 0, 0, 0) as u64).wrapping_sub(start) < 1000,
+            61,
+        );
+        require(syscall(SYS_SLEEP, 1, 0, 0) == 0, 62);
+    }
+    require(service.completed() == Some(0), 63);
+    service.check_idle_authority(&mut state);
+    require(state.submitted() == b"Hello from Mirror agent", 64);
+    write(console, b"Mirror desktop: agent operations passed\n");
     let packet = [
         0u8, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 73, 215, 199, 0,
     ];
@@ -284,7 +304,10 @@ fn log_pointer(console: u64, position: (usize, usize, u8)) {
 
 #[unsafe(no_mangle)]
 extern "C" fn desktop_main(mode: u64) -> ! {
-    require(mode <= 1, 1);
+    require(mode <= 3, 1);
+    if mode >= 2 {
+        shell::run(mode == 3);
+    }
     let code_segment: u16;
     // SAFETY: Reading CS is permitted in userspace.
     unsafe {
@@ -294,10 +317,11 @@ extern "C" fn desktop_main(mode: u64) -> ! {
     let console = boot_handle(0);
     let surface = boot_handle(3);
     let input = boot_handle(4);
+    let mut service = service::Service::new(boot_handle(1), boot_handle(2));
     check_input(console, surface, input);
     let (width, height) = surface_dimensions(surface);
     if mode == 1 {
-        smoke(console, surface, input);
+        smoke(console, surface, input, &mut service);
     }
     if width < 480 || height < 360 {
         write(console, b"Mirror desktop: display is too small\n");
@@ -308,17 +332,13 @@ extern "C" fn desktop_main(mode: u64) -> ! {
     ui.paint_initial(&mut renderer);
     require(renderer.flush(surface), 54);
     write(console, b"Mirror desktop: ready\n");
+    let mut deferred_changes = 0;
     loop {
-        let first = match next_input(SYS_INPUT_WAIT, input) {
-            Ok(event) => event,
-            Err(ETIMEDOUT) => continue,
-            Err(_) => exit(55),
-        };
-        let mut changes = ui.process(first);
-        if changes & ui::EXIT != 0 {
-            exit(0);
-        }
-        for _ in 1..16 {
+        let mut changes = deferred_changes;
+        deferred_changes = 0;
+        // Bound each source independently; a busy agent must leave human input
+        // responsive, and waiting for input alone would starve IPC requests.
+        for _ in 0..16 {
             match next_input(SYS_INPUT_POLL, input) {
                 Ok(event) => changes |= ui.process(event),
                 Err(EAGAIN) => break,
@@ -328,6 +348,12 @@ extern "C" fn desktop_main(mode: u64) -> ! {
                 exit(0);
             }
         }
+        if changes & ui::RUN_AGENT != 0 {
+            changes |= service.start(&mut ui);
+        }
+        let completed = service.completed();
+        let (remote_changes, _) = service.poll(&mut ui);
+        changes |= remote_changes;
         ui.paint_changes(&mut renderer, changes);
         if renderer.flush(surface) {
             write(console, b"Mirror desktop: frame\n");
@@ -340,6 +366,17 @@ extern "C" fn desktop_main(mode: u64) -> ! {
         if changes & ui::POINTER != 0 {
             log_pointer(console, ui.pointer());
         }
+        if service.completed() != completed {
+            match service.completed() {
+                Some(0) => write(console, b"Mirror desktop: agent complete\n"),
+                Some(1) => write(console, b"Mirror desktop: agent conflict\n"),
+                Some(_) => write(console, b"Mirror desktop: agent failed\n"),
+                None => {}
+            }
+        }
+        // A reply is released only after the frame it describes is visible.
+        deferred_changes |= service.flush_reply(&mut ui);
+        require(syscall(SYS_SLEEP, 1, 0, 0) == 0, 65);
     }
 }
 
