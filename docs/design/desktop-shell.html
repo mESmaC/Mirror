@@ -39,6 +39,9 @@
                radial-gradient(950px 640px at 108% 112%, #1A2340 0%, transparent 55%),
                linear-gradient(160deg, #0B0F16 0%, #0E1420 100%);
   --glass: rgba(18, 24, 38, .66);
+  --window-glass: rgba(18, 24, 38, .74);
+  --glass-edge: rgba(255, 255, 255, .06);
+  --sheen: rgba(255, 255, 255, .045);
 }
 #desktop[data-theme="light"] {
   --base: #F3F5F9; --surface: #FFFFFF; --elevated: #FFFFFF; --overlay: #EEF2F7;
@@ -58,10 +61,14 @@
                radial-gradient(900px 620px at 105% 110%, #DDE4F5 0%, transparent 55%),
                linear-gradient(160deg, #F4F6FA 0%, #E9EEF5 100%);
   --glass: rgba(255, 255, 255, .72);
+  --window-glass: rgba(255, 255, 255, .68);
+  --glass-edge: rgba(255, 255, 255, .7);
+  --sheen: rgba(255, 255, 255, .35);
 }
 
 html, body { height: 100%; }
-body { background: var(--pg-bg); font-family: var(--font-ui); overflow: hidden; }
+body { background: var(--pg-bg); font-family: var(--font-ui); overflow: hidden; user-select: none; -webkit-user-select: none; }
+textarea, input { user-select: text; -webkit-user-select: text; }
 
 #desktop { position: fixed; inset: 0; background: var(--wallpaper); color: var(--text-primary); overflow: hidden; }
 #desktop::before { content: ""; position: absolute; inset: 0; pointer-events: none;
@@ -98,10 +105,102 @@ body { background: var(--pg-bg); font-family: var(--font-ui); overflow: hidden; 
 
 /* ---------- Windows ---------- */
 #windows { position: absolute; inset: 0; z-index: 10; pointer-events: none; }
-.window { position: absolute; width: 348px; background: var(--surface); border: 1px solid var(--border-strong); border-radius: 12px; box-shadow: var(--shadow-3); overflow: hidden; pointer-events: auto; display: flex; flex-direction: column; }
+.window { position: absolute; width: 348px; background: var(--window-glass); border: 1px solid var(--border-strong); border-radius: 12px; box-shadow: var(--shadow-3), inset 0 1px 0 var(--glass-edge); overflow: hidden; pointer-events: auto; display: flex; flex-direction: column; backdrop-filter: blur(14px) saturate(1.25); -webkit-backdrop-filter: blur(14px) saturate(1.25); animation: win-in .18s cubic-bezier(.2,.8,.2,1); transition: border-color .15s, box-shadow .15s; }
+.window::before { content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; background: linear-gradient(135deg, var(--sheen), transparent 42%); }
+@keyframes win-in { from { opacity: 0; transform: translateY(6px) scale(.985); } to { opacity: 1; transform: none; } }
+.window.anim { transition: left .18s cubic-bezier(.2,.8,.2,1), top .18s cubic-bezier(.2,.8,.2,1), width .18s cubic-bezier(.2,.8,.2,1), height .18s cubic-bezier(.2,.8,.2,1), border-color .15s, box-shadow .15s; }
+.window.minimizing { animation: min-out .15s ease-in forwards; }
+@keyframes min-out { to { opacity: 0; transform: translateY(10px) scale(.98); } }
 .window.unfocused { border-color: var(--border-subtle); box-shadow: var(--shadow-1); }
 .window.min { display: none; }
-.window.maxed { left: 3% !important; top: 62px !important; width: 94% !important; height: calc(100% - 152px) !important; }
+.window.ws-hidden { display: none; }
+.rh { position: absolute; z-index: 6; }
+.rh-n { top: 0; left: 10px; right: 10px; height: 6px; cursor: ns-resize; }
+.rh-s { bottom: 0; left: 10px; right: 10px; height: 6px; cursor: ns-resize; }
+.rh-e { right: 0; top: 10px; bottom: 10px; width: 6px; cursor: ew-resize; }
+.rh-w { left: 0; top: 10px; bottom: 10px; width: 6px; cursor: ew-resize; }
+.rh-ne { right: 0; top: 0; width: 12px; height: 12px; cursor: nesw-resize; }
+.rh-sw { left: 0; bottom: 0; width: 12px; height: 12px; cursor: nesw-resize; }
+.rh-nw { left: 0; top: 0; width: 12px; height: 12px; cursor: nwse-resize; }
+.rh-se { right: 0; bottom: 0; width: 12px; height: 12px; cursor: nwse-resize; }
+.grip { position: absolute; right: 8px; bottom: 7px; width: 12px; height: 12px; pointer-events: none; opacity: 0; transition: opacity .12s; }
+.window:hover .grip { opacity: .55; }
+.grip i { position: absolute; right: 0; height: 1.5px; border-radius: 1px; background: var(--text-tertiary); transform: rotate(-45deg); transform-origin: right center; }
+.grip i:nth-child(1) { width: 5px; bottom: 1px; }
+.grip i:nth-child(2) { width: 9px; bottom: 4px; }
+.grip i:nth-child(3) { width: 12px; bottom: 7px; }
+.snap-preview { position: absolute; border-radius: 12px; border: 1.5px solid var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); backdrop-filter: blur(10px) saturate(1.3); -webkit-backdrop-filter: blur(10px) saturate(1.3); box-shadow: 0 0 0 3px var(--ring), inset 0 0 28px color-mix(in srgb, var(--accent) 9%, transparent); display: none; z-index: 90; pointer-events: none; transition: left .13s cubic-bezier(.2,.8,.2,1), top .13s cubic-bezier(.2,.8,.2,1), width .13s cubic-bezier(.2,.8,.2,1), height .13s cubic-bezier(.2,.8,.2,1); animation: snap-in .16s cubic-bezier(.2,.8,.2,1); }
+@keyframes snap-in { from { opacity: 0; transform: scale(.985); } to { opacity: 1; transform: none; } }
+.ws-pill { display: flex; align-items: center; gap: 8px; margin-left: 14px; height: 30px; padding: 0 12px; border-radius: 999px; background: var(--glass); border: 1px solid var(--border-subtle); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); color: var(--text-secondary); font-family: var(--font-mono); font-size: 10.5px; font-weight: 600; letter-spacing: .08em; cursor: pointer; box-shadow: var(--shadow-1); transition: background .12s, color .12s; }
+.ws-pill:hover { background: var(--overlay); color: var(--text-primary); }
+.ws-pill .wdots { display: flex; gap: 3px; }
+.ws-pill .wd { width: 5px; height: 5px; border-radius: 50%; background: var(--border-strong); transition: background .15s; }
+.ws-pill .wd.on { background: var(--accent); }
+.shortcuts { position: absolute; inset: 0; z-index: 220; display: flex; align-items: center; justify-content: center; background: rgba(5, 8, 13, .42); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); opacity: 0; pointer-events: none; transition: opacity .15s; }
+#desktop[data-theme="light"] .shortcuts { background: rgba(232, 238, 246, .55); }
+.shortcuts.open { opacity: 1; pointer-events: auto; }
+.sc-card { width: 540px; max-width: calc(100vw - 48px); max-height: 80vh; overflow: auto; background: var(--elevated); border: 1px solid var(--border-subtle); border-radius: 14px; box-shadow: var(--shadow-3); padding: 4px 18px 14px; }
+.sc-head { display: flex; align-items: center; padding: 12px 0 10px; border-bottom: 1px solid var(--border-subtle); position: sticky; top: 0; background: var(--elevated); }
+.sc-head h3 { font-size: 14px; font-weight: 650; flex: 1; }
+.sc-row { display: flex; align-items: center; gap: 14px; padding: 8px 0; border-bottom: 1px solid var(--border-subtle); }
+.sc-row:last-child { border-bottom: 0; }
+.sc-keys { min-width: 208px; flex: none; color: var(--text-primary); font-size: 12px; }
+.sc-what { color: var(--text-secondary); font-size: 12.5px; }
+
+/* ---------- Guided workflows ---------- */
+.panel.tour { width: 372px; }
+.tw-card { border: 1px solid var(--border-subtle); border-radius: 10px; padding: 11px 12px 12px; margin-bottom: 10px; transition: border-color .15s; }
+.tw-card:last-child { margin-bottom: 0; }
+.tw-card.running { border-color: var(--accent); }
+.tw-card.done { border-color: color-mix(in srgb, var(--success) 55%, transparent); }
+.tw-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.tw-title { font-size: 13px; font-weight: 650; color: var(--text-primary); }
+.tw-run { height: 26px; padding: 0 10px; font-size: 11.5px; }
+.tw-steps { margin: 9px 0 0; padding: 0; list-style: none; font-size: 12px; color: var(--text-secondary); }
+.tw-steps li { padding: 2.5px 0 2.5px 18px; position: relative; }
+.tw-steps li::before { content: "·"; position: absolute; left: 4px; color: var(--text-tertiary); }
+.tw-steps li.cur { color: var(--accent-subtle-text); font-weight: 600; }
+.tw-steps li.cur::before { content: "→"; color: var(--accent); }
+.tw-steps li.done { color: var(--text-tertiary); }
+.tw-steps li.done::before { content: "✓"; color: var(--success); }
+
+/* ---------- Implementation handoff ---------- */
+.handoff { position: absolute; inset: 0; z-index: 230; display: flex; background: rgba(5, 8, 13, .55); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); opacity: 0; pointer-events: none; transition: opacity .18s; }
+#desktop[data-theme="light"] .handoff { background: rgba(232, 238, 246, .6); }
+.handoff.open { opacity: 1; pointer-events: auto; }
+.h-wrap { margin: auto; width: min(980px, calc(100vw - 48px)); max-height: calc(100vh - 110px); display: flex; flex-direction: column; background: var(--elevated); border: 1px solid var(--border-subtle); border-radius: 16px; box-shadow: var(--shadow-3); overflow: hidden; transform: translateY(8px); transition: transform .18s cubic-bezier(.2,.8,.2,1); }
+.handoff.open .h-wrap { transform: none; }
+.h-head { display: flex; align-items: center; gap: 10px; padding: 14px 18px; border-bottom: 1px solid var(--border-subtle); flex: none; }
+.h-head .ic { color: var(--accent); }
+.h-head h2 { font-size: 15px; font-weight: 650; color: var(--text-primary); letter-spacing: 0; margin: 0; }
+.h-head .doc { font-size: 12px; color: var(--text-tertiary); }
+.h-head .sp { flex: 1; }
+.h-body { overflow: auto; padding: 6px 22px 24px; }
+.h-sec { margin-top: 26px; }
+.h-sec > h3 { font-size: 13.5px; font-weight: 650; color: var(--text-primary); margin-bottom: 3px; }
+.h-sec > .h-sub { font-size: 12px; color: var(--text-tertiary); margin-bottom: 12px; max-width: 76ch; }
+.htable { width: 100%; border-collapse: collapse; border: 1px solid var(--border-subtle); border-radius: 10px; overflow: hidden; }
+.htable th { text-align: left; font-family: var(--font-mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--text-tertiary); padding: 9px 12px; border-bottom: 1px solid var(--border-subtle); font-weight: 600; background: var(--surface); }
+.htable td { padding: 7px 12px; border-bottom: 1px solid var(--border-subtle); font-size: 12px; color: var(--text-primary); vertical-align: middle; }
+.htable tr:last-child td { border-bottom: 0; }
+.htable .tk { font-family: var(--font-mono); font-size: 11px; color: var(--accent-subtle-text); }
+.htable .vl { font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary); white-space: nowrap; }
+.htable .use { color: var(--text-tertiary); font-size: 11.5px; }
+.dotc { display: inline-block; width: 11px; height: 11px; border-radius: 3px; border: 1px solid rgba(128, 140, 160, .4); vertical-align: -1.5px; margin-right: 7px; }
+.h-icons { display: grid; grid-template-columns: repeat(auto-fill, minmax(86px, 1fr)); gap: 8px; }
+.h-icon { border: 1px solid var(--border-subtle); border-radius: 9px; background: var(--surface); padding: 10px 6px 8px; text-align: center; color: var(--text-primary); }
+.h-icon .ic { width: 17px; height: 17px; }
+.h-icon .nm { font-family: var(--font-mono); font-size: 9px; color: var(--text-tertiary); margin-top: 6px; }
+.h-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.h-rules { list-style: none; padding: 0; border: 1px solid var(--border-subtle); border-radius: 10px; overflow: hidden; }
+.h-rules li { padding: 8px 12px 8px 26px; position: relative; font-size: 12px; color: var(--text-secondary); border-bottom: 1px solid var(--border-subtle); line-height: 1.5; }
+.h-rules li:last-child { border-bottom: 0; }
+.h-rules li::before { content: ""; position: absolute; left: 11px; top: 14px; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
+.h-rules b { color: var(--text-primary); font-weight: 600; }
+.h-rules code { font-family: var(--font-mono); font-size: 11px; background: var(--overlay); padding: 1px 5px; border-radius: 4px; }
+.font-spec { border: 1px solid var(--border-subtle); border-radius: 10px; padding: 12px 14px; background: var(--surface); }
+.font-spec .fs-name { font-size: 13px; font-weight: 650; margin-bottom: 3px; }
+.font-spec .fs-stack { font-family: var(--font-mono); font-size: 10px; color: var(--text-tertiary); word-break: break-word; line-height: 1.7; }
 .titlebar { height: 38px; display: flex; align-items: center; gap: 9px; padding: 0 5px 0 11px; border-bottom: 1px solid var(--border-subtle); cursor: grab; user-select: none; flex: none; }
 .titlebar:active { cursor: grabbing; }
 .app-tile { width: 20px; height: 20px; border-radius: 6px; background: var(--accent-subtle); color: var(--accent-subtle-text); display: flex; align-items: center; justify-content: center; }
@@ -109,7 +208,7 @@ body { background: var(--pg-bg); font-family: var(--font-ui); overflow: hidden; 
 .titlebar .ttl { font-size: 13px; font-weight: 600; color: var(--text-primary); }
 .titlebar .doc { font-size: 12px; color: var(--text-tertiary); }
 .titlebar .caps { margin-left: auto; display: flex; gap: 2px; }
-.cap { width: 38px; height: 28px; border: 0; background: none; border-radius: 6px; color: var(--text-secondary); display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+.cap { width: 38px; height: 28px; border: 0; background: none; border-radius: 6px; color: var(--text-secondary); display: inline-flex; align-items: center; justify-content: center; cursor: pointer; transition: background .12s, color .12s; }
 .cap .ic { width: 13px; height: 13px; }
 .cap:hover { background: var(--overlay); color: var(--text-primary); }
 .cap.close:hover { background: var(--danger); color: var(--on-danger); }
@@ -131,7 +230,7 @@ body { background: var(--pg-bg); font-family: var(--font-ui); overflow: hidden; 
 .b-secondary:hover { background: var(--overlay); }
 .btn:disabled { opacity: .45; cursor: not-allowed; }
 
-textarea.input { width: 100%; height: auto; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--surface); color: var(--text-primary); font-family: var(--font-ui); font-size: 13px; resize: none; line-height: 1.5; transition: border-color .12s, box-shadow .12s; }
+textarea.input { width: 100%; height: auto; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border-strong); background: color-mix(in srgb, var(--surface) 82%, transparent); color: var(--text-primary); font-family: var(--font-ui); font-size: 13px; resize: none; line-height: 1.5; transition: border-color .12s, box-shadow .12s; }
 textarea.input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--ring); }
 textarea.input::placeholder { color: var(--text-tertiary); }
 .win-foot { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
@@ -139,18 +238,36 @@ textarea.input::placeholder { color: var(--text-tertiary); }
 .win-foot .note .ic { width: 12px; height: 12px; }
 
 .big-count { font-family: var(--font-mono); font-size: 34px; font-weight: 600; color: var(--text-primary); font-variant-numeric: tabular-nums; letter-spacing: .02em; }
-.count-box { border: 1px solid var(--border-subtle); border-radius: 8px; background: var(--base); padding: 14px; text-align: center; }
+.count-box { border: 1px solid var(--border-subtle); border-radius: 8px; background: color-mix(in srgb, var(--base) 62%, transparent); padding: 14px; text-align: center; }
 
-.f-row { display: flex; align-items: center; gap: 10px; padding: 8px 9px; border-radius: 8px; cursor: pointer; }
-.f-row:hover { background: var(--overlay); }
-.f-row .ic { color: var(--text-secondary); }
-.f-row .fn { font-size: 13px; color: var(--text-primary); }
-.f-row .fs { margin-left: auto; font-family: var(--font-mono); font-size: 10.5px; color: var(--text-tertiary); }
+.icon-btn:disabled { opacity: .35; cursor: not-allowed; }
 
-.term { font-family: var(--font-mono); font-size: 11.5px; line-height: 1.9; color: var(--text-secondary); white-space: pre-wrap; }
-.term .p { color: var(--accent); }
-.term .cur { display: inline-block; width: 7px; height: 12px; background: var(--accent); vertical-align: -1px; animation: blink 1.05s steps(1) infinite; }
-@keyframes blink { 50% { opacity: 0; } }
+/* compact files + terminal (shared patterns with docs/design/apps.html) */
+.sb { display: flex; align-items: center; gap: 6px; padding: 7px 9px; border-bottom: 1px solid var(--border-subtle); }
+.crumbs { display: flex; align-items: center; gap: 1px; font-size: 12px; overflow: hidden; }
+.crumb-b { border: 0; background: none; color: var(--text-secondary); font-family: var(--font-ui); font-size: 12px; font-weight: 550; padding: 3px 6px; border-radius: 5px; cursor: pointer; white-space: nowrap; }
+.crumb-b:hover { background: var(--overlay); color: var(--text-primary); }
+.crumb-b.cur { color: var(--text-primary); font-weight: 650; }
+.c-sep { width: 10px; height: 10px; color: var(--text-tertiary); }
+.sh-list { padding: 5px 6px; max-height: 192px; overflow: auto; }
+.sh-li { display: flex; align-items: center; gap: 8px; padding: 6px 9px; border-radius: 7px; cursor: pointer; font-size: 12.5px; color: var(--text-primary); }
+.sh-li:hover { background: var(--overlay); }
+.sh-li .ic { width: 14px; height: 14px; color: var(--text-secondary); }
+.sh-li.dir .ic { color: var(--accent); }
+.sh-li .fsz { margin-left: auto; font-family: var(--font-mono); font-size: 10px; color: var(--text-tertiary); }
+.sh-status { border-top: 1px solid var(--border-subtle); padding: 5px 11px; font-size: 10.5px; color: var(--text-tertiary); display: flex; gap: 6px; }
+.sh-status .right { margin-left: auto; }
+.sh-empty { padding: 18px 12px; text-align: center; color: var(--text-tertiary); font-size: 12px; line-height: 1.6; }
+.t-out { font-family: var(--font-mono); font-size: 11px; line-height: 1.8; padding: 10px 12px; height: 172px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+.t-in { display: flex; align-items: center; gap: 7px; border-top: 1px solid var(--border-subtle); padding: 8px 12px; }
+.t-in .t-p { font-family: var(--font-mono); font-size: 11px; color: var(--accent); flex: none; }
+.t-in input { flex: 1; border: 0; background: none; outline: none; color: var(--text-primary); font-family: var(--font-mono); font-size: 11px; }
+.t-p { color: var(--accent); }
+.t-dim { color: var(--text-tertiary); }
+.t-err { color: var(--danger); }
+.t-ok { color: var(--success); }
+.t-info { color: var(--info); }
+.t-line { display: flex; align-items: center; gap: 8px; }
 
 .set-row { display: flex; align-items: center; gap: 10px; padding: 9px 2px; border-bottom: 1px solid var(--border-subtle); }
 .set-row:last-child { border-bottom: 0; }
@@ -342,14 +459,27 @@ input[type="range"]:focus-visible { box-shadow: 0 0 0 3px var(--ring); border-ra
     <symbol id="i-moon" viewBox="0 0 16 16"><path d="M13.6 9.6A6 6 0 0 1 6.4 2.4a6 6 0 1 0 7.2 7.2z"/></symbol>
     <symbol id="i-volume" viewBox="0 0 16 16"><path d="M2.5 6v4h2.5L9 13V3L5 6z"/><path d="M11 6a3 3 0 0 1 0 4"/></symbol>
     <symbol id="i-wifi" viewBox="0 0 16 16"><path d="M2.5 5.8a8.5 8.5 0 0 1 11 0"/><path d="M5 8.6a5.4 5.4 0 0 1 6 0"/><path d="M8 11.4h.01"/></symbol>
+    <symbol id="i-back" viewBox="0 0 16 16"><path d="M10 3.5 5.5 8l4.5 4.5"/></symbol>
+    <symbol id="i-chev-r" viewBox="0 0 16 16"><path d="M6 4l4 4-4 4"/></symbol>
+    <symbol id="i-file" viewBox="0 0 16 16"><path d="M4.5 1.5h5l3 3v9a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1v-11a1 1 0 0 1 1-1z"/><path d="M9.5 1.5v3h3"/></symbol>
+    <symbol id="i-download" viewBox="0 0 16 16"><path d="M8 2.5v7M5.5 7 8 9.5 10.5 7"/><path d="M3 12.5h10"/></symbol>
+    <symbol id="i-image" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><circle cx="5.6" cy="6.4" r="1.1"/><path d="M2.5 11.5l3-3 2.5 2.5 3.5-3.5 2 2"/></symbol>
     <symbol id="i-power" viewBox="0 0 16 16"><path d="M8 2v5"/><path d="M4.6 4.4a5.6 5.6 0 1 0 6.8 0"/></symbol>
+    <symbol id="i-play" viewBox="0 0 16 16"><path d="M5.5 3.5v9l7.5-4.5z"/></symbol>
+    <symbol id="i-book" viewBox="0 0 16 16"><path d="M8 4C6.8 3 4.9 2.6 2.5 2.6v10c2.4 0 4.3.4 5.5 1.4 1.2-1 3.1-1.4 5.5-1.4v-10C11.1 2.6 9.2 3 8 4z"/><path d="M8 4v10"/></symbol>
   </defs>
 </svg>
 
 <div id="desktop" data-theme="dark">
   <div class="topbar">
     <div class="brand"><svg class="ic"><use href="#i-logo"/></svg>Mirror</div>
+    <button class="ws-pill" id="wsPill" title="Workspace 1 of 3 — click or Ctrl+Alt+1/2/3">
+      <span id="wsLabel">W1</span>
+      <span class="wdots"><span class="wd on"></span><span class="wd"></span><span class="wd"></span></span>
+    </button>
     <div class="status">
+      <button class="cell" id="btnTour" title="Guided workflows"><svg class="ic"><use href="#i-play"/></svg>tour</button>
+      <button class="cell" id="btnHandoff" title="Implementation handoff"><svg class="ic"><use href="#i-book"/></svg>handoff</button>
       <button class="cell" id="btnNotif" title="Notifications"><svg class="ic"><use href="#i-bell"/></svg><span class="badge" id="bellBadge" style="display:none">0</span></button>
       <button class="cell" id="btnAgent" title="Agent"><svg class="ic"><use href="#i-agent"/></svg>idle</button>
       <button class="cell" id="btnQS" title="Quick settings"><svg class="ic"><use href="#i-wifi"/></svg><svg class="ic"><use href="#i-volume"/></svg></button>
@@ -358,6 +488,26 @@ input[type="range"]:focus-visible { box-shadow: 0 0 0 3px var(--ring); border-ra
   </div>
 
   <div id="windows"></div>
+  <div class="snap-preview" id="snapPrev"></div>
+
+  <div class="shortcuts" id="shortcuts" role="dialog" aria-label="Keyboard shortcuts">
+    <div class="sc-card">
+      <div class="sc-head"><h3>Keyboard shortcuts</h3><button class="icon-btn" id="scClose" title="Close"><svg class="ic"><use href="#i-close"/></svg></button></div>
+      <div class="sc-row"><span class="sc-keys"><span class="kbd">/</span> or just type</span><span class="sc-what">Command palette — apps, actions, documents, widgets</span></div>
+      <div class="sc-row"><span class="sc-keys"><span class="kbd">`</span></span><span class="sc-what">Window switcher with live previews</span></div>
+      <div class="sc-row"><span class="sc-keys"><span class="kbd">esc</span></span><span class="sc-what">Close the topmost surface</span></div>
+      <div class="sc-row"><span class="sc-keys"><span class="kbd">ctrl</span><span class="kbd">alt</span><span class="kbd">↑</span></span><span class="sc-what">Maximize / restore the focused window</span></div>
+      <div class="sc-row"><span class="sc-keys"><span class="kbd">ctrl</span><span class="kbd">alt</span><span class="kbd">↓</span></span><span class="sc-what">Minimize the focused window</span></div>
+      <div class="sc-row"><span class="sc-keys"><span class="kbd">ctrl</span><span class="kbd">alt</span><span class="kbd">←</span><span class="kbd">→</span></span><span class="sc-what">Snap to left / right half — same again floats it back</span></div>
+      <div class="sc-row"><span class="sc-keys"><span class="kbd">ctrl</span><span class="kbd">alt</span><span class="kbd">1</span>–<span class="kbd">3</span></span><span class="sc-what">Switch workspace</span></div>
+      <div class="sc-row"><span class="sc-keys"><span class="kbd">ctrl</span><span class="kbd">alt</span><span class="kbd">shift</span><span class="kbd">←</span><span class="kbd">→</span></span><span class="sc-what">Move the focused window to the adjacent workspace</span></div>
+      <div class="sc-row"><span class="sc-keys">drag to screen edges</span><span class="sc-what">Snap preview — top edge maximizes, top corners quarter-snap</span></div>
+      <div class="sc-row"><span class="sc-keys">double-click titlebar</span><span class="sc-what">Maximize / restore</span></div>
+      <div class="sc-row"><span class="sc-keys">drag any edge or corner</span><span class="sc-what">Resize — from 240 × 150 up to the work area</span></div>
+      <div class="sc-row"><span class="sc-keys">topbar buttons</span><span class="sc-what">Tour runs guided workflows · Handoff opens dimensions, tokens, assets, behavior</span></div>
+      <div class="sc-row"><span class="sc-keys"><span class="kbd">?</span></span><span class="sc-what">This list</span></div>
+    </div>
+  </div>
 
   <div class="dock">
     <button class="tile launcher" id="dockLauncher" data-tip="Start"><svg class="ic"><use href="#i-logo"/></svg></button>
@@ -466,10 +616,82 @@ input[type="range"]:focus-visible { box-shadow: 0 0 0 3px var(--ring); border-ra
     </div>
   </div>
 
+  <div class="panel tour" id="tourPanel" aria-label="Guided workflows">
+    <div class="p-head"><h3>Guided workflows</h3><button class="btn b-ghost" id="tourStop" style="display:none">Stop</button></div>
+    <div class="p-body" id="tourBody"></div>
+    <div class="p-foot" style="justify-content:flex-start"><span class="dnd-note" style="padding:0"><svg class="ic"><use href="#i-info"/></svg>Workflows drive the real desktop — watch it happen.</span></div>
+  </div>
+
+  <div class="handoff" id="handoff" role="dialog" aria-label="Implementation handoff">
+    <div class="h-wrap">
+      <div class="h-head">
+        <svg class="ic"><use href="#i-book"/></svg>
+        <h2>Implementation handoff</h2>
+        <span class="doc">shell concept → renderer</span>
+        <span class="sp"></span>
+        <button class="icon-btn" id="hClose" title="Close"><svg class="ic"><use href="#i-close"/></svg></button>
+      </div>
+      <div class="h-body">
+        <div class="h-sec">
+          <h3>Dimensions &amp; geometry</h3>
+          <div class="h-sub">All values in CSS pixels at 100% scale. The work area excludes the top bar and dock.</div>
+          <table class="htable">
+            <tr><th>Element</th><th>Value</th><th>Notes</th></tr>
+            <tr><td class="tk">window radius / border</td><td class="vl">12 px · 1 px</td><td class="use">glass: blur 14 + saturate 1.25 over 74/68% tint</td></tr>
+            <tr><td class="tk">titlebar</td><td class="vl">38 px</td><td class="use">app tile 20 px · title 13/600</td></tr>
+            <tr><td class="tk">caption buttons</td><td class="vl">38 × 28 px</td><td class="use">inset focus ring, never clipped</td></tr>
+            <tr><td class="tk">window min size</td><td class="vl">240 × 150 px</td><td class="use">enforced during resize</td></tr>
+            <tr><td class="tk">dock tile / radius</td><td class="vl">42 px · 17 px</td><td class="use">gap 5 · padding 7 · running dot 5 px</td></tr>
+            <tr><td class="tk">controls</td><td class="vl">32 px</td><td class="use">compact 28–30 · input 34/30 · radius 6</td></tr>
+            <tr><td class="tk">focus ring</td><td class="vl">2 px + 2 px offset</td><td class="use">≥ 3:1 against any surface</td></tr>
+            <tr><td class="tk">panels</td><td class="vl">346 px wide</td><td class="use">top 58 · right 16 · radius 14</td></tr>
+            <tr><td class="tk">palette</td><td class="vl">min(920, vw−56)</td><td class="use">search 15×18 padding · grid gap 14</td></tr>
+            <tr><td class="tk">snap thresholds</td><td class="vl">20 px edges</td><td class="use">top corners ≤ 90 px → quarter zones</td></tr>
+            <tr><td class="tk">work area</td><td class="vl">viewport − 60 top − 104 bottom − 24 sides</td><td class="use">snap + maximize target</td></tr>
+            <tr><td class="tk">z-order</td><td class="vl">0 · 10–99 · 90 · 100 · 200 · 210 · 220 · 230 · 300</td><td class="use">desktop · windows · snap preview · dock/topbar · panels · switcher · shortcuts · handoff · toasts</td></tr>
+            <tr><td class="tk">motion</td><td class="vl">120 / 150–180 ms</td><td class="use">hover · fade/tween · cubic-bezier(.2,.8,.2,1)</td></tr>
+          </table>
+        </div>
+        <div class="h-sec">
+          <h3>Color tokens — both themes</h3>
+          <div class="h-sub">Generated from the spec table the shell itself consumes. A theme switch is a palette swap.</div>
+          <table class="htable" id="tokenTable"></table>
+        </div>
+        <div class="h-sec">
+          <h3>Assets</h3>
+          <div class="h-sub">No raster or font files. Icons are inline vector geometry on a 16 px grid (1.5 px stroke, round caps); the logo is a rounded square, a mirror diagonal, and two reflected triangles. Type is two system stacks.</div>
+          <div class="h-icons" id="iconGrid"></div>
+          <div class="h-cols" style="margin-top:14px">
+            <div class="font-spec"><div class="fs-name">UI — Inter / system</div><div class="fs-stack">"Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif</div></div>
+            <div class="font-spec"><div class="fs-name">Mono — code &amp; metrics</div><div class="fs-stack">"JetBrains Mono", "Cascadia Code", "Cascadia Mono", Consolas, "Liberation Mono", monospace</div></div>
+          </div>
+        </div>
+        <div class="h-sec">
+          <h3>Behavior contract</h3>
+          <div class="h-sub">The rules an implementation must reproduce.</div>
+          <div class="h-cols">
+            <ul class="h-rules">
+              <li><b>Focus:</b> click raises and focuses; unfocused chrome mutes title and tile. The ring shows only for keyboard focus (<code>:focus-visible</code>).</li>
+              <li><b>Snap:</b> dragging to an edge previews a frosted zone; dropping stores the pre-drag rect; repeat-snap or maximize restores it exactly.</li>
+              <li><b>Workspaces:</b> a window belongs to one workspace; dock clicks follow it across; the switcher shows the current workspace only.</li>
+              <li><b>Sessions:</b> apps are session-local; closing discards the document and announces it.</li>
+            </ul>
+            <ul class="h-rules">
+              <li><b>Notifications:</b> toasts cap at 3, auto-dismiss in 6 s, DND mutes; the bell counts unread until the center opens.</li>
+              <li><b>Apps:</b> every app ships navigation, loading, empty, and failure states — loading uses skeletons, failure always offers recovery.</li>
+              <li><b>Motion:</b> reduced-motion replaces fades with cuts and spinners with written state.</li>
+              <li><b>Palette:</b> typing anywhere opens search; Esc unwinds one layer at a time.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="toasts" id="toasts"></div>
 </div>
 
-<div class="meta">mirror shell · concept 02<br><b>logo tile</b> start menu &nbsp;·&nbsp; <b>/</b> palette &nbsp;·&nbsp; <b>`</b> switcher &nbsp;·&nbsp; drag titlebars</div>
+<div class="meta">mirror shell · prototype<br><b>logo</b> start &nbsp;·&nbsp; <b>/</b> palette &nbsp;·&nbsp; <b>`</b> switcher &nbsp;·&nbsp; <b>?</b> shortcuts &nbsp;·&nbsp; topbar: <b>tour · handoff</b></div>
 
 <script>
 const $ = (s, r = document) => r.querySelector(s);
@@ -506,19 +728,92 @@ function counterBody() {
       <button class="btn b-primary" data-act="reset">Reset</button>
     </div>`;
 }
-function filesBody() {
-  return `<h3>Home</h3><div class="sub">concept — no filesystem yet</div>
-    <div class="f-row"><svg class="ic"><use href="#i-file"/></svg><span class="fn">gamma.txt</span><span class="fs">96 B</span></div>
-    <div class="f-row"><svg class="ic"><use href="#i-file"/></svg><span class="fn">roadmap.md</span><span class="fs">2.1 KB</span></div>
-    <div class="f-row"><svg class="ic"><use href="#i-file"/></svg><span class="fn">boot.log</span><span class="fs">14 KB</span></div>
-    <div class="f-row"><svg class="ic"><use href="#i-file"/></svg><span class="fn">block-test.img</span><span class="fs">1.0 MiB</span></div>`;
+/* ---- shell Files (compact; shares patterns with docs/design/apps.html) ---- */
+const SH_FS = {
+  home: { label: "Home", items: [
+    { name: "Documents", kind: "dir" },
+    { name: "Downloads", kind: "dir" },
+    { name: "Images", kind: "dir" },
+    { name: "gamma.txt", kind: "file", size: "96 B" },
+    { name: "roadmap.md", kind: "file", size: "2.1 KB" },
+    { name: "boot.log", kind: "file", size: "14 KB" },
+  ]},
+  documents: { label: "Documents", items: [
+    { name: "gamma.txt", kind: "file", size: "96 B" },
+    { name: "spec-draft.md", kind: "file", size: "4.4 KB" },
+  ]},
+  downloads: { label: "Downloads", items: [] },
+  images: { label: "Images", items: [
+    { name: "native-desktop.png", kind: "img", size: "38 KB" },
+    { name: "boot-framebuffer.png", kind: "img", size: "41 KB" },
+  ]},
+};
+let shFsPath = ["home"];
+let shFsHist = [];
+function shRenderFiles(el) {
+  el = el || (wins.get("files") && wins.get("files").el);
+  if (!el) return;
+  const key = shFsPath[shFsPath.length - 1];
+  const folder = SH_FS[key];
+  el.querySelector("#shCrumbs").innerHTML = shFsPath.map((k, i) =>
+    `${i ? '<svg class="ic c-sep"><use href="#i-chev-r"/></svg>' : ""}<button class="crumb-b${i === shFsPath.length - 1 ? " cur" : ""}" data-sf="crumb" data-i="${i}">${SH_FS[k].label}</button>`
+  ).join("");
+  el.querySelector("#shList").innerHTML = folder.items.length
+    ? folder.items.map((i) => `<div class="sh-li${i.kind === "dir" ? " dir" : ""}" data-name="${i.name}" data-kind="${i.kind}"><svg class="ic"><use href="#${i.kind === "dir" ? "i-files" : i.kind === "img" ? "i-image" : "i-file"}"/></svg>${i.name}<span class="fsz">${i.size || ""}</span></div>`).join("")
+    : `<div class="sh-empty">This folder is empty.<br>Files you download will appear here.</div>`;
+  el.querySelector("#shStatus").innerHTML = `<span>${folder.items.length} items</span><span class="right">read-only</span>`;
+  el.querySelector('[data-sf="back"]').disabled = !shFsHist.length;
 }
+function filesBody() {
+  return `<div class="sb">
+      <button class="icon-btn" data-sf="back" title="Back"><svg class="ic"><use href="#i-back"/></svg></button>
+      <div class="crumbs" id="shCrumbs"></div>
+    </div>
+    <div class="sh-list" id="shList"></div>
+    <div class="sh-status" id="shStatus"></div>`;
+}
+
+/* ---- shell Terminal ---- */
+let shTLines = [];
+let shTHist = [];
+let shTHistIdx = -1;
 function termBody() {
-  return `<div class="term"><span class="p">mirror ~ $</span> status
-ticks=8412 · procs=4 · mem=62 MiB
-<span class="p">mirror ~ $</span> echo design review
-design review
-<span class="p">mirror ~ $</span> <span class="cur"></span></div>`;
+  return `<div class="t-out" id="stOut"></div><div class="t-in"><span class="t-p">mirror ~ $</span><input id="stInput" autocomplete="off" spellcheck="false"></div>`;
+}
+function shTRender(el) {
+  el = el || (wins.get("terminal") && wins.get("terminal").el);
+  if (!el) return;
+  const out = el.querySelector("#stOut");
+  out.innerHTML = shTLines.join("\n") || `<span class="t-dim">type </span><span class="t-ok">help</span><span class="t-dim"> to begin.</span>`;
+  out.scrollTop = out.scrollHeight;
+}
+function shTRun(cmd) {
+  const w = wins.get("terminal");
+  if (!w) return;
+  const inp = w.el.querySelector("#stInput");
+  const cmdEsc = cmd.replace(/</g, "&lt;");
+  shTLines.push(`<span class="t-p">mirror ~ $</span> ${cmdEsc}`);
+  const [name, ...args] = cmd.trim().split(/\s+/);
+  if (!name) { shTRender(); return; }
+  if (name === "help") shTLines.push(`<span class="t-dim">available:</span>  help  status  echo …  blocks  fault  clear`);
+  else if (name === "status") shTLines.push(`<span class="t-dim">ticks</span>=8412  <span class="t-dim">procs</span>=4  <span class="t-dim">mem</span>=62/128 MiB`);
+  else if (name === "echo") shTLines.push(args.join(" ").replace(/</g, "&lt;") || `<span class="t-dim">(empty)</span>`);
+  else if (name === "clear") { shTLines = []; shTRender(); return; }
+  else if (name === "blocks") {
+    if (inp) inp.disabled = true;
+    shTLines.push(`<span class="t-dim">claim 1af4:1001 … ok · queue 0</span>`, `<span class="t-line"><span class="spin" style="width:10px;height:10px;border-width:1.5px"></span><span class="t-dim">reading sector 1234…</span></span>`);
+    shTRender();
+    setTimeout(() => {
+      shTLines.pop();
+      shTLines.push(`<span class="t-ok">ok</span> <span class="t-dim">sector 1234 verified · 512 B · retries=0</span>`);
+      shTRender();
+      if (inp) inp.disabled = false;
+    }, 1100);
+    return;
+  }
+  else if (name === "fault") shTLines.push(`<span class="t-err">fault:</span> <span class="t-dim">UD2 in worker thread — contained, process ended</span>`, `<span class="t-dim">peers unaffected · handles reclaimed · exit 35</span>`);
+  else shTLines.push(`<span class="t-err">error:</span> <span class="t-dim">unknown command \u201c${cmdEsc.split(/\s+/)[0]}\u201d — type </span><span class="t-ok">help</span>`);
+  shTRender();
 }
 function settingsBody() {
   return `<h3>Appearance</h3><div class="sub">same tokens, two peer themes</div>
@@ -541,11 +836,16 @@ function createWin(id) {
       <span class="ttl">${app.name}</span><span class="doc">${app.doc}</span>
       <span class="caps">
         <button class="cap" data-cap="min" title="Minimize"><svg class="ic"><use href="#i-min"/></svg></button>
-        <button class="cap" data-cap="max" title="Maximize"><svg class="ic"><use href="#i-max"/></svg></button>
+        <button class="cap" data-cap="max" title="Maximize or restore"><svg class="ic"><use href="#i-max"/></svg></button>
         <button class="cap close" data-cap="close" title="Close"><svg class="ic"><use href="#i-close"/></svg></button>
       </span>
     </div>
-    <div class="wbody">${app.body()}</div>`;
+    <div class="wbody">${app.body()}</div>
+    <span class="rh rh-n" data-dir="n"></span><span class="rh rh-s" data-dir="s"></span>
+    <span class="rh rh-e" data-dir="e"></span><span class="rh rh-w" data-dir="w"></span>
+    <span class="rh rh-ne" data-dir="ne"></span><span class="rh rh-nw" data-dir="nw"></span>
+    <span class="rh rh-se" data-dir="se"></span><span class="rh rh-sw" data-dir="sw"></span>
+    <span class="grip"><i></i><i></i><i></i></span>`;
 
   el.querySelector(".caps").addEventListener("click", (e) => {
     const btn = e.target.closest(".cap");
@@ -554,30 +854,62 @@ function createWin(id) {
     const act = btn.dataset.cap;
     if (act === "close") closeWin(id);
     else if (act === "min") minimizeWin(id);
-    else if (act === "max") el.classList.toggle("maxed");
+    else if (act === "max") toggleMax(id);
   });
   el.addEventListener("pointerdown", () => focusWin(id));
 
   const tb = el.querySelector(".titlebar");
+  tb.addEventListener("dblclick", (e) => { if (!e.target.closest(".cap")) toggleMax(id); });
   tb.addEventListener("pointerdown", (e) => {
-    if (e.target.closest(".cap") || el.classList.contains("maxed")) return;
+    if (e.target.closest(".cap")) return;
+    const entry = wins.get(id);
     const rect = el.getBoundingClientRect();
-    const dx = e.clientX - rect.left, dy = e.clientY - rect.top;
+    const floatRect = entry.snap && entry.prev ? entry.prev : readRect(el);
+    let cw = rect.width, ch = rect.height;
+    let gx = e.clientX - rect.left, gy = e.clientY - rect.top;
     tb.setPointerCapture(e.pointerId);
+    let zone = null;
     const move = (ev) => {
-      const nx = Math.min(Math.max(ev.clientX - dx, -rect.width + 90), window.innerWidth - 90);
-      const ny = Math.min(Math.max(ev.clientY - dy, 52), window.innerHeight - 100);
+      if (entry.snap) {
+        const rel = gx / cw;
+        cw = floatRect.w; ch = floatRect.h;
+        gx = cw * rel; gy = Math.min(gy, 19);
+        entry.snap = ""; entry.prev = null;
+        el.style.width = cw + "px"; el.style.height = ch + "px";
+      }
+      const nx = Math.min(Math.max(ev.clientX - gx, -cw + 90), window.innerWidth - 90);
+      const ny = Math.min(Math.max(ev.clientY - gy, 52), window.innerHeight - 100);
       el.style.left = nx + "px";
       el.style.top = ny + "px";
+      zone = zoneAt(ev.clientX, ev.clientY);
+      showSnapPreview(zone);
     };
-    const up = () => { tb.removeEventListener("pointermove", move); tb.removeEventListener("pointerup", up); };
+    const up = () => {
+      tb.removeEventListener("pointermove", move);
+      tb.removeEventListener("pointerup", up);
+      showSnapPreview(null);
+      if (zone) snapTo(id, zone, floatRect);
+    };
     tb.addEventListener("pointermove", move);
     tb.addEventListener("pointerup", up);
   });
 
+  el.querySelectorAll(".rh").forEach((h) => {
+    h.addEventListener("pointerdown", (e) => startResize(e, el, id, h.dataset.dir));
+  });
+
   el.querySelector(".wbody").addEventListener("click", (e) => {
-    const row = e.target.closest(".f-row");
-    if (row) { spawnToast("info", "Files is a concept", "Mirror has no writable filesystem yet."); return; }
+    if (id === "files") {
+      const sfb = e.target.closest("[data-sf]");
+      if (sfb) {
+        if (sfb.dataset.sf === "back" && shFsHist.length) { shFsPath = shFsHist.pop(); shRenderFiles(); }
+        if (sfb.dataset.sf === "crumb") { const i = +sfb.dataset.i; if (i < shFsPath.length - 1) { shFsHist.push([...shFsPath]); shFsPath = shFsPath.slice(0, i + 1); shRenderFiles(); } }
+        return;
+      }
+      const li = e.target.closest(".sh-li");
+      if (li && li.dataset.kind !== "dir") spawnToast("info", li.dataset.name, "Opens in Notes — documents stay session-local.");
+      return;
+    }
     const b = e.target.closest("[data-act]");
     if (!b) return;
     const act = b.dataset.act;
@@ -596,18 +928,52 @@ function createWin(id) {
       el.querySelector(".cc").textContent = `${e.target.value.length} / 96 characters`;
     }
   });
+
+  if (id === "files") {
+    el.querySelector(".wbody").addEventListener("dblclick", (e) => {
+      const li = e.target.closest(".sh-li");
+      if (li && li.dataset.kind === "dir") {
+        shFsHist.push([...shFsPath]);
+        shFsPath.push(li.dataset.name.toLowerCase());
+        shRenderFiles();
+      }
+    });
+    shRenderFiles(el);
+  }
+  if (id === "terminal") {
+    el.querySelector(".wbody").addEventListener("keydown", (e) => {
+      if (!e.target.matches("#stInput")) return;
+      if (e.key === "Enter") {
+        const v = e.target.value;
+        e.target.value = "";
+        if (v.trim()) { shTHist.push(v); shTHistIdx = -1; }
+        shTRun(v);
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        if (shTHist.length) { shTHistIdx = shTHistIdx < 0 ? shTHist.length - 1 : Math.max(0, shTHistIdx - 1); e.target.value = shTHist[shTHistIdx]; }
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        if (shTHistIdx >= 0) { shTHistIdx = Math.min(shTHist.length - 1, shTHistIdx + 1); e.target.value = shTHist[shTHistIdx]; }
+      }
+    });
+    shTLines = [];
+    shTRender(el);
+    setTimeout(() => { const i = el.querySelector("#stInput"); if (i) i.focus(); }, 80);
+  }
   return el;
 }
 
 function launch(id) {
   const w = wins.get(id);
   if (w) {
-    if (w.minimized) { w.el.classList.remove("min"); w.minimized = false; }
+    if (w.ws !== currentWs) switchWs(w.ws);
+    if (w.minimized) { w.el.classList.remove("min", "minimizing"); w.minimized = false; }
+    w.el.classList.remove("ws-hidden");
     focusWin(id); updateDock(); return;
   }
   const el = createWin(id);
   $("#windows").appendChild(el);
-  const entry = { el, minimized: false };
+  const entry = { el, minimized: false, ws: currentWs, snap: "", prev: null };
   wins.set(id, entry);
   if (id === "counter") {
     entry.count = 0;
@@ -633,7 +999,7 @@ function closeWin(id) {
   wins.delete(id);
   if (focusedApp === id) {
     focusedApp = null;
-    const rest = [...wins.keys()].filter((k) => !wins.get(k).minimized);
+    const rest = [...wins.keys()].filter((k) => !wins.get(k).minimized && wins.get(k).ws === currentWs);
     if (rest.length) focusWin(rest[rest.length - 1]);
   }
   updateDock();
@@ -643,11 +1009,16 @@ function closeWin(id) {
 function minimizeWin(id) {
   const w = wins.get(id);
   if (!w) return;
-  w.el.classList.add("min");
   w.minimized = true;
+  w.el.classList.add("minimizing");
+  setTimeout(() => {
+    if (!w.minimized) return;
+    w.el.classList.remove("minimizing");
+    w.el.classList.add("min");
+  }, 150);
   if (focusedApp === id) {
     focusedApp = null;
-    const rest = [...wins.keys()].filter((k) => !wins.get(k).minimized);
+    const rest = [...wins.keys()].filter((k) => !wins.get(k).minimized && wins.get(k).ws === currentWs);
     if (rest.length) focusWin(rest[rest.length - 1]);
   }
   updateDock();
@@ -735,9 +1106,15 @@ feedEl.addEventListener("click", (e) => {
 $("#clearAll").onclick = () => { feed.length = 0; renderFeed(); };
 
 /* ================= Panels ================= */
-const panels = { notif: $("#notifPanel"), qs: $("#qsPanel") };
+const panels = { notif: $("#notifPanel"), qs: $("#qsPanel"), tour: $("#tourPanel") };
 let openPanel = null;
-function closePanels() { Object.values(panels).forEach((p) => p.classList.remove("open")); openPanel = null; }
+function closePanels() {
+  Object.entries(panels).forEach(([k, p]) => {
+    if (k === "tour" && tourActive) return;
+    p.classList.remove("open");
+    if (openPanel === k) openPanel = null;
+  });
+}
 function togglePanel(name) {
   const was = openPanel === name;
   closePanels();
@@ -917,6 +1294,143 @@ function updateWidgets() {
 setInterval(updateWidgets, 500);
 updateWidgets();
 
+/* ================= Window geometry: resize, snap, workspaces ================= */
+function workArea() {
+  return { x: 12, y: 60, w: window.innerWidth - 24, h: window.innerHeight - 60 - 104 };
+}
+function readRect(el) { const r = el.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; }
+function applyRect(el, r) {
+  el.style.left = r.x + "px"; el.style.top = r.y + "px";
+  el.style.width = r.w + "px"; el.style.height = r.h + "px";
+}
+function zoneAt(cx, cy) {
+  const vw = window.innerWidth;
+  if (cx <= 20 && cy <= 90) return "tl";
+  if (cx >= vw - 20 && cy <= 90) return "tr";
+  if (cy <= 10) return "max";
+  if (cx <= 20) return "left";
+  if (cx >= vw - 20) return "right";
+  return null;
+}
+function snapRect(zone) {
+  const wa = workArea();
+  switch (zone) {
+    case "max": return { x: wa.x, y: wa.y, w: wa.w, h: wa.h };
+    case "left": return { x: wa.x, y: wa.y, w: wa.w / 2 - 6, h: wa.h };
+    case "right": return { x: wa.x + wa.w / 2 + 6, y: wa.y, w: wa.w / 2 - 6, h: wa.h };
+    case "tl": return { x: wa.x, y: wa.y, w: wa.w / 2 - 6, h: wa.h / 2 - 6 };
+    case "tr": return { x: wa.x + wa.w / 2 + 6, y: wa.y, w: wa.w / 2 - 6, h: wa.h / 2 - 6 };
+  }
+}
+function showSnapPreview(zone) {
+  const p = $("#snapPrev");
+  if (!zone) { p.style.display = "none"; return; }
+  const r = snapRect(zone);
+  p.style.display = "block";
+  p.style.left = r.x + "px"; p.style.top = r.y + "px";
+  p.style.width = r.w + "px"; p.style.height = r.h + "px";
+}
+function tweenRect(el, r) {
+  el.classList.add("anim");
+  applyRect(el, r);
+  setTimeout(() => el.classList.remove("anim"), 220);
+}
+function snapTo(id, zone, prev) {
+  const entry = wins.get(id);
+  if (!entry) return;
+  const el = entry.el;
+  if (prev) entry.prev = prev;
+  else if (!entry.snap) entry.prev = readRect(el);
+  entry.snap = zone;
+  tweenRect(el, snapRect(zone));
+}
+function toggleMax(id) {
+  const entry = wins.get(id);
+  if (!entry) return;
+  if (entry.snap === "max") {
+    entry.snap = "";
+    if (entry.prev) { tweenRect(entry.el, entry.prev); entry.prev = null; }
+  } else snapTo(id, "max");
+}
+function snapFocused(zone) {
+  const entry = focusedApp && wins.get(focusedApp);
+  if (!entry) return;
+  if (entry.snap === zone && entry.prev) {
+    tweenRect(entry.el, entry.prev);
+    entry.snap = ""; entry.prev = null;
+  } else snapTo(focusedApp, zone);
+}
+
+function startResize(e, el, id, dir) {
+  e.preventDefault(); e.stopPropagation();
+  focusWin(id);
+  const entry = wins.get(id);
+  entry.snap = ""; entry.prev = null;
+  const r = el.getBoundingClientRect();
+  const x0 = r.left, y0 = r.top, w0 = r.width, h0 = r.height;
+  const sx = e.clientX, sy = e.clientY;
+  const move = (ev) => {
+    let x = x0, y = y0, w = w0, h = h0;
+    const dx = ev.clientX - sx, dy = ev.clientY - sy;
+    if (dir.includes("e")) w = w0 + dx;
+    if (dir.includes("w")) { w = w0 - dx; x = x0 + dx; }
+    if (dir.includes("s")) h = h0 + dy;
+    if (dir.includes("n")) { h = h0 - dy; y = y0 + dy; }
+    if (w < 240) { if (dir.includes("w")) x -= 240 - w; w = 240; }
+    if (h < 150) { if (dir.includes("n")) y -= 150 - h; h = 150; }
+    if (x < 0) { if (dir.includes("w")) w += x; x = 0; }
+    if (y < 52) { if (dir.includes("n")) h += y - 52; y = 52; }
+    applyRect(el, { x, y, w, h });
+  };
+  const up = () => {
+    document.removeEventListener("pointermove", move);
+    document.removeEventListener("pointerup", up);
+  };
+  document.addEventListener("pointermove", move);
+  document.addEventListener("pointerup", up);
+}
+
+/* ---- Workspaces ---- */
+let currentWs = 0;
+const WS_COUNT = 3;
+function switchWs(i) {
+  if (i === currentWs) return;
+  currentWs = i;
+  for (const [, w] of wins) {
+    w.el.classList.toggle("ws-hidden", w.ws !== i || w.minimized);
+  }
+  const top = [...wins.entries()]
+    .filter(([, w]) => w.ws === i && !w.minimized)
+    .sort((a, b) => (+b[1].el.style.zIndex || 0) - (+a[1].el.style.zIndex || 0));
+  if (top.length) focusWin(top[0][0]); else { focusedApp = null; updateDock(); }
+  $("#wsLabel").textContent = "W" + (i + 1);
+  document.querySelectorAll("#wsPill .wd").forEach((d, j) => d.classList.toggle("on", j === i));
+  spawnToast("info", "Workspace " + (i + 1), top.length ? "Focused " + APPS[top[0][0]].name + "." : "Empty workspace — launch something.");
+}
+function moveFocusedToWs(dir) {
+  const w = focusedApp && wins.get(focusedApp);
+  if (!w) return;
+  const next = Math.min(WS_COUNT - 1, Math.max(0, w.ws + dir));
+  if (next === w.ws) return;
+  const name = APPS[focusedApp].name;
+  w.ws = next;
+  w.el.classList.add("ws-hidden");
+  focusedApp = null;
+  const rest = [...wins.entries()].filter(([, v]) => v.ws === currentWs && !v.minimized);
+  if (rest.length) focusWin(rest[rest.length - 1][0]); else updateDock();
+  spawnToast("info", name + " → Workspace " + (next + 1), "Ctrl+Alt+" + (next + 1) + " to follow it.");
+}
+$("#wsPill").onclick = () => switchWs((currentWs + 1) % WS_COUNT);
+
+/* ---- Shortcuts overlay ---- */
+let scOpen = false;
+function toggleShortcuts(open) {
+  scOpen = open === undefined ? !scOpen : open;
+  $("#shortcuts").classList.toggle("open", scOpen);
+}
+$("#scClose").onclick = () => toggleShortcuts(false);
+$("#shortcuts").addEventListener("pointerdown", (e) => { if (e.target.id === "shortcuts") toggleShortcuts(false); });
+
 /* ================= Switcher ================= */
 let swOpen = false, swSel = 0, swIds = [];
 function miniFor(id) {
@@ -936,7 +1450,7 @@ function renderSwitcher() {
   }).join("");
 }
 function openSwitcher() {
-  swIds = [...wins.keys()];
+  swIds = [...wins.entries()].filter(([, w]) => w.ws === currentWs).map(([k]) => k);
   if (!swIds.length) { spawnToast("info", "No open windows", "Launch an app from the dock or start menu."); return; }
   closeMenu(); closePalette(); closePanels();
   const fi = swIds.indexOf(focusedApp);
@@ -961,6 +1475,10 @@ $("#swCards").addEventListener("click", (e) => {
 
 /* ================= Global keys + backdrop ================= */
 document.addEventListener("keydown", (e) => {
+  if (scOpen) {
+    if (e.key === "Escape" || e.key === "?") { e.preventDefault(); toggleShortcuts(false); }
+    return;
+  }
   if (swOpen) {
     e.preventDefault();
     if (e.key === "ArrowRight") { swSel = (swSel + 1) % swIds.length; renderSwitcher(); }
@@ -970,9 +1488,29 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   if (e.key === "Escape") {
-    if (paletteOpen) closePalette();
+    if (handoffOpen) closeHandoff();
+    else if (paletteOpen) closePalette();
     else if (menuOpen) closeMenu();
     else closePanels();
+    return;
+  }
+  const tagNow = (document.activeElement && document.activeElement.tagName) || "";
+  if (e.key === "?" && !/INPUT|TEXTAREA/.test(tagNow)) {
+    e.preventDefault();
+    toggleShortcuts(true);
+    return;
+  }
+  if (e.ctrlKey && e.altKey && !paletteOpen && !menuOpen) {
+    if (/^[123]$/.test(e.key)) { e.preventDefault(); switchWs(+e.key - 1); return; }
+    const w = focusedApp && wins.get(focusedApp);
+    if (w) {
+      if (e.key === "ArrowUp") { e.preventDefault(); toggleMax(focusedApp); return; }
+      if (e.key === "ArrowDown") { e.preventDefault(); minimizeWin(focusedApp); return; }
+      if (e.key === "ArrowLeft" && e.shiftKey) { e.preventDefault(); moveFocusedToWs(-1); return; }
+      if (e.key === "ArrowRight" && e.shiftKey) { e.preventDefault(); moveFocusedToWs(1); return; }
+      if (e.key === "ArrowLeft") { e.preventDefault(); snapFocused("left"); return; }
+      if (e.key === "ArrowRight") { e.preventDefault(); snapFocused("right"); return; }
+    }
     return;
   }
   if (e.key === "`" || (e.code === "Space" && e.ctrlKey)) {
@@ -1002,9 +1540,125 @@ document.addEventListener("keydown", (e) => {
   }
 });
 desktop.addEventListener("pointerdown", (e) => {
-  if (e.target.closest(".window, .dock, .topbar, .panel, .palette, .startmenu, .switcher, .toasts")) return;
-  closePanels(); closePalette(); closeMenu();
+  if (e.target.closest(".window, .dock, .topbar, .panel, .palette, .startmenu, .switcher, .toasts, .handoff")) return;
+  closePanels(); closePalette(); closeMenu(); closeHandoff();
 });
+
+/* ================= Guided workflows ================= */
+let tourTimer = null, tourActive = null;
+const TOURS = [
+  { id: "note", title: "Launch & take a note", needs: [], steps: [
+    ["Open the palette", () => openPalette()],
+    ["Launch Notes", () => activate({ kind: "app", id: "notes" })],
+    ["Type “alpha” into the draft", () => { const t = document.querySelector('#windows .window[data-app="notes"] textarea'); t.value = "alpha"; t.dispatchEvent(new Event("input", { bubbles: true})); }],
+    ["Apply — watch the notification", () => { document.querySelector('#windows .window[data-app="notes"] [data-act="apply"]').click(); }],
+  ]},
+  { id: "browse", title: "Browse files & open a document", needs: [], steps: [
+    ["Launch Files", () => launch("files")],
+    ["Drill into Documents", () => { shFsHist.push([...shFsPath]); shFsPath = ["home", "documents"]; shRenderFiles(); }],
+    ["Open gamma.txt", () => spawnToast("ok", "Opened gamma.txt", "Notes · 96 B")],
+  ]},
+  { id: "tile", title: "Tile two windows side by side", needs: ["notes"], steps: [
+    ["Launch Counter", () => launch("counter")],
+    ["Snap Counter to the left half", () => { focusWin("counter"); snapTo("counter", "left"); }],
+    ["Snap Notes to the right half", () => { focusWin("notes"); snapTo("notes", "right"); }],
+  ]},
+  { id: "theme", title: "Change settings & switch workspaces", needs: ["counter"], steps: [
+    ["Switch to the light theme", () => { if (desktop.dataset.theme !== "light") toggleTheme(); }],
+    ["Send Counter to Workspace 2", () => { focusWin("counter"); moveFocusedToWs(1); }],
+    ["Follow it to W2", () => switchWs(1)],
+    ["Return to W1 and dark", () => { switchWs(0); if (desktop.dataset.theme !== "dark") toggleTheme(); }],
+  ]},
+];
+function renderTours() {
+  $("#tourBody").innerHTML = TOURS.map((t) => `
+    <div class="tw-card" data-tour="${t.id}">
+      <div class="tw-head"><span class="tw-title">${t.title}</span><button class="btn b-secondary tw-run" data-run="${t.id}">Run</button></div>
+      <ol class="tw-steps">${t.steps.map((s) => `<li>${s[0]}</li>`).join("")}</ol>
+    </div>`).join("");
+}
+function stopTour() {
+  clearTimeout(tourTimer);
+  tourActive = null;
+  $("#tourStop").style.display = "none";
+  document.querySelectorAll(".tw-card").forEach((c) => c.classList.remove("running"));
+  document.querySelectorAll(".tw-steps li.cur").forEach((li) => li.classList.remove("cur"));
+}
+function runTour(id) {
+  stopTour();
+  const tour = TOURS.find((t) => t.id === id);
+  const card = document.querySelector(`.tw-card[data-tour="${id}"]`);
+  tourActive = id;
+  $("#tourStop").style.display = "";
+  card.classList.add("running");
+  card.classList.remove("done");
+  const lis = card.querySelectorAll(".tw-steps li");
+  lis.forEach((li) => li.classList.remove("done", "cur"));
+  tour.needs.forEach((n) => { if (!wins.has(n)) launch(n); });
+  let i = 0;
+  const step = () => {
+    if (tourActive !== id) return;
+    if (i > 0) { lis[i - 1].classList.remove("cur"); lis[i - 1].classList.add("done"); }
+    if (i >= tour.steps.length) {
+      card.classList.remove("running");
+      card.classList.add("done");
+      tourActive = null;
+      $("#tourStop").style.display = "none";
+      spawnToast("ok", "Workflow complete", tour.title + ".");
+      return;
+    }
+    lis[i].classList.add("cur");
+    tour.steps[i][1]();
+    i++;
+    tourTimer = setTimeout(step, 1000);
+  };
+  step();
+}
+$("#tourStop").onclick = stopTour;
+$("#tourBody").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-run]");
+  if (b) runTour(b.dataset.run);
+});
+$("#btnTour").onclick = () => { closeMenu(); closePalette(); togglePanel("tour"); };
+
+/* ================= Implementation handoff ================= */
+let handoffOpen = false;
+function openHandoff() {
+  closePanels(); closeMenu(); closePalette(); closeSwitcher(); stopTour();
+  $("#handoff").classList.add("open");
+  handoffOpen = true;
+}
+function closeHandoff() {
+  $("#handoff").classList.remove("open");
+  handoffOpen = false;
+}
+$("#btnHandoff").onclick = openHandoff;
+$("#hClose").onclick = closeHandoff;
+$("#handoff").addEventListener("pointerdown", (e) => { if (e.target.id === "handoff") closeHandoff(); });
+
+const TOKEN_SPEC = [
+  ["base", "#F3F5F9", "#0B0F16", "Desktop, app backdrop"],
+  ["surface", "#FFFFFF", "#121826", "Windows, cards, inputs"],
+  ["elevated", "#FFFFFF", "#1A2334", "Menus, toasts, popovers"],
+  ["overlay", "#EEF2F7", "#232E44", "Hover fills"],
+  ["border-subtle", "#E2E8F1", "#26314A", "Card edges, separators"],
+  ["border-strong", "#C6D0DF", "#3B4A6B", "Control outlines, window frames"],
+  ["text-primary", "#0F1726", "#ECF1F9", "Headings, values, body"],
+  ["text-secondary", "#475569", "#A6B2C7", "Descriptions, labels"],
+  ["text-tertiary", "#5D6B82", "#71809A", "Placeholders, captions"],
+  ["accent", "#0B7C6F", "#4FD8C2", "Primary actions, focus, active app"],
+  ["on-accent", "#FFFFFF", "#052B25", "Glyphs on accent fill"],
+  ["accent-subtle", "#E2F3EE", "#123A35", "Tinted tiles, badges"],
+  ["success", "#047857", "#34D399", "Completion"],
+  ["warning", "#B45309", "#FBBF24", "Caution"],
+  ["danger", "#C81E1E", "#F87171", "Errors, destructive"],
+  ["info", "#2563EB", "#60A5FA", "Notices"],
+  ["window-glass", "rgba(255,255,255,.68)", "rgba(18,24,38,.74)", "Frosted window tint"],
+];
+$("#tokenTable").innerHTML = `<tr><th>Token</th><th>Light</th><th>Dark</th><th>Used for</th></tr>` + TOKEN_SPEC.map(([n, l, d, u]) =>
+  `<tr><td class="tk">${n}</td><td class="vl"><span class="dotc" style="background:${l}"></span>${l}</td><td class="vl"><span class="dotc" style="background:${d}"></span>${d}</td><td class="use">${u}</td></tr>`).join("");
+$("#iconGrid").innerHTML = [...document.querySelectorAll("symbol")].map((s) =>
+  `<div class="h-icon"><svg class="ic"><use href="#${s.id}"/></svg><div class="nm">${s.id.replace("i-", "")}</div></div>`).join("");
 
 /* ================= Dock + clock + seed ================= */
 document.querySelector(".dock").addEventListener("click", (e) => {
@@ -1023,6 +1677,7 @@ tickClock();
 setInterval(tickClock, 5000);
 
 renderFeed();
+renderTours();
 launch("notes");
 launch("counter");
 setTimeout(() => notify("info", "i-logo", "Welcome to Mirror shell", "Launcher, dock, switcher, notifications, quick settings — all clickable."), 900);
