@@ -56,7 +56,7 @@ Line references are at HEAD 4614249; earlier M0 specs shift some of them. Work o
 
    Scripts and docs:
    - run.ps1 gets `-Fault KernelStackOverflow` and adds it to its fatal set (run.ps1:472) with vector 8 and `error=0x0`, which its fatal-diagnostic regex (run.ps1:790-796) already expects. It checks that cr2 lies in the page at `rsp0_guard`. On every smoke boot it checks the `MIRROR_CPU_STACKS` lines, `MIRROR_STACKS_READY` and `MIRROR_IST_OK`.
-   - test.ps1 adds KernelStackOverflow to the main battery (test.ps1:34).
+   - test.ps1 adds KernelStackOverflow to the main battery (test.ps1:45).
    - readme.md line 7 says every CPU has guarded stacks.
 
 ## Acceptance tests

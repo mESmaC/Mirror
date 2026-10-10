@@ -178,7 +178,7 @@ v1 order. The harness follows the process model (A15), and harness code is writt
 
 State after the 2026-10-09 gap interview, its write-up and its addendum, the 2026-10-10 pin change (P5a: 1.99.0), and the 2026-10-10 VMware addendum (Workstation Pro 26.0.1 checked and powered on).
 
-**Next in the M0 order:** 0011. 0012 is done (e6c5ec7, 2026-10-10). Its first step, the `kernel/src/usb.rs:538` as_chunks fix, waits on branch `claude/0011-usb-as-chunks` (23bdcba) for Cameron to merge; the full suite passed there on Rust 1.99.0. Build the rest of 0011 on top of it.
+**Next in the M0 order:** 0014. 0012 is done (e6c5ec7). 0011 is done on branch `claude/0011-toolchain-and-lints` (c26d5c7, 1cdd954, plus its spec update), and both full suites passed on Rust 1.99.0 (2026-10-10). Cameron merges it; once merged, `main` is pinned to 1.99.0 and checked by `Assert-MirrorToolchain`.
 
 **Confirmed, but not yet written into the spec text:** none. Confirmed decisions that name a spec not yet drafted (for example 0027a, 0033 or 0067) live in this ledger and the README.md spec map until that spec is written.
 

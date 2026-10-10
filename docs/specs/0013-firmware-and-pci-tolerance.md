@@ -59,7 +59,7 @@ There is no syscall or ABI change. Line numbers are at HEAD 4614249; 0014, 0010,
   - New `-CrowdedPci` switch that adds 32 root-port functions at 00:15.0-00:18.7, the slots where VMware puts its root ports. Each one is added like `-device pcie-root-port,bus=pcie.0,addr=0x15.0x0,multifunction=on,chassis=1,id=rp1,io-reserve=0`, with a unique `chassis` and `id` per port. `io-reserve=0` stops OVMF from exhausting the 64 KiB I/O space across 32 hotplug ports. It applies on top of any 0014 profile.
   - Near run.ps1:492-497, assert that no `MIRROR_ACPI_TABLE_SKIPPED` or `MIRROR_APIC_IOAPIC_ID` line appears and that every new `MIRROR_ACPI_READY` counter is 0.
 - `scripts/common.ps1:31`: the `retained -gt 32` bound becomes 256.
-- `scripts/test.ps1`: add test 11 to both build profiles, two boots in all. 0014 already computes the boot count (test.ps1:150).
+- `scripts/test.ps1`: add test 11 to both build profiles, two boots in all. 0014 already computes the boot count (test.ps1:161).
 - `readme.md` (or the `docs/` page that holds these sections under P5c):
   - :215: duplicate and surplus local NMI records and surplus CPU records no longer reject the topology (D3, D4), and the bounds list says 130 local NMI records.
   - :219: the HPET sentence drops the event-timer identity and descriptor-width checks (D5). The sentence "Invalid root resources or unreadable table identities still reject discovery" is replaced: only an invalid RSDP or root table rejects discovery, and null, repeated or unreadable root entries are skipped with `MIRROR_ACPI_TABLE_SKIPPED` (D6).
@@ -68,7 +68,7 @@ There is no syscall or ABI change. Line numbers are at HEAD 4614249; 0014, 0010,
 - `AGENTS.md` (0012, ledger P9), in the same commit as the D3-D6 and D9 changes: the "Fail closed" coding convention names firmware tables among the inputs where anything unknown or malformed is rejected. Reword it so that firmware tables are still validated before use, but duplicate or surplus MADT records and null, repeated, unreadable or unused root-table entries are tolerated: dropped or skipped, counted, and reported in markers (D3, D4, D6). HPET descriptor fields that Mirror does not use are ignored (D5). An IOAPIC ID register that disagrees with its MADT record is reported, not rejected (D9). Also update any other line this spec makes stale, such as a list of `run.ps1` device switches (`-CrowdedPci`).
 
 ## Acceptance tests
-Host tests (`cargo test -p mirror-acpi`, which scripts/test.ps1:15 already runs):
+Host tests (`cargo test -p mirror-acpi`, which scripts/test.ps1:28 already runs):
 1. Dual wildcard NMI: `[local_nmi(0xff, 1, 0), x2nmi(u32::MAX, 1, 5)]` parses, with `local_nmis().len() == 1` and `merged_nmis == 1`. The four tests.rs:544-547 cases each gain a CPU record with UID 4. They then parse with 1, 2, 2 and 1 local NMIs respectively, and `merged_nmis` of 1, 0, 0 and 1. Other tests with UID-specific NMI records and no matching CPU record (tests.rs:511, 687-696) gain CPU records or new expectations, because D4 drops unmatched records.
 2. NMI conflict: `[local_nmi(0xff, 1, 0xd), x2nmi(u32::MAX, 1, 5)]` parses, keeps the first record (level-triggered) and reports `conflicting_nmis == 1`.
 3. VMware-style per-slot records:

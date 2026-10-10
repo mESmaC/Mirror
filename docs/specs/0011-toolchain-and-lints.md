@@ -1,6 +1,6 @@
 # 0011: Toolchain pin and workspace lints
 
-Status: confirmed (2026-10-09; pin amended to 1.99.0 on 2026-10-10, ledger P5a)
+Status: done (2026-10-10, branch `claude/0011-toolchain-and-lints`: c26d5c7 and 1cdd954). All acceptance tests pass on Rust 1.99.0. Test 7: `scripts/test.ps1` in 12m30s and `-AgentDemo` in 15m48s, 120 smoke boots and both captures each. Test 8: 276 and 268 fresh logs, none older than the run. The "Current state" section keeps citations from HEAD 4614249. (Pin amended to 1.99.0 on 2026-10-10, ledger P5a.)
 Depends on: 0012 (lands first in the M0 order; this spec updates the AGENTS.md lines it changes). 0016b, which lands later, also edits `userspace/init/src/main.rs` (see Coordination).
 Ledger: P5a (related: P3, P5b, P7, P8, P9, S12)
 
@@ -10,9 +10,9 @@ Every build and test uses Rust 1.99.0. The scripts refuse a different compiler, 
 
 ## Non-goals
 
-- CI (deferred, ledger P3). Running host tests on non-Windows hosts (the MSVC triple is hard-coded at `scripts/test.ps1:15`).
+- CI (deferred, ledger P3). Running host tests on non-Windows hosts (the MSVC triple is hard-coded at `scripts/test.ps1:28`).
 - Lints beyond the two the kernel already denies, such as `clippy::pedantic` or `clippy::multiple_unsafe_ops_per_block`.
-- Linting `#[cfg(test)]` code. Clippy runs without `--tests` (`scripts/test.ps1:17-19`).
+- Linting `#[cfg(test)]` code. Clippy runs without `--tests` (`scripts/test.ps1:30-32`).
 - Pinning QEMU or OVMF versions, adding a build-identity banner, and fixing the `-Tkernel/linker.ld` rustflags trap in `.cargo/config.toml:4-8`.
 - Testing an MSRV older than the pinned toolchain.
 - The `rust-src` component and `build-std`. Spec 0028 (ledger S12) adds them later, on this same pinned compiler, to rebuild `core` and `alloc` for Mirror's userspace target. There is no second toolchain.
@@ -68,7 +68,7 @@ Every build and test uses Rust 1.99.0. The scripts refuse a different compiler, 
 - `scripts/test.ps1:22-23`: move the log-directory setup to just after the preflight and ahead of `cargo fmt` (line 13). If the directory exists, remove it recursively, then recreate it.
 - `kernel/src/usb.rs:538`: `bytes[6..].chunks_exact(3)` becomes `bytes[6..].as_chunks::<3>().0` (`clippy::chunks_exact_to_as_chunks`, new in 1.99; `as_chunks` is stable since 1.88). Both forms ignore a trailing partial chunk, so the loop body is unchanged.
 - Remove the Rust 1.88 workarounds, since the MSRV becomes 1.99 and no comment may name the old minimum:
-  - `__cpuid` is safe on 1.99. Drop the `#[allow(unused_unsafe)]` attributes, their 1.88 comments, and the `unsafe` blocks and `SAFETY` comments that exist only for the old signature at `kernel/src/fpu.rs:179-186`, `kernel/src/paging.rs:1678-1685` and `kernel/src/smp.rs:492-497`. At `kernel/src/interrupts.rs:225` drop the attribute only: the `unsafe` block in `tls_ready` stays for the CR4 read.
+  - `__cpuid` is safe on 1.99. Drop the `#[allow(unused_unsafe)]` attributes, their 1.88 comments, and the `unsafe` blocks and `SAFETY` comments that exist only for the old signature at `kernel/src/fpu.rs:179-186`, `kernel/src/paging.rs:1678-1685`, `kernel/src/smp.rs:492-497` and `kernel/src/apic.rs:993-1000` (`cpuid_edx`, found during implementation). At `kernel/src/interrupts.rs:225` drop the attribute: the `unsafe` block in `tls_ready` stays for the CR4 read. As implemented, the two CPUID calls move out of that block, so it wraps only the CR4 read and its SAFETY comment covers only that; order and behavior are unchanged.
   - `kernel/src/capability.rs:161-163`: replace the deprecated `fetch_update` with `try_update` (same arguments and result) and drop `#[allow(deprecated)]` and the 1.88 comment.
 - `readme.md:13`: replace the version clause with "Rust 1.99.0, pinned in `rust-toolchain.toml`".
 - `AGENTS.md` (written by 0012, which lands first; updated in the same commit, P9): the toolchain line names the 1.99.0 pin and the `Assert-MirrorToolchain` preflight, the unsafe rule says clippy enforces it in every crate, dropping the "not on yet" clause for `mirror-init` and `mirror-sync`, and the test-log line says `test.ps1` clears its log directory at start (D7) instead of "never cleared".
@@ -86,7 +86,7 @@ Every build and test uses Rust 1.99.0. The scripts refuse a different compiler, 
 - Raising `rust-version` from 1.88 to 1.99 can also enable MSRV-gated clippy lints in any crate. Measured on 2026-10-10 (Current state), it enables none besides the `usb.rs:538` one; any that appears at build time is fixed in the same change.
 
 **Coordination.** The M0 order (README) builds this spec right after 0012 and before 0014, 0010, 0016a and 0016b, so the `userspace/init` lines cited above still hold when it is built.
-- 0016b (SMEP/SMAP/UMIP, EFER.SCE, CPU probes) edits `userspace/init/src/main.rs`: it makes the register-preservation probe (`:958-990`) set and check RFLAGS.AC, adds user probe arms 21 and 22 next to `:1278-1281`, and raises the probe bound at `:1097`. Because it lands after this spec, it writes those blocks under the workspace lint: the `:958` comment this spec rewrites keeps its `SAFETY:` prefix, and each new match arm gets its own `// SAFETY:` line.
+- 0016b (SMEP/SMAP/UMIP, EFER.SCE, CPU probes) edits `userspace/init/src/main.rs`: it makes the register-preservation probe (`:961-993`) set and check RFLAGS.AC, adds user probe arms 21 and 22 next to `:1309-1315`, and raises the probe bound at `:1100`. Because it lands after this spec, it writes those blocks under the workspace lint: the `:961` comment this spec rewrites keeps its `SAFETY:` prefix, and each new match arm gets its own `// SAFETY:` line.
 - 0016a (guarded stacks, NMI/#MC stacks, stack-overflow probe) does not edit `userspace/init`. Its probes are kernel smoke modes, which the kernel lints already cover.
 - 0010 does not edit `userspace/init`. It adds a `--features test-trace` clippy run, which the workspace lint table also covers.
 
@@ -94,7 +94,7 @@ Every build and test uses Rust 1.99.0. The scripts refuse a different compiler, 
 1. Use one commit, titled "Bump Rust toolchain to X.Y.Z", made from a clean tree on its own branch (P7).
 2. Change `channel` and `rust-version` (X.Y) together.
 3. Run `cargo fmt --all`, then fix the clippy findings for both feature sets. Large fixes that also pass on the old toolchain land first, as separate commits.
-4. Run `scripts/test.ps1` and `scripts/test.ps1 -AgentDemo` to completion. A compiler change touches every crate, agent-demo code included, so both full runs apply under P8. `kernel/src/main.rs:1345` prints core's `PanicInfo` Display, and `scripts/run.ps1:144` matches its two-line layout, so the `SmpTlbTimeout` cases (`scripts/test.ps1:88`) catch a format change.
+4. Run `scripts/test.ps1` and `scripts/test.ps1 -AgentDemo` to completion. A compiler change touches every crate, agent-demo code included, so both full runs apply under P8. `kernel/src/main.rs:1345` prints core's `PanicInfo` Display, and `scripts/run.ps1:144` matches its two-line layout, so the `SmpTlbTimeout` cases (`scripts/test.ps1:99`) catch a format change.
 5. Update `readme.md:13`, and any version that `AGENTS.md` names, with the new version.
 
 ## Acceptance tests
@@ -111,12 +111,12 @@ All tests run on Cameron's development machine, on the pinned 1.99.0 toolchain (
    - The same `Select-String` with `-Pattern '^\[lints\]$' -Context 0,1` returns 12 matches, each followed by `workspace = true`.
    - `Select-String -Path crates/*/src/lib.rs -Pattern '^#!\[forbid\(unsafe_code\)\]'` matches exactly the six unsafe-free crates (not sync).
 4. **No suppressions.** `Get-ChildItem kernel,userspace,crates -Recurse -Filter *.rs | Select-String '(allow|expect)\((clippy::)?(undocumented_unsafe_blocks|unsafe_op_in_unsafe_fn)'` returns nothing.
-5. **Clean lint.** `cargo clippy --locked --workspace -- -D warnings` and the `--all-features` variant pass (`scripts/test.ps1:17-20`).
+5. **Clean lint.** `cargo clippy --locked --workspace -- -D warnings` and the `--all-features` variant pass (`scripts/test.ps1:30-33`).
 6. **The policy reaches init, sync and the unsafe-free crates.** Make each change below by hand, confirm the failure, then revert it.
    - Delete the `// SAFETY:` line at `userspace/init/src/clock.rs:24`: clippy fails with `undocumented_unsafe_blocks` in `mirror-init`.
    - Delete the comment at `crates/sync/src/lib.rs:252-253`: clippy fails with `undocumented_unsafe_blocks` in `mirror-sync`.
    - Add an `unsafe {}` block to a function in `crates/vm-protocol/src/lib.rs`: `cargo check -p mirror-vm-protocol` fails with the `unsafe_code` lint at forbid level.
-7. **Full suite.** `scripts/test.ps1` ends with its summary line, "All 120 kernel/userspace/device smoke cases and debug/release desktop/console captures passed." at HEAD 4614249 (`scripts/test.ps1:150`). The count is whatever the suite runs when this spec lands; 0014, which lands later, makes it computed. `scripts/test.ps1 -AgentDemo` ends with the same line.
+7. **Full suite.** `scripts/test.ps1` ends with its summary line, "All 120 kernel/userspace/device smoke cases and debug/release desktop/console captures passed." at HEAD 4614249 (`scripts/test.ps1:161`). The count is whatever the suite runs when this spec lands; 0014, which lands later, makes it computed. `scripts/test.ps1 -AgentDemo` ends with the same line.
 8. **Log hygiene.**
    - Create `build/test-logs/stale.serial.log` and add a trailing space to any `.rs` line. `scripts/test.ps1` fails at the formatting check, and `stale.serial.log` is gone. Revert the edit.
    - After a full default pass, no file under `build/test-logs` has a `LastWriteTime` earlier than the run's start. The file count equals what the script copies (276 at the time of writing: 2 profiles x (60 cases x 2 logs + 18 capture files)).

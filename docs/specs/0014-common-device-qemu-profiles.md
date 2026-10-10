@@ -42,9 +42,9 @@ Smoke cases, manual `run.ps1` boots and the debug and release normal-kernel capt
 - `run.ps1:318-335` and `capture.ps1:271-285` each build their own QEMU command line. Both use `q35,accel=tcg`, `-vga std` and `-nic none`, and expose the ESP as read-only vvfat on `virtio-blk-pci,...,disable-legacy=on,bootindex=0`.
 - The default fixture is the legacy VirtIO disk (`run.ps1:360-361`, `capture.ps1:282-285`).
 - `-AhciDisk` attaches a fresh copy, `build/ahci-test.img`, as `ide-hd,bus=ide.0` on the built-in AHCI controller (`run.ps1:352-361`), and hash-checks it after boot (`run.ps1:464-467`).
-- `test.ps1:24-146` runs 60 cases per build profile.
+- `test.ps1:35-157` runs 60 cases per build profile.
   - Five fault modes need the VirtIO fixture: BlockIoError, BlockWrite, BlockWriteError, BlockFlushError and BlockNoFlush (`run.ps1:203-209`).
-  - Four cases pass `-AhciDisk` (`test.ps1:42-49`).
+  - Four cases pass `-AhciDisk` (`test.ps1:53-60`).
 - `Assert-MirrorDriverCatalog` (`common.ps1:4-82`):
   - It accepts only the driver names `virtio-blk-legacy`, `ahci-sata`, `xhci-host` and `none` (`:36`).
   - It requires exactly one AHCI controller and one modern VirtIO boot device (`:78`).
@@ -102,10 +102,10 @@ Later M0 specs on these profiles:
 
 | Group | Today | After |
 | --- | --- | --- |
-| Fault loop (`test.ps1:34`) | 27, VirtIO fixture | 22 non-Block faults, `V1` |
+| Fault loop (`test.ps1:45`) | 27, VirtIO fixture | 22 non-Block faults, `V1` |
 | `LegacyVirtio` | 0 | 6: None, BlockIoError, BlockWrite, BlockWriteError, BlockFlushError, BlockNoFlush |
-| AHCI-specific (`test.ps1:42-49`) | 4: None, AhciIoError, AhciInitFailure, CpuCount4 | 2: AhciIoError and AhciInitFailure. None and CpuCount4 duplicate `V1` base cases (`test.ps1:34`, `:78`). |
-| xHCI, CPU, SMP, timer, clock, PIC and device-removal cases (`test.ps1:53-129`) | 29 | 29, now on `V1` |
+| AHCI-specific (`test.ps1:53-60`) | 4: None, AhciIoError, AhciInitFailure, CpuCount4 | 2: AhciIoError and AhciInitFailure. None and CpuCount4 duplicate `V1` base cases (`test.ps1:45`, `:89`). |
+| xHCI, CPU, SMP, timer, clock, PIC and device-removal cases (`test.ps1:64-140`) | 29 | 29, now on `V1` |
 | Total | 60 (120 boots) | 59 (118 boots) |
 
 ## Acceptance tests

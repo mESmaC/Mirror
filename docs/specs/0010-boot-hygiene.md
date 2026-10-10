@@ -106,7 +106,7 @@ Classification (confirmed 2026-10-09): `MIRROR_DESKTOP_INPUT_TIMEOUT` is gated w
 4. **Binary scan.** `test.ps1` runs a byte search on `build/esp/kernel.elf`, debug and release.
    - The default kernel contains none of `MIRROR_TRACE_ON`, `MIRROR_CONSOLE_COMMAND operation=`, `MIRROR_POINTER_UPDATED`, `MIRROR_POINTER_CLICK`, `MIRROR_SHELL_FRAME`, `MIRROR_DESKTOP_INPUT_TIMEOUT`, `Mirror shell: ready`, `MIRROR_USERSPACE_OK`, `Mirror init: VM checks passed`, `fixture data mismatch` or `unexpected budget exhaustion`. `MIRROR_PERF_` strings (0019) are allowed under D4's exception.
    - The trace kernel contains `MIRROR_TRACE_ON` and `MIRROR_SHELL_FRAME`, and contains neither `MIRROR_USERSPACE_OK` nor `fixture data mismatch`.
-5. **Clippy and host tests.** Clippy passes with `-D warnings` for the default, `--features test-trace` and `--all-features` configurations. No host tests are added, because the kernel crate has `test = false` (`kernel/Cargo.toml:11`). The existing host tests (`test.ps1:15`) still pass.
+5. **Clippy and host tests.** Clippy passes with `-D warnings` for the default, `--features test-trace` and `--all-features` configurations. No host tests are added, because the kernel crate has `test = false` (`kernel/Cargo.toml:11`). The existing host tests (`test.ps1:28`) still pass.
 
 ## Dependencies
 
