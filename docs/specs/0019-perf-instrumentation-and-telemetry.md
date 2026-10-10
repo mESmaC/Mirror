@@ -13,7 +13,7 @@ Every kernel build, in every flavor, carries the perf instrumentation, and a boo
 - The host harness, gate methods and targets (0018, O3). The agent bench client (0045).
 - A router or placement policy (C1, C2, C4), or any runtime use of telemetry.
 - Persisting records: 0066 does that once the filesystem exists (ledger C3, amended 2026-10-09). NIC telemetry (0070). Multi-sector or queued reads (0061, 0062). VirtIO telemetry (S1).
-- AP measurements. The kernel console fallback (`run_console`, `main.rs:457`), which draws without a present and is neither traced nor sampled. Changes to the boot-smoke battery.
+- AP measurements. The kernel console fallback (`run_console`, `main.rs:463`), which draws without a present and is neither traced nor sampled. Changes to the boot-smoke battery.
 
 ## Decisions
 
@@ -43,10 +43,10 @@ perf-token = "mirror.perf=" item *("," item)
 item       = "boot" / "1" / "flip" / "telemetry" / "agent"
 ```
 
-- **Lexical rules.** Tokens split on ASCII whitespace, as in `boot.rs:126`. Matching is exact and case-sensitive. At most one perf token, no empty or repeated items, at most 64 bytes.
+- **Lexical rules.** Tokens split on ASCII whitespace, as in `boot.rs:132`. Matching is exact and case-sensitive. At most one perf token, no empty or repeated items, at most 64 bytes.
 - **Items.** Any valid token enables the milestones. `boot`: milestones only. `1`: memory samples and the input trace (0018's `mirror.perf=1`). `flip`: flip calibration. `telemetry`: C3 records. `agent`: reserved for 0045; until then the kernel prints `MIRROR_PERF_SKIPPED item=agent reason=unavailable`.
-- **Parsing.** `perf::init()` runs right after `arch::disable_interrupts()` in `_start` (`main.rs:51`), before `serial::init`. It reads the TSC, then the Limine command line without `command_line()`'s `expect` (`boot.rs:137-143`); it never panics, and a missing command line means perf is off. The result is stored once in a static, and each perf site tests it with one branch.
-- **Existing parsers.** `legacy_pic()` and `pit_timer()` (`boot.rs:124-135`) are unchanged. `smoke_mode()`'s filter (`boot.rs:171-175`) also skips a `mirror.perf=` token when `perf::config()` is valid, so it composes with one fault selector; an invalid or second perf token still panics with `unknown smoke-test command line`.
+- **Parsing.** `perf::init()` runs right after `arch::disable_interrupts()` in `_start` (`main.rs:51`), before `serial::init`. It reads the TSC, then the Limine command line without `command_line()`'s `expect` (`boot.rs:143-149`); it never panics, and a missing command line means perf is off. The result is stored once in a static, and each perf site tests it with one branch.
+- **Existing parsers.** `legacy_pic()` and `pit_timer()` (`boot.rs:130-141`) are unchanged. `smoke_mode()`'s filter (`boot.rs:177-181`) also skips a `mirror.perf=` token when `perf::config()` is valid, so it composes with one fault selector; an invalid or second perf token still panics with `unknown smoke-test command line`.
 
 ### Line format
 
@@ -69,40 +69,40 @@ item       = "boot" / "1" / "flip" / "telemetry" / "agent"
 Each `MIRROR_PERF_T` event prints at most once, in this order. A milestone that never happens is not printed: `clock` without HPET, `display` without a framebuffer, `frame` and `shell_ready` without a shell.
 
 1. `clock ns=0 since_entry_ns=<n|none>`: HPET zero (`clock.rs:228`), printed just before the next milestone, which supplies D5's second TSC/HPET pair. `since_entry_ns` is `none` without a TSC (CPUID.01H:EDX[4]).
-2. `display`: at `MIRROR_FRAMEBUFFER_READY` (`main.rs:160`).
-3. `input`: after PS/2 init and IRQ enabling (`main.rs:253-279`).
+2. `display`: at `MIRROR_FRAMEBUFFER_READY` (`main.rs:164`).
+3. `input`: after PS/2 init and IRQ enabling (`main.rs:257-283`).
 4. `userspace`: the kernel first resumes the shell, or the agent-demo desktop. In default and trace builds this is the first user process (0010-D3).
-5. `frame`: that process's first successful display-surface present (`userspace.rs:2645-2650`).
-6. `shell_ready`: that process's first input syscall after `frame` (15 or 16 on the Input object, `userspace.rs:3070-3096`). Shell: `shell.rs:867-871`. Desktop: `userspace/desktop/src/main.rs:332-342`; its input checks at `:151-174` precede `frame` and do not count.
+5. `frame`: that process's first successful display-surface present (`userspace.rs:2803-2808`).
+6. `shell_ready`: that process's first input syscall after `frame` (15 or 16 on the Input object, `userspace.rs:3230-3256`). Shell: `shell.rs:867-871`. Desktop: `userspace/desktop/src/main.rs:332-342`; its input checks at `:151-174` precede `frame` and do not count.
 
 ### Memory samples (0018-D6)
 
-`available_kib` is 4 × (recycled + never-allocated frames) and `pool_kib` is 4 × total frames, both from `frames.stats()`, the sums `MIRROR_FRAME_POOL` prints (`main.rs:125-132`); a failed read prints `none`. Samples are taken in the `run_shell` and `run_desktop` scheduler loops (`userspace.rs:1914`, `1170`): on the first pass after `userspace`, then on the first pass after each further 10 s of HPET time (1000 ticks and `ns=none` without HPET).
+`available_kib` is 4 × (recycled + never-allocated frames) and `pool_kib` is 4 × total frames, both from `frames.stats()`, the sums `MIRROR_FRAME_POOL` prints (`main.rs:129-136`); a failed read prints `none`. Samples are taken in the `run_shell` and `run_desktop` scheduler loops (`userspace.rs:2038`, `1170`): on the first pass after `userspace`, then on the first pass after each further 10 s of HPET time (1000 ticks and `ns=none` without HPET).
 
 ### Input trace (D7)
 
 - **Start**, when no traced input is pending: a key press (break codes start nothing), or a mouse packet whose decoded buttons differ from the previous packet's (pointer motion is not traced, 0018-D7). The time is taken on entry to the `ps2::handle_irq` call (`interrupts.rs:877`) that drained the event's first byte. `irq=` is the source device's IRQ, 1 or 12.
 - **End.** The next successful display-surface present sets `present_ns`.
-- **Output.** A static ring, written just before each idle `sti; hlt` (`userspace.rs:1215`, `1986`). `seq` counts every traced input, so a full ring shows up as gaps. 0084 keeps the line.
+- **Output.** A static ring, written just before each idle `sti; hlt` (`userspace.rs:1308`, `1986`). `seq` counts every traced input, so a full ring shows up as gaps. 0084 keeps the line.
 
 ### Flip calibration (0018)
 
-After the `after_userspace` heap growth (`main.rs:311-317`) and before the first user process: 100 full-screen fills through the framebuffer driver, alternating black and white, 500 ms apart on the HPET. Each is followed by `MIRROR_PERF_FLIP seq= ns=`, with `ns` read after the fill's last store and a store fence. IF is clear here, so ticks do not advance; without HPET, flip prints `SKIPPED item=flip reason=no_clock`.
+After the `after_userspace` heap growth (`main.rs:313-319`) and before the first user process: 100 full-screen fills through the framebuffer driver, alternating black and white, 500 ms apart on the HPET. Each is followed by `MIRROR_PERF_FLIP seq= ns=`, with `ns` read after the fill's last store and a store fence. IF is clear here, so ticks do not advance; without HPET, flip prints `SKIPPED item=flip reason=no_clock`.
 
 ### Telemetry (C3; D8-D10)
 
 - `MIRROR_PERF_DEV v=1 dev=<n> class=<ram|block> ...`
-  - `ram` is always `dev=0`. Its `bytes=` is the usable memory from the memory map (`main.rs:62-66`).
+  - `ram` is always `dev=0`. Its `bytes=` is the usable memory from the memory map (`main.rs:66-70`).
   - `block` is the AHCI disk, `dev=1`, adding `driver=ahci-sata` (the catalog name, `drivers.rs:21`) `bdf=<bus*256+device*8+function> port= sata_gen= sector_bytes= sectors=`. `sata_gen` is PxSSTS.SPD, bits 7:4, which `ahci.rs:240` masks out today, or `none` when it reads 0.
 - `MIRROR_PERF_TEL v=1 src= dst= op=<copy|read> pattern=<seq|rand> request_bytes= depth= span_bytes= count= elapsed_ns= min_ns= p50_ns= p95_ns= max_ns=`
   - Copies are `src=0 dst=0`; reads are `src=1 dst=0`. Throughput is count × request_bytes / elapsed_ns. Copies are too short to time singly, so their per-request fields are `none`. Consumers reject an unknown `v`.
-- **Memory benchmark**, just before `probe_ahci_device` (`main.rs:217`), with one CPU running. It copies 4 KiB pages through the direct map from source to destination frames, allocated one at a time and listed in the source frames themselves, so it uses no heap; all are freed afterwards. Two spans: 32 KiB, and min(64 MiB, free memory / 8). Each span gets one untimed warm-up pass, then is copied repeatedly until 256 MiB have been copied or 1 s has passed.
-- **Storage benchmark**, in the AHCI probe after its existing reads succeed and before shutdown (`main.rs:861-872`): 256 sequential reads from LBA 0, then 256 reads at fixed-seed xorshift64 LBAs over the capacity, each timed. Each pattern stops at 2 s, and `count` records the reads done. Reads go to a stack buffer and allocate no frame, so the DMA accounting assert (`main.rs:877-881`) holds.
+- **Memory benchmark**, just before `probe_ahci_device` (`main.rs:221`), with one CPU running. It copies 4 KiB pages through the direct map from source to destination frames, allocated one at a time and listed in the source frames themselves, so it uses no heap; all are freed afterwards. Two spans: 32 KiB, and min(64 MiB, free memory / 8). Each span gets one untimed warm-up pass, then is copied repeatedly until 256 MiB have been copied or 1 s has passed.
+- **Storage benchmark**, in the AHCI probe after its existing reads succeed and before shutdown (`main.rs:876-891`): 256 sequential reads from LBA 0, then 256 reads at fixed-seed xorshift64 LBAs over the capacity, each timed. Each pattern stops at 2 s, and `count` records the reads done. Reads go to a stack buffer and allocate no frame, so the DMA accounting assert (`main.rs:896-900`) holds.
 - **Without HPET**, both benchmarks print `SKIPPED item=telemetry reason=no_clock`; DEV records still print. Without `telemetry`, each site costs one branch.
 
 ### Files
 
-- **`crates/perf-protocol`** (`mirror-perf-protocol`, D11): `#![no_std]` and `#![forbid(unsafe_code)]` (0011-D6), `[lints] workspace = true` (0011-D5), no dependencies. It holds the token parser, family and identifier names, a formatter for each line into a fixed buffer, min/p50/p95/max over a slice, and a line parser for tests and host tools. It joins the root `members` (`Cargo.toml:2`) and the host-test command (`test.ps1:39`).
+- **`crates/perf-protocol`** (`mirror-perf-protocol`, D11): `#![no_std]` and `#![forbid(unsafe_code)]` (0011-D6), `[lints] workspace = true` (0011-D5), no dependencies. It holds the token parser, family and identifier names, a formatter for each line into a fixed buffer, min/p50/p95/max over a slice, and a line parser for tests and host tools. It joins the root `members` (`Cargo.toml:2`) and the host-test command (`test.ps1:69`).
 - **`kernel/src/perf.rs`**: config, milestone hooks, input ring, sampler, flip and benchmarks. Hooks: `main.rs` (milestone, benchmark and flip sites), `clock.rs:71` (the TSC/HPET pair), `ahci.rs` (SPD and BDF getters), `framebuffer.rs` (a full-screen fill), `ps2.rs`, `keyboard.rs` and `mouse.rs` (start stamps), `userspace.rs` (present, input syscall, idle point, sampler), `boot.rs` (smoke filter, non-panicking command-line read).
 - **Scripts (D12):**
   - A `-Perf` capture boots the SMBIOS config instead of the image's embedded one. `run.ps1` checks `-Perf` against D4's grammar; under `-Smoke`, an invalid list expects `MIRROR_PERF_OFF`, the `unknown smoke-test command line` panic and exit 35.
@@ -111,7 +111,7 @@ After the `after_userspace` heap growth (`main.rs:311-317`) and before the first
 
 ## Acceptance tests
 
-1. **Host tests.** `test.ps1:39` adds `-p mirror-perf-protocol`.
+1. **Host tests.** `test.ps1:69` adds `-p mirror-perf-protocol`.
    - Grammar: accepts `boot`, `1`, `1,flip`, `telemetry,boot` and `agent`, and ignores other tokens (`mirror.test=page-fault`, `mirror.irq=pic`). Rejects `mirror.perf=`, `1,`, `,1`, `BOOT`, `1,1`, `2`, two perf tokens, a 65-byte token and a non-ASCII byte.
    - Lines: every family round-trips through format and parse, every value fits the vocabulary, and INPUT and MEM lines hold only decimals and `none`.
    - Statistics on known vectors: odd and even lengths, a single sample, all values equal.
@@ -152,5 +152,5 @@ Follow-ups, outside this spec:
 
 Design questions, for Cameron with D3-D12:
 
-6. Flip calibration in boot-smoke builds. The Flip calibration section runs it after the `after_userspace` heap growth (`main.rs:311-317`) and before the first user process. In default and trace builds the shell is that process (0010-D3), so both hold. In boot-smoke builds init's battery runs first, from `userspace::run_init` at `main.rs:303`, before the `after_userspace` rendezvous (`main.rs:311`), so no point satisfies both, and acceptance 5 runs exactly that build. Options: in smoke builds, run flip before `run_init`, ahead of that heap growth; or after the heap growth and before the shell, after init's battery has run.
+6. Flip calibration in boot-smoke builds. The Flip calibration section runs it after the `after_userspace` heap growth (`main.rs:313-319`) and before the first user process. In default and trace builds the shell is that process (0010-D3), so both hold. In boot-smoke builds init's battery runs first, from `userspace::run_init` at `main.rs:304`, before the `after_userspace` rendezvous (`main.rs:313`), so no point satisfies both, and acceptance 5 runs exactly that build. Options: in smoke builds, run flip before `run_init`, ahead of that heap growth; or after the heap growth and before the shell, after init's battery has run.
 7. Clicks under 0017c (added 2026-10-09). 0017c's vmmouse is active by default on q35 and VMware, and 0018-D12 drives Mirror's clicks through it. While it is active, PS/2 packets are doorbells whose buttons are discarded and button changes arrive in vmmouse DATA packets (0017-D13, confirmed 2026-10-09), so D7's start rule ("a mouse packet whose decoded buttons differ", Input trace) never fires for a click, and 0018's Mirror click rows would get no INPUT lines. Proposed with D7: a click also starts a trace when a drained vmmouse event's buttons differ from the previous event's; the stamp is still taken on entry to the IRQ 12 `ps2::handle_irq` call that drained it, `irq=12`; and `vmmouse.rs` joins the start-stamp hooks under Files.

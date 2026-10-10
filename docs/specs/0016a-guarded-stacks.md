@@ -32,11 +32,11 @@ Line references are at HEAD 4614249; earlier M0 specs shift some of them. Work o
    - It maps zeroed frames and rolls back its own pages on failure, as smp.rs:375-389 does. It applies the guard check from smp.rs:347-355: the page below and the page above must be unmapped, both before and after mapping.
    - Every stack has its own unmapped page below and above, so neighbouring stacks are separated by two unmapped pages, as in the AP layout (smp.rs:186-191). A fault frame pushed just below a guard page therefore faults too. One page per side is enough because the x86_64-unknown-none target emits inline stack probes for frames larger than a page.
    - `smp::allocate_stacks` (smp.rs:339-391) switches to it.
-2. **BSP stacks.** A BSP region at the start of the stack arena (smp.rs:29), ahead of the AP slots, holds a 256 KiB scheduler stack replacing Limine's stack (boot.rs:52), a 64 KiB RSP0 stack replacing the static `KERNEL_STACK` (userspace.rs:48-49, removed), and IST1 #DF, IST2 NMI and IST3 #MC stacks of 16 KiB each.
-   - The region is mapped right after `heap::init` (main.rs:117). That is before `share_with_secondaries` (paging.rs:122-126) seals kernel mappings, after which `map_kernel_page` refuses new leaves (paging.rs:606-608), and before any process root copies the upper half (paging.rs:861-866).
+2. **BSP stacks.** A BSP region at the start of the stack arena (smp.rs:29), ahead of the AP slots, holds a 256 KiB scheduler stack replacing Limine's stack (boot.rs:52), a 64 KiB RSP0 stack replacing the static `KERNEL_STACK` (userspace.rs:58-59, removed), and IST1 #DF, IST2 NMI and IST3 #MC stacks of 16 KiB each.
+   - The region is mapped right after `heap::init` (main.rs:121). That is before `share_with_secondaries` (paging.rs:122-126) seals kernel mappings, after which `map_kernel_page` refuses new leaves (paging.rs:606-608), and before any process root copies the upper half (paging.rs:861-866).
    - `_start` then loads RSP with the scheduler stack top and calls a `-> !` continuation, using the pattern of smp.rs:433-436. The continuation receives the state built so far (boot info, `PageTables`, `FrameAllocator`) and runs the rest of `_start`.
    - Until this switch, BSP IST1-3 all point at the existing static 16 KiB stack (interrupts.rs:174, installed at 298-306). The switch rewrites the BSP TSS IST fields and reads them back.
-   - The three RSP0 installs (userspace.rs:611-614, 1164-1167, 1910-1912) use `stacks::bsp_rsp0_top()`.
+   - The three RSP0 installs (userspace.rs:698-701, 1164-1167, 1910-1912) use `stacks::bsp_rsp0_top()`.
 3. **AP stacks.** Each AP arena slot gains guarded 16 KiB IST1-3 stacks.
    - `interrupts::init_secondary` takes their tops the way it takes RSP0 today (interrupts.rs:428-467) and verifies all three by readback (as at interrupts.rs:521-524).
    - The static `SECONDARY_DOUBLE_FAULT_STACKS` (interrupts.rs:186-187, 1008 KiB of .bss) is removed.
@@ -52,16 +52,16 @@ Line references are at HEAD 4614249; earlier M0 specs shift some of them. Work o
 
    These probes and markers exist in boot-smoke builds only:
    - `MIRROR_IST_OK nmi=2 mc=3`. On the BSP, the probe runs `int 2` and `int 18` at CPL0 against an armed expectation (modelled on the int3 test, interrupts.rs:923-926). The handler checks that its frame lies inside the matching IST stack, then returns.
-   - A new fatal mode, `kernel-stack-overflow`, in `SmokeMode` (boot.rs:146-217), handled next to the existing ones (main.rs:391-399). It prints `MIRROR_TEST_EXPECT_FATAL vector=8`, sets RSP to the RSP0 stack top minus 2 KiB, then repeats `sub rsp, 4096` and `mov qword ptr [rsp], 0`. The write that reaches the guard page faults with RSP inside that page, so pushing the #PF frame faults again and the CPU raises #DF on IST1.
+   - A new fatal mode, `kernel-stack-overflow`, in `SmokeMode` (boot.rs:152-223), handled next to the existing ones (main.rs:393-401). It prints `MIRROR_TEST_EXPECT_FATAL vector=8`, sets RSP to the RSP0 stack top minus 2 KiB, then repeats `sub rsp, 4096` and `mov qword ptr [rsp], 0`. The write that reaches the guard page faults with RSP inside that page, so pushing the #PF frame faults again and the CPU raises #DF on IST1.
 
    Scripts and docs:
-   - run.ps1 gets `-Fault KernelStackOverflow` and adds it to its fatal set (run.ps1:474) with vector 8 and `error=0x0`, which its fatal-diagnostic regex (run.ps1:792-798) already expects. It checks that cr2 lies in the page at `rsp0_guard`. On every smoke boot it checks the `MIRROR_CPU_STACKS` lines, `MIRROR_STACKS_READY` and `MIRROR_IST_OK`.
-   - test.ps1 adds KernelStackOverflow to the main battery (test.ps1:58).
+   - run.ps1 gets `-Fault KernelStackOverflow` and adds it to its fatal set (run.ps1:475) with vector 8 and `error=0x0`, which its fatal-diagnostic regex (run.ps1:795-801) already expects. It checks that cr2 lies in the page at `rsp0_guard`. On every smoke boot it checks the `MIRROR_CPU_STACKS` lines, `MIRROR_STACKS_READY` and `MIRROR_IST_OK`.
+   - test.ps1 adds KernelStackOverflow to the main battery (test.ps1:90).
    - readme.md line 7 says every CPU has guarded stacks.
 
 ## Acceptance tests
 1. `scripts/test.ps1` passes in debug and release with KernelStackOverflow included.
-2. Every smoke boot prints one `MIRROR_CPU_STACKS` line per online CPU, cpu=0..N-1: CpuCount lines on APIC runs, and one line on `-LegacyPic` runs, where SMP is skipped (run.ps1:58-70). Every line shows `ist=3`, and its `mce` equals its `cpuid_mce`.
+2. Every smoke boot prints one `MIRROR_CPU_STACKS` line per online CPU, cpu=0..N-1: CpuCount lines on APIC runs, and one line on `-LegacyPic` runs, where SMP is skipped (run.ps1:59-71). Every line shows `ist=3`, and its `mce` equals its `cpuid_mce`.
 3. Every smoke boot prints `MIRROR_IST_OK nmi=2 mc=3` and exactly one `MIRROR_STACKS_READY` line in the format above.
 4. KernelStackOverflow prints `MIRROR_TEST_EXPECT_FATAL vector=8`, then `MIRROR_EXCEPTION vector=8 error=0x0` with cr2 inside the 4 KiB page at `rsp0_guard`. QEMU exits with 35 (isa-debug-exit value 0x11, arch.rs:141-148), and no `MIRROR_BOOT_OK` appears.
 5. The 2-, 4- and 8-CPU runs bring every AP online with the new slot layout. `MIRROR_SMP_GUARD_OK` and the SmpUnmap and SmpTlbTimeout modes still pass.

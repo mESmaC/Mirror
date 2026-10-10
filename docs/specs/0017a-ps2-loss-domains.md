@@ -11,7 +11,7 @@ A mouse fault or a full mouse ring never changes keyboard state: held modifiers,
 - Keyboard LED sync (0xED) and lock-state agreement with the VM: spec 0084. Mirror never sends 0xED today, so a keyboard loss, which still clears Caps Lock, can leave the VM's LED disagreeing until 0084. After D3 a mouse loss no longer does this.
 - Keycodes, shortcuts, new keys, wheel and extra buttons, the window-protocol key event and a device-independent input layer (all 0084). Input provenance and seats (0047). USB HID is outside the v1 device set (S1a); USB HID pointing comes with physical hardware after v1 (S1d).
 - Absolute pointing through the VMware vmmouse protocol: spec 0017c (ledger S1d). The relative PS/2 mouse this spec handles stays the fallback.
-- Scheduler changes. The 32-of-100-tick service throttle (`kernel/src/userspace.rs:39-40`) belongs to 0052 (ledger S4).
+- Scheduler changes. The 32-of-100-tick service throttle (`kernel/src/userspace.rs:44-45`) belongs to 0052 (ledger S4).
 - Init timeouts, the controller self-test, scan-set selection and init order (0017b).
 
 ## Decisions
@@ -28,23 +28,23 @@ A mouse fault or a full mouse ring never changes keyboard state: held modifiers,
 **Loss events** (`kernel/src/ps2.rs`, `keyboard.rs`, `mouse.rs`)
 - `ps2::InputEvent::Lost` becomes `Lost { keyboard: bool, pointer: bool }`. `ps2::next_event` (ps2.rs:179-203) sets exactly one flag per marker.
 - In each device state, `lost: Option<u64>` replaces `overflow: bool`. It holds the sequence that `ps2::next_sequence()` returned at the first loss since the consumer last took that device's marker. `peek_sequence` reports `lost` ahead of the queue head, and `next_event` merges both heads by sequence. The cross-device `discard_input` calls in `next_event` are removed; `discard_input` stays only for `State::stop_routing` (ps2.rs:106-112).
-- Behaviour change: events a device queues after its own loss (for example after keyboard recovery completes) are delivered after its marker. Today's barrier discards them (ps2.rs:624-626).
+- Behaviour change: events a device queues after its own loss (for example after keyboard recovery completes) are delivered after its marker. Today's barrier discards them (ps2.rs:625-627).
 - Keyboard: `Decoder::lose_input` (keyboard.rs:139-143) runs only on keyboard faults or keyboard ring overflow. The recovery gate (keyboard.rs:189-194) is unchanged.
 - Mouse: `Decoder::discard_partial` (mouse.rs:108-116) runs only from `stop_routing`. Coalescing (D6) replaces the full-ring branch (mouse.rs:170-175). `State::accept` takes the current `timer::ticks()` value as a parameter for the gap check (D7), next to the header-bit-3 check (mouse.rs:68-70).
 
 **Lost record** (`kernel/src/input.rs:12, 31, 97`): words are `[1, 3, mask, 0, 0, 0, 0, 0]` with mask 1 (keyboard), 2 (pointer) or 3 (initial session record only).
 
 **Consumers**
-- Kernel console (`kernel/src/main.rs:520-526`): a keyboard loss calls only `console.input_lost()` (console.rs:189-193); a pointer loss calls only `pointer.input_lost()` (pointer.rs:64-67). The marker becomes `MIRROR_CONSOLE_INPUT_LOST device=keyboard|pointer`, which `capture.ps1:187` and `:258` still match. It carries no user content and stays in every build flavor, as 0010 lists it (S7b).
-- Desktop decoder (`userspace/desktop/src/main.rs:128-131`): returns `Event::Lost { keyboard, pointer }` and rejects mask 0 or any bit above bit 1. main.rs:175 expects the initial mask 3.
+- Kernel console (`kernel/src/main.rs:531-537`): a keyboard loss calls only `console.input_lost()` (console.rs:191-195); a pointer loss calls only `pointer.input_lost()` (pointer.rs:64-67). The marker becomes `MIRROR_CONSOLE_INPUT_LOST device=keyboard|pointer`, which `capture.ps1:198` and `:269` still match. It carries no user content and stays in every build flavor, as 0010 lists it (S7b).
+- Desktop decoder (`userspace/desktop/src/main.rs:128-131`): returns `Event::Lost { keyboard, pointer }` and rejects mask 0 or any bit above bit 1. main.rs:179 expects the initial mask 3.
 - Shell (`userspace/desktop/src/shell.rs:365-376`): a pointer loss resets capture, buttons and click arming, then sends Reset to each app. A keyboard loss sends apps nothing, because app Reset and Focus clear only pointer and focus state (`userspace/app/src/main.rs:211-220`). Behaviour change: the per-window `pending` reset (shell.rs:369-372) is removed, so a loss no longer drops events already queued for apps.
 - Scratchpad UI (`userspace/desktop/src/ui.rs:176-182`): only a keyboard loss clears the draft and sets the notice. A pointer loss resets buttons and click arming.
 
-**Files touched:** `kernel/src/{ps2,keyboard,mouse,input,main}.rs`, `userspace/desktop/src/{main,shell,ui}.rs`, `readme.md:321` (the global loss barrier becomes per-device loss and coalescing) and `readme.md:496` ("loss records clear every payload field" becomes the device mask).
+**Files touched:** `kernel/src/{ps2,keyboard,mouse,input,main}.rs`, `userspace/desktop/src/{main,shell,ui}.rs`, `readme.md:332` (the global loss barrier becomes per-device loss and coalescing) and `readme.md:507` ("loss records clear every payload field" becomes the device mask).
 
 ## Acceptance tests
 Boot-smoke self-tests; the existing markers must still print.
-1. `ps2::dispatch_self_test` (MIRROR_PS2_TESTS_OK) replaces the global-barrier cases (ps2.rs:616-657):
+1. `ps2::dispatch_self_test` (MIRROR_PS2_TESTS_OK) replaces the global-barrier cases (ps2.rs:617-658):
    - With Shift held, Caps Lock on and a queued `a` make, run each mouse-only loss in turn: an AUX RECEIVE_ERROR byte, a motion-overflow packet, and a button change on a full ring. Expected order: Key(a), Lost{pointer}, then the button snapshot (overflow case only). The next 0x1c make is delivered from its first byte, with shift and caps_lock both true.
    - Keyboard RECEIVE_ERROR between two mouse packets: the order is mouse, Lost{keyboard}, mouse, with no packet dropped. The keyboard recovery gate still applies.
    - Both devices lost: two markers, in loss-sequence order.
@@ -64,5 +64,5 @@ Manual check on VMware Workstation. The VM boots 0015a's disk image with the set
 No crates. QEMU (`.tools/qemu`, GPL-2.0) is already used. The manual check needs VMware Workstation (proprietary, no cost), installed: Workstation Pro 26.0.1 (26H1u1) build 25688693 (2026-10-10).
 
 ## Open questions
-1. Resolved 2026-10-09: absolute pointing is spec 0017c (ledger S1d), the VMware vmmouse protocol in M0, so the pointer is not grabbed. QEMU q35 enables `vmport` (and its vmmouse) by default, and `run.ps1:323` turns it off only for `-NoKeyboard`, so 0017c tests the protocol in QEMU.
+1. Resolved 2026-10-09: absolute pointing is spec 0017c (ledger S1d), the VMware vmmouse protocol in M0, so the pointer is not grabbed. QEMU q35 enables `vmport` (and its vmmouse) by default, and `run.ps1:324` turns it off only for `-NoKeyboard`, so 0017c tests the protocol in QEMU.
 2. Follow-up suggestion: move the keyboard and mouse decoders into a `no_std` crate with host cargo tests. This spec keeps boot-smoke tests only.

@@ -1,6 +1,6 @@
 # 0010: Boot hygiene
 
-Status: confirmed (2026-10-09)
+Status: done (2026-10-10, branch `claude/0010-boot-hygiene`: 702f77a). All acceptance tests pass. `scripts/test.ps1` (118 smoke boots, trace captures, kernel image scans, hygiene probes) took 12m58s, and `-AgentDemo` took 15m13s. The hygiene probe also fails, in the intended step, against kernels that echo Console WRITE or log console commands. The Interfaces section keeps its HEAD 4614249 kernel citations.
 Depends on: 0014 (the `V1` capture profile and its AHCI fixture), 0012 (AGENTS.md)
 Ledger: S7, S7a, S7b (related: S17)
 
@@ -61,18 +61,21 @@ Line numbers are at HEAD 4614249. 0011 and 0014 land first (M0 order) and shift 
 | `MIRROR_CONSOLE_COMMAND` and `MIRROR_CONSOLE_INPUT` | `console.rs:109-119` | absent | prints | n/a |
 | `MIRROR_POINTER_CLICK`, `MIRROR_CONSOLE_UPDATED`, `MIRROR_POINTER_UPDATED` | `main.rs:544`, `573-578`, `581-590` | absent | prints | n/a |
 | `MIRROR_DESKTOP_INPUT_TIMEOUT` (`agent-demo` only) | `userspace.rs:1589-1596` | absent | prints | prints |
+| `Mirror idle: timer ticks=N`, printed once after the shell or desktop exits | `main.rs:413` | absent | prints | n/a |
 | `MIRROR_TRACE_ON`, printed once in `_start` before PCI discovery | new | absent | prints | prints |
 
 "n/a" means the code does not exist in smoke builds: `run_console` is `cfg(not(feature = "boot-smoke"))` (`main.rs:456`). 0019's `MIRROR_PERF_*` markers are outside this table: they follow 0018-D9 and D4's exception in every flavor.
 
 Classification (confirmed 2026-10-09): `MIRROR_DESKTOP_INPUT_TIMEOUT` is gated with the content-free per-input markers. It prints on the `agent-demo` desktop's first input-wait timeout (`CpuPolicy::Desktop` is set only in `run_desktop`, `userspace.rs:1131`), so whether it appears depends on whether input arrived in that window. Before this classification it was in neither this table nor the "Unchanged in every flavor" list. Smoke builds keep it, because `boot-smoke` implies `test-trace`, so the `agent-demo` smoke list (`run.ps1:577`) still finds it. Acceptance test 4's default-kernel list includes it.
 
+Implementation note (2026-10-10): the idle line was found in review. The shell or desktop exits when the user presses Esc, so the line dates that keypress, which is input-dependent timing that D4 allows only with a `mirror.perf=` token. It is therefore gated with the per-input markers, applying D4 rather than a new decision. Acceptance test 4's scan list does not yet include it; adding `Mirror idle` there is a candidate follow-up.
+
 - **Probes (D5):** open the device, read sector 0, compare nothing, shut down, and print the existing `MIRROR_BLOCK_PROBE_OK fixture=0 reads=1` or `MIRROR_AHCI_PROBE_OK fixture=0 reads=1` (`main.rs:982`, `867`). A read error prints the existing `MIRROR_*_FAILED phase=read` (`main.rs:983`, `868`), and boot continues.
 - **Dead code:** items left unused in default or trace builds, such as init-only `Process` counters, `BootInfo::init` and the `inject_error` paths, are gated together with their users, so Clippy `-D warnings` passes in every flavor.
 - **Unchanged in every flavor:**
   - device and catalog markers;
   - `MIRROR_CONSOLE_READY`, `MIRROR_POINTER_READY` (its position comes from geometry, not input) and `MIRROR_CONSOLE_INPUT_LOST` (`main.rs:486-499`, `525`);
-  - `MIRROR_APP_*`, `MIRROR_SHELL_CLEANUP_OK` and `MIRROR_USER_FAULT`;
+  - `MIRROR_APP_*`, `MIRROR_SHELL_CLEANUP_OK`, `MIRROR_USER_FAULT`, and the content-free `Native process: pid=... pages=...` line printed at each process load (`userspace.rs:517`);
   - the `after_userspace` rendezvous and heap-growth phase (`main.rs:311-317`), so the capture's SMP and heap phase lists stay valid.
 
 **Scripts.**
