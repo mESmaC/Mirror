@@ -58,7 +58,7 @@ There is no syscall or ABI change. Line numbers are at HEAD 4614249; 0014, 0010,
 - `scripts/run.ps1`:
   - New `-CrowdedPci` switch that adds 32 root-port functions at 00:15.0-00:18.7, the slots where VMware puts its root ports. Each one is added like `-device pcie-root-port,bus=pcie.0,addr=0x15.0x0,multifunction=on,chassis=1,id=rp1,io-reserve=0`, with a unique `chassis` and `id` per port. `io-reserve=0` stops OVMF from exhausting the 64 KiB I/O space across 32 hotplug ports. It applies on top of any 0014 profile.
   - Near run.ps1:492-497, assert that no `MIRROR_ACPI_TABLE_SKIPPED` or `MIRROR_APIC_IOAPIC_ID` line appears and that every new `MIRROR_ACPI_READY` counter is 0.
-- `scripts/common.ps1:31`: the `retained -gt 32` bound becomes 256.
+- `scripts/common.ps1:68`: the `retained -gt 32` bound becomes 256.
 - `scripts/test.ps1`: add test 11 to both build profiles, two boots in all. 0014 already computes the boot count (test.ps1:161).
 - `readme.md` (or the `docs/` page that holds these sections under P5c):
   - :215: duplicate and surplus local NMI records and surplus CPU records no longer reject the topology (D3, D4), and the bounds list says 130 local NMI records.
@@ -99,7 +99,7 @@ QEMU cases (scripts/test.ps1, debug and release):
     - `MIRROR_AHCI_READY` and `MIRROR_AHCI_READ_OK` appear, and 0014's catalog check finds the one `8086:100f` record.
     - Before changing the kernel, run this case once against the current kernel. The run fails, and its log shows `retained=32 omitted=7` and `MIRROR_AHCI_SKIPPED reason=no_disk`, which proves that the case exercises the cap.
 12. No new case for HPET-less boots. 0014's `V1` NoHpet-CpuCount4 case covers a platform without an HPET (ledger S10), and its log shows `MIRROR_ACPI_HPET_SKIPPED reason=missing`, `MIRROR_CLOCK_SKIPPED reason=no_hpet`, `MIRROR_SMP_READY` with `online=4`, and `MIRROR_AHCI_READ_OK`.
-13. Every existing case still passes, including the new run.ps1 assertion: no `MIRROR_ACPI_TABLE_SKIPPED` or `MIRROR_APIC_IOAPIC_ID` line, and every new counter at 0. `MIRROR_CLOCK_ID_MISMATCH` never appears; common.ps1:335-337 already throws on any unexpected clock marker.
+13. Every existing case still passes, including the new run.ps1 assertion: no `MIRROR_ACPI_TABLE_SKIPPED` or `MIRROR_APIC_IOAPIC_ID` line, and every new counter at 0. `MIRROR_CLOCK_ID_MISMATCH` never appears; common.ps1:372-374 already throws on any unexpected clock marker.
 
 Manual checks, after 0015a. Use a default-flavor build (S7a), as 0015a packages it, because smoke builds assert a VirtIO disk (main.rs:202-205). Use the reference VM settings in 0015a's VM settings doc: the VMware Workstation version, the virtual hardware version, and the HPET enabled explicitly. The VM has UEFI firmware, a SATA (AHCI) disk holding the 0015a image, an e1000 (82545EM) NIC, and COM1 sent to a file. Keep the logs in `build/vm-logs/`.
 14. VMware Workstation at 1 and 4 vCPUs. Expected:

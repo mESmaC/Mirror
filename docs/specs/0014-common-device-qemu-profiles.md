@@ -45,9 +45,9 @@ Smoke cases, manual `run.ps1` boots and the debug and release normal-kernel capt
 - `test.ps1:35-157` runs 60 cases per build profile.
   - Five fault modes need the VirtIO fixture: BlockIoError, BlockWrite, BlockWriteError, BlockFlushError and BlockNoFlush (`run.ps1:203-209`).
   - Four cases pass `-AhciDisk` (`test.ps1:53-60`).
-- `Assert-MirrorDriverCatalog` (`common.ps1:4-82`):
-  - It accepts only the driver names `virtio-blk-legacy`, `ahci-sata`, `xhci-host` and `none` (`:36`).
-  - It requires exactly one AHCI controller and one modern VirtIO boot device (`:78`).
+- `Assert-MirrorDriverCatalog` (`common.ps1:41-119`):
+  - It accepts only the driver names `virtio-blk-legacy`, `ahci-sata`, `xhci-host` and `none` (`:73`).
+  - It requires exactly one AHCI controller and one modern VirtIO boot device (`:115`).
 - `run.ps1:648-650` requires `virtio_block>=1`. That check stays (0014-D7, S1b).
 - PCI inventory and paging:
   - Today's q35 inventory has 7 functions with the VirtIO fixture and 6 without it (`build/test-logs/debug-None.serial.log`, `debug-AhciDisk-None.serial.log`). AHCI is at `00:1f.2`, ID `8086:2922`, class `01:06:01`.
@@ -73,7 +73,7 @@ NIC and variant details:
 - The variant switches (`-NoTestDisk`, `-NoKeyboard`, `-NoDisplayDevice`, `-NoHpet`, `-Xhci*`, `-ExtendedCpu`, `-LegacyPic`, `-PitTimer`, `-CpuCount`) apply on top of either profile. 0017c later adds `-NoVmport`.
 
 Later M0 specs on these profiles:
-- 0015a replaces the vvfat ESP with its disk image on the same firmware-only virtio-blk device (0015-D10, S1b), in both profiles. The catalog's one-modern-VirtIO rule (`common.ps1:78`) and `run.ps1:648-650` are unchanged by it.
+- 0015a replaces the vvfat ESP with its disk image on the same firmware-only virtio-blk device (0015-D10, S1b), in both profiles. The catalog's one-modern-VirtIO rule (`common.ps1:115`) and `run.ps1:648-650` are unchanged by it.
 - 0015b's `-Iso` case attaches the ISO as an ATAPI CD on `ide.2`, which the AHCI driver skips (`kernel/src/ahci.rs:238-245`). It has no modern virtio-blk boot disk, so only the legacy fixture satisfies the smoke assert (`kernel/src/main.rs:202-205`): `-Iso` requires `-DeviceProfile LegacyVirtio`, and the `test.ps1` `-Iso` case runs under that profile, on top of its six cases. 0015b owns these script changes.
 - The VMware column holds the reference settings for 0015a's manual VMware boot check, and 0015a's VM settings doc holds the full settings. That check also confirms this device set in the serial log: one `driver=ahci-sata` record, one `id=8086:100f class=02:00:00` record, and `MIRROR_KEYBOARD_READY`, `MIRROR_MOUSE_READY` and `MIRROR_FRAMEBUFFER_READY`. On VMware the `driver=ahci-sata` record names `id=15ad:07e0 class=01:06:01`. That is VMware's own AHCI controller, not an Intel ICH ID like q35's `8086:2922`, and Mirror binds it by class alone (`kernel/src/pci.rs:82-84`, `kernel/src/drivers.rs:40`), so no ID list needs it. (Amended 2026-10-10 from the VMware Workstation Pro 26.0.1 check: AHCI.ROM's PCI header and vmware-vmx's config-space template.)
 
@@ -122,7 +122,7 @@ Later M0 specs on these profiles:
    - `MIRROR_BLOCK_SKIPPED reason=no_supported_device`
 
    After 0010, the captures print `MIRROR_AHCI_PROBE_OK fixture=0 reads=1` instead of `MIRROR_AHCI_READ_OK`; smoke boots are unchanged. After each boot and each capture, `build/ahci-test.img` is byte-identical to the fixture. Most configurations have never run AHCI with a disk attached. NoHpet-CpuCount4, NoHpet-LegacyPic and ClockActivation-CpuCount4 have no clock, so their AHCI waits rely on the 50,000,000-poll bound instead (`kernel/src/ahci.rs:74, 654-659`).
-4. **LegacyVirtio parity.** Before making the change, copy `build/test-logs` outside `build/`, because `test.ps1` empties it at start (0011-D7). For each of the six `LegacyVirtio` cases, the `^MIRROR_BLOCK_` lines match those in the saved log for the same fault and build. The writable-image reconstruction (`common.ps1:712-751`) still passes.
+4. **LegacyVirtio parity.** Before making the change, copy `build/test-logs` outside `build/`, because `test.ps1` empties it at start (0011-D7). For each of the six `LegacyVirtio` cases, the `^MIRROR_BLOCK_` lines match those in the saved log for the same fault and build. The writable-image reconstruction (`common.ps1:749-788`) still passes.
 5. **Argument validation.** In each of these cases the script throws and QEMU does not start:
    - `run.ps1 -Smoke -NoBuild -Fault BlockWrite`. The error names `-DeviceProfile LegacyVirtio`.
    - `run.ps1 -Smoke -NoBuild -DeviceProfile LegacyVirtio -Fault AhciIoError`
@@ -148,4 +148,4 @@ None: no crates and no new tools. The profiles use the QEMU 11.1.0 already in `.
 - For 0070: should the driver also accept the 82540EM (8086:100E)? It is QEMU's plain `e1000`, and it shares the 8254x register model. If so, 0070 adds one `V1` variant case that uses that model.
 - For 0062: delete the `LegacyVirtio` profile, or replace its cases, when it adds AHCI write and flush cases (0014-D5). 0015b's `-Iso` case also runs under that profile, so 0062 must rehome it too; under `V1` it needs the smoke assert at `kernel/src/main.rs:202-205` to accept a boot with no VirtIO block device.
 - For 0069: this spec keeps `-vga std`. The VMware SVGA II adapter joined the v1 device set when S1a was amended (2026-10-09, S1c), and 0069 drives it for mode setting and live resize. (Amended 2026-10-10 with S1c's rewording: VMware sends resize requests only over the guest RPC channel, so live resize also needs that channel. Whether an RPC core moves ahead of 0069 or live resize moves to 0087 is pending in decisions.md. Either way QEMU has no model of the channel.) Until 0069 the kernel uses only the GOP framebuffer, so no M0 code depends on the QEMU display choice. Should 0069 switch the profiles to QEMU's `-vga vmware`, an SVGA II model (`vgabios-vmware.bin` ships locally), or add it as a `V1` variant case?
-- Suggested follow-up spec: per-case work directories, so that cases can run in parallel. Fixed paths force serial runs: `run.ps1:308-316`, `:357` and `common.ps1:707`. Parallel runs are the main way to cut the 20-minute suite time. README.md lists it under the unscheduled follow-ups.
+- Suggested follow-up spec: per-case work directories, so that cases can run in parallel. Fixed paths force serial runs: `run.ps1:308-316`, `:357` and `common.ps1:744`. Parallel runs are the main way to cut the 20-minute suite time. README.md lists it under the unscheduled follow-ups.

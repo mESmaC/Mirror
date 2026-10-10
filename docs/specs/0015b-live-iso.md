@@ -34,7 +34,7 @@ Decisions in 0015a that also govern this spec:
 
 **ISO layout.** The ISO uses Limine's UEFI CD layout, written natively:
 - an ISO9660 primary volume descriptor at sector 16, an El Torito boot record at sector 17, then a terminator;
-- a boot catalog with one no-emulation entry for platform 0xEF. It points at `limine-uefi-cd.bin` from the pinned archive verified at `build.ps1:48-75`, a 3 MiB FAT12 image holding only `EFI/BOOT/*.EFI`. The entry's sector count equals the image size in 512-byte sectors (6144 for 3 MiB), which host test 1 asserts. VMware's EFI firmware uses EDK2's El Torito partition driver, which sizes the boot partition from that count (inference, 2026-10-10);
+- a boot catalog with one no-emulation entry for platform 0xEF. It points at `limine-uefi-cd.bin` from the pinned archive verified at `build.ps1:49-76`, a 3 MiB FAT12 image holding only `EFI/BOOT/*.EFI`. The entry's sector count equals the image size in 512-byte sectors (6144 for 3 MiB), which host test 1 asserts. VMware's EFI firmware uses EDK2's El Torito partition driver, which sizes the boot partition from that count (inference, 2026-10-10);
 - a flat root directory holding `LIMINE.CONF`, `KERNEL.ELF`, the four module files, `LICENSE` and `3RDPARTY.MD`, with ISO9660 level 2 uppercase names and `;1`;
 - no Rock Ridge, Joliet, BIOS entry or hybrid partition table.
 
@@ -47,7 +47,7 @@ Limine scans the El Torito image first, which has no config, and then the whole 
   - `-Iso` requires `-DeviceProfile LegacyVirtio`. With no modern virtio-blk boot disk, the legacy fixture is the only device that satisfies the smoke assert (`kernel/src/main.rs:202-205`). 0014 already rejects `LegacyVirtio` with `-NoTestDisk`.
   - `-Iso` rejects any `-Fault` other than `None`, plus `-LegacyPic` and `-PitTimer`, because those need a kernel command line.
   - The kernel skips ATAPI ports (`ahci.rs:238-245`), so AHCI reports `MIRROR_AHCI_SKIPPED reason=no_disk` (`main.rs:847`).
-- `common.ps1`: `Assert-MirrorDriverCatalog` gets a parameter for the expected number of modern VirtIO devices, which today is fixed at 1 (`common.ps1:75-78`). `run.ps1:519` passes 0 for `-Iso` and 1 otherwise. `run.ps1:648-650` is unchanged, because the legacy fixture satisfies it.
+- `common.ps1`: `Assert-MirrorDriverCatalog` gets a parameter for the expected number of modern VirtIO devices, which today is fixed at 1 (`common.ps1:112-115`). `run.ps1:519` passes 0 for `-Iso` and 1 otherwise. `run.ps1:648-650` is unchanged, because the legacy fixture satisfies it.
 - `test.ps1`: adds one `-Iso` smoke case per build profile under `LegacyVirtio`, two boots in all. 0014's computed boot count includes them.
 - `package.ps1` (0015a): also copies `mirror.iso` to `build/dist/`.
 - `docs/vm-settings.md` (0015-D11): add the ISO steps. Remove the disk (delete the `sata0:0` lines, or set `sata0:0.present = "FALSE"`) and attach `build/dist/mirror.iso` on a SATA CD-ROM: `sata0:1.present = "TRUE"`, `sata0:1.deviceType = "cdrom-image"`, `sata0:1.fileName = "<abs>\build\dist\mirror.iso"`. Keep every other reference setting.
@@ -81,7 +81,7 @@ As in 0015a, firmware must start Limine from the El Torito image, and Limine mus
 ## Dependencies
 
 - No new crates. The ISO9660/El Torito writer is hand-written (0015-D4).
-- From the pinned Limine v12.9.3 release (BSD-2-Clause, `build.ps1:48-49`): `limine-uefi-cd.bin`, `LICENSE` and `3RDPARTY.md`.
+- From the pinned Limine v12.9.3 release (BSD-2-Clause, `build.ps1:49-50`): `limine-uefi-cd.bin`, `LICENSE` and `3RDPARTY.md`.
 - QEMU 11.1.0 in `.tools/qemu` (GPL-2.0), already used for tests.
 - Manual checks only: VMware Workstation Pro at the reference version in `docs/vm-settings.md`.
 
