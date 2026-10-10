@@ -144,10 +144,10 @@ Source interviews: the 2026-10-09 spec interview, then the 2026-10-09 gap interv
 | ID | Decision | Status |
 | --- | --- | --- |
 | P1 | Specs live in `docs/specs/` as small numbered files following the template in README.md. Nothing is built from unconfirmed decisions. | confirmed |
-| P2 | Cameron dispatches agents. Claude proposes non-blocking side tasks on request. Kimi stays on UI. | confirmed |
+| P2 | Cameron dispatches agents. Claude proposes non-blocking side tasks on request. Kimi stays on UI. Kimi's UI work is design, mostly outside Rust, and blocks nothing: Cameron passes its details on when it is ready, and specs marked "with Kimi" proceed without waiting for it. (Amended 2026-10-10.) | confirmed |
 | P3 | CI is deferred. Work is mostly one agent at a time. | confirmed |
 | P4 | The license is deferred while the repo is private. Every adopted dependency's license is recorded. | confirmed |
-| P5a | Pin the Rust toolchain to 1.96.0 and bump it deliberately. | confirmed |
+| P5a | Pin the Rust toolchain to 1.99.0 and bump it deliberately. (Amended 2026-10-10: 1.96.0 became 1.99.0, the stable compiler already on the development machine. With `rust-version = "1.99"` the only new clippy finding is at `kernel/src/usb.rs:538`, which 0011 fixes.) | confirmed |
 | P5b | Add an `AGENTS.md` that every agent reads: spec rules, test commands, coding conventions, references policy. | confirmed |
 | P5c | Gradually split the readme into `docs/` (building, testing, architecture, ABI), leaving a short readme. | confirmed |
 | P6 | References policy: the local reference trees (linux, nt5src, freebsd-src, colibri) are best-practice references only, and Mirror code is written independently against Mirror's own interfaces. They live on the development machine; exact paths vary by machine, so agents ask Cameron for a tree's location rather than assuming one. readme.md:694 ("reuse device-specific source where licensing permits") is reworded to match. (Amended 2026-10-09: readme.md:698 ("port drivers for named physical hardware", "each port has a bounded interface") and readme.md:700 ("Porting source does not mean ...") are reworded with it, spec 0012-D5; the replacement wording of all three lines is confirmed.) | confirmed |
@@ -175,13 +175,14 @@ v1 order. The harness follows the process model (A15), and harness code is writt
 
 ## Pending (resume here)
 
-State after the 2026-10-09 gap interview, its write-up and its addendum.
+State after the 2026-10-09 gap interview, its write-up and its addendum, and the 2026-10-10 pin change (P5a: 1.99.0).
+
+**Next in the M0 order:** build 0012, then 0011.
 
 **Confirmed, but not yet written into the spec text:** none. Confirmed decisions that name a spec not yet drafted (for example 0027a, 0033 or 0067) live in this ledger and the README.md spec map until that spec is written.
 
-**Still awaiting Cameron's decision:**
-1. 0012: Kimi's UI branch name. AGENTS.md keeps the placeholder "name supplied by Cameron" until then.
-2. Spec 0019 (all proposed; D3-D12 unchanged by the gap interview):
+**Decided when their spec comes up** (Cameron, 2026-10-10; none blocks the current M0 work):
+1. Spec 0019 (all proposed; D3-D12 unchanged by the gap interview):
    - 0019-D3: gate every perf line, milestones included, behind a valid `mirror.perf=` token. This narrows confirmed 0018-D9 and changes 0018's marker contract, so it needs re-confirmation together with them.
    - Whether to split 0019 into 0019a (perf markers) and 0019b (C3 telemetry), since it is about three pages.
    - 0019-D12: VMware token delivery through a perf copy of the disk image, or through a boot menu entry. Either way the perf boot entry sets 1920x1080 through Limine's `resolution:` option (confirmed 2026-10-09, 0015a).
@@ -190,8 +191,10 @@ State after the 2026-10-09 gap interview, its write-up and its addendum.
    - The rest of 0019 (D4 grammar, D5 TSC entry timing, D6 syscall-observed frame and shell_ready, D7 deferred input ring, D8 text telemetry records, D11 the perf-protocol crate), each with the reviewer's recommendation in the spec.
    - 0019 open question 6 (added 2026-10-09): where flip calibration runs in boot-smoke builds, where `run_init` (`main.rs:303`) runs before the `after_userspace` rendezvous (`main.rs:311`).
    - 0019 open question 7 (added 2026-10-09): with 0017c's vmmouse active, a click arrives in vmmouse DATA, not in the PS/2 packet, so D7's start rule needs a vmmouse case.
-3. 0017c open question 1: setting `monitor_control.restrict_backdoor = "TRUE"`, which limits the VMware backdoor to CPL0. It stays proposed until manual check 7 shows that the option exists on current Workstation and that vmmouse still works with it. If adopted, it applies only to Mirror's VMs (0015a's reference VM and 0018's Mirror VM), and 0018-D3 lists it as an accepted exception, because VMware Tools in the baselines needs user-mode backdoor access.
-4. O7: the v1 full-access ceiling, decided before v1 acceptance.
+2. 0017c open question 1: setting `monitor_control.restrict_backdoor = "TRUE"`, which limits the VMware backdoor to CPL0. It stays proposed until manual check 7 shows that the option exists on current Workstation and that vmmouse still works with it. If adopted, it applies only to Mirror's VMs (0015a's reference VM and 0018's Mirror VM), and 0018-D3 lists it as an accepted exception, because VMware Tools in the baselines needs user-mode backdoor access.
+3. O7: the v1 full-access ceiling, decided before v1 acceptance.
+
+Kimi's UI branch is not on the remote yet. It blocks nothing (P2), and AGENTS.md keeps the placeholder "name supplied by Cameron" until Cameron passes the details on.
 
 **Spec-map placements Claude inferred** (for Cameron's awareness, not blocking): S2b's boot-time ext2 checker in 0064; the per-CPU SYSCALL entry rework in 0050.
 
