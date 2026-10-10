@@ -535,7 +535,7 @@ fn validate_hid(bytes: &[u8]) -> Result<bool, DescriptorError> {
     }
     let mut report = false;
     let mut extra = false;
-    for entry in bytes[6..].chunks_exact(3) {
+    for entry in bytes[6..].as_chunks::<3>().0 {
         if entry[0] == 0x22 {
             if report || word(entry, 1) == 0 {
                 return Err(DescriptorError::HidDescriptor);
