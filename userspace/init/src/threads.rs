@@ -313,11 +313,13 @@ extern "C" fn mirror_thread_main(task: &'static Task, initial_stack: u64) -> ! {
         BASIC => {
             await_value(&GATE, 1);
             let stack_canary = EXIT_VALUE ^ tid;
+            // SAFETY: `stack_canary` is a live, initialized and aligned local.
             // Volatile stack data observes accidental sharing of thread stacks.
             unsafe { (&raw const stack_canary).read_volatile() };
             check_fpu(tid);
             check_tls(task);
             require(
+                // SAFETY: `stack_canary` is still a live, initialized and aligned local.
                 unsafe { (&raw const stack_canary).read_volatile() } == EXIT_VALUE ^ tid,
                 523,
             );

@@ -123,7 +123,8 @@ fn write(console: u64, message: &[u8]) {
 
 fn exit(status: u64) -> ! {
     syscall(SYS_EXIT, status, 0, 0);
-    // An exit returning is an ABI failure. UD2 makes that visible to the kernel.
+    // SAFETY: An exit returning is an ABI failure. UD2 makes that visible to the
+    // kernel, which ends the process at the trap, so the block never returns.
     unsafe { asm!("ud2", options(noreturn, nostack)) }
 }
 
@@ -951,10 +952,12 @@ fn check_syscall_registers(pid: i64) {
     let mut r13 = seed ^ 0xaa;
     let mut r14 = seed ^ 0xbb;
     let mut r15 = seed ^ 0xcc;
-    // Declare outputs so broken register restoration can be detected without
-    // compiler assumptions hiding the problem. RBX/RBP are reserved by LLVM;
-    // save, test, and restore them inside the assembly instead. Capture DF after
-    // rescheduling and clear it before any Rust code resumes.
+    // SAFETY: YIELD restores the user stack, and the assembly pops everything it
+    // pushes. Declare every other general-purpose register as an output so broken
+    // restoration can be detected without compiler assumptions hiding the
+    // problem. RBX/RBP are reserved by LLVM; save, test, and restore them inside
+    // the assembly instead. Capture DF after rescheduling and clear it before any
+    // Rust code resumes.
     unsafe {
         asm!(
             "push rbx",
@@ -1118,8 +1121,10 @@ extern "C" fn init_main(launch: u64) -> ! {
     threads::check(console, pid as u64);
     sync::check(console);
 
-    // These volatile accesses ensure both file-backed data and zero-filled BSS
-    // are exercised even in optimized builds.
+    // SAFETY: Both statics are live in this process's private address space, and
+    // only this thread accesses them, always through raw pointers. These volatile
+    // accesses ensure both file-backed data and zero-filled BSS are exercised
+    // even in optimized builds.
     unsafe {
         require(
             (&raw const INITIALIZED).read_volatile() == 0x0123_4567_89ab_cdef,
@@ -1235,21 +1240,34 @@ extern "C" fn init_main(launch: u64) -> ! {
     // expressing deliberately invalid accesses as undefined Rust operations.
     match probe {
         0 | 8 | 9 => exit(0),
+        // SAFETY: This read of the supervisor-only kernel mapping deliberately
+        // raises #PF. The kernel ends the process at the fault without resuming it.
         1 => unsafe {
             asm!("mov rax, [rdi]", in("rdi") KERNEL_BASE, out("rax") _, options(nostack));
         },
+        // SAFETY: This store to the read-execute code page deliberately raises
+        // #PF. The kernel ends the process at the fault without resuming it.
         2 => unsafe {
             asm!("mov byte ptr [rdi], 0x90", in("rdi") CODE_BASE, options(nostack));
         },
+        // SAFETY: Jumping into the RET byte pushed onto the non-executable stack
+        // deliberately raises #PF. The kernel ends the process, so it never returns.
         3 => unsafe {
             // If execution protection is missing, RET will not give a false
             // success: the kernel must observe a page fault on this stack page.
             asm!("push 0xc3", "jmp rsp", options(noreturn));
         },
+        // SAFETY: This read of the unmapped guard page below the initial stack
+        // deliberately raises #PF. The kernel ends the process at the fault.
         4 => unsafe {
             asm!("mov rax, [rdi]", in("rdi") STACK_GUARD, out("rax") _, options(nostack));
         },
+        // SAFETY: CLI at CPL 3 with IOPL 0 deliberately raises #GP instead of
+        // masking interrupts. The kernel ends the process at the fault.
         5 => unsafe { asm!("cli", options(nostack)) },
+        // SAFETY: This syscall deliberately enters the kernel with a noncanonical
+        // RSP, and no Rust code runs afterward. The kernel rejects the return
+        // frame and ends the process; UD2 traps if the syscall ever returns.
         6 => unsafe {
             // A syscall can arrive with an unusable user stack. The kernel must
             // reject this return frame against the native address contract.
@@ -1264,18 +1282,34 @@ extern "C" fn init_main(launch: u64) -> ! {
             );
         },
         7 => threads::budget(),
+        // SAFETY: This store to the arena page made read-only above deliberately
+        // raises #PF. The kernel ends the process at the fault without resuming it.
         10 => unsafe {
             asm!("mov byte ptr [rdi], 0x90", in("rdi") VM_FAULT, options(nostack));
         },
+        // SAFETY: Jumping into the writable, non-executable arena page deliberately
+        // raises #PF on the fetch. The kernel ends the process, so it never returns.
         11 => unsafe {
             asm!("jmp rdi", in("rdi") VM_FAULT, options(noreturn, nostack));
         },
+        // SAFETY: This read of the released (12) or PROT_NONE (13) arena page
+        // deliberately raises #PF. The kernel ends the process at the fault.
         12 | 13 => unsafe {
             asm!("mov rax, [rdi]", in("rdi") VM_FAULT, out("rax") _, options(nostack));
         },
+        // SAFETY: This argument-free routine deliberately divides by zero with the
+        // x87 exception unmasked, so FWAIT raises #MF and the kernel ends the process.
         14 => unsafe { fpu::mirror_probe_x87_fault() },
+        // SAFETY: This argument-free routine deliberately divides by zero with the
+        // SSE exception unmasked, so DIVSD raises #XM and the kernel ends the process.
         15 => unsafe { fpu::mirror_probe_sse_fault() },
+        // SAFETY: This argument-free routine deliberately executes a VEX-encoded
+        // instruction while the kernel leaves OSXSAVE clear, so it raises #UD and
+        // the kernel ends the process.
         16 => unsafe { fpu::mirror_probe_avx_fault() },
+        // SAFETY: This argument-free routine deliberately executes WRFSBASE while
+        // the kernel leaves CR4.FSGSBASE clear, so it raises #UD and the kernel
+        // ends the process.
         17 => unsafe { tls::mirror_probe_fsgsbase_fault() },
         18..=20 => threads::scenario(probe),
         _ => exit(30),

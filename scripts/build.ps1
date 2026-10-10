@@ -11,6 +11,7 @@ $profile = if ($Release) { 'release' } else { 'debug' }
 
 Push-Location -LiteralPath $repositoryRoot
 try {
+    Assert-MirrorToolchain
     # Package-specific linker flags without a host build-script/linker dependency.
     # Encoded flags override the kernel defaults and preserve paths with spaces.
     $previousFlags = $env:CARGO_ENCODED_RUSTFLAGS

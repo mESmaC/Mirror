@@ -176,13 +176,8 @@ fn configure_current() -> Result<bool, &'static str> {
     Ok(features.ecx & (1 << 28) != 0)
 }
 
-// Rust 1.88 declares this intrinsic unsafe; newer compilers declare it safe.
-// Keep the advertised minimum compiler without lint noise on newer toolchains.
-#[allow(unused_unsafe)]
 fn cpuid(leaf: u32) -> CpuidResult {
-    // SAFETY: CPUID is guaranteed on the x86-64 target, including extended-leaf
-    // discovery. The caller checks the maximum leaf before querying features.
-    unsafe { __cpuid(leaf) }
+    __cpuid(leaf)
 }
 
 #[cfg(feature = "boot-smoke")]

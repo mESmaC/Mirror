@@ -24,8 +24,5 @@ mirror-clock-protocol = { path = "../crates/clock-protocol" }
 boot-smoke = []
 agent-demo = []
 
-[lints.rust]
-unsafe_op_in_unsafe_fn = "deny"
-
-[lints.clippy]
-undocumented_unsafe_blocks = "deny"
+[lints]
+workspace = true

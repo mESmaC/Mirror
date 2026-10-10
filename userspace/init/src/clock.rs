@@ -102,8 +102,8 @@ fn check_copy(previous: ClockSnapshot) {
     require(get(output) == EFAULT, 735);
     require(vm_stats() == before, 736);
     for index in 0..8 {
-        // SAFETY: Only the retained prefix is read after releasing the suffix.
         require(
+            // SAFETY: Only the retained prefix is read after releasing the suffix.
             unsafe { ((output + index) as *const u8).read_volatile() } == SENTINEL,
             737,
         );

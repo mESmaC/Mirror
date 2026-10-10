@@ -10,6 +10,19 @@ param(
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 Push-Location -LiteralPath $repositoryRoot
 try {
+    Assert-MirrorToolchain
+    # Start from an empty log directory so every log in it comes from this run.
+    # Refuse links, so the recursive removal never reaches outside the directory.
+    $logDirectory = Join-Path $repositoryRoot $(if ($AgentDemo) { 'build/test-agent-logs' } else { 'build/test-logs' })
+    if (Test-Path -LiteralPath $logDirectory) {
+        @(Get-Item -LiteralPath $logDirectory -Force) + @(Get-ChildItem -LiteralPath $logDirectory -Recurse -Force) | ForEach-Object {
+            if ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw "Refusing to clear $logDirectory because $($_.FullName) is a link."
+            }
+        }
+        Remove-Item -LiteralPath $logDirectory -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
     & cargo fmt --all -- --check
     if ($LASTEXITCODE -ne 0) { throw 'Rust formatting check failed.' }
     & cargo test --locked -p mirror-desktop-protocol -p mirror-window-protocol -p mirror-vm-protocol -p mirror-thread-protocol -p mirror-clock-protocol -p mirror-sync -p mirror-acpi --target x86_64-pc-windows-msvc
@@ -19,8 +32,6 @@ try {
     & cargo clippy --locked --workspace --all-features -- -D warnings
     if ($LASTEXITCODE -ne 0) { throw 'Smoke kernel Clippy check failed.' }
 
-    $logDirectory = Join-Path $repositoryRoot $(if ($AgentDemo) { 'build/test-agent-logs' } else { 'build/test-logs' })
-    New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
     foreach ($release in @($false, $true)) {
         $profile = if ($release) { 'release' } else { 'debug' }
         # Keep firmware and full debug ELF loading out of the kernel memory

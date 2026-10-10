@@ -1,6 +1,43 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Assert-MirrorToolchain {
+    param([string]$RustcVersion)
+
+    # A RUSTUP_TOOLCHAIN variable, a rustup directory override or another rustc
+    # on PATH silently replaces rust-toolchain.toml, so check the compiler itself.
+    $repositoryRoot = Split-Path -Parent $PSScriptRoot
+    $toolchain = Get-Content -LiteralPath (Join-Path $repositoryRoot 'rust-toolchain.toml') -Raw
+    $channel = [regex]::Match($toolchain, '(?m)^channel\s*=\s*"(\d+\.\d+\.\d+)"')
+    if (-not $channel.Success) {
+        throw 'rust-toolchain.toml must pin an exact channel such as "1.99.0".'
+    }
+    $expected = $channel.Groups[1].Value
+    $expectedMinor = $expected -replace '\.\d+$', ''
+    $manifest = Get-Content -LiteralPath (Join-Path $repositoryRoot 'Cargo.toml') -Raw
+    $rustVersion = [regex]::Matches($manifest, '(?m)^rust-version\s*=\s*"([^"]*)"')
+    if ($rustVersion.Count -ne 1) {
+        throw 'Cargo.toml must declare exactly one workspace rust-version.'
+    }
+    $declared = $rustVersion[0].Groups[1].Value
+    if ($PSBoundParameters.ContainsKey('RustcVersion')) {
+        $actual = $RustcVersion
+    }
+    else {
+        Push-Location -LiteralPath $repositoryRoot
+        try {
+            $actual = (@(& rustc --version) -join "`n").Trim()
+            if ($LASTEXITCODE -ne 0) { throw "rustc --version failed with exit code $LASTEXITCODE." }
+        }
+        finally {
+            Pop-Location
+        }
+    }
+    if (-not $actual.StartsWith("rustc $expected ", [StringComparison]::Ordinal) -or $declared -ne $expectedMinor) {
+        throw "Rust toolchain mismatch: rust-toolchain.toml pins $expected, so rustc must report 'rustc $expected' and Cargo.toml rust-version must be $expectedMinor. Found '$actual' and rust-version $declared. A RUSTUP_TOOLCHAIN variable, a 'rustup override' directory override or another rustc on PATH replaces the pin; a toolchain bump changes channel and rust-version in the same commit."
+    }
+}
+
 function Assert-MirrorDriverCatalog {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,

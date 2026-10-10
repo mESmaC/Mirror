@@ -991,10 +991,5 @@ pub fn self_test() {
 }
 
 fn cpuid_edx() -> u32 {
-    // SAFETY: CPUID leaf1 exists on all supported x86-64 CPUs. The explicit
-    // unsafe block supports the workspace MSRV, before this intrinsic was safe.
-    #[allow(unused_unsafe)]
-    unsafe {
-        __cpuid(1).edx
-    }
+    __cpuid(1).edx
 }

@@ -158,12 +158,10 @@ impl HandleTable {
     }
 }
 
-// Keep Rust 1.88 support: the replacement try_update API is newer than our MSRV.
-#[allow(deprecated)]
 fn allocate_token(next: &AtomicU64) -> Result<u64, CapError> {
     // Relaxed ordering supplies uniqueness without implying publication of a
     // table entry. Table access itself requires the caller's synchronization.
-    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+    next.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         if (1..=MAX_TOKEN).contains(&value) {
             Some(value + 1)
         } else {

@@ -1,4 +1,5 @@
 #![no_std]
+#![forbid(unsafe_code)]
 //! Optional hardware monotonic elapsed time, independent of delivered timer
 //! interrupts. Values are nanoseconds since clock initialization, not UTC.
 

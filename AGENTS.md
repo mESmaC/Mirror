@@ -28,7 +28,7 @@ Run commands from the repository root in PowerShell.
 - `.\scripts\build.ps1 [-Release] [-Smoke] [-AgentDemo]` builds the four userspace programs and the kernel and stages `build\esp\`. `-Smoke` and `-AgentDemo` enable the kernel features `boot-smoke` and `agent-demo`.
 - The ledger (S7a) defines three kernel flavors: default (clean, for daily use), `test-trace` (adds test serial markers, for captures; spec 0010 adds it) and `boot-smoke` (`test-trace` plus the self-test and fault battery).
 - Trap: `.cargo\config.toml` links every `x86_64-unknown-none` crate with `kernel\linker.ld`. `build.ps1` overrides this per program through `CARGO_ENCODED_RUSTFLAGS`: the program's own `userspace\<pkg>\linker.ld`, the small code model, and release LTO off. Never build userspace with `cargo build --workspace` or `cargo build -p mirror-<pkg>`: the images come out wrongly linked. `cargo check` and `cargo clippy` are safe because they do not link.
-- Use the toolchain that `rust-toolchain.toml` selects. Change it only in a dedicated commit.
+- Use Rust 1.99.0, pinned in `rust-toolchain.toml`. `build.ps1` and `test.ps1` first run the `Assert-MirrorToolchain` preflight (`scripts\common.ps1`). It fails unless `rustc --version` reports the pinned version and the workspace `rust-version` in `Cargo.toml` is its major.minor, because a `RUSTUP_TOOLCHAIN` variable, a `rustup override` or another `rustc` on `PATH` silently replaces the pin. Change the pin only in a dedicated bump commit that changes both values, following the bump procedure in spec 0011.
 
 ## Test
 - `.\scripts\test.ps1` is the full suite: rustfmt `--check`, host unit tests, and clippy `-D warnings` with no features and with all features. Then, for debug and for release, a smoke build, every smoke boot and a normal-boot capture. It takes about 20 minutes and stops at the first failure. `test.ps1 -AgentDemo` reruns the whole suite with `agent-demo`, about 20 minutes more.
@@ -37,7 +37,7 @@ Run commands from the repository root in PowerShell.
 - `.\scripts\capture.ps1` boots a normal kernel, drives it with QMP input and checks screenshots.
 - Run the build, run, capture and test scripts one at a time, across all agents and terminals. They share `build\` (the staged ESP and its `limine.conf`, firmware variables, serial logs), so a second command silently corrupts the first.
 - QEMU and OVMF are found in `.tools\qemu\` or on `PATH`, or set through `QEMU_PATH`, `OVMF_CODE` and `OVMF_VARS`.
-- A failed boot leaves its output in `build\serial.log` and `build\qemu.stderr.log`. `build\test-logs\` and `build\test-agent-logs\` receive only passing cases and are never cleared, so check timestamps before you trust them.
+- A failed boot leaves its output in `build\serial.log` and `build\qemu.stderr.log`. `test.ps1` clears its log directory, `build\test-logs\` (or `build\test-agent-logs\` with `-AgentDemo`), when it starts, then copies in only passing cases, so after a failed run it holds just the cases that passed before the failure.
 
 ### When to test
 - Before each commit, run the targeted cases for what it touches. `test.ps1` lists every case; copy the matching commands from it:
@@ -49,7 +49,7 @@ Run commands from the repository root in PowerShell.
 - When the spec is complete, run the full `test.ps1` before Cameron merges the branch, plus `test.ps1 -AgentDemo` if you touched agent-demo code.
 
 ## Coding conventions
-- Every `unsafe` block has a `// SAFETY:` comment that says why its preconditions hold, and every `unsafe fn` documents its caller contract, normally under `# Safety`. Clippy enforces the comments in the kernel, desktop, app and agent. Follow the rule in `mirror-init` and `mirror-sync` too, where the lint is not on yet. The protocol crates and `mirror-acpi` forbid `unsafe`.
+- Every `unsafe` block has a `// SAFETY:` comment that says why its preconditions hold, and every `unsafe fn` documents its caller contract, normally under `# Safety`. Clippy enforces the comments in every crate: the root `Cargo.toml` denies `unsafe_op_in_unsafe_fn` and `clippy::undocumented_unsafe_blocks` in `[workspace.lints]`, and every member inherits that table. Never `allow` or `expect` either lint. The protocol crates and `mirror-acpi` forbid `unsafe` with `#![forbid(unsafe_code)]`.
 - Fail closed. Fully validate untrusted input before acting on it: ELF images, firmware tables, device descriptors, syscall arguments and the boot command line. Reject anything unknown or malformed, and bound every loop and wait.
 - Roll back on failure. An operation that fails partway undoes its partial effects before it returns the error. A smoke test proves this, usually by comparing allocated frames before and after.
 - DMA buffers have no `Drop`. Release them only after the device is reset or quiesced, and quarantine them if that fails. Report cleanup in markers such as `dma_reclaimed=1`.

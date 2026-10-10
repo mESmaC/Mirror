@@ -222,19 +222,16 @@ pub(crate) fn is_initialized() -> bool {
 
 /// Report the TLS execution contract after fpu::init disabled FSGSBASE. Only
 /// the syscall ABI may install arbitrary bases; selector loads remain legal.
-#[allow(unused_unsafe)] // CPUID intrinsics were unsafe at the Rust 1.88 MSRV.
 pub(crate) fn tls_ready() {
     assert!(fpu::is_initialized(), "TLS setup requires CPU state setup");
     assert!(!arch::interrupts_enabled(), "TLS setup requires IF=0");
     assert_kernel_tls_clean();
     let cr4: u64;
-    // SAFETY: CPL0, and CPUID exists on x86-64. Check the maximum basic leaf
-    // before reading structured feature flags. No feature is enabled here.
-    let supports_fsgsbase = unsafe {
-        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
-        core::arch::x86_64::__cpuid(0).eax >= 7
-            && core::arch::x86_64::__cpuid_count(7, 0).ebx & 1 != 0
-    };
+    // SAFETY: CPL0. This only reads CR4; no feature is enabled here.
+    unsafe { asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
+    // Check the maximum basic leaf before reading structured feature flags.
+    let supports_fsgsbase = core::arch::x86_64::__cpuid(0).eax >= 7
+        && core::arch::x86_64::__cpuid_count(7, 0).ebx & 1 != 0;
     assert_eq!(cr4 & (1 << 16), 0, "userspace FSGSBASE must stay disabled");
     serial::println!(
         "MIRROR_TLS_READY cpuid_fsgsbase={} fsgsbase=0 selectors=1",

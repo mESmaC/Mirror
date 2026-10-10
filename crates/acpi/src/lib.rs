@@ -1,4 +1,5 @@
 #![no_std]
+#![forbid(unsafe_code)]
 //! Bounded, allocation-free ACPI discovery. Physical memory access belongs to
 //! the caller: this crate only reads immutable byte slices and never follows
 //! firmware addresses. Tables must remain immutable while being inspected.

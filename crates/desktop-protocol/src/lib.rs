@@ -1,4 +1,5 @@
 #![no_std]
+#![forbid(unsafe_code)]
 
 //! Native scratchpad operations and their bounded, canonical IPC encoding.
 //!

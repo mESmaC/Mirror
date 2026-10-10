@@ -1,4 +1,5 @@
 #![no_std]
+#![forbid(unsafe_code)]
 //! Fixed-size process, frame and routed-input contracts for the native desktop.
 //! Geometry, decorations, focus and stacking remain userspace policy.
 //!

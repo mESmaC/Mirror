@@ -1,4 +1,5 @@
 #![no_std]
+#![forbid(unsafe_code)]
 //! Anonymous virtual-memory ABI. Addresses and lengths are page aligned;
 //! reservation does not commit physical pages. Protection never permits execute.
 

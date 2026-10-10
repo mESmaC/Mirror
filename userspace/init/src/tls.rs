@@ -157,9 +157,11 @@ pub(super) fn start(pid: u64) {
         require(bases() == [fs, gs], 413);
     }
 
-    // Loading a present flat user data selector resets the actual hidden base.
-    // GET and context switches must observe that change rather than resurrect
-    // the old bases last assigned through SET.
+    // SAFETY: CPL 3 may load the present flat user data selector 0x2b, and AX is
+    // a declared clobber. Nothing addresses memory through FS or GS until `set`
+    // installs owned bases again. Loading this selector resets the actual hidden
+    // base. GET and context switches must observe that change rather than
+    // resurrect the old bases last assigned through SET.
     unsafe {
         asm!(
             "mov ax, 0x2b",
@@ -178,8 +180,11 @@ pub(super) fn start(pid: u64) {
     require(selectors() == [0x2b, 0x2b] && bases() == [0, 0], 420);
     set(fs, gs);
 
-    // Null-selector loads need not have identical hidden-base behavior on all
-    // processors. Preserve the actual observed bases and exact selector bits.
+    // SAFETY: Loading null selectors into FS and GS is permitted at CPL 3, and AX
+    // is a declared clobber. Nothing addresses memory through FS or GS until
+    // `set` installs owned bases again. Null-selector loads need not have
+    // identical hidden-base behavior on all processors. Preserve the actual
+    // observed bases and exact selector bits.
     unsafe {
         asm!(
             "mov ax, 3",

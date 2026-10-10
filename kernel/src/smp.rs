@@ -489,11 +489,9 @@ fn fail(index: usize, reason: u64) -> ! {
     arch::halt()
 }
 
-#[allow(unused_unsafe)] // Rust 1.88 CPUID intrinsic is unsafe.
 fn initial_apic_id() -> u32 {
-    // SAFETY: CPUID leaf1 is supported on every supported x86-64 CPU. xAPIC
-    // discovery rejects IDs >=255, where this 8-bit field would be ambiguous.
-    unsafe { __cpuid(1).ebx >> 24 }
+    // xAPIC discovery rejects IDs >=255, where this 8-bit field would be ambiguous.
+    __cpuid(1).ebx >> 24
 }
 
 pub fn is_secondary() -> bool {

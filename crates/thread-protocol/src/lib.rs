@@ -1,4 +1,5 @@
 #![no_std]
+#![forbid(unsafe_code)]
 //! Native threads, execution-context TLS, and process-private word waits. The
 //! runtime owns every thread's stack and TLS storage, retaining them until join.
 
