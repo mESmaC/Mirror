@@ -34,7 +34,7 @@ Decisions in 0015a that also govern this spec:
 
 **ISO layout.** The ISO uses Limine's UEFI CD layout, written natively:
 - an ISO9660 primary volume descriptor at sector 16, an El Torito boot record at sector 17, then a terminator;
-- a boot catalog with one no-emulation entry for platform 0xEF. It points at `limine-uefi-cd.bin` from the pinned archive verified at `build.ps1:48-75`, a 3 MiB FAT12 image holding only `EFI/BOOT/*.EFI`;
+- a boot catalog with one no-emulation entry for platform 0xEF. It points at `limine-uefi-cd.bin` from the pinned archive verified at `build.ps1:48-75`, a 3 MiB FAT12 image holding only `EFI/BOOT/*.EFI`. The entry's sector count equals the image size in 512-byte sectors (6144 for 3 MiB), which host test 1 asserts. VMware's EFI firmware uses EDK2's El Torito partition driver, which sizes the boot partition from that count (inference, 2026-10-10);
 - a flat root directory holding `LIMINE.CONF`, `KERNEL.ELF`, the four module files, `LICENSE` and `3RDPARTY.MD`, with ISO9660 level 2 uppercase names and `;1`;
 - no Rock Ridge, Joliet, BIOS entry or hybrid partition table.
 
@@ -50,7 +50,7 @@ Limine scans the El Torito image first, which has no config, and then the whole 
 - `common.ps1`: `Assert-MirrorDriverCatalog` gets a parameter for the expected number of modern VirtIO devices, which today is fixed at 1 (`common.ps1:75-78`). `run.ps1:519` passes 0 for `-Iso` and 1 otherwise. `run.ps1:648-650` is unchanged, because the legacy fixture satisfies it.
 - `test.ps1`: adds one `-Iso` smoke case per build profile under `LegacyVirtio`, two boots in all. 0014's computed boot count includes them.
 - `package.ps1` (0015a): also copies `mirror.iso` to `build/dist/`.
-- `docs/vm-settings.md` (0015-D11): add the ISO steps. Remove the disk and attach `build/dist/mirror.iso` on a SATA CD-ROM, keeping every other reference setting.
+- `docs/vm-settings.md` (0015-D11): add the ISO steps. Remove the disk (delete the `sata0:0` lines, or set `sata0:0.present = "FALSE"`) and attach `build/dist/mirror.iso` on a SATA CD-ROM: `sata0:1.present = "TRUE"`, `sata0:1.deviceType = "cdrom-image"`, `sata0:1.fileName = "<abs>\build\dist\mirror.iso"`. Keep every other reference setting.
 - `AGENTS.md`: list the `-Iso` case and its `LegacyVirtio` requirement wherever it lists `run.ps1` cases.
 
 Line numbers are at HEAD 4614249. 0014, 0010 and 0015a land first and shift them.
@@ -59,7 +59,7 @@ Line numbers are at HEAD 4614249. 0014, 0010 and 0015a land first and shift them
 
 1. Host tests in `tools/mirror-image` cover:
    - volume descriptors at sectors 16-18;
-   - a valid boot catalog checksum and one no-emulation entry for platform 0xEF;
+   - a valid boot catalog checksum and one no-emulation entry for platform 0xEF, whose sector count is the size of `limine-uefi-cd.bin` in 512-byte sectors;
    - every ESP file reading back byte-identical under its level 2 name;
    - byte-identical output from two runs with identical inputs;
    - a missing `limine-uefi-cd.bin` failing with an error and leaving no output file.

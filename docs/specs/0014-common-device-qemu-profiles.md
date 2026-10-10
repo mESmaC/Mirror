@@ -60,10 +60,10 @@ Smoke cases, manual `run.ps1` boots and the debug and release normal-kernel capt
 | Element | `V1` (default) | `LegacyVirtio` | VMware reference |
 | --- | --- | --- | --- |
 | Machine | `q35,accel=tcg`, i8042 and HPET on | same | EFI firmware |
-| Storage fixture | fresh `build/ahci-test.img`, `ide-hd,bus=ide.0,rerror=report` | legacy `virtio-blk-pci,disable-modern=on,disable-legacy=off` | SATA (AHCI) disk |
-| NIC | `-netdev user,id=mirror-net,restrict=on` and `-device e1000-82545em,netdev=mirror-net,romfile=` | same | `ethernet0.virtualDev = "e1000"` |
+| Storage fixture | fresh `build/ahci-test.img`, `ide-hd,bus=ide.0,rerror=report` | legacy `virtio-blk-pci,disable-modern=on,disable-legacy=off` | SATA (AHCI) disk on VMware's own AHCI controller, `15ad:07e0`, class `01:06:01` |
+| NIC | `-netdev user,id=mirror-net,restrict=on` and `-device e1000-82545em,netdev=mirror-net,romfile=` | same | `ethernet0.virtualDev = "e1000"` (`8086:100f`) |
 | Keyboard and mouse | q35 i8042 PS/2 | same | PS/2 |
-| Display | `-vga std`, OVMF GOP | same | SVGA II; Mirror uses the GOP framebuffer until 0069 |
+| Display | `-vga std`, OVMF GOP | same | SVGA II (`15ad:0405`); Mirror uses the GOP framebuffer until 0069 |
 | Boot medium | modern virtio-blk, read only by firmware (0014-D7, S1b): vvfat ESP, then 0015a's image | same | 0015a VMDK or 0015b ISO |
 
 NIC and variant details:
@@ -75,7 +75,7 @@ NIC and variant details:
 Later M0 specs on these profiles:
 - 0015a replaces the vvfat ESP with its disk image on the same firmware-only virtio-blk device (0015-D10, S1b), in both profiles. The catalog's one-modern-VirtIO rule (`common.ps1:78`) and `run.ps1:648-650` are unchanged by it.
 - 0015b's `-Iso` case attaches the ISO as an ATAPI CD on `ide.2`, which the AHCI driver skips (`kernel/src/ahci.rs:238-245`). It has no modern virtio-blk boot disk, so only the legacy fixture satisfies the smoke assert (`kernel/src/main.rs:202-205`): `-Iso` requires `-DeviceProfile LegacyVirtio`, and the `test.ps1` `-Iso` case runs under that profile, on top of its six cases. 0015b owns these script changes.
-- The VMware column holds the reference settings for 0015a's manual VMware boot check, and 0015a's VM settings doc holds the full settings. That check also confirms this device set in the serial log: one `driver=ahci-sata` record, one `id=8086:100f class=02:00:00` record, and `MIRROR_KEYBOARD_READY`, `MIRROR_MOUSE_READY` and `MIRROR_FRAMEBUFFER_READY`.
+- The VMware column holds the reference settings for 0015a's manual VMware boot check, and 0015a's VM settings doc holds the full settings. That check also confirms this device set in the serial log: one `driver=ahci-sata` record, one `id=8086:100f class=02:00:00` record, and `MIRROR_KEYBOARD_READY`, `MIRROR_MOUSE_READY` and `MIRROR_FRAMEBUFFER_READY`. On VMware the `driver=ahci-sata` record names `id=15ad:07e0 class=01:06:01`. That is VMware's own AHCI controller, not an Intel ICH ID like q35's `8086:2922`, and Mirror binds it by class alone (`kernel/src/pci.rs:82-84`, `kernel/src/drivers.rs:40`), so no ID list needs it. (Amended 2026-10-10 from the VMware Workstation Pro 26.0.1 check: AHCI.ROM's PCI header and vmware-vmx's config-space template.)
 
 **Script changes.**
 - `common.ps1`:
@@ -147,5 +147,5 @@ None: no crates and no new tools. The profiles use the QEMU 11.1.0 already in `.
 
 - For 0070: should the driver also accept the 82540EM (8086:100E)? It is QEMU's plain `e1000`, and it shares the 8254x register model. If so, 0070 adds one `V1` variant case that uses that model.
 - For 0062: delete the `LegacyVirtio` profile, or replace its cases, when it adds AHCI write and flush cases (0014-D5). 0015b's `-Iso` case also runs under that profile, so 0062 must rehome it too; under `V1` it needs the smoke assert at `kernel/src/main.rs:202-205` to accept a boot with no VirtIO block device.
-- For 0069: this spec keeps `-vga std`. The VMware SVGA II adapter joined the v1 device set when S1a was amended (2026-10-09, S1c), and 0069 drives it for mode setting and live resize. Until 0069 the kernel uses only the GOP framebuffer, so no M0 code depends on the QEMU display choice. Should 0069 switch the profiles to QEMU's `-vga vmware`, an SVGA II model (`vgabios-vmware.bin` ships locally), or add it as a `V1` variant case?
+- For 0069: this spec keeps `-vga std`. The VMware SVGA II adapter joined the v1 device set when S1a was amended (2026-10-09, S1c), and 0069 drives it for mode setting and live resize. (Amended 2026-10-10 with S1c's rewording: VMware sends resize requests only over the guest RPC channel, so live resize also needs that channel. Whether an RPC core moves ahead of 0069 or live resize moves to 0087 is pending in decisions.md. Either way QEMU has no model of the channel.) Until 0069 the kernel uses only the GOP framebuffer, so no M0 code depends on the QEMU display choice. Should 0069 switch the profiles to QEMU's `-vga vmware`, an SVGA II model (`vgabios-vmware.bin` ships locally), or add it as a `V1` variant case?
 - Suggested follow-up spec: per-case work directories, so that cases can run in parallel. Fixed paths force serial runs: `run.ps1:308-316`, `:357` and `common.ps1:707`. Parallel runs are the main way to cut the 20-minute suite time. README.md lists it under the unscheduled follow-ups.

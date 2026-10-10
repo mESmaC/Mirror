@@ -1,6 +1,6 @@
 # 0012: AGENTS.md shared conventions
 
-Status: confirmed (2026-10-09). Kimi's UI branch name is still to be supplied; AGENTS.md carries the confirmed placeholder `<name supplied by Cameron>` until then (decisions.md "Pending (resume here)", item 1).
+Status: confirmed (2026-10-09). Kimi's UI branch name is still to be supplied; AGENTS.md carries the confirmed placeholder `<name supplied by Cameron>` until then (decisions.md "Pending (resume here)").
 Depends on: none. Precondition: `docs/specs/` is committed to `main` first (confirmed M0 order).
 Ledger: P5b, P1, P2, P3, P6, P7, P7a, P8, P9 (the text also restates G3a, P4, P5a, P5c, S3, S7, S7a, S7b, O1, O6)
 
@@ -144,7 +144,7 @@ Lines that later M0 specs make stale. Under P9, each spec updates them in the sa
 - 0010: the flavor line drops "spec 0010 adds it"; `build.ps1 -Trace`; captures are trace builds; the user-content rule names `test-trace` and the `mirror.perf=` exception (ledger S7b); the suite line lists the `--features test-trace` clippy run, and "When to test" says "the three clippy commands" instead of "both clippy commands".
 - 0015a: `build.ps1` also writes the disk image and VMDK and needs the MSVC linker and Windows SDK; the shared-`build\` line names the image and its SMBIOS config instead of the staged `limine.conf`; VM checks use `docs/vm-settings.md`. The test lines add host tests, fmt and clippy for the `tools\` workspaces, starting with `tools\mirror-image`, which `cargo fmt --all` and `clippy --workspace` do not reach. `package.ps1` joins the one-script-at-a-time rule.
 - 0015b: `build.ps1` also writes the ISO; `run.ps1 -Iso`.
-- 0013: the fail-closed convention line notes the firmware-table tolerance 0013 adopts: duplicate or surplus MADT records are dropped, and unreadable or unused root-table entries are skipped, instead of rejecting the table (0013-D3 to D6). Its cases follow the procedure above.
+- 0013: the fail-closed convention line notes the firmware-table tolerance 0013 adopts: duplicate or surplus MADT records are dropped, and unreadable or unused root-table entries are skipped, instead of rejecting the table (0013-D3 to D6); an IOAPIC ID register that disagrees with its MADT record is reported with `MIRROR_APIC_IOAPIC_ID`, not rejected (0013-D9). Its cases follow the procedure above.
 - 0016b: the one-boot line names `-BaselineCpu`; the host-side fault line says the default smoke CPU is `qemu64,+smep,+smap`.
 - 0018: a "When to test" line for `tools\perf-probe`: a change there runs its fmt check, clippy and host tests through `--manifest-path`, because the root workspace does not reach it; `perf.ps1` joins the one-script-at-a-time rule in the commit that adds it.
 - 0019: the `mirror.perf=` grammar and `-Perf`.
@@ -175,7 +175,7 @@ Lines that later M0 specs make stale. Under P9, each spec updates them in the sa
 None.
 
 ## Open questions
-- Partly resolved (2026-10-09): Kimi's UI branch name. It is not in the local clone, so AGENTS.md carries the confirmed placeholder `<name supplied by Cameron>`. The name itself is still awaited (decisions.md "Pending (resume here)", item 1).
+- Partly resolved (2026-10-09): Kimi's UI branch name. It is not in the local clone, so AGENTS.md carries the confirmed placeholder `<name supplied by Cameron>`. The name itself is still awaited (decisions.md "Pending (resume here)").
 - Does each agent's harness load AGENTS.md automatically? Codex does, and the repo has `refs/codex/` checkpoints, which suggests GPT Astra runs under it. Kimi K3's harness is unconfirmed. If it does not, its dispatch prompt must point to AGENTS.md.
 - Resolved (2026-10-09): readme.md:700, which opens with "Porting source" and lists licensing in each driver's assessment, and readme.md:698, which says "port drivers" and "each port", are reworded here along with :694. The replacement wording of all three under Interfaces is confirmed.
 - Resolved (2026-10-09): the AGENTS.md update rule is permanent, not M0-only, and applies per commit (ledger P9). The "Keep this file current" line says so.

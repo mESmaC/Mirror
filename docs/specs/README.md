@@ -13,7 +13,7 @@ M0's specs are drafted in this folder (see each file's Status). M1-M9 specs are 
 - 0010 Boot hygiene: test battery and fixture asserts behind `boot-smoke`, user-content logging and test oracles behind `test-trace`, opt-in perf exception (S7, S7a, S7b)
 - 0011 Toolchain pin, workspace lints, and test-log clearing (P5a)
 - 0012 AGENTS.md, CLAUDE.md, and the readme references wording (P5b, P6, P7, P7a, P8, P9)
-- 0013 Firmware and PCI tolerance for VMware: duplicate NMI records, HPET register width, per-entry ACPI table handling, the 32-function PCI cap
+- 0013 Firmware and PCI tolerance for VMware: per-slot MADT capacity, the 32-function PCI cap, IOAPIC ID tolerance (0013-D9) and per-entry root-table handling; duplicate-NMI and HPET-descriptor leniency (0013-D3, D5) as general hardening
 - 0014 Common device-set QEMU profiles: AHCI, e1000 (82545EM), PS/2, framebuffer; LegacyVirtio profile until 0062 (S1a, S1b)
 - 0015a Disk image: GPT, FAT32 ESP, minimal ext2 root, VMDK, QEMU boot switch, VM settings doc (S5, S2, S1b)
 - 0015b Live ISO and its test case (S5, S5a)
@@ -22,10 +22,10 @@ M0's specs are drafted in this folder (see each file's Status). M1-M9 specs are 
 - 0017a PS/2: separate keyboard and mouse loss handling, mouse coalescing and resync
 - 0017b PS/2: time-based init timeouts and init order
 - 0017c Absolute pointing on VMware: vmmouse protocol (S1a, S1d)
-- 0018 Performance baseline harness: the four gates, measured on Linux and Windows VMs (G7, O3)
+- 0018 Performance baseline harness: the four gates, measured on Linux and Windows VMs in the host's ULM monitor mode (G7, G7a, O3)
 - 0019 Mirror perf instrumentation and telemetry: kernel side of 0018-D9 and device/link telemetry (S7b, C3)
 
-M0 execution order (confirmed): commit `docs/specs`, then 0012 first. Then 0011, 0014, 0010, 0015a, 0015b, 0013, 0016a, 0016b, 0017a and 0017b, then 0017c, then 0019, one at a time, each updating the AGENTS.md lines it changes in the same commit (P9). 0018's baseline track runs in parallel once VMware is installed; its Mirror rows follow 0015a, 0013, 0017c and 0019.
+M0 execution order (confirmed): commit `docs/specs`, then 0012 first. Then 0011, 0014, 0010, 0015a, 0015b, 0013, 0016a, 0016b, 0017a and 0017b, then 0017c, then 0019, one at a time, each updating the AGENTS.md lines it changes in the same commit (P9). 0018's baseline track runs in parallel; its Mirror rows follow 0015a, 0013 (without 0013-D9 a VMware boot falls back to one CPU on the legacy PIC), 0017c and 0019.
 
 **M1: ABI reset, kernel objects, compositor protocol, userspace target**
 - 0020 `mirror-sys`: one syscall and error table (S8); UTF-8 strings (S11); reserves realtime-clock and random-bytes calls (S14, S15)
@@ -68,7 +68,7 @@ M0 execution order (confirmed): commit `docs/specs`, then 0012 first. Then 0011,
 - 0053 XSAVE/AVX2 user state (I6)
 - 0054 Large memory: frame allocator v2, per-frame metadata, dynamic limits (I6); memory reserve, pressure notifications, OOM order (S18)
 - 0055 Interrupt robustness: catch-all vector handlers, boot-CPU-only external NMI, PCAT_COMPAT=0, HPET-based timer calibration, x2APIC handoff, non-HPET time source (S10)
-- 0056 Wall clock: RTC as UTC, realtime syscall, time zones, who sets the clock (S15)
+- 0056 Wall clock: RTC as UTC (Mirror's VMs set `rtc.diffFromUTC = "0"`), realtime syscall, time zones, who sets the clock (S15)
 - 0057 ACPI namespace: AML interpreter, `_S5`, `_PRT`, power button (S16)
 - 0058 Shutdown and reboot: service stop order, filesystem sync, clean-pool marker, reset methods (S16)
 
@@ -80,9 +80,9 @@ M0 execution order (confirmed): commit `docs/specs`, then 0012 first. Then 0011,
 - 0064 ext2 read/write; boot-time checker after an unclean shutdown (S2, S2b); after 0067
 - 0065 ext3 journaling (S2, S2b): daily-driving persistent files waits for it
 - 0066 Filesystem capabilities and VFS; persisted audit log (A8); file-authority model, system log and C3 telemetry persistence (S17, C3)
-- 0067 Daily VM layout and host-side updates: data on the pool, update tool, previous-kernel fallback, format versions, build identity, daily-drive profile (G9, G11; before 0064)
+- 0067 Daily VM layout and host-side updates: data on the pool, update tool, previous-kernel fallback, format versions, build identity, daily-drive profile with `rtc.diffFromUTC = "0"` (G9, G11, S15; before 0064)
 - 0068 Persisted settings store (A21)
-- 0069 VMware SVGA II display driver: mode setting and live resize (S1a, S1c; after 0060)
+- 0069 VMware SVGA II display driver: mode setting, and live resize driven by guest RPC (TCLO) resize requests (S1a, S1c; after 0060). Placement is decided when 0069 comes up (decisions.md Pending): a GuestRpc/TCLO core split out of 0087 and placed before 0069, or mode setting only, with live resize moving to 0087
 
 **M6: Network, remote agent access, MCP adapter**
 - 0070 e1000 driver
@@ -91,7 +91,7 @@ M0 execution order (confirmed): commit `docs/specs`, then 0012 first. Then 0011,
 - 0073 MCP adapter: Mirror as an MCP server (A13, A13a; after 0074 and 0076)
 - 0074 HTTP/1.1 client and server, SSE, JSON (S19; before 0073)
 - 0075 Network capabilities and egress scope (S20, O7)
-- 0076 Remote agent access: host-facing listener, pairing, tokens (A13a)
+- 0076 Remote agent access: host-facing listener, pairing, tokens (A13a); decides the adapter, host-only (VMnet1) or a NAT forward plus a host firewall rule
 
 **M7: Shell, tools, text, apps, guest services, std port, panel**
 - 0080 Typed shell; session contract (A17, A17a)
@@ -101,7 +101,7 @@ M0 execution order (confirmed): commit `docs/specs`, then 0012 first. Then 0011,
 - 0084 Input v2: device-independent events, keycodes, shortcuts, keyboard layouts and dead keys, LED and lock-state sync (S11; replaces the 0027a envelope payload; before 0082 and 0083)
 - 0085 Text editor with typed document operations, the gate 3/4 target (G10)
 - 0086 Text stack: OpenType fonts, rasterizer, fallback, shaping (S11; with Kimi; before 0082, 0083, 0085)
-- 0087 VMware guest services: RPC channel, host clipboard sharing, shared folders (A20, S20)
+- 0087 VMware guest services: RPC channel, host clipboard sharing, shared folders (A20, S20); its RPC core may move ahead of 0069 (S1c, see 0069)
 - 0088 Desktop apps: file manager, settings, system and task monitor (G10; with Kimi)
 - 0089 Rust std port for Mirror's userspace target (S8, S12; staged as services land; before 0081)
 
@@ -122,7 +122,7 @@ M0 execution order (confirmed): commit `docs/specs`, then 0012 first. Then 0011,
 - 0104 AI evaluation benchmark (I15, I8a; before 0093)
 
 **M9: v1 acceptance**
-- 0199 Performance gates and daily-drive checklist; local-inference floors and input latency under inference (G7, I15)
+- 0199 Performance gates and daily-drive checklist; local-inference floors and input latency under inference (G7, G7a, I15)
 
 ## After v1 (planned, not in v1)
 

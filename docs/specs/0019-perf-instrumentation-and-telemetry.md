@@ -30,7 +30,7 @@ Every kernel build, in every flavor, carries the perf instrumentation, and a boo
 | 0019-D9 | M0 benchmarks run only under `telemetry` and only with HPET, on the BSP, before SMP. Memory copy is measured at a cache-sized span and a DRAM-sized span. AHCI reads are depth 1 and 512 bytes, sequential and random, read-only and time-capped. `read_sector` (`ahci.rs:364`) reads one sector at a time, so storage bandwidth is a depth-1, 512-byte figure until 0061 and 0062. Alternative: record only memory in M0, and start storage telemetry once the block layer has multi-sector queued reads. | proposed |
 | 0019-D10 | M0 output is serial only: the kernel keeps no records, and the host saves captured lines under `docs/perf/telemetry/`. After M5, a follow-up spec writes the same lines to a file. Alternative: also keep the last 64 records in a kernel ring shown by a console `perf` command, which helps a VM without a serial file at the cost of the ring and a console page. (Note 2026-10-09: amended ledger C3 now says serial capture during perf runs before 0066 and persistence to the pool in 0066, which may settle this; Cameron confirms it with the rest of 0019.) | proposed |
 | 0019-D11 | The grammar, names, line formatter and statistics live in a new `no_std` crate, `crates/perf-protocol`, with host tests. 0018's host tools may reuse its parser. Alternative: everything in `kernel/src/perf.rs`, tested only by QEMU boots (the kernel has `test = false`, `kernel/Cargo.toml:11`). | proposed |
-| 0019-D12 | Token delivery. QEMU: `run.ps1 -Perf <items>` and `capture.ps1 -Perf <items>` add `mirror.perf=<items>` to 0015-D7's SMBIOS config. VMware: `package.ps1 -Perf <items>` writes a perf image under `build/dist/perf/`, with the token in `limine.conf`, its own fixed disk UUID, and a kernel and modules byte-identical to the default image's. Alternative: a second Limine menu entry chosen over VNC, which keeps one image but adds a timed menu to every boot (today `timeout: 0`). | proposed |
+| 0019-D12 | Token delivery. QEMU: `run.ps1 -Perf <items>` and `capture.ps1 -Perf <items>` add `mirror.perf=<items>` to 0015-D7's SMBIOS config. VMware: `package.ps1 -Perf <items>` writes a perf image under `build/dist/perf/`, with the token in `limine.conf`, its own fixed CID, and a kernel and modules byte-identical to the default image's. Alternative: a second Limine menu entry chosen over VNC, which keeps one image but adds a timed menu to every boot (today `timeout: 0`). (Reworded 2026-10-10 with 0015-D9's amendment: "disk UUID" became "CID", the descriptor identity VMware checks.) | proposed |
 
 ## Interfaces
 
@@ -106,7 +106,7 @@ After the `after_userspace` heap growth (`main.rs:311-317`) and before the first
 - **`kernel/src/perf.rs`**: config, milestone hooks, input ring, sampler, flip and benchmarks. Hooks: `main.rs` (milestone, benchmark and flip sites), `clock.rs:71` (the TSC/HPET pair), `ahci.rs` (SPD and BDF getters), `framebuffer.rs` (a full-screen fill), `ps2.rs`, `keyboard.rs` and `mouse.rs` (start stamps), `userspace.rs` (present, input syscall, idle point, sampler), `boot.rs` (smoke filter, non-panicking command-line read).
 - **Scripts (D12):**
   - A `-Perf` capture boots the SMBIOS config instead of the image's embedded one. `run.ps1` checks `-Perf` against D4's grammar; under `-Smoke`, an invalid list expects `MIRROR_PERF_OFF`, the `unknown smoke-test command line` panic and exit 35.
-  - `package.ps1 -Perf` stages a copy of `build/esp` with the token in `limine.conf`, plus `resolution: 1920x1080` for 0018's reference display (0018-D3, ledger S1c; the mechanism 0015a confirms, 2026-10-09), and runs `mirror-image` with a second fixed `ddb.uuid.image` (a new option; the default stays 0015-D9's).
+  - `package.ps1 -Perf` stages a copy of `build/esp` with the token in `limine.conf`, plus `resolution: 1920x1080` for 0018's reference display (0018-D3, ledger S1c; the mechanism 0015a confirms, 2026-10-09), and runs `mirror-image` with a second fixed descriptor `CID` (a new option; the default stays 0015-D9's).
   - `common.ps1` adds `Assert-MirrorPerfMarkers -Items` and `Assert-MirrorNoPerf`. `AGENTS.md` gains the grammar and `-Perf`.
 
 ## Acceptance tests
@@ -130,7 +130,7 @@ After the `after_userspace` heap growth (`main.rs:311-317`) and before the first
 5. **Flip, one-off** (in the commit message, not in `test.ps1`). `run.ps1 -Smoke -Perf flip -TimeoutSeconds 120` prints 100 FLIP lines, with `seq` 1-100 and `ns` at least 500 ms apart.
 6. **VMware, manual**, after 0013 and 0015a, on the 0018-D3 VM (or `docs/vm-settings.md` settings until it exists). Run every step twice, with a debug image and a release image (`-Release`), and label each result with its profile, per 0018-D11.
    - `package.ps1 -Perf boot,telemetry` passes `mirror-image verify`, and its `kernel.elf` and modules hash-equal those in `build/esp`.
-   - Its serial file has the ON line; the six milestones, with numeric `ns` and `since_entry_ns`; `DEV class=ram` and `DEV class=block driver=ahci-sata`; two copy and two read TEL lines. The commit message records `sata_gen` (Open question 1), and for each file the commit, profile and features, by hand until build identity exists (0067). Save the files as `docs/perf/telemetry/<date>-vmware-<debug|release>.log`.
+   - Its serial file has the ON line (on the 0018-D3 VM, whose serial port is a named pipe, the serial file is the log that `perf-probe serial` writes); the six milestones, with numeric `ns` and `since_entry_ns`; `DEV class=ram` and `DEV class=block driver=ahci-sata`; two copy and two read TEL lines. The commit message records `sata_gen` (Open question 1), and for each file the commit, profile and features, by hand until build identity exists (0067). Save the files as `docs/perf/telemetry/<date>-vmware-<debug|release>.log`.
    - The default `package.ps1` image prints zero `MIRROR_PERF_` lines.
 7. **Clippy** passes with `-D warnings` in the default, `test-trace` and `--all-features` configurations (0010 acceptance 5).
 
@@ -141,8 +141,8 @@ None. `crates/perf-protocol` is in-tree, with no external crate.
 ## Open questions
 
 External facts, checked in acceptance 6:
-1. Does VMware's AHCI port report PxSSTS.SPD? If not, `sata_gen=none` there.
-2. Is VMware's virtual TSC steady through early boot? If not, `since_entry_ns` is unreliable there, and D5's alternative applies on VMware.
+1. Does VMware's AHCI port report PxSSTS.SPD? If not, `sata_gen=none` there. Static evidence (26.0.1, 2026-10-10): VMware advertises CAP.ISS = 3 (the `ahci.iss` default), so expect `sata_gen=3`; `none` means SPD read 0.
+2. Is VMware's virtual TSC steady through early boot? If not, `since_entry_ns` is unreliable there, and D5's alternative applies on VMware. Under Host VBS mode (the user-level monitor, which the development host runs: `Monitor Mode: ULM`, scratch power-on 2026-10-10), also record the vmware.log `Monitor Mode:` line and the `TimeTrackerULMStats` `ulmTrapRDTSC` count, and compare `since_entry_ns` with the 0018 serial-arrival cross-check. In that mode VMware can trap RDTSC and serve an emulated linear TSC, and it always traps when syncing the WHP TSCs fails; the scratch power-on logged `Syncing WHP TSCs took 11 us`, a successful sync.
 
 Follow-ups, outside this spec:
 

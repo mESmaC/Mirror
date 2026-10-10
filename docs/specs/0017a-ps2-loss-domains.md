@@ -61,7 +61,7 @@ Manual check on VMware Workstation. The VM boots 0015a's disk image with the set
 6. In the default shell, focus Notes, turn Caps Lock on and type `a`. Drag the other window by its title bar in fast circles for 10 s, release, and type `b` in Notes. Expected: Notes shows `AB` with nothing dropped, and the dragged window ends where the pointer was released.
 
 ## Dependencies
-No crates. QEMU (`.tools/qemu`, GPL-2.0) is already used. The manual check needs VMware Workstation (proprietary, no cost), which is not installed at its default path on the current development host.
+No crates. QEMU (`.tools/qemu`, GPL-2.0) is already used. The manual check needs VMware Workstation (proprietary, no cost), installed: Workstation Pro 26.0.1 (26H1u1) build 25688693 (2026-10-10).
 
 ## Open questions
 1. Resolved 2026-10-09: absolute pointing is spec 0017c (ledger S1d), the VMware vmmouse protocol in M0, so the pointer is not grabbed. QEMU q35 enables `vmport` (and its vmmouse) by default, and `run.ps1:320` turns it off only for `-NoKeyboard`, so 0017c tests the protocol in QEMU.

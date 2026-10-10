@@ -54,10 +54,10 @@ QEMU integration (`scripts/run.ps1`, `scripts/test.ps1`):
 5. `scripts/test.ps1` runs cases 3 (both clocks) and 4 in each profile, which adds 3 smoke boots per profile. Before merge (ledger P8), the full `scripts/test.ps1` passes.
 
 Manual check on VMware Workstation. The VM boots 0015a's disk image with the reference settings in `docs/vm-settings.md` (0015-D11), which enable VMware's HPET explicitly (S10), and uses a PS/2 keyboard and a PS/2 mouse with no USB controller, so no USB mouse or tablet:
-6. Over 10 cold boots in VMware, the serial log shows `MIRROR_KEYBOARD_READY ... set=2`, MIRROR_MOUSE_READY, no MIRROR_PS2_TIMEOUT, and `MIRROR_PS2_INIT elapsed_ms` < 1000 with clock=hpet. Record every value. The PIT path is covered in QEMU by test 3's `-NoHpet` case.
+6. Over 10 cold boots in VMware, the serial log shows `MIRROR_KEYBOARD_READY ... set=2`, MIRROR_MOUSE_READY, no MIRROR_PS2_TIMEOUT, and `MIRROR_PS2_INIT elapsed_ms` < 1000 with clock=hpet. Record every value. `set=2` means the F0 00 readback returned 0x02, and a failed readback shows as `MIRROR_KEYBOARD_SKIPPED reason=WrongScanSet` (Open question 1). The PIT path is covered in QEMU by test 3's `-NoHpet` case.
 
 ## Dependencies
-No crates. QEMU (`.tools/qemu`, GPL-2.0) is already used. The manual check needs VMware Workstation (proprietary, no cost), which is not installed at its default path on the current development host.
+No crates. QEMU (`.tools/qemu`, GPL-2.0) is already used. The manual check needs VMware Workstation (proprietary, no cost), installed: Workstation Pro 26.0.1 (26H1u1) build 25688693 (2026-10-10).
 
 ## Open questions
-1. External fact, checked by test 6: whether VMware passes the F0 00 readback. If it fails, D9's rejected alternative (the translated Set 1 fallback) becomes required. That changes a confirmed decision, so it goes back to Cameron first (README rule 5), and the Set 1 work then joins this spec.
+1. External fact, checked by test 6: whether VMware passes the F0 00 readback. If it fails, D9's rejected alternative (the translated Set 1 fallback) becomes required. That changes a confirmed decision, so it goes back to Cameron first (README rule 5), and the Set 1 work then joins this spec. Static evidence (VMware 26.0.1, 2026-10-10): VMware answers the get-scancode-set query only while `keyboard.queryScancodeSet` is TRUE (default TRUE); `docs/vm-settings.md` must not set it FALSE. VMware's internal key codes are Set 1, so Set 2 output with translation off is a less-exercised path (inference). Test 6 reads the readback result from the existing markers (`set=2`, or `reason=WrongScanSet`).
