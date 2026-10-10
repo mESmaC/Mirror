@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mirror Accessibility — concept sample</title>
+<style>
+/* ============================================================
+   Mirror accessibility — interactive concept sample
+   Keyboard navigation · visible focus · contrast · scaling ·
+   reduced motion · semantics. Single file, no external assets.
+   ============================================================ */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --font-ui: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+  --pg-bg: #0E1219;
+  --pg-text: #D5DCE8;
+  --pg-secondary: #8C99AE;
+  --pg-tertiary: #5C6B84;
+  --pg-accent: #4FD8C2;
+  --pg-border: #232E42;
+}
+
+#page[data-theme="dark"] {
+  --base: #0B0F16; --surface: #121826; --elevated: #1A2334; --overlay: #232E44;
+  --border-subtle: #26314A; --border-strong: #3B4A6B;
+  --text-primary: #ECF1F9; --text-secondary: #A6B2C7; --text-tertiary: #71809A;
+  --accent: #4FD8C2; --accent-hover: #71E3D1; --accent-pressed: #38BFA9; --on-accent: #052B25;
+  --accent-subtle: #123A35; --accent-subtle-text: #7CE7D4;
+  --success: #34D399; --success-bg: #0F2E25;
+  --warning: #FBBF24; --warning-bg: #2E2410;
+  --danger: #F87171; --danger-bg: #381A1F; --on-danger: #2B0B0B;
+  --info: #60A5FA; --info-bg: #16283F;
+  --ring: rgba(79, 216, 194, .32); --focus-ring: #71E3D1;
+  --shadow-1: 0 1px 2px rgba(0,0,0,.35);
+  --shadow-2: 0 4px 14px rgba(0,0,0,.45), 0 1px 3px rgba(0,0,0,.4);
+  --shadow-3: 0 18px 48px rgba(0,0,0,.6), 0 4px 12px rgba(0,0,0,.45);
+  --wallpaper: radial-gradient(900px 460px at 10% -10%, #123A35 0%, transparent 55%),
+               radial-gradient(760px 480px at 108% 112%, #1A2340 0%, transparent 55%),
+               linear-gradient(160deg, #0B0F16 0%, #0E1420 100%);
+  --window-glass: rgba(18, 24, 38, .78);
+  --glass-edge: rgba(255, 255, 255, .06);
+  --sheen: rgba(255, 255, 255, .045);
+}
+#page[data-theme="light"] {
+  --base: #F3F5F9; --surface: #FFFFFF; --elevated: #FFFFFF; --overlay: #EEF2F7;
+  --border-subtle: #E2E8F1; --border-strong: #C6D0DF;
+  --text-primary: #0F1726; --text-secondary: #475569; --text-tertiary: #5D6B82;
+  --accent: #0B7C6F; --accent-hover: #0A6C61; --accent-pressed: #085A50; --on-accent: #FFFFFF;
+  --accent-subtle: #E2F3EE; --accent-subtle-text: #0B5F55;
+  --success: #047857; --success-bg: #E7F7F0;
+  --warning: #B45309; --warning-bg: #FBF0DC;
+  --danger: #C81E1E; --danger-bg: #FCEBEB; --on-danger: #FFFFFF;
+  --info: #2563EB; --info-bg: #EBF1FE;
+  --ring: rgba(11, 124, 111, .32); --focus-ring: #0B7C6F;
+  --shadow-1: 0 1px 2px rgba(15,23,38,.07), 0 1px 3px rgba(15,23,38,.05);
+  --shadow-2: 0 4px 12px rgba(15,23,38,.10), 0 2px 4px rgba(15,23,38,.06);
+  --shadow-3: 0 16px 40px rgba(15,23,38,.16), 0 4px 10px rgba(15,23,38,.08);
+  --wallpaper: radial-gradient(900px 460px at 12% -10%, #D9EDE9 0%, transparent 55%),
+               radial-gradient(760px 480px at 105% 112%, #DDE4F5 0%, transparent 55%),
+               linear-gradient(160deg, #F4F6FA 0%, #E9EEF5 100%);
+  --window-glass: rgba(255, 255, 255, .72);
+  --glass-edge: rgba(255, 255, 255, .7);
+  --sheen: rgba(255, 255, 255, .35);
+}
+
+html, body { height: 100%; }
+body { background: var(--pg-bg); color: var(--pg-text); font-family: var(--font-ui); font-size: 14px; }
+.wrap { max-width: 1240px; margin: 0 auto; padding: 40px 44px 80px; }
+.mono { font-family: var(--font-mono); }
+.ic { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+
+.pg-head { display: flex; align-items: center; gap: 14px; padding-bottom: 24px; border-bottom: 1px solid var(--pg-border); }
+.pg-head h1 { font-size: 21px; font-weight: 650; letter-spacing: -.01em; color: #F2F6FC; }
+.pg-head .logo { display: flex; align-items: center; gap: 10px; }
+.pg-head .logo .ic { width: 22px; height: 22px; color: var(--pg-accent); }
+.pg-head .tag { font-family: var(--font-mono); font-size: 11px; color: var(--pg-accent); border: 1px solid #1E4B44; background: #10231F; padding: 3px 8px; border-radius: 999px; }
+.pg-head .spacer { flex: 1; }
+.theme-btn { height: 30px; padding: 0 12px; border-radius: 6px; border: 1px solid var(--pg-border); background: transparent; color: var(--pg-text); font-family: var(--font-mono); font-size: 11px; letter-spacing: .08em; cursor: pointer; display: inline-flex; align-items: center; gap: 7px; }
+.theme-btn:hover { background: #131B2A; }
+.theme-btn .ic { width: 13px; height: 13px; color: var(--pg-accent); }
+.intro { color: var(--pg-secondary); max-width: 80ch; margin: 18px 0 0; }
+.intro strong { color: var(--pg-text); font-weight: 600; }
+
+.sec { margin-top: 60px; }
+.kicker { font-family: var(--font-mono); font-size: 11px; letter-spacing: .16em; text-transform: uppercase; color: var(--pg-accent); }
+h2 { font-size: 22px; font-weight: 650; letter-spacing: -.01em; color: #F2F6FC; margin: 6px 0 0; }
+.s-lead { color: var(--pg-secondary); max-width: 80ch; margin: 10px 0 20px; }
+.s-lead code, .note code { font-family: var(--font-mono); font-size: .92em; color: #A8E8DB; background: #14202C; padding: 1px 5px; border-radius: 5px; }
+.note { color: var(--pg-tertiary); font-size: 12px; margin-top: 14px; }
+.stage { border-radius: 18px; border: 1px solid var(--pg-border); background: var(--wallpaper); padding: 42px 36px; overflow: hidden; }
+
+/* shared controls */
+.btn { height: 30px; padding: 0 12px; border-radius: 6px; border: 1px solid transparent; font-family: var(--font-ui); font-size: 12.5px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; cursor: pointer; transition: background .12s, border-color .12s; }
+.btn:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.b-primary { background: var(--accent); color: var(--on-accent); }
+.b-primary:hover { background: var(--accent-hover); }
+.b-secondary { background: var(--surface); border-color: var(--border-strong); color: var(--text-primary); }
+.b-secondary:hover { background: var(--overlay); }
+.b-ghost { background: transparent; color: var(--text-secondary); }
+.b-ghost:hover { background: var(--overlay); color: var(--text-primary); }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.icon-btn { width: 28px; height: 28px; border: 0; border-radius: 7px; background: none; color: var(--text-secondary); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; transition: background .12s, color .12s; }
+.icon-btn:hover:not(:disabled) { background: var(--overlay); color: var(--text-primary); }
+.icon-btn:disabled { opacity: .35; cursor: not-allowed; }
+.icon-btn:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+.icon-btn .ic { width: 14px; height: 14px; }
+.input { height: 30px; padding: 0 10px; border-radius: 6px; border: 1px solid var(--border-strong); background: color-mix(in srgb, var(--surface) 82%, transparent); color: var(--text-primary); font-family: var(--font-ui); font-size: 12.5px; transition: border-color .12s, box-shadow .12s; }
+.input::placeholder { color: var(--text-tertiary); }
+.input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--ring); }
+.sw2 { width: 34px; height: 20px; border-radius: 999px; background: var(--border-strong); position: relative; flex: none; transition: background .15s; cursor: pointer; border: 0; }
+.sw2::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.3); transition: left .15s; }
+.sw2.on { background: var(--accent); }
+.sw2.on::after { left: 16px; }
+.sw2:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+input[type="range"] { -webkit-appearance: none; appearance: none; flex: 1; height: 4px; border-radius: 2px; background: var(--border-subtle); outline: none; }
+input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: var(--surface); border: 1.5px solid var(--accent); cursor: pointer; }
+input[type="range"]:focus-visible { box-shadow: 0 0 0 3px var(--ring); border-radius: 2px; }
+.kbd { font-family: var(--font-mono); font-size: 9.5px; border: 1px solid var(--border-strong); border-bottom-width: 2px; border-radius: 5px; padding: 1px 5px; color: var(--text-secondary); }
+select.input { padding-right: 26px; }
+
+/* demo window (shared) */
+.appwin { background: var(--window-glass); border: 1px solid var(--border-strong); border-radius: 12px; box-shadow: var(--shadow-3), inset 0 1px 0 var(--glass-edge); overflow: hidden; backdrop-filter: blur(14px) saturate(1.25); -webkit-backdrop-filter: blur(14px) saturate(1.25); color: var(--text-primary); position: relative; }
+.appwin::before { content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; background: linear-gradient(135deg, var(--sheen), transparent 42%); z-index: 7; }
+.titlebar { height: 38px; display: flex; align-items: center; gap: 9px; padding: 0 5px 0 11px; border-bottom: 1px solid var(--border-subtle); user-select: none; position: relative; z-index: 8; }
+.app-tile { width: 20px; height: 20px; border-radius: 6px; background: var(--accent-subtle); color: var(--accent-subtle-text); display: flex; align-items: center; justify-content: center; }
+.app-tile .ic { width: 13px; height: 13px; }
+.titlebar .ttl { font-size: 13px; font-weight: 600; }
+.titlebar .doc { font-size: 12px; color: var(--text-tertiary); }
+.titlebar .caps { margin-left: auto; display: flex; gap: 2px; }
+.cap { width: 38px; height: 28px; border: 0; background: none; border-radius: 6px; color: var(--text-secondary); display: inline-flex; align-items: center; justify-content: center; cursor: default; transition: background .12s, color .12s; }
+.cap .ic { width: 13px; height: 13px; }
+.cap:hover { background: var(--overlay); color: var(--text-primary); }
+.cap.close:hover { background: var(--danger); color: var(--on-danger); }
+.cap:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
+
+/* ---------- 01 Keyboard lab ---------- */
+.lab-grid { display: grid; grid-template-columns: 1.25fr 1fr; gap: 20px; align-items: start; }
+.lab { width: 100%; }
+.skip-link { position: absolute; top: 8px; left: 10px; z-index: 20; transform: translateY(-64px); transition: transform .15s; }
+.skip-link:focus { transform: none; }
+.lab-toolbar { display: flex; gap: 4px; padding: 8px 10px; border-bottom: 1px solid var(--border-subtle); position: relative; z-index: 8; }
+.lab-body { padding: 13px 14px 14px; position: relative; z-index: 8; }
+.lab-row { display: flex; align-items: center; gap: 9px; margin-bottom: 10px; }
+.lab-row .input { flex: 1; }
+.listbox { border: 1px solid var(--border-subtle); border-radius: 8px; padding: 4px; }
+.listbox [role="option"] { display: flex; align-items: center; gap: 8px; padding: 6px 9px; border-radius: 6px; font-size: 12.5px; color: var(--text-primary); cursor: default; }
+.listbox [role="option"].active { background: var(--accent-subtle); color: var(--accent-subtle-text); }
+.listbox [role="option"]:focus-visible, .listbox:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+.tbadge { position: absolute; top: -7px; left: -7px; z-index: 30; width: 16px; height: 16px; border-radius: 50%; background: var(--accent); color: var(--on-accent); font-family: var(--font-mono); font-size: 9.5px; font-weight: 700; display: flex; align-items: center; justify-content: center; box-shadow: var(--shadow-1); }
+.ann-bar { margin-top: 12px; border: 1px solid var(--border-subtle); border-radius: 9px; background: color-mix(in srgb, var(--base) 72%, transparent); padding: 10px 13px; font-family: var(--font-mono); font-size: 11px; line-height: 1.7; color: var(--text-secondary); min-height: 58px; }
+.ann-bar .k { color: var(--accent-subtle-text); }
+.ann-bar .t { color: var(--text-tertiary); }
+.lab-side .ann-bar { margin-top: 0; }
+.lab-toggle { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 12.5px; color: var(--text-secondary); }
+
+/* ---------- 02 Visible focus ---------- */
+.focus-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; }
+.focus-cell { border: 1px solid var(--border-subtle); border-radius: 10px; background: color-mix(in srgb, var(--surface) 80%, transparent); padding: 16px; display: flex; flex-direction: column; gap: 10px; align-items: flex-start; }
+.focus-cell .nm { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-tertiary); }
+.focus-cell .lab-l { font-size: 12px; color: var(--text-secondary); }
+.f-ring { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.f-ring-inset { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
+.pointer-note { font-size: 12px; color: var(--text-secondary); margin-top: 8px; }
+.pointer-note b { color: var(--text-primary); }
+
+/* ---------- 03 Contrast ---------- */
+.contrast-grid { display: grid; grid-template-columns: 1fr 1.1fr; gap: 20px; align-items: start; }
+.inspector { border: 1px solid var(--border-subtle); border-radius: 12px; background: var(--elevated); padding: 16px; }
+.insp-row { display: flex; gap: 10px; margin-bottom: 12px; }
+.insp-row .field { flex: 1; display: flex; flex-direction: column; gap: 5px; }
+.field .lb { font-size: 11px; font-weight: 600; color: var(--text-secondary); }
+.insp-sample { border: 1px solid var(--border-subtle); border-radius: 10px; padding: 22px; text-align: center; margin: 4px 0 12px; }
+.insp-sample .big { font-size: 26px; font-weight: 650; }
+.insp-sample .small { font-size: 12px; margin-top: 5px; }
+.insp-out { display: flex; align-items: center; gap: 10px; }
+.insp-ratio { font-family: var(--font-mono); font-size: 20px; font-weight: 600; }
+.chip { font-family: var(--font-mono); font-size: 10px; font-weight: 700; padding: 3px 8px; border-radius: 999px; }
+.chip.ok { background: var(--success-bg); color: var(--success); }
+.chip.warn { background: var(--warning-bg); color: var(--warning); }
+.chip.err { background: var(--danger-bg); color: var(--danger); }
+.ctable { width: 100%; border-collapse: collapse; background: var(--elevated); border: 1px solid var(--border-subtle); border-radius: 12px; overflow: hidden; }
+.ctable th { text-align: left; font-family: var(--font-mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--text-tertiary); padding: 10px 14px; border-bottom: 1px solid var(--border-subtle); font-weight: 600; }
+.ctable td { padding: 8px 14px; border-bottom: 1px solid var(--border-subtle); font-size: 12.5px; color: var(--text-primary); vertical-align: middle; }
+.ctable tr:last-child td { border-bottom: 0; }
+.ctable .tk { font-family: var(--font-mono); font-size: 11px; color: var(--accent-subtle-text); }
+.ctable .rt { font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary); }
+
+/* ---------- 04 Scaling ---------- */
+.scale-grid { display: grid; grid-template-columns: 210px 1fr; gap: 20px; align-items: start; }
+.scale-ctl { border: 1px solid var(--border-subtle); border-radius: 12px; background: var(--elevated); padding: 16px; }
+.scale-ctl .val { font-family: var(--font-mono); font-size: 20px; font-weight: 600; margin: 6px 0 10px; }
+.scale-ctl input[type="range"] { width: 100%; }
+.scale-ctl .st { font-size: 11.5px; color: var(--text-tertiary); margin-top: 10px; line-height: 1.55; }
+.scale-viewport { border: 1px solid var(--border-subtle); border-radius: 12px; background: var(--wallpaper); min-height: 330px; overflow: auto; padding: 18px; }
+.scale-inner { transform-origin: top left; }
+.mini-win { width: 300px; border: 1px solid var(--border-strong); border-radius: 10px; background: var(--window-glass); backdrop-filter: blur(10px); overflow: hidden; box-shadow: var(--shadow-2); }
+.mini-win .mt { display: flex; align-items: center; gap: 7px; padding: 8px 10px; border-bottom: 1px solid var(--border-subtle); font-size: 12px; font-weight: 600; }
+.mini-win .mb { padding: 10px; font-size: 12px; color: var(--text-secondary); line-height: 1.55; }
+.mini-win .mb .btn { margin-top: 8px; }
+.mini-dock { display: flex; gap: 5px; padding: 6px; border-radius: 13px; background: var(--elevated); border: 1px solid var(--border-subtle); box-shadow: var(--shadow-1); margin-top: 14px; width: max-content; }
+.mini-dock .dt { width: 30px; height: 30px; border-radius: 8px; background: var(--overlay); display: flex; align-items: center; justify-content: center; color: var(--text-secondary); }
+.mini-dock .dt.on { background: var(--accent-subtle); color: var(--accent-subtle-text); }
+.mini-dock .dt .ic { width: 15px; height: 15px; }
+
+/* ---------- 05 Reduced motion ---------- */
+.motion-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.motion-card { border: 1px solid var(--border-subtle); border-radius: 12px; background: var(--elevated); padding: 16px; }
+.motion-card h3 { font-size: 13.5px; font-weight: 650; margin-bottom: 4px; }
+.motion-card .mc-sub { font-size: 11.5px; color: var(--text-tertiary); margin-bottom: 14px; }
+.demo-win { border: 1px solid var(--border-strong); border-radius: 10px; background: var(--surface); box-shadow: var(--shadow-1); overflow: hidden; }
+.demo-win .dt2 { padding: 6px 10px; border-bottom: 1px solid var(--border-subtle); font-size: 11px; font-weight: 600; display: flex; gap: 6px; align-items: center; }
+.demo-win .db { padding: 12px 10px; font-size: 11.5px; color: var(--text-secondary); }
+.m-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border-subtle); font-size: 11.5px; color: var(--text-secondary); }
+.m-row:last-child { border-bottom: 0; }
+.pbar { flex: 1; height: 5px; border-radius: 3px; background: var(--border-subtle); overflow: hidden; }
+.pbar i { display: block; height: 100%; border-radius: 3px; background: var(--accent); }
+.spin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--border-subtle); border-top-color: var(--accent); flex: none; }
+.m-note { font-size: 11px; color: var(--text-tertiary); margin-top: 10px; font-family: var(--font-mono); }
+
+@keyframes demo-in-loop { 0% { opacity: 0; transform: translateY(8px) scale(.98); } 18% { opacity: 1; transform: none; } 78% { opacity: 1; } 100% { opacity: 1; } }
+@keyframes demo-shimmer { from { background-position: 180% 0; } to { background-position: -20% 0; } }
+@keyframes demo-spin { to { transform: rotate(360deg); } }
+.anim-on .demo-win { animation: demo-in-loop 3.4s cubic-bezier(.2,.8,.2,1) infinite; }
+.anim-on .shimmer { background: linear-gradient(90deg, var(--overlay) 25%, var(--border-subtle) 50%, var(--overlay) 75%); background-size: 200% 100%; animation: demo-shimmer 1.2s linear infinite; }
+.anim-on .spin { animation: demo-spin 1s linear infinite; }
+.anim-off .demo-win { animation: none; }
+.anim-off .shimmer { background: var(--overlay); }
+.anim-off .spin { animation: none; border-top-color: var(--border-strong); }
+.anim-off .pbar i { transition: none; }
+#page.force-rm *, #page.force-rm *::before, #page.force-rm *::after { animation: none !important; transition: none !important; }
+
+/* ---------- 06 Semantics ---------- */
+.sem-grid { display: grid; grid-template-columns: 1fr 1.1fr; gap: 20px; align-items: start; }
+.sem-demo { border: 1px solid var(--border-subtle); border-radius: 12px; background: var(--elevated); padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.sem-demo .sd-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.menu-wrap { position: relative; }
+.menu-pop { position: absolute; top: calc(100% + 6px); left: 0; z-index: 30; background: var(--elevated); border: 1px solid var(--border-subtle); border-radius: 9px; box-shadow: var(--shadow-2); padding: 4px; width: 190px; display: none; }
+.menu-pop.open { display: block; }
+.menu-pop [role="menuitem"] { display: flex; align-items: center; gap: 8px; padding: 6px 9px; border-radius: 6px; font-size: 12.5px; color: var(--text-primary); cursor: default; }
+.menu-pop [role="menuitem"].active, .menu-pop [role="menuitem"]:hover { background: var(--overlay); }
+.menu-pop [role="menuitem"]:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
+.ann-log { border: 1px solid var(--border-subtle); border-radius: 12px; background: #070B12; padding: 12px 14px; font-family: var(--font-mono); font-size: 11px; line-height: 1.85; color: #9DB4C8; height: 330px; overflow: auto; }
+#page[data-theme="light"] .ann-log { background: #0F1726; }
+.ann-log .a-role { color: #7CE7D4; }
+.ann-log .a-name { color: #ECF1F9; }
+.ann-log .a-state { color: #60A5FA; }
+.ann-log .a-time { color: #4A5A70; }
+.ann-log .a-line { animation: ann-in .18s ease; }
+@keyframes ann-in { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+
+footer { margin-top: 70px; padding-top: 20px; border-top: 1px solid var(--pg-border); display: flex; gap: 10px; align-items: center; color: var(--pg-tertiary); font-size: 12px; }
+footer .spacer { flex: 1; }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-logo" viewBox="0 0 24 24"><rect x="2.5" y="2.5" width="19" height="19" rx="5.5"/><path d="M6 18 18 6"/><path d="M7.5 12V7.5H12z" fill="currentColor" stroke="none"/><path d="M16.5 12v4.5H12z" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-min" viewBox="0 0 16 16"><path d="M4 8h8"/></symbol>
+    <symbol id="i-max" viewBox="0 0 16 16"><rect x="3.5" y="3.5" width="9" height="9" rx="1.5"/></symbol>
+    <symbol id="i-close" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></symbol>
+    <symbol id="i-notes" viewBox="0 0 16 16"><path d="M4.5 1.5h5l3 3v9a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1v-11a1 1 0 0 1 1-1z"/><path d="M9.5 1.5v3h3"/><path d="M6 9h4.5M6 11.5h4.5"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 1.5"/></symbol>
+    <symbol id="i-files" viewBox="0 0 16 16"><path d="M2 4.5a1 1 0 0 1 1-1h3l1.5 1.5H13a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="1.5"/><path d="M5 6.5 7 8l-2 1.5"/><path d="M8.5 10.5H11"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 16 16"><path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11"/><circle cx="6" cy="4.5" r="1.7"/><circle cx="10" cy="8" r="1.7"/><circle cx="4.5" cy="11.5" r="1.7"/></symbol>
+    <symbol id="i-kbd" viewBox="0 0 16 16"><rect x="1.5" y="4.5" width="13" height="7.5" rx="1.5"/><path d="M4 7h.01M6.5 7h.01M9 7h.01M11.5 7h.01M4 9.5h.01M11.5 9.5h.01M6 9.5h4"/></symbol>
+    <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4"/><path d="M10.2 10.2 13.5 13.5"/></symbol>
+    <symbol id="i-check" viewBox="0 0 16 16"><path d="M3 8.5l3.2 3L13 4.5"/></symbol>
+    <symbol id="i-error" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M5.8 5.8l4.4 4.4M10.2 5.8l-4.4 4.4"/></symbol>
+    <symbol id="i-info" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 7.5V11"/><path d="M8 5h.01"/></symbol>
+    <symbol id="i-back" viewBox="0 0 16 16"><path d="M10 3.5 5.5 8l4.5 4.5"/></symbol>
+    <symbol id="i-fwd" viewBox="0 0 16 16"><path d="M6 3.5 10.5 8 6 12.5"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 16 16"><rect x="2.5" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="9" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="2.5" y="9" width="4.5" height="4.5" rx="1"/><rect x="9" y="9" width="4.5" height="4.5" rx="1"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 16 16"><path d="M13.6 9.6A6 6 0 0 1 6.4 2.4a6 6 0 1 0 7.2 7.2z"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.6"/><path d="M8 1.5v1.8M8 12.7v1.8M1.5 8h1.8M12.7 8h1.8M3.4 3.4l1.3 1.3M11.3 11.3l1.3 1.3M12.6 3.4l-1.3 1.3M4.7 11.3l-1.3 1.3"/></symbol>
+    <symbol id="i-file" viewBox="0 0 16 16"><path d="M4.5 1.5h5l3 3v9a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1v-11a1 1 0 0 1 1-1z"/><path d="M9.5 1.5v3h3"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></symbol>
+    <symbol id="i-warning" viewBox="0 0 16 16"><path d="M8 2.5 14.5 13h-13z"/><path d="M8 6.5v3"/><path d="M8 11h.01"/></symbol>
+  </defs>
+</svg>
+
+<div id="page" data-theme="dark">
+<div class="wrap">
+
+<header class="pg-head">
+  <div class="logo">
+    <svg class="ic"><use href="#i-logo"/></svg>
+    <h1>Mirror Accessibility</h1>
+  </div>
+  <span class="tag">v0.1 · review sample</span>
+  <div class="spacer"></div>
+  <button class="theme-btn" id="themeBtn"><svg class="ic"><use href="#i-moon"/></svg><span id="themeLbl">dark</span></button>
+</header>
+
+<p class="intro">
+  Accessibility as a first-class surface of the Mirror design system. Every demo on this page is <strong>live</strong>:
+  tab through the keyboard lab and watch the focus announcer, measure any token pair in the contrast inspector,
+  drag the scaling slider, force reduced motion, and read what a screen reader would say.
+</p>
+
+<!-- ============================== 01 KEYBOARD ============================== -->
+<section class="sec" id="sec-kbd">
+  <div class="kicker">01 — Keyboard navigation</div>
+  <h2>Keyboard lab</h2>
+  <p class="s-lead">A complete focus model: <code>Tab</code> moves between groups, arrow keys move inside a group (roving tabindex), <code>Esc</code> unwinds, and the first Tab reveals a skip link. The announcer on the right reports what focus would speak.</p>
+  <div class="stage">
+    <div class="lab-grid">
+      <div>
+        <div class="appwin lab" id="labWin">
+          <button class="btn b-primary skip-link" data-ar="link" data-an="Skip to content" data-ak="Enter activates">Skip to content →</button>
+          <div class="titlebar">
+            <span class="app-tile"><svg class="ic"><use href="#i-kbd"/></svg></span>
+            <span class="ttl">Keyboard lab</span><span class="doc">— tab through me</span>
+            <span class="caps">
+              <button class="cap" tabindex="-1"><svg class="ic"><use href="#i-min"/></svg></button>
+              <button class="cap" tabindex="-1"><svg class="ic"><use href="#i-max"/></svg></button>
+              <button class="cap close" tabindex="-1"><svg class="ic"><use href="#i-close"/></svg></button>
+            </span>
+          </div>
+          <div class="lab-toolbar" role="toolbar" aria-label="File actions" id="labToolbar">
+            <button class="icon-btn" data-ar="toolbar button" data-an="Back" data-ak="← → move within the toolbar" tabindex="0"><svg class="ic"><use href="#i-back"/></svg></button>
+            <button class="icon-btn" data-ar="toolbar button" data-an="Forward" data-ak="← → move within the toolbar" tabindex="-1"><svg class="ic"><use href="#i-fwd"/></svg></button>
+            <button class="icon-btn" data-ar="toolbar button" data-an="Reload" data-ak="← → move within the toolbar" tabindex="-1"><svg class="ic"><use href="#i-clock"/></svg></button>
+            <button class="icon-btn" data-ar="toolbar button" data-an="Grid view" data-ak="← → move within the toolbar" tabindex="-1"><svg class="ic"><use href="#i-grid"/></svg></button>
+          </div>
+          <div class="lab-body">
+            <div class="lab-row">
+              <input class="input" placeholder="Document name" data-ar="text field" data-an="Document name" data-ak="type to edit" aria-label="Document name">
+              <button class="btn b-primary" data-ar="button" data-an="Apply" data-ak="Enter activates">Apply</button>
+            </div>
+            <div class="listbox" role="listbox" aria-label="Recent documents" id="labList" tabindex="0" data-ar="listbox" data-an="Recent documents" data-ak="↑ ↓ move · Enter opens">
+              <div role="option" aria-selected="true" class="active" data-ar="option" data-an="gamma.txt" data-ak="Enter opens"><svg class="ic"><use href="#i-file"/></svg>gamma.txt</div>
+              <div role="option" aria-selected="false" data-ar="option" data-an="roadmap.md" data-ak="Enter opens"><svg class="ic"><use href="#i-file"/></svg>roadmap.md</div>
+              <div role="option" aria-selected="false" data-ar="option" data-an="boot.log" data-ak="Enter opens"><svg class="ic"><use href="#i-file"/></svg>boot.log</div>
+            </div>
+            <div class="lab-row" style="margin:12px 0 0;justify-content:flex-end">
+              <button class="btn b-ghost" data-ar="button" data-an="Clear" data-ak="Enter activates">Clear</button>
+              <button class="btn b-secondary" data-ar="button" data-an="Save draft" data-ak="Enter activates">Save draft</button>
+            </div>
+          </div>
+        </div>
+        <div class="lab-toggle">
+          <button class="sw2" id="tabOrderBtn" role="switch" aria-checked="false" aria-label="Show tab order"></button>
+          <label for="tabOrderBtn">Show tab order badges</label>
+        </div>
+      </div>
+      <div class="lab-side">
+        <div class="ann-bar" id="annBar"><span class="t">Focus something in the lab window —<br>this bar announces its role, name, and keys.</span></div>
+      </div>
+    </div>
+  </div>
+  <p class="note">Try it: press <span class="kbd">Tab</span> until the skip link appears, then the toolbar. Inside the toolbar only arrows move; <span class="kbd">Tab</span> leaves the group. The listbox is one tab stop; arrows move inside it.</p>
+</section>
+
+<!-- ============================== 02 VISIBLE FOCUS ============================== -->
+<section class="sec" id="sec-focus">
+  <div class="kicker">02 — Visible focus</div>
+  <h2>Focus rings</h2>
+  <p class="s-lead">One ring everywhere: <strong>2 px accent with a 2 px offset</strong>, meeting 3:1 against every surface. Rings appear for keyboard focus (<code>:focus-visible</code>) and stay quiet for pointer clicks — clicking is already visible feedback.</p>
+  <div class="stage">
+    <div class="focus-grid">
+      <div class="focus-cell"><span class="nm">button</span><button class="btn b-primary f-ring">Apply</button><span class="lab-l">offset ring</span></div>
+      <div class="focus-cell"><span class="nm">secondary</span><button class="btn b-secondary f-ring">Reset</button><span class="lab-l">offset ring</span></div>
+      <div class="focus-cell"><span class="nm">icon button</span><button class="icon-btn f-ring" aria-label="Settings"><svg class="ic"><use href="#i-settings"/></svg></button><span class="lab-l">offset ring</span></div>
+      <div class="focus-cell"><span class="nm">text field</span><input class="input" value="gamma" aria-label="Focused field" style="border-color:var(--accent);box-shadow:0 0 0 3px var(--ring)"><span class="lab-l">accent border + soft ring</span></div>
+      <div class="focus-cell"><span class="nm">switch</span><button class="sw2 on f-ring" role="switch" aria-checked="true" aria-label="Dark theme"></button><span class="lab-l">offset ring</span></div>
+      <div class="focus-cell"><span class="nm">slider</span><input type="range" value="60" class="f-ring" aria-label="Volume" style="border-radius:2px"><span class="lab-l">ring hugs the track</span></div>
+      <div class="focus-cell"><span class="nm">caption button</span><button class="cap f-ring-inset" aria-label="Close" style="border:1px solid var(--border-subtle)"><svg class="ic"><use href="#i-close"/></svg></button><span class="lab-l">inset — never clipped by the window edge</span></div>
+      <div class="focus-cell"><span class="nm">list option</span><div class="listbox" style="width:100%"><div role="option" class="active f-ring-inset" tabindex="0"><svg class="ic"><use href="#i-file"/></svg>gamma.txt</div></div><span class="lab-l">inset inside the listbox</span></div>
+    </div>
+    <div style="display:flex;gap:16px;align-items:center;margin-top:22px;flex-wrap:wrap">
+      <button class="btn b-secondary" id="fvBtn">Click me, then Tab to me</button>
+      <span class="pointer-note" id="fvNote">Last interaction: <b>none yet</b></span>
+    </div>
+  </div>
+  <p class="note">Try it: click the button — no ring. Press <span class="kbd">Tab</span> to reach it — the ring appears. That distinction is <code>:focus-visible</code>, and it is the rule everywhere in the shell.</p>
+</section>
+
+<!-- ============================== 03 CONTRAST ============================== -->
+<section class="sec" id="sec-contrast">
+  <div class="kicker">03 — Contrast</div>
+  <h2>Contrast inspector</h2>
+  <p class="s-lead">Every shipped pair is measured, not eyeballed. Pick any text token against any surface — the ratio computes live with the WCAG relative-luminance formula, against <strong>AA 4.5:1</strong> for text and <strong>3:1</strong> for large text and UI boundaries.</p>
+  <div class="stage">
+    <div class="contrast-grid">
+      <div class="inspector">
+        <div class="insp-row">
+          <div class="field"><label class="lb" for="inspFg">Text token</label><select class="input" id="inspFg"></select></div>
+          <div class="field"><label class="lb" for="inspBg">Surface token</label><select class="input" id="inspBg"></select></div>
+        </div>
+        <div class="insp-sample" id="inspSample">
+          <div class="big">Mirror Aa</div>
+          <div class="small">The quick brown fox — 0123456789</div>
+        </div>
+        <div class="insp-out">
+          <span class="insp-ratio" id="inspRatio">—</span>
+          <span class="chip ok" id="inspAA">AA text</span>
+          <span class="chip ok" id="inspAAA">AAA</span>
+          <span class="chip warn" id="inspUI">UI 3:1</span>
+        </div>
+      </div>
+      <table class="ctable">
+        <tr><th>Pair</th><th>Ratio</th><th>Level</th></tr>
+        <tr><td class="tk">text-primary / base</td><td class="rt">16.4 – 16.9 : 1</td><td><span class="chip ok">AAA</span></td></tr>
+        <tr><td class="tk">text-secondary / base</td><td class="rt">6.9 – 9.0 : 1</td><td><span class="chip ok">AAA</span></td></tr>
+        <tr><td class="tk">text-tertiary / base</td><td class="rt">4.8 – 4.9 : 1</td><td><span class="chip ok">AA</span></td></tr>
+        <tr><td class="tk">accent / base</td><td class="rt">4.7 · 10.9 : 1</td><td><span class="chip ok">AA</span></td></tr>
+        <tr><td class="tk">on-accent / accent</td><td class="rt">5.1 · 8.7 : 1</td><td><span class="chip ok">AA</span></td></tr>
+        <tr><td class="tk">danger text / base</td><td class="rt">5.3 – 6.9 : 1</td><td><span class="chip ok">AA</span></td></tr>
+        <tr><td class="tk">success · warning · info / base</td><td class="rt">4.6 – 11.5 : 1</td><td><span class="chip ok">AA</span></td></tr>
+        <tr><td class="tk">semantic text / subtle bg</td><td class="rt">5.6 – 8.5 : 1</td><td><span class="chip ok">AA</span></td></tr>
+        <tr><td class="tk">focus ring / any surface</td><td class="rt">≥ 3 : 1</td><td><span class="chip warn">UI AA</span></td></tr>
+      </table>
+    </div>
+  </div>
+  <p class="note">The table is the contract; the inspector is the proof. Both themes pass the same rows — no second-class theme.</p>
+</section>
+
+<!-- ============================== 04 SCALING ============================== -->
+<section class="sec" id="sec-scale">
+  <div class="kicker">04 — Display scaling</div>
+  <h2>Scaling</h2>
+  <p class="s-lead">The layout is vector- and token-driven, so scaling is a multiplier, not a redesign. Text reflows, targets grow, borders stay crisp. Drag from 100% to 200% and watch the window and dock reflow.</p>
+  <div class="stage">
+    <div class="scale-grid">
+      <div class="scale-ctl">
+        <div class="lb" style="font-size:11px;font-weight:600;color:var(--text-secondary)">Display scale</div>
+        <div class="val" id="scaleVal">100%</div>
+        <input type="range" id="scaleRange" min="100" max="200" step="25" value="100" aria-label="Display scale">
+        <div class="st">100% · 125% · 150% · 200%.<br>Layout tokens and type scale together; hairline borders stay 1 physical px where the panel allows it.</div>
+      </div>
+      <div class="scale-viewport">
+        <div class="scale-inner" id="scaleInner">
+          <div class="mini-win">
+            <div class="mt"><span class="app-tile"><svg class="ic"><use href="#i-notes"/></svg></span>Notes — gamma</div>
+            <div class="mb">Text reflows and controls grow; the layout never clips.
+              <br><button class="btn b-primary">Apply</button></div>
+          </div>
+          <div class="mini-dock">
+            <span class="dt on"><svg class="ic"><use href="#i-notes"/></svg></span>
+            <span class="dt"><svg class="ic"><use href="#i-clock"/></svg></span>
+            <span class="dt"><svg class="ic"><use href="#i-files"/></svg></span>
+            <span class="dt"><svg class="ic"><use href="#i-terminal"/></svg></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <p class="note">At 200% the same information stays on screen — larger text wraps, the dock grows, nothing overlaps.</p>
+</section>
+
+<!-- ============================== 05 REDUCED MOTION ============================== -->
+<section class="sec" id="sec-motion">
+  <div class="kicker">05 — Reduced motion</div>
+  <h2>Reduced motion</h2>
+  <p class="s-lead">Every animation has a static equivalent. Under <code>prefers-reduced-motion: reduce</code> the shell cuts instead of fades, spinners become labeled states, and the boot animation renders as a still frame with an honest progress bar.</p>
+  <div class="stage">
+    <div class="motion-grid">
+      <div class="motion-card anim-on" id="motionOn">
+        <h3>Motion on</h3>
+        <div class="mc-sub">window fades in · progress shimmers · spinner turns</div>
+        <div class="demo-win"><div class="dt2"><span class="app-tile"><svg class="ic"><use href="#i-notes"/></svg></span>Notes</div><div class="db">I arrive gently.</div></div>
+        <div class="m-row"><span class="spin"></span> working…</div>
+        <div class="m-row"><div class="pbar"><i class="shimmer" style="width:100%"></i></div> loading</div>
+      </div>
+      <div class="motion-card anim-off">
+        <h3>Reduced</h3>
+        <div class="mc-sub">window appears instantly · bars are static · state is written out</div>
+        <div class="demo-win"><div class="dt2"><span class="app-tile"><svg class="ic"><use href="#i-notes"/></svg></span>Notes</div><div class="db">I am simply here.</div></div>
+        <div class="m-row"><span class="spin"></span> working… (static indicator)</div>
+        <div class="m-row"><div class="pbar"><i class="shimmer" style="width:64%"></i></div> loading — 64%</div>
+      </div>
+    </div>
+    <div class="lab-toggle" style="margin-top:16px">
+      <button class="sw2" id="rmBtn" role="switch" aria-checked="false" aria-label="Simulate prefers-reduced-motion"></button>
+      <label for="rmBtn">Simulate <code class="mono" style="font-size:11px">prefers-reduced-motion</code> for this whole page</label>
+    </div>
+  </div>
+  <p class="note">The simulator applies the same override the media query triggers — try it, then watch the boot concept hold its mark still.</p>
+</section>
+
+<!-- ============================== 06 SEMANTICS ============================== -->
+<section class="sec" id="sec-sem">
+  <div class="kicker">06 — Semantics</div>
+  <h2>What a screen reader hears</h2>
+  <p class="s-lead">Drive the panel on the left with keyboard or pointer; the log on the right shows the announcement each action would produce — role, name, state, and event. Every shell element maps to an explicit role with a visible-text name.</p>
+  <div class="stage">
+    <div class="sem-grid">
+      <div class="sem-demo" id="semDemo">
+        <div class="sd-row">
+          <button class="btn b-primary" data-ar="button" data-an="Save note">Save note</button>
+          <button class="sw2" role="switch" aria-checked="false" aria-label="Dark theme" data-ar="switch" data-an="Dark theme"></button>
+          <span style="font-size:12px;color:var(--text-secondary)">Dark theme</span>
+        </div>
+        <div class="sd-row">
+          <div class="menu-wrap">
+            <button class="btn b-secondary" id="semMenuBtn" aria-haspopup="menu" aria-expanded="false" data-ar="button" data-an="File menu">File ▾</button>
+            <div class="menu-pop" id="semMenu" role="menu" aria-label="File">
+              <div role="menuitem" tabindex="0" data-ar="menuitem" data-an="New note"><svg class="ic"><use href="#i-plus"/></svg>New note</div>
+              <div role="menuitem" tabindex="0" data-ar="menuitem" data-an="Rename note"><svg class="ic"><use href="#i-notes"/></svg>Rename…</div>
+              <div role="menuitem" tabindex="0" data-ar="menuitem" data-an="Delete note"><svg class="ic"><use href="#i-close"/></svg>Delete note</div>
+            </div>
+          </div>
+          <button class="btn b-ghost" id="semToastBtn" data-ar="button" data-an="Send notification">Send notification</button>
+        </div>
+        <div class="sd-row">
+          <input type="range" value="45" aria-label="Pointer speed" data-ar="slider" data-an="Pointer speed" id="semSlider">
+          <span class="mono" style="font-size:11px;color:var(--text-tertiary)" id="semSliderVal">45%</span>
+        </div>
+      </div>
+      <div class="ann-log" id="semLog" aria-live="polite"></div>
+    </div>
+  </div>
+  <table class="ctable" style="margin-top:20px">
+    <tr><th>Shell element</th><th>Role</th><th>Name comes from</th><th>Announces</th></tr>
+    <tr><td>Window</td><td class="tk">region</td><td>titlebar text</td><td class="rt">focus in / out</td></tr>
+    <tr><td>Dock</td><td class="tk">navigation</td><td>“Applications”</td><td class="rt">tile name + running state</td></tr>
+    <tr><td>Start menu / palette</td><td class="tk">dialog</td><td>aria-label + aria-modal</td><td class="rt">opens, closes, result counts</td></tr>
+    <tr><td>Caption buttons</td><td class="tk">button</td><td>aria-label (Minimize…)</td><td class="rt">action on activate</td></tr>
+    <tr><td>Toasts</td><td class="tk">status / alert</td><td>title + body</td><td class="rt">polite; errors assertive</td></tr>
+    <tr><td>Switches</td><td class="tk">switch</td><td>row label</td><td class="rt">on / off</td></tr>
+    <tr><td>Sliders</td><td class="tk">slider</td><td>row label</td><td class="rt">value on change</td></tr>
+    <tr><td>File list</td><td class="tk">listbox / option</td><td>file name</td><td class="rt">position “2 of 6”</td></tr>
+    <tr><td>Progress</td><td class="tk">progressbar</td><td>task label</td><td class="rt">percent at milestones</td></tr>
+  </table>
+</section>
+
+<footer>
+  <svg class="ic" style="color:var(--pg-accent)"><use href="#i-logo"/></svg>
+  Mirror accessibility — v0.1 draft for review
+  <span class="spacer"></span>
+  <span class="mono">docs/design/accessibility.html</span>
+</footer>
+
+</div>
+</div>
+
+<script>
+const $ = (s, r = document) => r.querySelector(s);
+
+/* ================= Theme ================= */
+const page = $("#page");
+function setPageTheme(light) {
+  page.dataset.theme = light ? "light" : "dark";
+  $("#themeLbl").textContent = light ? "light" : "dark";
+  $("#themeBtn").querySelector("use").setAttribute("href", light ? "#i-sun" : "#i-moon");
+  buildInspector();
+}
+$("#themeBtn").onclick = () => setPageTheme(page.dataset.theme !== "light");
+
+/* ================= 01 Keyboard lab ================= */
+const annBar = $("#annBar");
+function announce(ar, an, ak) {
+  annBar.innerHTML = `<span class="k">${ar}</span> <span style="color:var(--text-primary)">“${an}”</span>${ak ? ` <span class="t">— ${ak}</span>` : ""}`;
+}
+$("#labWin").addEventListener("focusin", (e) => {
+  const t = e.target.closest("[data-ar]");
+  if (t) announce(t.dataset.ar, t.dataset.an, t.dataset.ak);
+});
+
+/* Roving tabindex in the toolbar */
+const toolbar = $("#labToolbar");
+toolbar.addEventListener("keydown", (e) => {
+  if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+  const btns = [...toolbar.querySelectorAll("button")];
+  let i = btns.indexOf(document.activeElement);
+  if (i < 0) return;
+  e.preventDefault();
+  btns[i].tabIndex = -1;
+  i = (i + (e.key === "ArrowRight" ? 1 : btns.length - 1)) % btns.length;
+  btns[i].tabIndex = 0;
+  btns[i].focus();
+});
+
+/* Listbox: arrows move the active option, Enter opens */
+const labList = $("#labList");
+labList.addEventListener("keydown", (e) => {
+  const opts = [...labList.querySelectorAll('[role="option"]')];
+  let i = opts.findIndex((o) => o.classList.contains("active"));
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    opts[i].classList.remove("active");
+    opts[i].setAttribute("aria-selected", "false");
+    i = (i + (e.key === "ArrowDown" ? 1 : opts.length - 1)) % opts.length;
+    opts[i].classList.add("active");
+    opts[i].setAttribute("aria-selected", "true");
+    announce("option", opts[i].dataset.an, "↑ ↓ move · Enter opens");
+  } else if (e.key === "Enter") {
+    e.preventDefault();
+    announce("option", opts[i].dataset.an, "opened in Notes");
+  }
+});
+
+/* Tab order badges */
+let badgesOn = false;
+$("#tabOrderBtn").addEventListener("click", () => {
+  badgesOn = !badgesOn;
+  const btn = $("#tabOrderBtn");
+  btn.classList.toggle("on", badgesOn);
+  btn.setAttribute("aria-checked", String(badgesOn));
+  const win = $("#labWin");
+  win.querySelectorAll(".tbadge").forEach((b) => b.remove());
+  if (!badgesOn) return;
+  const focusables = [...win.querySelectorAll("button, input, [tabindex]")]
+    .filter((el) => el.tabIndex >= 0 && !el.classList.contains("cap"));
+  focusables.forEach((el, i) => {
+    let host = el;
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) host = el.parentElement;
+    if (getComputedStyle(host).position === "static") host.style.position = "relative";
+    const b = document.createElement("span");
+    b.className = "tbadge";
+    b.textContent = i + 1;
+    host.appendChild(b);
+  });
+});
+
+/* ================= 02 focus-visible demo ================= */
+let fvKeyboard = false;
+document.addEventListener("keydown", (e) => { if (e.key === "Tab") fvKeyboard = true; });
+const fvBtn = $("#fvBtn");
+fvBtn.addEventListener("pointerdown", () => { fvKeyboard = false; });
+fvBtn.addEventListener("focus", () => {
+  $("#fvNote").innerHTML = fvKeyboard
+    ? `Last interaction: <b>keyboard</b> — the ring is showing.`
+    : `Last interaction: <b>pointer</b> — no ring needed.`;
+});
+
+/* ================= 03 Contrast inspector ================= */
+const TOKENS_FG = ["text-primary", "text-secondary", "text-tertiary", "accent", "on-accent", "success", "warning", "danger", "info", "accent-subtle-text"];
+const TOKENS_BG = ["base", "surface", "elevated", "overlay", "accent", "accent-subtle", "success-bg", "warning-bg", "danger-bg", "info-bg"];
+function tokenValue(name) {
+  return getComputedStyle(page).getPropertyValue("--" + name).trim();
+}
+function hexToRgb(hex) {
+  const m = hex.replace("#", "").trim();
+  if (!/^[0-9a-fA-F]{6}$/.test(m)) return null;
+  return [0, 2, 4].map((i) => parseInt(m.slice(i, i + 2), 16) / 255);
+}
+function luminance(hex) {
+  const c = hexToRgb(hex);
+  if (!c) return null;
+  const l = c.map((v) => (v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4)));
+  return 0.2126 * l[0] + 0.7152 * l[1] + 0.0722 * l[2];
+}
+function buildInspector() {
+  const fg = $("#inspFg"), bg = $("#inspBg");
+  const curF = fg.value || "text-primary", curB = bg.value || "base";
+  fg.innerHTML = TOKENS_FG.map((t) => `<option ${t === curF ? "selected" : ""}>${t}</option>`).join("");
+  bg.innerHTML = TOKENS_BG.map((t) => `<option ${t === curB ? "selected" : ""}>${t}</option>`).join("");
+  updateInspector();
+}
+function updateInspector() {
+  const fHex = tokenValue($("#inspFg").value);
+  const bHex = tokenValue($("#inspBg").value);
+  const l1 = luminance(fHex), l2 = luminance(bHex);
+  const sample = $("#inspSample");
+  sample.style.color = fHex;
+  sample.style.background = bHex;
+  const out = $("#inspRatio");
+  const chips = { aa: $("#inspAA"), aaa: $("#inspAAA"), ui: $("#inspUI") };
+  if (l1 === null || l2 === null) { out.textContent = "n/a"; return; }
+  const ratio = (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+  out.textContent = ratio.toFixed(2) + " : 1";
+  chips.aa.textContent = ratio >= 4.5 ? "AA text ✓" : "AA text ✗";
+  chips.aa.className = "chip " + (ratio >= 4.5 ? "ok" : "err");
+  chips.aaa.textContent = ratio >= 7 ? "AAA ✓" : "AAA ✗";
+  chips.aaa.className = "chip " + (ratio >= 7 ? "ok" : "err");
+  chips.ui.textContent = ratio >= 3 ? "UI 3:1 ✓" : "UI 3:1 ✗";
+  chips.ui.className = "chip " + (ratio >= 3 ? "ok" : "err");
+}
+$("#inspFg").addEventListener("change", updateInspector);
+$("#inspBg").addEventListener("change", updateInspector);
+buildInspector();
+
+/* ================= 04 Scaling ================= */
+$("#scaleRange").addEventListener("input", (e) => {
+  const v = +e.target.value;
+  $("#scaleVal").textContent = v + "%";
+  $("#scaleInner").style.zoom = v / 100;
+});
+
+/* ================= 05 Reduced motion ================= */
+$("#rmBtn").addEventListener("click", () => {
+  const on = page.classList.toggle("force-rm");
+  const btn = $("#rmBtn");
+  btn.classList.toggle("on", on);
+  btn.setAttribute("aria-checked", String(on));
+});
+
+/* ================= 06 Semantics ================= */
+const semLog = $("#semLog");
+function semLine(role, name, state) {
+  const d = new Date();
+  const t = String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0") + ":" + String(d.getSeconds()).padStart(2, "0");
+  const div = document.createElement("div");
+  div.className = "a-line";
+  div.innerHTML = `<span class="a-time">${t}</span> <span class="a-role">${role}</span> <span class="a-name">“${name}”</span>${state ? ` <span class="a-state">${state}</span>` : ""}`;
+  semLog.appendChild(div);
+  while (semLog.children.length > 40) semLog.firstChild.remove();
+  semLog.scrollTop = semLog.scrollHeight;
+}
+semLine("log", "ready", "interact with the panel on the left");
+
+$("#semDemo").addEventListener("focusin", (e) => {
+  const t = e.target.closest("[data-ar]");
+  if (t) semLine("focus", t.dataset.an, t.dataset.ar);
+});
+$("#semDemo").addEventListener("click", (e) => {
+  const t = e.target.closest("[data-ar]");
+  if (!t) return;
+  if (t.dataset.an === "Save note") semLine("activate", "Save note", "button pressed");
+  if (t.dataset.an === "Send notification") semLine("alert", "Note applied — revision 5", "status, polite");
+});
+
+const semSwitch = $('#semDemo [data-an="Dark theme"]');
+semSwitch.addEventListener("click", () => {
+  const on = semSwitch.classList.toggle("on");
+  semSwitch.setAttribute("aria-checked", String(on));
+  semLine("toggle", "Dark theme", on ? "on" : "off");
+});
+
+const semMenuBtn = $("#semMenuBtn");
+const semMenu = $("#semMenu");
+function setMenu(open) {
+  semMenu.classList.toggle("open", open);
+  semMenuBtn.setAttribute("aria-expanded", String(open));
+  semMenuBtn.textContent = open ? "File ▴" : "File ▾";
+  if (open) {
+    semLine("open", "File menu", "menu · 3 items");
+    const first = semMenu.querySelector('[role="menuitem"]');
+    if (first) first.focus();
+  } else {
+    semLine("close", "File menu", "menu dismissed");
+  }
+}
+semMenuBtn.addEventListener("click", () => setMenu(!semMenu.classList.contains("open")));
+semMenu.addEventListener("keydown", (e) => {
+  const items = [...semMenu.querySelectorAll('[role="menuitem"]')];
+  let i = items.indexOf(document.activeElement);
+  if (e.key === "Escape") { setMenu(false); semMenuBtn.focus(); return; }
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    i = i < 0 ? 0 : (i + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length;
+    items[i].focus();
+  }
+  if (e.key === "Enter" && i >= 0) { e.preventDefault(); semLine("activate", items[i].dataset.an, "menuitem"); setMenu(false); semMenuBtn.focus(); }
+});
+semMenu.addEventListener("click", (e) => {
+  const it = e.target.closest('[role="menuitem"]');
+  if (it) { semLine("activate", it.dataset.an, "menuitem"); setMenu(false); }
+});
+document.addEventListener("pointerdown", (e) => {
+  if (!e.target.closest(".menu-wrap") && semMenu.classList.contains("open")) setMenu(false);
+});
+
+const semSlider = $("#semSlider");
+semSlider.addEventListener("change", () => semLine("adjust", "Pointer speed", semSlider.value + "%", ));
+semSlider.addEventListener("input", () => { $("#semSliderVal").textContent = semSlider.value + "%"; });
+</script>
+</body>
+</html>
