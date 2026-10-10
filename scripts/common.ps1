@@ -80,6 +80,8 @@ function Assert-MirrorDriverCatalog {
     $xhci = 0
     $unknown = 0
     $modernBoot = 0
+    $nic = 0
+    $otherNetwork = 0
     foreach ($device in $devices) {
         $bus = [Convert]::ToInt32($device.Groups[1].Value, 16)
         $slot = [Convert]::ToInt32($device.Groups[2].Value, 16)
@@ -111,6 +113,15 @@ function Assert-MirrorDriverCatalog {
             $unknown++
             if ($identity -eq '1af4:1042') { $modernBoot++ }
         }
+        # Every device profile attaches one Intel 82545EM, which stays unmatched
+        # until its driver exists (spec 0014). No other network controller may appear.
+        if ($class.StartsWith('02:', [StringComparison]::Ordinal)) {
+            if ($identity -eq '8086:100f' -and $class -eq '02:00:00' -and $driver -eq 'none' -and $kind -eq 'none') { $nic++ }
+            else { $otherNetwork++ }
+        }
+    }
+    if ($nic -ne 1 -or $otherNetwork -ne 0) {
+        throw 'The device profile must expose exactly one unmatched Intel 82545EM NIC (id=8086:100f class=02:00:00 driver=none match=none) and no other network controller.'
     }
     if ($legacy -ne [int]$LegacyDisk -or $ahci -ne 1 -or $xhci -ne [int]$XhciAttached -or $modernBoot -ne 1 -or
         $matched -ne $legacy + $ahci + $xhci -or $unsupported -ne $unknown) {
@@ -744,6 +755,49 @@ function New-MirrorWritableTestDisk {
     $path = Join-Path $RepositoryRoot 'build/block-write-test.img'
     Copy-Item -LiteralPath $source -Destination $path -Force
     return $path
+}
+
+function Get-MirrorDeviceArguments {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('V1', 'LegacyVirtio')][string]$Profile,
+        [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+        [switch]$NoTestDisk
+    )
+    # The QEMU device profiles of spec 0014. Both present the v1 NIC; they differ
+    # only in the storage fixture. The caller keeps -nic none, the firmware-only
+    # boot disk and the variant switches, and chooses the fixture's backend
+    # (-drive or -blockdev) for the node id mirror-test.
+    if ($Profile -eq 'LegacyVirtio' -and $NoTestDisk) {
+        throw '-DeviceProfile LegacyVirtio attaches the legacy VirtIO test disk; it cannot be combined with -NoTestDisk.'
+    }
+    $root = (Resolve-Path -LiteralPath $RepositoryRoot).ProviderPath
+    # The Intel 82545EM (8086:100f) on a user-mode backend, which avoids QEMU's
+    # "has no peer" warning. restrict=on keeps the guest off the host network,
+    # and an empty romfile keeps the iPXE option ROM out of firmware startup.
+    $nicArguments = [string[]]@('-netdev', 'user,id=mirror-net,restrict=on', '-device', 'e1000-82545em,netdev=mirror-net,romfile=')
+    $ahciFixture = $Profile -eq 'V1' -and -not $NoTestDisk
+    $fixtureDevice = $null
+    $fixtureImage = $null
+    if ($ahciFixture) {
+        # QEMU ide_init_drive requires a writable backend for ATA hard disks:
+        # https://raw.githubusercontent.com/qemu/qemu/v10.1.0/hw/ide/core.c
+        # Mirror exposes only IDENTIFY/reads. Attach a reset disposable copy, which
+        # the caller verifies in full afterward instead of trusting ATA write protect.
+        $source = Get-MirrorTestDisk -RepositoryRoot $root
+        $fixtureImage = Join-Path (Join-Path $root 'build') 'ahci-test.img'
+        Copy-Item -LiteralPath $source -Destination $fixtureImage -Force
+        $fixtureDevice = 'ide-hd,drive=mirror-test,bus=ide.0,rerror=report'
+    }
+    elseif (-not $NoTestDisk) {
+        $fixtureImage = Get-MirrorTestDisk -RepositoryRoot $root
+        $fixtureDevice = 'virtio-blk-pci,drive=mirror-test,disable-modern=on,disable-legacy=off'
+    }
+    return [pscustomobject]@{
+        NicArguments = $nicArguments
+        FixtureDevice = $fixtureDevice
+        FixtureImage = $fixtureImage
+        AhciFixture = [bool]$ahciFixture
+    }
 }
 
 function Assert-MirrorWritableTestDisk {

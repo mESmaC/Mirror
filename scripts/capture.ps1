@@ -56,8 +56,8 @@ function Assert-MirrorCaptureSmp {
     Assert-MirrorTimer -Serial $Serial -Smoke $false -UseLegacyPic $false -ForcePit $false
     Assert-MirrorClock -Serial $Serial -Smoke $false -WithoutHpet $false
     Assert-MirrorHeapGrowth -Serial $Serial -RequestedCpus $RequestedCpus -Smoke $false -UseLegacyPic $false
-    Assert-MirrorDriverCatalog -Serial $Serial -Smoke $false -LegacyDisk $true
-    Assert-MirrorAhciMarkers -Serial $Serial -Attached $false -Smoke $false
+    Assert-MirrorDriverCatalog -Serial $Serial -Smoke $false -LegacyDisk $false
+    Assert-MirrorAhciMarkers -Serial $Serial -Attached $true -Smoke $false
     Assert-MirrorXhciMarkers -Serial $Serial -Attached $false -Smoke $false
     Assert-MirrorUsbMarkers -Serial $Serial -Attached $false -Smoke $false
     if ($Serial -match '(?m)^MIRROR_(?:SMP_SKIPPED|SMP_CPU_FAILED|SMP_GUARD_OK|SMP_UNMAP_OK|SMP_TLB_TIMEOUT_ARMED|SHARED_TIMEOUT_\w+|SHARED_VM_SKIPPED|SHARED_OFFLINE_OK)(?:\s|$)') {
@@ -277,11 +277,16 @@ $qemuArguments = @(
     '-drive', "if=none,id=mirror-esp,format=raw,readonly=on,file=fat:$(ConvertTo-QemuOptionValue $espDirectory)",
     '-device', 'virtio-blk-pci,drive=mirror-esp,disable-legacy=on,bootindex=0', '-serial', "file:$serialLog"
 )
+# Captures use the V1 device profile: the e1000 NIC and the AHCI SATA fixture.
+# The QEMU ATA model needs a writable backend, so the fixture is the fresh
+# disposable copy build/ahci-test.img, verified in full after QEMU exits.
+$deviceArguments = Get-MirrorDeviceArguments -Profile V1 -RepositoryRoot $repositoryRoot
 $testDisk = Get-MirrorTestDisk -RepositoryRoot $repositoryRoot
 $testDiskHash = (Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash
+$qemuArguments += $deviceArguments.NicArguments
 $qemuArguments += @(
-    '-drive', "if=none,id=mirror-test,format=raw,readonly=on,file=$(ConvertTo-QemuOptionValue $testDisk)",
-    '-device', 'virtio-blk-pci,drive=mirror-test,disable-modern=on,disable-legacy=off'
+    '-drive', "if=none,id=mirror-test,format=raw,readonly=off,file=$(ConvertTo-QemuOptionValue $deviceArguments.FixtureImage)",
+    '-device', $deviceArguments.FixtureDevice
 )
 if (Test-Path -LiteralPath (Join-Path $qemuDirectory 'share') -PathType Container) {
     $qemuArguments += @('-L', (Join-Path $qemuDirectory 'share'))
@@ -419,7 +424,7 @@ try {
         if ($elapsed.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw "Normal boot timed out. See $serialLog." }
         Start-Sleep -Milliseconds 100
     } while ($true)
-    foreach ($marker in @('MIRROR_BOOT_OK', 'MIRROR_USERSPACE_OK scenario=0', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_SCHEDULER_OK processes=2', 'MIRROR_IPC_OK messages=3', 'MIRROR_PCI_READY', 'MIRROR_FRAMEBUFFER_READY', 'MIRROR_FRAMEBUFFER_PRESENTED', 'MIRROR_BLOCK_READY', 'MIRROR_BLOCK_READ_OK', 'MIRROR_BLOCK_CLEANUP_OK', 'MIRROR_KEYBOARD_READY', 'MIRROR_MOUSE_READY', 'MIRROR_POINTER_READY', 'MIRROR_USER_SURFACE_OK', 'MIRROR_USER_SURFACE_CLEANUP_OK handles_reclaimed=1')) {
+    foreach ($marker in @('MIRROR_BOOT_OK', 'MIRROR_USERSPACE_OK scenario=0', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_SCHEDULER_OK processes=2', 'MIRROR_IPC_OK messages=3', 'MIRROR_PCI_READY', 'MIRROR_FRAMEBUFFER_READY', 'MIRROR_FRAMEBUFFER_PRESENTED', 'MIRROR_AHCI_READY', 'MIRROR_AHCI_READ_OK', 'MIRROR_AHCI_CLEANUP_OK', 'MIRROR_BLOCK_SKIPPED', 'MIRROR_KEYBOARD_READY', 'MIRROR_MOUSE_READY', 'MIRROR_POINTER_READY', 'MIRROR_USER_SURFACE_OK', 'MIRROR_USER_SURFACE_CLEANUP_OK handles_reclaimed=1')) {
         if ($serial -notmatch "(?m)^$marker(?:\s|$)") { throw "Normal boot missing $marker. See $serialLog." }
     }
     if ($serial -match '(?m)^MIRROR_FRAMEBUFFER_SKIPPED(?:\s|$)') { throw 'Normal boot skipped framebuffer output.' }
@@ -533,6 +538,10 @@ try {
     Assert-MirrorCaptureSmp -Serial (Read-MirrorSerial) -RequestedCpus $CpuCount
     if ((Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash -ne $testDiskHash) {
         throw 'The read-only block fixture was modified during the capture.'
+    }
+    if ((Get-Item -LiteralPath $deviceArguments.FixtureImage).Length -ne 1048576 -or
+        (Get-FileHash -LiteralPath $deviceArguments.FixtureImage -Algorithm SHA256).Hash -ne $testDiskHash) {
+        throw 'The AHCI read-only probe modified its disposable disk image during the capture.'
     }
     Write-Host "Native desktop and fallback console captures passed (agent-demo=$AgentDemo, cpus=$CpuCount). Images: $buildDirectory"
 }

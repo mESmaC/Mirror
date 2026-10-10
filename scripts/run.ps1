@@ -7,7 +7,7 @@ param(
     [switch]$AgentDemo,
     [switch]$NoDisplayDevice,
     [switch]$NoTestDisk,
-    [switch]$AhciDisk,
+    [ValidateSet('V1', 'LegacyVirtio')][string]$DeviceProfile = 'V1',
     [switch]$Xhci,
     [switch]$XhciKeyboard,
     [switch]$XhciMouse,
@@ -201,14 +201,17 @@ if ($Graphical -and ($Smoke -or $NoDisplayDevice)) {
     throw '-Graphical requires a normal boot with a display device.'
 }
 $writableBlock = $Fault -in @('BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush')
-if ($AhciDisk -and $NoTestDisk) {
-    throw '-AhciDisk requires the test disk; it cannot be combined with -NoTestDisk.'
+# V1 attaches the test fixture as an AHCI SATA disk. Only LegacyVirtio keeps the
+# legacy VirtIO fixture, which the Block* fault modes exercise (spec 0014).
+$ahciFixture = $DeviceProfile -eq 'V1' -and -not $NoTestDisk
+if ($DeviceProfile -eq 'LegacyVirtio' -and $NoTestDisk) {
+    throw '-DeviceProfile LegacyVirtio attaches the legacy VirtIO test disk; it cannot be combined with -NoTestDisk.'
 }
-if ($AhciDisk -and $Fault -like 'Block*') {
-    throw '-AhciDisk cannot exercise legacy VirtIO block fault modes.'
+if ($Fault -like 'Block*' -and $DeviceProfile -ne 'LegacyVirtio') {
+    throw "-Fault $Fault requires -DeviceProfile LegacyVirtio."
 }
-if ($Fault -in @('AhciIoError', 'AhciInitFailure') -and -not $AhciDisk) {
-    throw "-Fault $Fault requires -AhciDisk."
+if ($Fault -in @('AhciIoError', 'AhciInitFailure') -and -not $ahciFixture) {
+    throw "-Fault $Fault requires -DeviceProfile V1 with the test disk."
 }
 if ($Fault -eq 'XhciInitFailure' -and -not $Xhci) {
     throw '-Fault XhciInitFailure requires -Xhci.'
@@ -333,6 +336,11 @@ $qemuArguments = @(
     '-drive', "if=none,id=mirror-esp,format=raw,readonly=on,file=fat:$(ConvertTo-QemuOptionValue $espDirectory)",
     '-device', 'virtio-blk-pci,drive=mirror-esp,disable-legacy=on,bootindex=0'
 )
+$deviceArguments = Get-MirrorDeviceArguments -Profile $DeviceProfile -RepositoryRoot $repositoryRoot -NoTestDisk:$NoTestDisk
+if ($deviceArguments.AhciFixture -ne $ahciFixture) {
+    throw "Device profile $DeviceProfile disagrees with the runner about the AHCI fixture."
+}
+$qemuArguments += $deviceArguments.NicArguments
 if ($Xhci) { $qemuArguments += @('-device', 'qemu-xhci,id=mirror-xhci') }
 # Pin the USB descriptor version and physical port assignment. Both HID models
 # expose one configuration/interface; their interface protocols distinguish them.
@@ -348,17 +356,11 @@ if ($XhciMouse -or $XhciPair) {
 if (-not $NoTestDisk) {
     $testDisk = Get-MirrorTestDisk -RepositoryRoot $repositoryRoot
     $testDiskHash = (Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash
-    $attachedDisk = $testDisk
-    if ($AhciDisk) {
-        # QEMU ide_init_drive requires a writable backend for ATA hard disks:
-        # https://raw.githubusercontent.com/qemu/qemu/v10.1.0/hw/ide/core.c
-        # Mirror exposes only IDENTIFY/reads. Use a reset disposable copy and
-        # verify its entire image afterward instead of trusting ATA write protect.
-        $attachedDisk = Join-Path $buildDirectory 'ahci-test.img'
-        Copy-Item -LiteralPath $testDisk -Destination $attachedDisk -Force
-    }
-    $testDevice = if ($AhciDisk) { 'ide-hd,drive=mirror-test,bus=ide.0,rerror=report' }
-        else { 'virtio-blk-pci,drive=mirror-test,disable-modern=on,disable-legacy=off' }
+    # V1's fixture is the fresh disposable copy build/ahci-test.img, because the
+    # QEMU ATA model needs a writable backend; its entire image is verified after
+    # boot. LegacyVirtio reads the source fixture itself, read-only.
+    $attachedDisk = $deviceArguments.FixtureImage
+    $testDevice = $deviceArguments.FixtureDevice
     if ($writableBlock) {
         $writableDisk = New-MirrorWritableTestDisk -RepositoryRoot $repositoryRoot
         $fileNode = @{ driver = 'file'; filename = $writableDisk; cache = @{ 'no-flush' = $false } }
@@ -392,7 +394,7 @@ if (-not $NoTestDisk) {
         # Inject into a data sector used by the kernel probe, away from firmware
         # partition discovery. JSON preserves paths without blkdebug URL colons.
         $testNode = @{
-            driver = 'raw'; 'node-name' = 'mirror-test'; 'read-only' = (-not $AhciDisk)
+            driver = 'raw'; 'node-name' = 'mirror-test'; 'read-only' = (-not $ahciFixture)
             file = @{
                 driver = 'blkdebug'
                 image = @{ driver = 'file'; filename = $attachedDisk }
@@ -402,7 +404,7 @@ if (-not $NoTestDisk) {
         $qemuArguments += @('-blockdev', $testNode)
     }
     else {
-        $readOnlyOption = if ($AhciDisk) { 'off' } else { 'on' }
+        $readOnlyOption = if ($ahciFixture) { 'off' } else { 'on' }
         $qemuArguments += @('-drive', "if=none,id=mirror-test,format=raw,readonly=$readOnlyOption,file=$(ConvertTo-QemuOptionValue $attachedDisk)")
     }
     $qemuArguments += @('-device', $testDevice)
@@ -461,7 +463,7 @@ try {
     if (-not $NoTestDisk -and (Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash -ne $testDiskHash) {
         throw 'The read-only block fixture was modified during the boot.'
     }
-    if ($AhciDisk -and ((Get-Item -LiteralPath $attachedDisk).Length -ne 1048576 -or
+    if ($ahciFixture -and ((Get-Item -LiteralPath $attachedDisk).Length -ne 1048576 -or
             (Get-FileHash -LiteralPath $attachedDisk -Algorithm SHA256).Hash -ne $testDiskHash)) {
         throw 'The AHCI read-only probe modified its disposable disk image.'
     }
@@ -516,8 +518,8 @@ try {
     Assert-MirrorClock -Serial $serial -Smoke $true -WithoutHpet ([bool]$NoHpet) -FaultMode $Fault
     Assert-MirrorSmpMarkers -Serial $serial -RequestedCpus $CpuCount -UseLegacyPic ([bool]$LegacyPic) -FaultMode $Fault
     Assert-MirrorHeapGrowth -Serial $serial -RequestedCpus $CpuCount -Smoke $true -UseLegacyPic ([bool]$LegacyPic)
-    Assert-MirrorDriverCatalog -Serial $serial -Smoke $true -LegacyDisk (-not $NoTestDisk -and -not $AhciDisk) -XhciAttached ([bool]$Xhci)
-    Assert-MirrorAhciMarkers -Serial $serial -Attached ([bool]$AhciDisk) -Smoke $true -FaultMode $Fault
+    Assert-MirrorDriverCatalog -Serial $serial -Smoke $true -LegacyDisk ($DeviceProfile -eq 'LegacyVirtio' -and -not $NoTestDisk) -XhciAttached ([bool]$Xhci)
+    Assert-MirrorAhciMarkers -Serial $serial -Attached $ahciFixture -Smoke $true -FaultMode $Fault
     Assert-MirrorXhciMarkers -Serial $serial -Attached ([bool]$Xhci) -UsbDevice $usbFixture -WithoutHpet ([bool]$NoHpet) -Smoke $true -FaultMode $Fault
     Assert-MirrorUsbMarkers -Serial $serial -Attached ([bool]$Xhci) -UsbDevice $usbFixture -FullSpeed ([bool]$XhciFullSpeed) -WithoutHpet ([bool]$NoHpet) -Smoke $true -FaultMode $Fault
     $markers += 'MIRROR_USER_SYNC_OK'
@@ -626,7 +628,7 @@ try {
     if ($writableBlock) {
         Assert-MirrorWritableBlockMarkers -Serial $serial -FaultMode $Fault
     }
-    elseif ($NoTestDisk -or $AhciDisk) {
+    elseif ($NoTestDisk -or $ahciFixture) {
         $markers += 'MIRROR_BLOCK_SKIPPED'
         if ($serial -match '(?m)^MIRROR_BLOCK_(?:READY|READ_OK|IO_ERROR_OK)(?:\s|$)') {
             throw "Mirror unexpectedly bound a block device. See $serialLog."
@@ -804,7 +806,7 @@ try {
             throw "Mirror smoke test did not report $marker. See $serialLog."
         }
     }
-    Write-Host "Mirror boot smoke test passed (fault=$Fault, ahci-disk=$AhciDisk, xhci=$Xhci, usb=$usbFixture, usb-full-speed=$XhciFullSpeed, no-display=$NoDisplayDevice, extended-cpu=$ExtendedCpu, cpus=$CpuCount, legacy-pic=$LegacyPic, pit-timer=$PitTimer, no-hpet=$NoHpet, QEMU exit $expectedExitCode). Serial log: $serialLog"
+    Write-Host "Mirror boot smoke test passed (fault=$Fault, profile=$DeviceProfile, xhci=$Xhci, usb=$usbFixture, usb-full-speed=$XhciFullSpeed, no-display=$NoDisplayDevice, extended-cpu=$ExtendedCpu, cpus=$CpuCount, legacy-pic=$LegacyPic, pit-timer=$PitTimer, no-hpet=$NoHpet, QEMU exit $expectedExitCode). Serial log: $serialLog"
     # Keep firmware's terminal control sequences in the raw log, not tool output.
     Write-Output (($serial -split '\r?\n' | Where-Object { $_ -match '^(MIRROR_|Memory map:|Direct map offset:|Page tables:)' }) -join [Environment]::NewLine)
 }

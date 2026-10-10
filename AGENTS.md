@@ -33,7 +33,7 @@ Run commands from the repository root in PowerShell.
 ## Test
 - `.\scripts\test.ps1` is the full suite: rustfmt `--check`, host unit tests, and clippy `-D warnings` with no features and with all features. Then, for debug and for release, a smoke build, every smoke boot and a normal-boot capture. It takes about 20 minutes and stops at the first failure. `test.ps1 -AgentDemo` reruns the whole suite with `agent-demo`, about 20 minutes more.
 - Host tests need an explicit target because the default target is bare metal: `cargo test --locked -p <crate> --target x86_64-pc-windows-msvc`. This needs the MSVC build tools. Only the `crates\` packages have host tests.
-- One boot: `.\scripts\run.ps1 -Smoke [-Release] [-Fault <Name>] [device switches]`. Without `-Smoke` it boots interactively and never exits on its own, so always pass `-Smoke`. Pass `-NoBuild` only if the staged kernel already matches the requested profile and features. Nothing checks this.
+- One boot: `.\scripts\run.ps1 -Smoke [-Release] [-DeviceProfile <V1|LegacyVirtio>] [-Fault <Name>]`. `V1`, the default, attaches the v1 devices: the AHCI test disk, an e1000 NIC, PS/2 and VGA. `LegacyVirtio` attaches the legacy VirtIO test disk instead, and the `Block*` faults need it. Without `-Smoke` it boots interactively and never exits on its own, so always pass `-Smoke`. Pass `-NoBuild` only if the staged kernel already matches the requested profile and features. Nothing checks this.
 - `.\scripts\capture.ps1` boots a normal kernel, drives it with QMP input and checks screenshots.
 - Run the build, run, capture and test scripts one at a time, across all agents and terminals. They share `build\` (the staged ESP and its `limine.conf`, firmware variables, serial logs), so a second command silently corrupts the first.
 - QEMU and OVMF are found in `.tools\qemu\` or on `PATH`, or set through `QEMU_PATH`, `OVMF_CODE` and `OVMF_VARS`.
@@ -42,7 +42,7 @@ Run commands from the repository root in PowerShell.
 ### When to test
 - Before each commit, run the targeted cases for what it touches. `test.ps1` lists every case; copy the matching commands from it:
   - Any Rust change: `cargo fmt --all -- --check` and both clippy commands. A change under `crates\` also runs that crate's host tests.
-  - Kernel or userspace code: `build.ps1 -Smoke`, then `run.ps1 -Smoke -NoBuild` with no `-Fault`, plus every case whose switches or `-Fault` name exercise the touched code (for example the `-Xhci` cases for xHCI code). To find them, search `run.ps1` and `common.ps1` for the markers that code prints. Add `-AgentDemo` to the build and runs if you touched agent-demo code.
+  - Kernel or userspace code: `build.ps1 -Smoke`, then `run.ps1 -Smoke -NoBuild` with no `-Fault`, plus every case whose switches or `-Fault` name exercise the touched code (for example the `-Xhci` cases for xHCI code, or the `LegacyVirtio` cases for VirtIO block code). To find them, search `run.ps1` and `common.ps1` for the markers that code prints. Add `-AgentDemo` to the build and runs if you touched agent-demo code.
   - Desktop, console, input or display code: also `build.ps1`, then `capture.ps1 -NoBuild -CpuCount 4`.
   - A script change: the cases that execute the changed lines.
   - Docs only: nothing to run.
@@ -70,7 +70,7 @@ Guest-side faults exist only in `boot-smoke` kernels. To add one:
 2. For a `User(n)` probe that faults, add its expected `(vector, error, cr2)` arm to `validate_process` in `kernel\src\userspace.rs`. Without it the boot panics with `unexpected probe`.
 3. Add the PascalCase name to `-Fault` in `scripts\run.ps1`: both its `ValidateSet` and the `$testMode` switch. A `User(n)` probe also gets its number in the `$scenario` map and, unless it expects vector 14, an entry in the `$userVector` map. An expected fatal kernel fault joins `$fatalKernelFault`.
 4. Assert the scenario's marker in that case, and reject the marker in every other case.
-5. Add the case to `scripts\test.ps1`, which runs it in both profiles.
+5. Add the case to `scripts\test.ps1`, which runs it in both build profiles, debug and release.
 A passing smoke boot exits QEMU with code 33. An expected fatal fault exits with 35 and an exact diagnostic. Host-side faults are QEMU options in `run.ps1`: blkdebug errors, removed devices, CPU models and CPU counts.
 
 ## References

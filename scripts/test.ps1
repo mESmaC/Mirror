@@ -8,6 +8,17 @@ param(
 
 . (Join-Path $PSScriptRoot 'common.ps1')
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
+$smokeBoots = 0
+
+function Save-MirrorSmokeLogs {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    # Count each smoke boot as its logs are kept, so the summary reports the
+    # boots that actually ran instead of a hard-coded total.
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$Name.serial.log") -Force
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$Name.stderr.log") -Force
+    $script:smokeBoots++
+}
+
 Push-Location -LiteralPath $repositoryRoot
 try {
     Assert-MirrorToolchain
@@ -40,24 +51,28 @@ try {
         $memoryMiB = 256
         $smpMemoryMiB = 256
         & (Join-Path $PSScriptRoot 'build.ps1') -Smoke -Release:$release -AgentDemo:$AgentDemo
+        # Every case uses the V1 device profile, with the test fixture on AHCI
+        # SATA, unless it names -DeviceProfile LegacyVirtio (spec 0014).
         # UserSimd remains a strict manual #XM probe: current QEMU TCG does not
         # deliver that unmasked SSE arithmetic exception (QEMU issue 215).
-        foreach ($fault in @('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault')) {
+        foreach ($fault in @('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault')) {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Release:$release -AgentDemo:$AgentDemo -Fault $fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
-            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-$fault.serial.log") -Force
-            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-$fault.stderr.log") -Force
+            Save-MirrorSmokeLogs "$profile-$fault"
         }
-        # Exercise the class-standard SATA path instead of the legacy VirtIO
-        # fixture, including a completed ATA error and failed initialization
-        # after engine activation, followed by safe DMA reuse and a reopen.
-        foreach ($fault in @('None', 'AhciIoError', 'AhciInitFailure')) {
-            & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -AhciDisk -Release:$release -AgentDemo:$AgentDemo -Fault $fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
-            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-AhciDisk-$fault.serial.log") -Force
-            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-AhciDisk-$fault.stderr.log") -Force
+        # The legacy VirtIO fixture holds the suite's only write, flush,
+        # write-error and dirty-shutdown checks until AHCI gains a write path
+        # (0014-D5, spec 0062).
+        foreach ($fault in @('None', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush')) {
+            & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -DeviceProfile LegacyVirtio -Release:$release -AgentDemo:$AgentDemo -Fault $fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+            Save-MirrorSmokeLogs "$profile-LegacyVirtio-$fault"
         }
-        & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -AhciDisk -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-AhciDisk-CpuCount4.serial.log") -Force
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-AhciDisk-CpuCount4.stderr.log") -Force
+        # Exercise the class-standard SATA path's recovery: a completed ATA
+        # error, and failed initialization after engine activation, followed by
+        # safe DMA reuse and a reopen.
+        foreach ($fault in @('AhciIoError', 'AhciInitFailure')) {
+            & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Release:$release -AgentDemo:$AgentDemo -Fault $fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+            Save-MirrorSmokeLogs "$profile-$fault"
+        }
         # Verify controller ring wrapping and bounded USB2 enumeration through
         # endpoint zero. Include addressed-slot failure cleanup and refusal of
         # multiple devices or missing reset timing; HID report input is separate.
@@ -74,70 +89,55 @@ try {
                 @{ Name = 'Keyboard-DeviceFailure'; Fault = 'XhciDeviceFailure'; NoHpet = $false; Device = 'Keyboard'; FullSpeed = $false; Cpus = 1 },
                 @{ Name = 'Pair'; Fault = 'None'; NoHpet = $false; Device = 'Pair'; FullSpeed = $false; Cpus = 1 })) {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Xhci -XhciKeyboard:($case.Device -eq 'Keyboard') -XhciMouse:($case.Device -eq 'Mouse') -XhciPair:($case.Device -eq 'Pair') -XhciFullSpeed:$case.FullSpeed -NoHpet:$case.NoHpet -CpuCount $case.Cpus -Release:$release -AgentDemo:$AgentDemo -Fault $case.Fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
-            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-Xhci-$($case.Name).serial.log") -Force
-            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-Xhci-$($case.Name).stderr.log") -Force
+            Save-MirrorSmokeLogs "$profile-Xhci-$($case.Name)"
         }
         # Expose AVX and FSGSBASE through CPUID as well as exercising the
         # conservative CPU model. The kernel must keep both features disabled.
         foreach ($fault in @('None', 'UserAvx', 'UserFsgsbase')) {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -ExtendedCpu -Release:$release -AgentDemo:$AgentDemo -Fault $fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
-            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-ExtendedCpu-$fault.serial.log") -Force
-            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-ExtendedCpu-$fault.stderr.log") -Force
+            Save-MirrorSmokeLogs "$profile-ExtendedCpu-$fault"
         }
         # Bring all configured CPUs online with private stacks/descriptors and
         # verify IPI rendezvous before and after the BSP's userspace workloads.
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-CpuCount4.serial.log") -Force
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-CpuCount4.stderr.log") -Force
+        Save-MirrorSmokeLogs "$profile-CpuCount4"
         foreach ($cpuCount in @(2, 8)) {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -ExtendedCpu -CpuCount $cpuCount -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
-            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-ExtendedCpu-CpuCount$cpuCount.serial.log") -Force
-            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-ExtendedCpu-CpuCount$cpuCount.stderr.log") -Force
+            Save-MirrorSmokeLogs "$profile-ExtendedCpu-CpuCount$cpuCount"
         }
         # A removed shared alias must fault on an AP, and a missing shootdown
         # ACK must stop unmap before returning a frame for allocator reuse.
         foreach ($fault in @('SmpUnmap', 'SmpTlbTimeout')) {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -CpuCount 4 -Fault $fault -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
-            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-$fault.serial.log") -Force
-            Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-$fault.stderr.log") -Force
+            Save-MirrorSmokeLogs "$profile-$fault"
         }
         # Both PIT selection paths retain the APIC/SMP backend and must still
         # preempt userspace after explicit policy or a rejected calibration.
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -PitTimer -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-PitTimer-CpuCount4.serial.log") -Force
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-PitTimer-CpuCount4.stderr.log") -Force
+        Save-MirrorSmokeLogs "$profile-PitTimer-CpuCount4"
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Fault TimerCalibration -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-TimerCalibration-CpuCount4.serial.log") -Force
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-TimerCalibration-CpuCount4.stderr.log") -Force
+        Save-MirrorSmokeLogs "$profile-TimerCalibration-CpuCount4"
         # An optional elapsed-time clock must not change IRQ timer behavior.
         # Cover absent hardware with both controllers and active-device cleanup.
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -NoHpet -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-NoHpet-CpuCount4.serial.log") -Force
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-NoHpet-CpuCount4.stderr.log") -Force
+        Save-MirrorSmokeLogs "$profile-NoHpet-CpuCount4"
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -NoHpet -LegacyPic -CpuCount 1 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-NoHpet-LegacyPic.serial.log") -Force
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-NoHpet-LegacyPic.stderr.log") -Force
+        Save-MirrorSmokeLogs "$profile-NoHpet-LegacyPic"
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Fault ClockActivation -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-ClockActivation-CpuCount4.serial.log") -Force
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-ClockActivation-CpuCount4.stderr.log") -Force
+        Save-MirrorSmokeLogs "$profile-ClockActivation-CpuCount4"
         # Explicit boot policy must keep the legacy PIC/PIT backend functional,
         # including userspace preemption and PS/2 input. OVMF still needs APIC
         # hardware during firmware startup, so retain the CPU's APIC feature.
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -LegacyPic -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-LegacyPic.serial.log") -Force
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-LegacyPic.stderr.log") -Force
+        Save-MirrorSmokeLogs "$profile-LegacyPic"
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -LegacyPic -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-LegacyPic-CpuCount4.serial.log") -Force
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-LegacyPic-CpuCount4.stderr.log") -Force
+        Save-MirrorSmokeLogs "$profile-LegacyPic-CpuCount4"
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -NoDisplayDevice -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-NoDisplayDevice.serial.log") -Force
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-NoDisplayDevice.stderr.log") -Force
+        Save-MirrorSmokeLogs "$profile-NoDisplayDevice"
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -NoTestDisk -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-NoTestDisk.serial.log") -Force
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-NoTestDisk.stderr.log") -Force
+        Save-MirrorSmokeLogs "$profile-NoTestDisk"
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -NoKeyboard -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/serial.log') -Destination (Join-Path $logDirectory "$profile-NoKeyboard.serial.log") -Force
-        Copy-Item -LiteralPath (Join-Path $repositoryRoot 'build/qemu.stderr.log') -Destination (Join-Path $logDirectory "$profile-NoKeyboard.stderr.log") -Force
+        Save-MirrorSmokeLogs "$profile-NoKeyboard"
 
         & (Join-Path $PSScriptRoot 'build.ps1') -Release:$release -AgentDemo:$AgentDemo
         & (Join-Path $PSScriptRoot 'capture.ps1') -NoBuild -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
@@ -158,7 +158,7 @@ try {
 
     # Leave the boot tree ready for a normal run after the test cases finish.
     & (Join-Path $PSScriptRoot 'build.ps1')
-    Write-Host "All 120 kernel/userspace/device smoke cases and debug/release desktop/console captures passed. Logs: $logDirectory"
+    Write-Host "All $smokeBoots kernel/userspace/device smoke cases and debug/release desktop/console captures passed. Logs: $logDirectory"
 }
 finally {
     Pop-Location
