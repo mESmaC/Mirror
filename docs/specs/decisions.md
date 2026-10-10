@@ -146,6 +146,7 @@ Source interviews: the 2026-10-09 spec interview, then the 2026-10-09 gap interv
 | --- | --- | --- |
 | P1 | Specs live in `docs/specs/` as small numbered files following the template in README.md. Nothing is built from unconfirmed decisions. | confirmed |
 | P2 | Cameron dispatches agents. Claude proposes non-blocking side tasks on request. Kimi stays on UI. Kimi's UI work is design, mostly outside Rust, and blocks nothing: Cameron passes its details on when it is ready, and specs marked "with Kimi" proceed without waiting for it. (Amended 2026-10-10.) | confirmed |
+| P2a | Kimi's design files in `docs/design/` are design references, not contracts. A spec that builds UI cites the sections it uses and confirms the specific values it adopts in its own decision table; where a page and a confirmed decision disagree, the decision wins and the page is revised. (Cameron, 2026-10-10, when merging Kimi's `design/design-system` branch.) | confirmed |
 | P3 | CI is deferred. Work is mostly one agent at a time. | confirmed |
 | P4 | The license is deferred while the repo is private. Every adopted dependency's license is recorded. | confirmed |
 | P5a | Pin the Rust toolchain to 1.99.0 and bump it deliberately. (Amended 2026-10-10: 1.96.0 became 1.99.0, the stable compiler already on the development machine. With `rust-version = "1.99"` the only new clippy finding is at `kernel/src/usb.rs:538`, which 0011 fixes.) | confirmed |
@@ -202,7 +203,7 @@ State after the 2026-10-09 gap interview, its write-up and its addendum, the 202
    - Absolute VNC pointer events not reaching vmmouse (0017c check 8, 0018 open question 9). Recommended fallback: 0018-D12's corner homing.
    - `monitor_control.restrict_backdoor` after 0017c check 7: item 2.
 
-Kimi's UI branch is not on the remote yet. It blocks nothing (P2), and AGENTS.md keeps the placeholder "name supplied by Cameron" until Cameron passes the details on.
+Kimi's UI branch is `design/design-system`, kept in Kimi's own clone. Its five design pages were merged into `docs/design/` on 2026-10-10 as references (P2a). `docs/design/README.md` lists the review notes Kimi should address; none blocks anything (P2).
 
 **Spec-map placements Claude inferred** (for Cameron's awareness, not blocking): S2b's boot-time ext2 checker in 0064; the per-CPU SYSCALL entry rework in 0050.
 

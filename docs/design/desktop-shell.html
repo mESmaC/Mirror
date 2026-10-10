@@ -1,0 +1,1686 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mirror Shell — concept sample</title>
+<style>
+/* ============================================================
+   Mirror desktop shell — interactive concept sample
+   Launcher · window switching · dock · notifications · quick settings
+   Built on the approved design-system tokens. Single file, no deps.
+   ============================================================ */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --font-ui: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+  --pg-bg: #0E1219;
+  --pg-text: #D5DCE8;
+  --pg-tertiary: #5C6B84;
+  --pg-accent: #4FD8C2;
+}
+
+#desktop[data-theme="dark"] {
+  --base: #0B0F16; --surface: #121826; --elevated: #1A2334; --overlay: #232E44;
+  --border-subtle: #26314A; --border-strong: #3B4A6B;
+  --text-primary: #ECF1F9; --text-secondary: #A6B2C7; --text-tertiary: #71809A;
+  --accent: #4FD8C2; --accent-hover: #71E3D1; --accent-pressed: #38BFA9; --on-accent: #052B25;
+  --accent-subtle: #123A35; --accent-subtle-text: #7CE7D4;
+  --success: #34D399; --success-bg: #0F2E25;
+  --warning: #FBBF24; --warning-bg: #2E2410;
+  --danger: #F87171; --danger-bg: #381A1F; --on-danger: #2B0B0B;
+  --info: #60A5FA; --info-bg: #16283F;
+  --ring: rgba(79, 216, 194, .32); --focus-ring: #71E3D1;
+  --shadow-1: 0 1px 2px rgba(0,0,0,.35);
+  --shadow-2: 0 4px 14px rgba(0,0,0,.45), 0 1px 3px rgba(0,0,0,.4);
+  --shadow-3: 0 18px 48px rgba(0,0,0,.6), 0 4px 12px rgba(0,0,0,.45);
+  --wallpaper: radial-gradient(1100px 620px at 10% -10%, #123A35 0%, transparent 55%),
+               radial-gradient(950px 640px at 108% 112%, #1A2340 0%, transparent 55%),
+               linear-gradient(160deg, #0B0F16 0%, #0E1420 100%);
+  --glass: rgba(18, 24, 38, .66);
+  --window-glass: rgba(18, 24, 38, .74);
+  --glass-edge: rgba(255, 255, 255, .06);
+  --sheen: rgba(255, 255, 255, .045);
+}
+#desktop[data-theme="light"] {
+  --base: #F3F5F9; --surface: #FFFFFF; --elevated: #FFFFFF; --overlay: #EEF2F7;
+  --border-subtle: #E2E8F1; --border-strong: #C6D0DF;
+  --text-primary: #0F1726; --text-secondary: #475569; --text-tertiary: #5D6B82;
+  --accent: #0B7C6F; --accent-hover: #0A6C61; --accent-pressed: #085A50; --on-accent: #FFFFFF;
+  --accent-subtle: #E2F3EE; --accent-subtle-text: #0B5F55;
+  --success: #047857; --success-bg: #E7F7F0;
+  --warning: #B45309; --warning-bg: #FBF0DC;
+  --danger: #C81E1E; --danger-bg: #FCEBEB; --on-danger: #FFFFFF;
+  --info: #2563EB; --info-bg: #EBF1FE;
+  --ring: rgba(11, 124, 111, .32); --focus-ring: #0B7C6F;
+  --shadow-1: 0 1px 2px rgba(15,23,38,.07), 0 1px 3px rgba(15,23,38,.05);
+  --shadow-2: 0 4px 12px rgba(15,23,38,.10), 0 2px 4px rgba(15,23,38,.06);
+  --shadow-3: 0 16px 40px rgba(15,23,38,.16), 0 4px 10px rgba(15,23,38,.08);
+  --wallpaper: radial-gradient(1100px 600px at 12% -10%, #D9EDE9 0%, transparent 55%),
+               radial-gradient(900px 620px at 105% 110%, #DDE4F5 0%, transparent 55%),
+               linear-gradient(160deg, #F4F6FA 0%, #E9EEF5 100%);
+  --glass: rgba(255, 255, 255, .72);
+  --window-glass: rgba(255, 255, 255, .68);
+  --glass-edge: rgba(255, 255, 255, .7);
+  --sheen: rgba(255, 255, 255, .35);
+}
+
+html, body { height: 100%; }
+body { background: var(--pg-bg); font-family: var(--font-ui); overflow: hidden; user-select: none; -webkit-user-select: none; }
+textarea, input { user-select: text; -webkit-user-select: text; }
+
+#desktop { position: fixed; inset: 0; background: var(--wallpaper); color: var(--text-primary); overflow: hidden; }
+#desktop::before { content: ""; position: absolute; inset: 0; pointer-events: none;
+  background-image: radial-gradient(circle, rgba(140,160,190,.05) 1px, transparent 1px); background-size: 28px 28px; }
+#desktop[data-theme="light"]::before { background-image: radial-gradient(circle, rgba(60,80,110,.06) 1px, transparent 1px); }
+
+.ic { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+
+/* ---------- Top bar ---------- */
+.topbar { position: absolute; top: 0; left: 0; right: 0; height: 52px; display: flex; align-items: center; padding: 0 16px; z-index: 100; }
+.brand { display: flex; align-items: center; gap: 8px; font-size: 13.5px; font-weight: 650; color: var(--text-primary); letter-spacing: .01em; }
+.brand .ic { width: 22px; height: 22px; color: var(--accent); }
+.status { margin-left: auto; display: flex; align-items: center; gap: 2px; background: var(--glass); border: 1px solid var(--border-subtle); border-radius: 999px; padding: 4px; backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); box-shadow: var(--shadow-1); }
+.cell { position: relative; display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 9px; border: 0; border-radius: 999px; background: none; color: var(--text-secondary); font-family: var(--font-ui); font-size: 11.5px; font-weight: 600; font-variant-numeric: tabular-nums; cursor: pointer; transition: background .12s, color .12s; }
+.cell:hover { background: var(--overlay); color: var(--text-primary); }
+.cell:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+.cell .ic { width: 14px; height: 14px; }
+.cell.on { color: var(--accent-subtle-text); background: var(--accent-subtle); }
+.badge { position: absolute; top: 1px; right: 1px; min-width: 13px; height: 13px; border-radius: 999px; background: var(--danger); color: var(--on-danger); font-size: 8.5px; font-weight: 700; display: flex; align-items: center; justify-content: center; padding: 0 3px; }
+
+/* ---------- Dock ---------- */
+.dock { position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 5px; padding: 7px; background: var(--glass); border: 1px solid var(--border-subtle); border-radius: 17px; box-shadow: var(--shadow-2); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); z-index: 100; }
+.tile { position: relative; width: 42px; height: 42px; border: 0; border-radius: 11px; display: flex; align-items: center; justify-content: center; color: var(--text-secondary); background: transparent; cursor: pointer; transition: background .12s, transform .12s, color .12s; }
+.tile .ic { width: 20px; height: 20px; }
+.tile:hover { background: var(--overlay); color: var(--text-primary); transform: translateY(-2px); }
+.tile:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+.tile.launcher { color: var(--accent); }
+.tile.active { background: var(--accent-subtle); color: var(--accent-subtle-text); }
+.tile .dot { position: absolute; bottom: -4px; left: 50%; margin-left: -2.5px; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); opacity: 0; transition: opacity .15s; }
+.tile.running .dot { opacity: 1; }
+.dock .sep { width: 1px; height: 30px; background: var(--border-subtle); margin: 0 3px; }
+.tile::after { content: attr(data-tip); position: absolute; bottom: calc(100% + 11px); left: 50%; transform: translateX(-50%) translateY(2px); background: var(--text-primary); color: var(--base); font-size: 11px; font-weight: 500; padding: 4px 9px; border-radius: 6px; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity .12s, transform .12s; }
+.tile:hover::after { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* ---------- Windows ---------- */
+#windows { position: absolute; inset: 0; z-index: 10; pointer-events: none; }
+.window { position: absolute; width: 348px; background: var(--window-glass); border: 1px solid var(--border-strong); border-radius: 12px; box-shadow: var(--shadow-3), inset 0 1px 0 var(--glass-edge); overflow: hidden; pointer-events: auto; display: flex; flex-direction: column; backdrop-filter: blur(14px) saturate(1.25); -webkit-backdrop-filter: blur(14px) saturate(1.25); animation: win-in .18s cubic-bezier(.2,.8,.2,1); transition: border-color .15s, box-shadow .15s; }
+.window::before { content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; background: linear-gradient(135deg, var(--sheen), transparent 42%); }
+@keyframes win-in { from { opacity: 0; transform: translateY(6px) scale(.985); } to { opacity: 1; transform: none; } }
+.window.anim { transition: left .18s cubic-bezier(.2,.8,.2,1), top .18s cubic-bezier(.2,.8,.2,1), width .18s cubic-bezier(.2,.8,.2,1), height .18s cubic-bezier(.2,.8,.2,1), border-color .15s, box-shadow .15s; }
+.window.minimizing { animation: min-out .15s ease-in forwards; }
+@keyframes min-out { to { opacity: 0; transform: translateY(10px) scale(.98); } }
+.window.unfocused { border-color: var(--border-subtle); box-shadow: var(--shadow-1); }
+.window.min { display: none; }
+.window.ws-hidden { display: none; }
+.rh { position: absolute; z-index: 6; }
+.rh-n { top: 0; left: 10px; right: 10px; height: 6px; cursor: ns-resize; }
+.rh-s { bottom: 0; left: 10px; right: 10px; height: 6px; cursor: ns-resize; }
+.rh-e { right: 0; top: 10px; bottom: 10px; width: 6px; cursor: ew-resize; }
+.rh-w { left: 0; top: 10px; bottom: 10px; width: 6px; cursor: ew-resize; }
+.rh-ne { right: 0; top: 0; width: 12px; height: 12px; cursor: nesw-resize; }
+.rh-sw { left: 0; bottom: 0; width: 12px; height: 12px; cursor: nesw-resize; }
+.rh-nw { left: 0; top: 0; width: 12px; height: 12px; cursor: nwse-resize; }
+.rh-se { right: 0; bottom: 0; width: 12px; height: 12px; cursor: nwse-resize; }
+.grip { position: absolute; right: 8px; bottom: 7px; width: 12px; height: 12px; pointer-events: none; opacity: 0; transition: opacity .12s; }
+.window:hover .grip { opacity: .55; }
+.grip i { position: absolute; right: 0; height: 1.5px; border-radius: 1px; background: var(--text-tertiary); transform: rotate(-45deg); transform-origin: right center; }
+.grip i:nth-child(1) { width: 5px; bottom: 1px; }
+.grip i:nth-child(2) { width: 9px; bottom: 4px; }
+.grip i:nth-child(3) { width: 12px; bottom: 7px; }
+.snap-preview { position: absolute; border-radius: 12px; border: 1.5px solid var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); backdrop-filter: blur(10px) saturate(1.3); -webkit-backdrop-filter: blur(10px) saturate(1.3); box-shadow: 0 0 0 3px var(--ring), inset 0 0 28px color-mix(in srgb, var(--accent) 9%, transparent); display: none; z-index: 90; pointer-events: none; transition: left .13s cubic-bezier(.2,.8,.2,1), top .13s cubic-bezier(.2,.8,.2,1), width .13s cubic-bezier(.2,.8,.2,1), height .13s cubic-bezier(.2,.8,.2,1); animation: snap-in .16s cubic-bezier(.2,.8,.2,1); }
+@keyframes snap-in { from { opacity: 0; transform: scale(.985); } to { opacity: 1; transform: none; } }
+.ws-pill { display: flex; align-items: center; gap: 8px; margin-left: 14px; height: 30px; padding: 0 12px; border-radius: 999px; background: var(--glass); border: 1px solid var(--border-subtle); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); color: var(--text-secondary); font-family: var(--font-mono); font-size: 10.5px; font-weight: 600; letter-spacing: .08em; cursor: pointer; box-shadow: var(--shadow-1); transition: background .12s, color .12s; }
+.ws-pill:hover { background: var(--overlay); color: var(--text-primary); }
+.ws-pill .wdots { display: flex; gap: 3px; }
+.ws-pill .wd { width: 5px; height: 5px; border-radius: 50%; background: var(--border-strong); transition: background .15s; }
+.ws-pill .wd.on { background: var(--accent); }
+.shortcuts { position: absolute; inset: 0; z-index: 220; display: flex; align-items: center; justify-content: center; background: rgba(5, 8, 13, .42); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); opacity: 0; pointer-events: none; transition: opacity .15s; }
+#desktop[data-theme="light"] .shortcuts { background: rgba(232, 238, 246, .55); }
+.shortcuts.open { opacity: 1; pointer-events: auto; }
+.sc-card { width: 540px; max-width: calc(100vw - 48px); max-height: 80vh; overflow: auto; background: var(--elevated); border: 1px solid var(--border-subtle); border-radius: 14px; box-shadow: var(--shadow-3); padding: 4px 18px 14px; }
+.sc-head { display: flex; align-items: center; padding: 12px 0 10px; border-bottom: 1px solid var(--border-subtle); position: sticky; top: 0; background: var(--elevated); }
+.sc-head h3 { font-size: 14px; font-weight: 650; flex: 1; }
+.sc-row { display: flex; align-items: center; gap: 14px; padding: 8px 0; border-bottom: 1px solid var(--border-subtle); }
+.sc-row:last-child { border-bottom: 0; }
+.sc-keys { min-width: 208px; flex: none; color: var(--text-primary); font-size: 12px; }
+.sc-what { color: var(--text-secondary); font-size: 12.5px; }
+
+/* ---------- Guided workflows ---------- */
+.panel.tour { width: 372px; }
+.tw-card { border: 1px solid var(--border-subtle); border-radius: 10px; padding: 11px 12px 12px; margin-bottom: 10px; transition: border-color .15s; }
+.tw-card:last-child { margin-bottom: 0; }
+.tw-card.running { border-color: var(--accent); }
+.tw-card.done { border-color: color-mix(in srgb, var(--success) 55%, transparent); }
+.tw-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.tw-title { font-size: 13px; font-weight: 650; color: var(--text-primary); }
+.tw-run { height: 26px; padding: 0 10px; font-size: 11.5px; }
+.tw-steps { margin: 9px 0 0; padding: 0; list-style: none; font-size: 12px; color: var(--text-secondary); }
+.tw-steps li { padding: 2.5px 0 2.5px 18px; position: relative; }
+.tw-steps li::before { content: "·"; position: absolute; left: 4px; color: var(--text-tertiary); }
+.tw-steps li.cur { color: var(--accent-subtle-text); font-weight: 600; }
+.tw-steps li.cur::before { content: "→"; color: var(--accent); }
+.tw-steps li.done { color: var(--text-tertiary); }
+.tw-steps li.done::before { content: "✓"; color: var(--success); }
+
+/* ---------- Implementation handoff ---------- */
+.handoff { position: absolute; inset: 0; z-index: 230; display: flex; background: rgba(5, 8, 13, .55); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); opacity: 0; pointer-events: none; transition: opacity .18s; }
+#desktop[data-theme="light"] .handoff { background: rgba(232, 238, 246, .6); }
+.handoff.open { opacity: 1; pointer-events: auto; }
+.h-wrap { margin: auto; width: min(980px, calc(100vw - 48px)); max-height: calc(100vh - 110px); display: flex; flex-direction: column; background: var(--elevated); border: 1px solid var(--border-subtle); border-radius: 16px; box-shadow: var(--shadow-3); overflow: hidden; transform: translateY(8px); transition: transform .18s cubic-bezier(.2,.8,.2,1); }
+.handoff.open .h-wrap { transform: none; }
+.h-head { display: flex; align-items: center; gap: 10px; padding: 14px 18px; border-bottom: 1px solid var(--border-subtle); flex: none; }
+.h-head .ic { color: var(--accent); }
+.h-head h2 { font-size: 15px; font-weight: 650; color: var(--text-primary); letter-spacing: 0; margin: 0; }
+.h-head .doc { font-size: 12px; color: var(--text-tertiary); }
+.h-head .sp { flex: 1; }
+.h-body { overflow: auto; padding: 6px 22px 24px; }
+.h-sec { margin-top: 26px; }
+.h-sec > h3 { font-size: 13.5px; font-weight: 650; color: var(--text-primary); margin-bottom: 3px; }
+.h-sec > .h-sub { font-size: 12px; color: var(--text-tertiary); margin-bottom: 12px; max-width: 76ch; }
+.htable { width: 100%; border-collapse: collapse; border: 1px solid var(--border-subtle); border-radius: 10px; overflow: hidden; }
+.htable th { text-align: left; font-family: var(--font-mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--text-tertiary); padding: 9px 12px; border-bottom: 1px solid var(--border-subtle); font-weight: 600; background: var(--surface); }
+.htable td { padding: 7px 12px; border-bottom: 1px solid var(--border-subtle); font-size: 12px; color: var(--text-primary); vertical-align: middle; }
+.htable tr:last-child td { border-bottom: 0; }
+.htable .tk { font-family: var(--font-mono); font-size: 11px; color: var(--accent-subtle-text); }
+.htable .vl { font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary); white-space: nowrap; }
+.htable .use { color: var(--text-tertiary); font-size: 11.5px; }
+.dotc { display: inline-block; width: 11px; height: 11px; border-radius: 3px; border: 1px solid rgba(128, 140, 160, .4); vertical-align: -1.5px; margin-right: 7px; }
+.h-icons { display: grid; grid-template-columns: repeat(auto-fill, minmax(86px, 1fr)); gap: 8px; }
+.h-icon { border: 1px solid var(--border-subtle); border-radius: 9px; background: var(--surface); padding: 10px 6px 8px; text-align: center; color: var(--text-primary); }
+.h-icon .ic { width: 17px; height: 17px; }
+.h-icon .nm { font-family: var(--font-mono); font-size: 9px; color: var(--text-tertiary); margin-top: 6px; }
+.h-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.h-rules { list-style: none; padding: 0; border: 1px solid var(--border-subtle); border-radius: 10px; overflow: hidden; }
+.h-rules li { padding: 8px 12px 8px 26px; position: relative; font-size: 12px; color: var(--text-secondary); border-bottom: 1px solid var(--border-subtle); line-height: 1.5; }
+.h-rules li:last-child { border-bottom: 0; }
+.h-rules li::before { content: ""; position: absolute; left: 11px; top: 14px; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
+.h-rules b { color: var(--text-primary); font-weight: 600; }
+.h-rules code { font-family: var(--font-mono); font-size: 11px; background: var(--overlay); padding: 1px 5px; border-radius: 4px; }
+.font-spec { border: 1px solid var(--border-subtle); border-radius: 10px; padding: 12px 14px; background: var(--surface); }
+.font-spec .fs-name { font-size: 13px; font-weight: 650; margin-bottom: 3px; }
+.font-spec .fs-stack { font-family: var(--font-mono); font-size: 10px; color: var(--text-tertiary); word-break: break-word; line-height: 1.7; }
+.titlebar { height: 38px; display: flex; align-items: center; gap: 9px; padding: 0 5px 0 11px; border-bottom: 1px solid var(--border-subtle); cursor: grab; user-select: none; flex: none; }
+.titlebar:active { cursor: grabbing; }
+.app-tile { width: 20px; height: 20px; border-radius: 6px; background: var(--accent-subtle); color: var(--accent-subtle-text); display: flex; align-items: center; justify-content: center; }
+.app-tile .ic { width: 13px; height: 13px; }
+.titlebar .ttl { font-size: 13px; font-weight: 600; color: var(--text-primary); }
+.titlebar .doc { font-size: 12px; color: var(--text-tertiary); }
+.titlebar .caps { margin-left: auto; display: flex; gap: 2px; }
+.cap { width: 38px; height: 28px; border: 0; background: none; border-radius: 6px; color: var(--text-secondary); display: inline-flex; align-items: center; justify-content: center; cursor: pointer; transition: background .12s, color .12s; }
+.cap .ic { width: 13px; height: 13px; }
+.cap:hover { background: var(--overlay); color: var(--text-primary); }
+.cap.close:hover { background: var(--danger); color: var(--on-danger); }
+.cap:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
+.window.unfocused .ttl, .window.unfocused .doc { color: var(--text-tertiary); }
+.window.unfocused .cap { color: var(--text-tertiary); }
+.window.unfocused .app-tile { background: var(--overlay); color: var(--text-tertiary); }
+.wbody { padding: 14px 15px 15px; overflow: auto; }
+.wbody h3 { font-size: 15px; font-weight: 650; margin-bottom: 2px; }
+.wbody .sub { font-size: 11.5px; color: var(--text-tertiary); margin-bottom: 11px; }
+
+.btn { height: 30px; padding: 0 12px; border-radius: 6px; border: 1px solid transparent; font-family: var(--font-ui); font-size: 12.5px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; cursor: pointer; transition: background .12s, border-color .12s; }
+.btn:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.b-primary { background: var(--accent); color: var(--on-accent); }
+.b-primary:hover { background: var(--accent-hover); }
+.b-ghost { background: transparent; color: var(--text-secondary); }
+.b-ghost:hover { background: var(--overlay); color: var(--text-primary); }
+.b-secondary { background: var(--surface); border-color: var(--border-strong); color: var(--text-primary); }
+.b-secondary:hover { background: var(--overlay); }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+
+textarea.input { width: 100%; height: auto; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border-strong); background: color-mix(in srgb, var(--surface) 82%, transparent); color: var(--text-primary); font-family: var(--font-ui); font-size: 13px; resize: none; line-height: 1.5; transition: border-color .12s, box-shadow .12s; }
+textarea.input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--ring); }
+textarea.input::placeholder { color: var(--text-tertiary); }
+.win-foot { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+.win-foot .note { font-size: 11px; color: var(--text-tertiary); margin-right: auto; display: flex; align-items: center; gap: 5px; }
+.win-foot .note .ic { width: 12px; height: 12px; }
+
+.big-count { font-family: var(--font-mono); font-size: 34px; font-weight: 600; color: var(--text-primary); font-variant-numeric: tabular-nums; letter-spacing: .02em; }
+.count-box { border: 1px solid var(--border-subtle); border-radius: 8px; background: color-mix(in srgb, var(--base) 62%, transparent); padding: 14px; text-align: center; }
+
+.icon-btn:disabled { opacity: .35; cursor: not-allowed; }
+
+/* compact files + terminal (shared patterns with docs/design/apps.html) */
+.sb { display: flex; align-items: center; gap: 6px; padding: 7px 9px; border-bottom: 1px solid var(--border-subtle); }
+.crumbs { display: flex; align-items: center; gap: 1px; font-size: 12px; overflow: hidden; }
+.crumb-b { border: 0; background: none; color: var(--text-secondary); font-family: var(--font-ui); font-size: 12px; font-weight: 550; padding: 3px 6px; border-radius: 5px; cursor: pointer; white-space: nowrap; }
+.crumb-b:hover { background: var(--overlay); color: var(--text-primary); }
+.crumb-b.cur { color: var(--text-primary); font-weight: 650; }
+.c-sep { width: 10px; height: 10px; color: var(--text-tertiary); }
+.sh-list { padding: 5px 6px; max-height: 192px; overflow: auto; }
+.sh-li { display: flex; align-items: center; gap: 8px; padding: 6px 9px; border-radius: 7px; cursor: pointer; font-size: 12.5px; color: var(--text-primary); }
+.sh-li:hover { background: var(--overlay); }
+.sh-li .ic { width: 14px; height: 14px; color: var(--text-secondary); }
+.sh-li.dir .ic { color: var(--accent); }
+.sh-li .fsz { margin-left: auto; font-family: var(--font-mono); font-size: 10px; color: var(--text-tertiary); }
+.sh-status { border-top: 1px solid var(--border-subtle); padding: 5px 11px; font-size: 10.5px; color: var(--text-tertiary); display: flex; gap: 6px; }
+.sh-status .right { margin-left: auto; }
+.sh-empty { padding: 18px 12px; text-align: center; color: var(--text-tertiary); font-size: 12px; line-height: 1.6; }
+.t-out { font-family: var(--font-mono); font-size: 11px; line-height: 1.8; padding: 10px 12px; height: 172px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+.t-in { display: flex; align-items: center; gap: 7px; border-top: 1px solid var(--border-subtle); padding: 8px 12px; }
+.t-in .t-p { font-family: var(--font-mono); font-size: 11px; color: var(--accent); flex: none; }
+.t-in input { flex: 1; border: 0; background: none; outline: none; color: var(--text-primary); font-family: var(--font-mono); font-size: 11px; }
+.t-p { color: var(--accent); }
+.t-dim { color: var(--text-tertiary); }
+.t-err { color: var(--danger); }
+.t-ok { color: var(--success); }
+.t-info { color: var(--info); }
+.t-line { display: flex; align-items: center; gap: 8px; }
+
+.set-row { display: flex; align-items: center; gap: 10px; padding: 9px 2px; border-bottom: 1px solid var(--border-subtle); }
+.set-row:last-child { border-bottom: 0; }
+.set-row .sn { font-size: 13px; color: var(--text-primary); }
+.set-row .sd { font-size: 11px; color: var(--text-tertiary); margin-top: 1px; }
+.set-row .sw2 { margin-left: auto; }
+.sw2 { width: 34px; height: 20px; border-radius: 999px; background: var(--border-strong); position: relative; flex: none; transition: background .15s; cursor: pointer; border: 0; }
+.sw2::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.3); transition: left .15s; }
+.sw2.on { background: var(--accent); }
+.sw2.on::after { left: 16px; }
+.sw2:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+
+/* ---------- Command palette (full screen) ---------- */
+.palette { position: absolute; inset: 0; z-index: 200; display: flex; overflow: auto; background: rgba(5, 8, 13, .42); backdrop-filter: blur(9px) saturate(1.12); -webkit-backdrop-filter: blur(9px) saturate(1.12); opacity: 0; pointer-events: none; transition: opacity .18s ease; }
+#desktop[data-theme="light"] .palette { background: rgba(232, 238, 246, .55); }
+.palette.open { opacity: 1; pointer-events: auto; }
+.pal-wrap { margin: auto; width: min(920px, calc(100vw - 56px)); transform: translateY(10px) scale(.985); transition: transform .18s cubic-bezier(.2,.8,.2,1); }
+.palette.open .pal-wrap { transform: none; }
+.pal-search { display: flex; align-items: center; gap: 12px; background: var(--elevated); border: 1px solid var(--border-subtle); border-radius: 14px; box-shadow: var(--shadow-3); padding: 15px 18px; }
+.pal-search .ic { width: 20px; height: 20px; color: var(--text-tertiary); }
+.pal-search input { flex: 1; border: 0; background: none; outline: none; color: var(--text-primary); font-family: var(--font-ui); font-size: 19px; }
+.pal-search input::placeholder { color: var(--text-tertiary); }
+.pal-search .kbd { flex: none; }
+.pal-grid { display: grid; grid-template-columns: 1fr 296px; gap: 14px; margin-top: 14px; align-items: start; }
+.pal-main { background: var(--elevated); border: 1px solid var(--border-subtle); border-radius: 14px; box-shadow: var(--shadow-2); padding: 10px; min-height: 210px; max-height: 54vh; overflow: auto; }
+.pal-side { display: flex; flex-direction: column; gap: 12px; transition: opacity .15s; }
+.palette.searching .pal-side { opacity: .38; }
+.widget { background: var(--elevated); border: 1px solid var(--border-subtle); border-radius: 14px; box-shadow: var(--shadow-2); padding: 13px 15px; }
+.w-head { display: flex; align-items: center; gap: 7px; font-size: 10.5px; font-weight: 650; letter-spacing: .1em; text-transform: uppercase; color: var(--text-tertiary); margin-bottom: 9px; }
+.w-head .ic { width: 13px; height: 13px; }
+.w-big { font-family: var(--font-mono); font-size: 24px; font-weight: 600; color: var(--text-primary); font-variant-numeric: tabular-nums; letter-spacing: .02em; }
+.w-sub { font-size: 11.5px; color: var(--text-tertiary); margin-top: 2px; }
+.w-row { display: flex; align-items: center; justify-content: space-between; font-size: 12px; color: var(--text-secondary); padding: 3px 0; }
+.w-row .w-val { font-family: var(--font-mono); font-size: 11px; color: var(--text-primary); }
+.w-quote { font-family: var(--font-mono); font-size: 12px; color: var(--accent-subtle-text); background: var(--accent-subtle); border-radius: 8px; padding: 8px 10px; word-break: break-word; }
+.pal-foot { margin-top: 14px; text-align: center; font-size: 11px; color: var(--text-secondary); }
+.pal-foot .kbd { background: var(--glass); }
+
+/* ---------- Start menu (normal launcher) ---------- */
+.startmenu { position: absolute; left: 50%; bottom: 76px; transform: translateX(-50%) translateY(8px); width: 452px; max-width: calc(100vw - 40px); background: var(--elevated); border: 1px solid var(--border-subtle); border-radius: 14px; box-shadow: var(--shadow-3); z-index: 200; padding: 12px; opacity: 0; pointer-events: none; transition: opacity .15s, transform .15s; }
+.startmenu.open { opacity: 1; pointer-events: auto; transform: translateX(-50%) translateY(0); }
+.sm-head { display: flex; align-items: center; gap: 10px; padding: 2px 2px 10px; }
+.sm-title { font-size: 12px; font-weight: 650; letter-spacing: .1em; text-transform: uppercase; color: var(--text-tertiary); }
+.sm-search { margin-left: auto; display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 10px; border-radius: 8px; border: 1px solid var(--border-subtle); background: var(--base); color: var(--text-tertiary); font-family: var(--font-ui); font-size: 12px; cursor: pointer; transition: border-color .12s, color .12s; }
+.sm-search:hover { border-color: var(--border-strong); color: var(--text-secondary); }
+.sm-search .ic { width: 13px; height: 13px; }
+.sm-search .kbd { margin-left: 4px; }
+.sm-grid { padding: 2px 0 6px; }
+.sm-recent { padding-bottom: 4px; }
+.sm-foot { display: flex; align-items: center; gap: 4px; border-top: 1px solid var(--border-subtle); padding: 8px 2px 2px; }
+.sm-user { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-tertiary); padding-left: 6px; flex: 1; }
+.l-sec { font-size: 10.5px; font-weight: 650; letter-spacing: .1em; text-transform: uppercase; color: var(--text-tertiary); padding: 9px 9px 5px; }
+.l-apps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.l-app { display: flex; flex-direction: column; align-items: center; gap: 7px; padding: 12px 6px 10px; border-radius: 10px; cursor: pointer; border: 1px solid transparent; background: none; font-family: var(--font-ui); }
+.l-app:hover { background: var(--overlay); }
+.l-app.sel { background: var(--overlay); border-color: var(--accent); }
+.l-app .a-tile { width: 38px; height: 38px; border-radius: 10px; background: var(--accent-subtle); color: var(--accent-subtle-text); display: flex; align-items: center; justify-content: center; }
+.l-app .a-tile .ic { width: 19px; height: 19px; }
+.l-app .an { font-size: 12px; font-weight: 550; color: var(--text-primary); }
+.l-row { display: flex; align-items: center; gap: 10px; padding: 7px 9px; border-radius: 8px; cursor: pointer; font-size: 13px; color: var(--text-primary); background: none; border: 0; font-family: var(--font-ui); width: 100%; text-align: left; }
+.l-row .ic { color: var(--text-secondary); }
+.l-row:hover, .l-row.sel { background: var(--overlay); }
+.l-row.sel { box-shadow: inset 2px 0 0 var(--accent); }
+.l-row .hint { margin-left: auto; color: var(--text-tertiary); font-size: 11px; }
+.l-empty { padding: 28px; text-align: center; color: var(--text-tertiary); font-size: 12.5px; }
+.pal-main::-webkit-scrollbar, .pal-side::-webkit-scrollbar, .p-body::-webkit-scrollbar, .wbody::-webkit-scrollbar { width: 8px; }
+.pal-main::-webkit-scrollbar-thumb, .pal-side::-webkit-scrollbar-thumb, .p-body::-webkit-scrollbar-thumb, .wbody::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+.pal-main::-webkit-scrollbar-track, .pal-side::-webkit-scrollbar-track, .p-body::-webkit-scrollbar-track, .wbody::-webkit-scrollbar-track { background: transparent; }
+.kbd { font-family: var(--font-mono); font-size: 9.5px; border: 1px solid var(--border-strong); border-bottom-width: 2px; border-radius: 5px; padding: 1px 5px; color: var(--text-secondary); margin-right: 3px; }
+
+/* ---------- Switcher ---------- */
+.switcher { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(5, 8, 13, .38); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); z-index: 210; opacity: 0; pointer-events: none; transition: opacity .15s; }
+#desktop[data-theme="light"] .switcher { background: rgba(90, 105, 130, .28); }
+.switcher.open { opacity: 1; pointer-events: auto; }
+.sw-wrap { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+.sw-cards { display: flex; gap: 14px; padding: 16px; background: var(--glass); border: 1px solid var(--border-subtle); border-radius: 16px; box-shadow: var(--shadow-3); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); }
+.sw-card { width: 172px; cursor: pointer; border-radius: 10px; border: 1px solid var(--border-subtle); background: var(--surface); overflow: hidden; transition: transform .12s, border-color .12s, box-shadow .12s; }
+.sw-card:hover { transform: translateY(-2px); }
+.sw-card.sel { border-color: var(--accent); box-shadow: 0 0 0 3px var(--ring); transform: translateY(-3px); }
+.sw-thumb { height: 92px; background: var(--base); padding: 10px; }
+.sw-mini { background: var(--surface); border: 1px solid var(--border-subtle); border-radius: 6px; height: 100%; overflow: hidden; }
+.sw-mtb { height: 13px; border-bottom: 1px solid var(--border-subtle); display: flex; align-items: center; gap: 3px; padding: 0 5px; }
+.sw-mtb i { width: 3px; height: 3px; border-radius: 50%; background: var(--border-strong); }
+.sw-lines { padding: 7px 8px; display: flex; flex-direction: column; gap: 5px; }
+.sw-lines i { display: block; height: 4px; border-radius: 2px; background: var(--overlay); border: 1px solid var(--border-subtle); }
+.sw-lines i.acc { background: var(--accent-subtle); border-color: transparent; }
+.sw-num { font-family: var(--font-mono); font-size: 16px; color: var(--accent); padding: 6px 8px 0; }
+.sw-name { display: flex; gap: 7px; align-items: center; padding: 8px 10px; font-size: 12px; font-weight: 600; color: var(--text-primary); }
+.sw-name .ic { width: 13px; height: 13px; color: var(--text-secondary); }
+.sw-hint { color: var(--text-tertiary); font-size: 11px; }
+
+/* ---------- Panels (notification center / quick settings) ---------- */
+.panel { position: absolute; top: 58px; right: 16px; width: 346px; max-height: calc(100vh - 170px); background: var(--elevated); border: 1px solid var(--border-subtle); border-radius: 14px; box-shadow: var(--shadow-3); z-index: 200; opacity: 0; pointer-events: none; transform: translateY(-6px); transition: opacity .15s, transform .15s; display: flex; flex-direction: column; }
+.panel.open { opacity: 1; pointer-events: auto; transform: none; }
+.p-head { display: flex; align-items: center; gap: 8px; padding: 13px 14px 11px; border-bottom: 1px solid var(--border-subtle); flex: none; }
+.p-head h3 { font-size: 13.5px; font-weight: 650; color: var(--text-primary); flex: 1; }
+.p-head .btn { height: 26px; padding: 0 9px; font-size: 11.5px; }
+.p-body { overflow: auto; padding: 8px; }
+.n-sec { font-size: 10.5px; font-weight: 650; text-transform: uppercase; letter-spacing: .1em; color: var(--text-tertiary); padding: 8px 10px 5px; }
+.n-item { display: flex; gap: 10px; padding: 10px; border-radius: 10px; position: relative; transition: background .12s; }
+.n-item:hover { background: var(--overlay); }
+.n-ic { width: 30px; height: 30px; border-radius: 8px; background: var(--accent-subtle); color: var(--accent-subtle-text); display: flex; align-items: center; justify-content: center; flex: none; }
+.n-ic .ic { width: 15px; height: 15px; }
+.n-ic.ok { background: var(--success-bg); color: var(--success); }
+.n-ic.warn { background: var(--warning-bg); color: var(--warning); }
+.n-ic.err { background: var(--danger-bg); color: var(--danger); }
+.n-ic.info { background: var(--info-bg); color: var(--info); }
+.n-title { font-size: 12.5px; font-weight: 600; color: var(--text-primary); }
+.n-body { font-size: 12px; color: var(--text-secondary); margin-top: 1px; line-height: 1.45; }
+.n-time { font-size: 10.5px; color: var(--text-tertiary); margin-top: 3px; font-family: var(--font-mono); }
+.n-x { position: absolute; top: 7px; right: 7px; width: 22px; height: 22px; border: 0; border-radius: 6px; background: none; color: var(--text-tertiary); cursor: pointer; display: flex; align-items: center; justify-content: center; opacity: 0; transition: opacity .12s, background .12s; }
+.n-item:hover .n-x { opacity: 1; }
+.n-x:hover { background: var(--border-subtle); color: var(--text-primary); }
+.n-x .ic { width: 11px; height: 11px; }
+.n-empty { padding: 30px 20px; text-align: center; color: var(--text-tertiary); font-size: 12.5px; }
+
+/* Quick settings */
+.qs-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 12px 12px 6px; }
+.qs-tile { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; padding: 11px 12px; border-radius: 10px; background: var(--overlay); border: 1px solid transparent; cursor: pointer; text-align: left; font-family: var(--font-ui); transition: background .12s, border-color .12s; }
+.qs-tile:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+.qs-tile .qt-ic { width: 30px; height: 30px; border-radius: 50%; background: var(--surface); display: flex; align-items: center; justify-content: center; color: var(--text-secondary); border: 1px solid var(--border-subtle); }
+.qs-tile .qt-ic .ic { width: 15px; height: 15px; }
+.qs-tile .qt-name { font-size: 12px; font-weight: 600; color: var(--text-primary); }
+.qs-tile .qt-state { font-size: 10.5px; color: var(--text-tertiary); }
+.qs-tile.on { background: var(--accent-subtle); }
+.qs-tile.on .qt-ic { background: var(--accent); color: var(--on-accent); border-color: transparent; }
+.qs-tile.on .qt-state { color: var(--accent-subtle-text); }
+.qs-tile.locked { opacity: .55; cursor: not-allowed; }
+.qs-slider { display: flex; align-items: center; gap: 11px; padding: 9px 14px; }
+.qs-slider .ic { width: 15px; height: 15px; color: var(--text-secondary); }
+.qs-slider .sv { width: 34px; text-align: right; font-family: var(--font-mono); font-size: 10.5px; color: var(--text-tertiary); }
+input[type="range"] { -webkit-appearance: none; appearance: none; flex: 1; height: 4px; border-radius: 2px; background: var(--border-subtle); outline: none; }
+input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: var(--surface); border: 1.5px solid var(--accent); cursor: pointer; box-shadow: var(--shadow-1); }
+input[type="range"]:focus-visible { box-shadow: 0 0 0 3px var(--ring); border-radius: 2px; }
+.p-foot { border-top: 1px solid var(--border-subtle); padding: 8px 10px; display: flex; gap: 6px; justify-content: flex-end; flex: none; }
+.icon-btn { width: 30px; height: 30px; border: 0; border-radius: 8px; background: none; color: var(--text-secondary); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }
+.icon-btn:hover { background: var(--overlay); color: var(--text-primary); }
+.icon-btn:focus-visible { outline: 2px solid var(--focus-ring); }
+.dnd-note { display: flex; gap: 7px; align-items: center; padding: 8px 14px 10px; font-size: 11px; color: var(--text-tertiary); }
+.dnd-note .ic { width: 12px; height: 12px; }
+
+/* ---------- Toasts ---------- */
+.toasts { position: absolute; top: 58px; right: 16px; display: flex; flex-direction: column; gap: 10px; z-index: 300; width: 320px; pointer-events: none; }
+.toast { display: flex; gap: 10px; align-items: flex-start; background: var(--elevated); border: 1px solid var(--border-subtle); border-left: 3px solid var(--accent); border-radius: 10px; box-shadow: var(--shadow-2); padding: 11px 12px; pointer-events: auto; animation: toast-in .18s cubic-bezier(.2,.8,.2,1); }
+.toast.ok { border-left-color: var(--success); } .toast.ok > .ic { color: var(--success); }
+.toast.warn { border-left-color: var(--warning); } .toast.warn > .ic { color: var(--warning); }
+.toast.err { border-left-color: var(--danger); } .toast.err > .ic { color: var(--danger); }
+.toast.info { border-left-color: var(--info); } .toast.info > .ic { color: var(--info); }
+.toast .tt { font-size: 12.5px; font-weight: 600; color: var(--text-primary); }
+.toast .tb { font-size: 11.5px; color: var(--text-secondary); margin-top: 1px; }
+.toast .tx { margin-left: auto; color: var(--text-tertiary); cursor: pointer; border: 0; background: none; border-radius: 4px; padding: 1px; }
+.toast .tx:hover { color: var(--text-primary); background: var(--overlay); }
+.toast .tx .ic { width: 12px; height: 12px; }
+.toast.out { transition: opacity .2s, transform .2s; opacity: 0; transform: translateX(14px); }
+@keyframes toast-in { from { opacity: 0; transform: translateX(14px); } to { opacity: 1; transform: none; } }
+
+/* ---------- Review chrome ---------- */
+.meta { position: fixed; left: 16px; bottom: 14px; font-family: var(--font-mono); font-size: 10px; letter-spacing: .1em; color: var(--pg-tertiary); text-transform: uppercase; z-index: 400; line-height: 1.8; pointer-events: none; }
+.meta b { color: var(--pg-accent); font-weight: 600; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+</style>
+</head>
+<body>
+<!-- Icon sprite: 16px grid, 1.5px stroke, round caps -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-logo" viewBox="0 0 24 24"><rect x="2.5" y="2.5" width="19" height="19" rx="5.5"/><path d="M6 18 18 6"/><path d="M7.5 12V7.5H12z" fill="currentColor" stroke="none"/><path d="M16.5 12v4.5H12z" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-min" viewBox="0 0 16 16"><path d="M4 8h8"/></symbol>
+    <symbol id="i-max" viewBox="0 0 16 16"><rect x="3.5" y="3.5" width="9" height="9" rx="1.5"/></symbol>
+    <symbol id="i-close" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></symbol>
+    <symbol id="i-notes" viewBox="0 0 16 16"><path d="M4.5 1.5h5l3 3v9a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1v-11a1 1 0 0 1 1-1z"/><path d="M9.5 1.5v3h3"/><path d="M6 9h4.5M6 11.5h4.5"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 1.5"/></symbol>
+    <symbol id="i-files" viewBox="0 0 16 16"><path d="M2 4.5a1 1 0 0 1 1-1h3l1.5 1.5H13a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="1.5"/><path d="M5 6.5 7 8l-2 1.5"/><path d="M8.5 10.5H11"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 16 16"><path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11"/><circle cx="6" cy="4.5" r="1.7"/><circle cx="10" cy="8" r="1.7"/><circle cx="4.5" cy="11.5" r="1.7"/></symbol>
+    <symbol id="i-agent" viewBox="0 0 16 16"><path d="M8 1.8l1.3 4.9 4.9 1.3-4.9 1.3L8 14.2l-1.3-4.9-4.9-1.3 4.9-1.3z"/></symbol>
+    <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4"/><path d="M10.2 10.2 13.5 13.5"/></symbol>
+    <symbol id="i-bell" viewBox="0 0 16 16"><path d="M8 2a4 4 0 0 1 4 4v2.5l1.2 2.5H2.8L4 8.5V6a4 4 0 0 1 4-4z"/><path d="M6.5 13a1.5 1.5 0 0 0 3 0"/></symbol>
+    <symbol id="i-check" viewBox="0 0 16 16"><path d="M3 8.5l3.2 3L13 4.5"/></symbol>
+    <symbol id="i-warning" viewBox="0 0 16 16"><path d="M8 2.5 14.5 13h-13z"/><path d="M8 6.5v3"/><path d="M8 11h.01"/></symbol>
+    <symbol id="i-error" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M5.8 5.8l4.4 4.4M10.2 5.8l-4.4 4.4"/></symbol>
+    <symbol id="i-info" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 7.5V11"/><path d="M8 5h.01"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></symbol>
+    <symbol id="i-file" viewBox="0 0 16 16"><path d="M4.5 1.5h5l3 3v9a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1v-11a1 1 0 0 1 1-1z"/><path d="M9.5 1.5v3h3"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.6"/><path d="M8 1.5v1.8M8 12.7v1.8M1.5 8h1.8M12.7 8h1.8M3.4 3.4l1.3 1.3M11.3 11.3l1.3 1.3M12.6 3.4l-1.3 1.3M4.7 11.3l-1.3 1.3"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 16 16"><path d="M13.6 9.6A6 6 0 0 1 6.4 2.4a6 6 0 1 0 7.2 7.2z"/></symbol>
+    <symbol id="i-volume" viewBox="0 0 16 16"><path d="M2.5 6v4h2.5L9 13V3L5 6z"/><path d="M11 6a3 3 0 0 1 0 4"/></symbol>
+    <symbol id="i-wifi" viewBox="0 0 16 16"><path d="M2.5 5.8a8.5 8.5 0 0 1 11 0"/><path d="M5 8.6a5.4 5.4 0 0 1 6 0"/><path d="M8 11.4h.01"/></symbol>
+    <symbol id="i-back" viewBox="0 0 16 16"><path d="M10 3.5 5.5 8l4.5 4.5"/></symbol>
+    <symbol id="i-chev-r" viewBox="0 0 16 16"><path d="M6 4l4 4-4 4"/></symbol>
+    <symbol id="i-file" viewBox="0 0 16 16"><path d="M4.5 1.5h5l3 3v9a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1v-11a1 1 0 0 1 1-1z"/><path d="M9.5 1.5v3h3"/></symbol>
+    <symbol id="i-download" viewBox="0 0 16 16"><path d="M8 2.5v7M5.5 7 8 9.5 10.5 7"/><path d="M3 12.5h10"/></symbol>
+    <symbol id="i-image" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><circle cx="5.6" cy="6.4" r="1.1"/><path d="M2.5 11.5l3-3 2.5 2.5 3.5-3.5 2 2"/></symbol>
+    <symbol id="i-power" viewBox="0 0 16 16"><path d="M8 2v5"/><path d="M4.6 4.4a5.6 5.6 0 1 0 6.8 0"/></symbol>
+    <symbol id="i-play" viewBox="0 0 16 16"><path d="M5.5 3.5v9l7.5-4.5z"/></symbol>
+    <symbol id="i-book" viewBox="0 0 16 16"><path d="M8 4C6.8 3 4.9 2.6 2.5 2.6v10c2.4 0 4.3.4 5.5 1.4 1.2-1 3.1-1.4 5.5-1.4v-10C11.1 2.6 9.2 3 8 4z"/><path d="M8 4v10"/></symbol>
+  </defs>
+</svg>
+
+<div id="desktop" data-theme="dark">
+  <div class="topbar">
+    <div class="brand"><svg class="ic"><use href="#i-logo"/></svg>Mirror</div>
+    <button class="ws-pill" id="wsPill" title="Workspace 1 of 3 — click or Ctrl+Alt+1/2/3">
+      <span id="wsLabel">W1</span>
+      <span class="wdots"><span class="wd on"></span><span class="wd"></span><span class="wd"></span></span>
+    </button>
+    <div class="status">
+      <button class="cell" id="btnTour" title="Guided workflows"><svg class="ic"><use href="#i-play"/></svg>tour</button>
+      <button class="cell" id="btnHandoff" title="Implementation handoff"><svg class="ic"><use href="#i-book"/></svg>handoff</button>
+      <button class="cell" id="btnNotif" title="Notifications"><svg class="ic"><use href="#i-bell"/></svg><span class="badge" id="bellBadge" style="display:none">0</span></button>
+      <button class="cell" id="btnAgent" title="Agent"><svg class="ic"><use href="#i-agent"/></svg>idle</button>
+      <button class="cell" id="btnQS" title="Quick settings"><svg class="ic"><use href="#i-wifi"/></svg><svg class="ic"><use href="#i-volume"/></svg></button>
+      <button class="cell" id="clock" title="Notifications">09:41</button>
+    </div>
+  </div>
+
+  <div id="windows"></div>
+  <div class="snap-preview" id="snapPrev"></div>
+
+  <div class="shortcuts" id="shortcuts" role="dialog" aria-label="Keyboard shortcuts">
+    <div class="sc-card">
+      <div class="sc-head"><h3>Keyboard shortcuts</h3><button class="icon-btn" id="scClose" title="Close"><svg class="ic"><use href="#i-close"/></svg></button></div>
+      <div class="sc-row"><span class="sc-keys"><span class="kbd">/</span> or just type</span><span class="sc-what">Command palette — apps, actions, documents, widgets</span></div>
+      <div class="sc-row"><span class="sc-keys"><span class="kbd">`</span></span><span class="sc-what">Window switcher with live previews</span></div>
+      <div class="sc-row"><span class="sc-keys"><span class="kbd">esc</span></span><span class="sc-what">Close the topmost surface</span></div>
+      <div class="sc-row"><span class="sc-keys"><span class="kbd">ctrl</span><span class="kbd">alt</span><span class="kbd">↑</span></span><span class="sc-what">Maximize / restore the focused window</span></div>
+      <div class="sc-row"><span class="sc-keys"><span class="kbd">ctrl</span><span class="kbd">alt</span><span class="kbd">↓</span></span><span class="sc-what">Minimize the focused window</span></div>
+      <div class="sc-row"><span class="sc-keys"><span class="kbd">ctrl</span><span class="kbd">alt</span><span class="kbd">←</span><span class="kbd">→</span></span><span class="sc-what">Snap to left / right half — same again floats it back</span></div>
+      <div class="sc-row"><span class="sc-keys"><span class="kbd">ctrl</span><span class="kbd">alt</span><span class="kbd">1</span>–<span class="kbd">3</span></span><span class="sc-what">Switch workspace</span></div>
+      <div class="sc-row"><span class="sc-keys"><span class="kbd">ctrl</span><span class="kbd">alt</span><span class="kbd">shift</span><span class="kbd">←</span><span class="kbd">→</span></span><span class="sc-what">Move the focused window to the adjacent workspace</span></div>
+      <div class="sc-row"><span class="sc-keys">drag to screen edges</span><span class="sc-what">Snap preview — top edge maximizes, top corners quarter-snap</span></div>
+      <div class="sc-row"><span class="sc-keys">double-click titlebar</span><span class="sc-what">Maximize / restore</span></div>
+      <div class="sc-row"><span class="sc-keys">drag any edge or corner</span><span class="sc-what">Resize — from 240 × 150 up to the work area</span></div>
+      <div class="sc-row"><span class="sc-keys">topbar buttons</span><span class="sc-what">Tour runs guided workflows · Handoff opens dimensions, tokens, assets, behavior</span></div>
+      <div class="sc-row"><span class="sc-keys"><span class="kbd">?</span></span><span class="sc-what">This list</span></div>
+    </div>
+  </div>
+
+  <div class="dock">
+    <button class="tile launcher" id="dockLauncher" data-tip="Start"><svg class="ic"><use href="#i-logo"/></svg></button>
+    <span class="sep"></span>
+    <button class="tile" data-app="notes" data-tip="Notes"><svg class="ic"><use href="#i-notes"/></svg><span class="dot"></span></button>
+    <button class="tile" data-app="counter" data-tip="Counter"><svg class="ic"><use href="#i-clock"/></svg><span class="dot"></span></button>
+    <button class="tile" data-app="files" data-tip="Files"><svg class="ic"><use href="#i-files"/></svg><span class="dot"></span></button>
+    <button class="tile" data-app="terminal" data-tip="Terminal"><svg class="ic"><use href="#i-terminal"/></svg><span class="dot"></span></button>
+    <span class="sep"></span>
+    <button class="tile" id="dockAgent" data-tip="Agent — no task granted"><svg class="ic"><use href="#i-agent"/></svg></button>
+    <button class="tile" data-app="settings" data-tip="Settings"><svg class="ic"><use href="#i-settings"/></svg><span class="dot"></span></button>
+  </div>
+
+  <div class="startmenu" id="startmenu" role="dialog" aria-label="Start">
+    <div class="sm-head">
+      <span class="sm-title">Apps</span>
+      <button class="sm-search" id="smSearch"><svg class="ic"><use href="#i-search"/></svg>Search anything…<span class="kbd">/</span></button>
+    </div>
+    <div class="l-apps sm-grid">
+      <button class="l-app" data-app="notes"><span class="a-tile"><svg class="ic"><use href="#i-notes"/></svg></span><span class="an">Notes</span></button>
+      <button class="l-app" data-app="counter"><span class="a-tile"><svg class="ic"><use href="#i-clock"/></svg></span><span class="an">Counter</span></button>
+      <button class="l-app" data-app="files"><span class="a-tile"><svg class="ic"><use href="#i-files"/></svg></span><span class="an">Files</span></button>
+      <button class="l-app" data-app="terminal"><span class="a-tile"><svg class="ic"><use href="#i-terminal"/></svg></span><span class="an">Terminal</span></button>
+      <button class="l-app" data-app="settings"><span class="a-tile"><svg class="ic"><use href="#i-settings"/></svg></span><span class="an">Settings</span></button>
+    </div>
+    <div class="l-sec">Recent documents</div>
+    <div class="sm-recent">
+      <button class="l-row" data-doc="0"><svg class="ic"><use href="#i-file"/></svg>gamma.txt<span class="hint">Notes · 96 B</span></button>
+      <button class="l-row" data-doc="1"><svg class="ic"><use href="#i-file"/></svg>roadmap.md<span class="hint">Notes · 2.1 KB</span></button>
+      <button class="l-row" data-doc="2"><svg class="ic"><use href="#i-file"/></svg>boot.log<span class="hint">Terminal · 14 KB</span></button>
+    </div>
+    <div class="sm-foot">
+      <span class="sm-user">session · local</span>
+      <button class="icon-btn" data-sm="theme" title="Toggle theme"><svg class="ic"><use href="#i-moon"/></svg></button>
+      <button class="icon-btn" data-sm="settings" title="Settings"><svg class="ic"><use href="#i-settings"/></svg></button>
+      <button class="icon-btn" data-sm="power" title="Power"><svg class="ic"><use href="#i-power"/></svg></button>
+    </div>
+  </div>
+
+  <div class="palette" id="palette" role="dialog" aria-label="Command palette">
+    <div class="pal-wrap">
+      <div class="pal-search">
+        <svg class="ic"><use href="#i-search"/></svg>
+        <input id="lInput" placeholder="Search apps, actions, documents…" autocomplete="off" spellcheck="false">
+        <span class="kbd">esc</span>
+      </div>
+      <div class="pal-grid">
+        <div class="pal-main" id="lBody"></div>
+        <div class="pal-side">
+          <div class="widget">
+            <div class="w-head"><svg class="ic"><use href="#i-clock"/></svg>Time</div>
+            <div class="w-big" id="wClock">09:41</div>
+            <div class="w-sub" id="wDate">—</div>
+          </div>
+          <div class="widget">
+            <div class="w-head"><svg class="ic"><use href="#i-clock"/></svg>Counter</div>
+            <div class="w-big" id="wTicks">—</div>
+            <div class="w-sub"><span id="wCounterState">not running</span> · ~100 ticks/s</div>
+          </div>
+          <div class="widget">
+            <div class="w-head"><svg class="ic"><use href="#i-terminal"/></svg>System</div>
+            <div class="w-row"><span>processes</span><span class="w-val" id="wProcs">2</span></div>
+            <div class="w-row"><span>memory</span><span class="w-val">62 MiB</span></div>
+            <div class="w-row"><span>theme</span><span class="w-val" id="wTheme">dark</span></div>
+          </div>
+          <div class="widget">
+            <div class="w-head"><svg class="ic"><use href="#i-notes"/></svg>Notes draft</div>
+            <div class="w-quote" id="wDraft">no draft</div>
+          </div>
+          <div class="widget">
+            <div class="w-head"><svg class="ic"><use href="#i-agent"/></svg>Agent</div>
+            <div class="w-sub">idle — no task granted</div>
+          </div>
+        </div>
+      </div>
+      <div class="pal-foot"><span class="kbd">↑↓</span> select &nbsp; <span class="kbd">↵</span> open &nbsp; <span class="kbd">esc</span> close &nbsp;·&nbsp; Mirror palette</div>
+    </div>
+  </div>
+
+  <div class="switcher" id="switcher">
+    <div class="sw-wrap">
+      <div class="sw-cards" id="swCards"></div>
+      <div class="sw-hint"><span class="kbd">←→</span> move &nbsp;·&nbsp; <span class="kbd">↵</span> focus &nbsp;·&nbsp; <span class="kbd">esc</span> close</div>
+    </div>
+  </div>
+
+  <div class="panel" id="notifPanel" aria-label="Notifications">
+    <div class="p-head"><h3>Notifications</h3><button class="btn b-ghost" id="clearAll">Clear all</button></div>
+    <div class="p-body" id="nList"></div>
+    <div class="p-foot" style="justify-content:flex-start"><span class="dnd-note" style="padding:0"><svg class="ic"><use href="#i-info"/></svg>The bell badge counts unread until this panel opens.</span></div>
+  </div>
+
+  <div class="panel" id="qsPanel" aria-label="Quick settings">
+    <div class="p-head"><h3>Quick settings</h3></div>
+    <div class="qs-grid">
+      <button class="qs-tile on" id="qsTheme"><span class="qt-ic"><svg class="ic"><use href="#i-moon"/></svg></span><span class="qt-name">Theme</span><span class="qt-state">Dark</span></button>
+      <button class="qs-tile" id="qsDnd"><span class="qt-ic"><svg class="ic"><use href="#i-bell"/></svg></span><span class="qt-name">Do not disturb</span><span class="qt-state">Off</span></button>
+      <button class="qs-tile on" id="qsNet"><span class="qt-ic"><svg class="ic"><use href="#i-wifi"/></svg></span><span class="qt-name">Network</span><span class="qt-state">mirror-net</span></button>
+      <button class="qs-tile locked" id="qsAgent" disabled><span class="qt-ic"><svg class="ic"><use href="#i-agent"/></svg></span><span class="qt-name">Agent access</span><span class="qt-state">Requires grant</span></button>
+    </div>
+    <div class="qs-slider"><svg class="ic"><use href="#i-sun"/></svg><input type="range" id="qsBright" min="0" max="100" value="80"><span class="sv" id="qsBrightV">80%</span></div>
+    <div class="qs-slider"><svg class="ic"><use href="#i-volume"/></svg><input type="range" id="qsVol" min="0" max="100" value="45"><span class="sv" id="qsVolV">45%</span></div>
+    <div class="p-foot">
+      <button class="icon-btn" id="qsSettings" title="Open Settings"><svg class="ic"><use href="#i-settings"/></svg></button>
+      <button class="icon-btn" id="qsPower" title="Power"><svg class="ic"><use href="#i-power"/></svg></button>
+    </div>
+  </div>
+
+  <div class="panel tour" id="tourPanel" aria-label="Guided workflows">
+    <div class="p-head"><h3>Guided workflows</h3><button class="btn b-ghost" id="tourStop" style="display:none">Stop</button></div>
+    <div class="p-body" id="tourBody"></div>
+    <div class="p-foot" style="justify-content:flex-start"><span class="dnd-note" style="padding:0"><svg class="ic"><use href="#i-info"/></svg>Workflows drive the real desktop — watch it happen.</span></div>
+  </div>
+
+  <div class="handoff" id="handoff" role="dialog" aria-label="Implementation handoff">
+    <div class="h-wrap">
+      <div class="h-head">
+        <svg class="ic"><use href="#i-book"/></svg>
+        <h2>Implementation handoff</h2>
+        <span class="doc">shell concept → renderer</span>
+        <span class="sp"></span>
+        <button class="icon-btn" id="hClose" title="Close"><svg class="ic"><use href="#i-close"/></svg></button>
+      </div>
+      <div class="h-body">
+        <div class="h-sec">
+          <h3>Dimensions &amp; geometry</h3>
+          <div class="h-sub">All values in CSS pixels at 100% scale. The work area excludes the top bar and dock.</div>
+          <table class="htable">
+            <tr><th>Element</th><th>Value</th><th>Notes</th></tr>
+            <tr><td class="tk">window radius / border</td><td class="vl">12 px · 1 px</td><td class="use">glass: blur 14 + saturate 1.25 over 74/68% tint</td></tr>
+            <tr><td class="tk">titlebar</td><td class="vl">38 px</td><td class="use">app tile 20 px · title 13/600</td></tr>
+            <tr><td class="tk">caption buttons</td><td class="vl">38 × 28 px</td><td class="use">inset focus ring, never clipped</td></tr>
+            <tr><td class="tk">window min size</td><td class="vl">240 × 150 px</td><td class="use">enforced during resize</td></tr>
+            <tr><td class="tk">dock tile / radius</td><td class="vl">42 px · 17 px</td><td class="use">gap 5 · padding 7 · running dot 5 px</td></tr>
+            <tr><td class="tk">controls</td><td class="vl">32 px</td><td class="use">compact 28–30 · input 34/30 · radius 6</td></tr>
+            <tr><td class="tk">focus ring</td><td class="vl">2 px + 2 px offset</td><td class="use">≥ 3:1 against any surface</td></tr>
+            <tr><td class="tk">panels</td><td class="vl">346 px wide</td><td class="use">top 58 · right 16 · radius 14</td></tr>
+            <tr><td class="tk">palette</td><td class="vl">min(920, vw−56)</td><td class="use">search 15×18 padding · grid gap 14</td></tr>
+            <tr><td class="tk">snap thresholds</td><td class="vl">20 px edges</td><td class="use">top corners ≤ 90 px → quarter zones</td></tr>
+            <tr><td class="tk">work area</td><td class="vl">viewport − 60 top − 104 bottom − 24 sides</td><td class="use">snap + maximize target</td></tr>
+            <tr><td class="tk">z-order</td><td class="vl">0 · 10–99 · 90 · 100 · 200 · 210 · 220 · 230 · 300</td><td class="use">desktop · windows · snap preview · dock/topbar · panels · switcher · shortcuts · handoff · toasts</td></tr>
+            <tr><td class="tk">motion</td><td class="vl">120 / 150–180 ms</td><td class="use">hover · fade/tween · cubic-bezier(.2,.8,.2,1)</td></tr>
+          </table>
+        </div>
+        <div class="h-sec">
+          <h3>Color tokens — both themes</h3>
+          <div class="h-sub">Generated from the spec table the shell itself consumes. A theme switch is a palette swap.</div>
+          <table class="htable" id="tokenTable"></table>
+        </div>
+        <div class="h-sec">
+          <h3>Assets</h3>
+          <div class="h-sub">No raster or font files. Icons are inline vector geometry on a 16 px grid (1.5 px stroke, round caps); the logo is a rounded square, a mirror diagonal, and two reflected triangles. Type is two system stacks.</div>
+          <div class="h-icons" id="iconGrid"></div>
+          <div class="h-cols" style="margin-top:14px">
+            <div class="font-spec"><div class="fs-name">UI — Inter / system</div><div class="fs-stack">"Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif</div></div>
+            <div class="font-spec"><div class="fs-name">Mono — code &amp; metrics</div><div class="fs-stack">"JetBrains Mono", "Cascadia Code", "Cascadia Mono", Consolas, "Liberation Mono", monospace</div></div>
+          </div>
+        </div>
+        <div class="h-sec">
+          <h3>Behavior contract</h3>
+          <div class="h-sub">The rules an implementation must reproduce.</div>
+          <div class="h-cols">
+            <ul class="h-rules">
+              <li><b>Focus:</b> click raises and focuses; unfocused chrome mutes title and tile. The ring shows only for keyboard focus (<code>:focus-visible</code>).</li>
+              <li><b>Snap:</b> dragging to an edge previews a frosted zone; dropping stores the pre-drag rect; repeat-snap or maximize restores it exactly.</li>
+              <li><b>Workspaces:</b> a window belongs to one workspace; dock clicks follow it across; the switcher shows the current workspace only.</li>
+              <li><b>Sessions:</b> apps are session-local; closing discards the document and announces it.</li>
+            </ul>
+            <ul class="h-rules">
+              <li><b>Notifications:</b> toasts cap at 3, auto-dismiss in 6 s, DND mutes; the bell counts unread until the center opens.</li>
+              <li><b>Apps:</b> every app ships navigation, loading, empty, and failure states — loading uses skeletons, failure always offers recovery.</li>
+              <li><b>Motion:</b> reduced-motion replaces fades with cuts and spinners with written state.</li>
+              <li><b>Palette:</b> typing anywhere opens search; Esc unwinds one layer at a time.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toasts" id="toasts"></div>
+</div>
+
+<div class="meta">mirror shell · prototype<br><b>logo</b> start &nbsp;·&nbsp; <b>/</b> palette &nbsp;·&nbsp; <b>`</b> switcher &nbsp;·&nbsp; <b>?</b> shortcuts &nbsp;·&nbsp; topbar: <b>tour · handoff</b></div>
+
+<script>
+const $ = (s, r = document) => r.querySelector(s);
+const desktop = $("#desktop");
+
+/* ================= Window manager ================= */
+const APPS = {
+  notes:    { name: "Notes",    icon: "i-notes",    doc: "— gamma",            body: notesBody },
+  counter:  { name: "Counter",  icon: "i-clock",    doc: "— ticks since reset", body: counterBody },
+  files:    { name: "Files",    icon: "i-files",    doc: "— /home",            body: filesBody },
+  terminal: { name: "Terminal", icon: "i-terminal", doc: "— console",          body: termBody },
+  settings: { name: "Settings", icon: "i-settings", doc: "— appearance",       body: settingsBody },
+};
+const wins = new Map();
+let zTop = 20, focusedApp = null;
+const SPOTS = [[9, 15], [46, 25], [27, 46], [60, 12], [13, 50]];
+
+function notesBody() {
+  return `<h3>Your own space to write</h3>
+    <div class="sub">96 characters · session only</div>
+    <textarea class="input" rows="3" maxlength="96" placeholder="Write something…"></textarea>
+    <div class="win-foot">
+      <span class="note"><svg class="ic"><use href="#i-info"/></svg><span class="cc">0 / 96 characters</span></span>
+      <button class="btn b-ghost" data-act="clear">Clear</button>
+      <button class="btn b-primary" data-act="apply">Apply</button>
+    </div>`;
+}
+function counterBody() {
+  return `<h3>Elapsed timer ticks</h3>
+    <div class="sub">about 100 per second</div>
+    <div class="count-box"><div class="big-count">0</div></div>
+    <div class="win-foot">
+      <span class="note"><svg class="ic"><use href="#i-info"/></svg>Reset restarts the count</span>
+      <button class="btn b-primary" data-act="reset">Reset</button>
+    </div>`;
+}
+/* ---- shell Files (compact; shares patterns with docs/design/apps.html) ---- */
+const SH_FS = {
+  home: { label: "Home", items: [
+    { name: "Documents", kind: "dir" },
+    { name: "Downloads", kind: "dir" },
+    { name: "Images", kind: "dir" },
+    { name: "gamma.txt", kind: "file", size: "96 B" },
+    { name: "roadmap.md", kind: "file", size: "2.1 KB" },
+    { name: "boot.log", kind: "file", size: "14 KB" },
+  ]},
+  documents: { label: "Documents", items: [
+    { name: "gamma.txt", kind: "file", size: "96 B" },
+    { name: "spec-draft.md", kind: "file", size: "4.4 KB" },
+  ]},
+  downloads: { label: "Downloads", items: [] },
+  images: { label: "Images", items: [
+    { name: "native-desktop.png", kind: "img", size: "38 KB" },
+    { name: "boot-framebuffer.png", kind: "img", size: "41 KB" },
+  ]},
+};
+let shFsPath = ["home"];
+let shFsHist = [];
+function shRenderFiles(el) {
+  el = el || (wins.get("files") && wins.get("files").el);
+  if (!el) return;
+  const key = shFsPath[shFsPath.length - 1];
+  const folder = SH_FS[key];
+  el.querySelector("#shCrumbs").innerHTML = shFsPath.map((k, i) =>
+    `${i ? '<svg class="ic c-sep"><use href="#i-chev-r"/></svg>' : ""}<button class="crumb-b${i === shFsPath.length - 1 ? " cur" : ""}" data-sf="crumb" data-i="${i}">${SH_FS[k].label}</button>`
+  ).join("");
+  el.querySelector("#shList").innerHTML = folder.items.length
+    ? folder.items.map((i) => `<div class="sh-li${i.kind === "dir" ? " dir" : ""}" data-name="${i.name}" data-kind="${i.kind}"><svg class="ic"><use href="#${i.kind === "dir" ? "i-files" : i.kind === "img" ? "i-image" : "i-file"}"/></svg>${i.name}<span class="fsz">${i.size || ""}</span></div>`).join("")
+    : `<div class="sh-empty">This folder is empty.<br>Files you download will appear here.</div>`;
+  el.querySelector("#shStatus").innerHTML = `<span>${folder.items.length} items</span><span class="right">read-only</span>`;
+  el.querySelector('[data-sf="back"]').disabled = !shFsHist.length;
+}
+function filesBody() {
+  return `<div class="sb">
+      <button class="icon-btn" data-sf="back" title="Back"><svg class="ic"><use href="#i-back"/></svg></button>
+      <div class="crumbs" id="shCrumbs"></div>
+    </div>
+    <div class="sh-list" id="shList"></div>
+    <div class="sh-status" id="shStatus"></div>`;
+}
+
+/* ---- shell Terminal ---- */
+let shTLines = [];
+let shTHist = [];
+let shTHistIdx = -1;
+function termBody() {
+  return `<div class="t-out" id="stOut"></div><div class="t-in"><span class="t-p">mirror ~ $</span><input id="stInput" autocomplete="off" spellcheck="false"></div>`;
+}
+function shTRender(el) {
+  el = el || (wins.get("terminal") && wins.get("terminal").el);
+  if (!el) return;
+  const out = el.querySelector("#stOut");
+  out.innerHTML = shTLines.join("\n") || `<span class="t-dim">type </span><span class="t-ok">help</span><span class="t-dim"> to begin.</span>`;
+  out.scrollTop = out.scrollHeight;
+}
+function shTRun(cmd) {
+  const w = wins.get("terminal");
+  if (!w) return;
+  const inp = w.el.querySelector("#stInput");
+  const cmdEsc = cmd.replace(/</g, "&lt;");
+  shTLines.push(`<span class="t-p">mirror ~ $</span> ${cmdEsc}`);
+  const [name, ...args] = cmd.trim().split(/\s+/);
+  if (!name) { shTRender(); return; }
+  if (name === "help") shTLines.push(`<span class="t-dim">available:</span>  help  status  echo …  blocks  fault  clear`);
+  else if (name === "status") shTLines.push(`<span class="t-dim">ticks</span>=8412  <span class="t-dim">procs</span>=4  <span class="t-dim">mem</span>=62/128 MiB`);
+  else if (name === "echo") shTLines.push(args.join(" ").replace(/</g, "&lt;") || `<span class="t-dim">(empty)</span>`);
+  else if (name === "clear") { shTLines = []; shTRender(); return; }
+  else if (name === "blocks") {
+    if (inp) inp.disabled = true;
+    shTLines.push(`<span class="t-dim">claim 1af4:1001 … ok · queue 0</span>`, `<span class="t-line"><span class="spin" style="width:10px;height:10px;border-width:1.5px"></span><span class="t-dim">reading sector 1234…</span></span>`);
+    shTRender();
+    setTimeout(() => {
+      shTLines.pop();
+      shTLines.push(`<span class="t-ok">ok</span> <span class="t-dim">sector 1234 verified · 512 B · retries=0</span>`);
+      shTRender();
+      if (inp) inp.disabled = false;
+    }, 1100);
+    return;
+  }
+  else if (name === "fault") shTLines.push(`<span class="t-err">fault:</span> <span class="t-dim">UD2 in worker thread — contained, process ended</span>`, `<span class="t-dim">peers unaffected · handles reclaimed · exit 35</span>`);
+  else shTLines.push(`<span class="t-err">error:</span> <span class="t-dim">unknown command \u201c${cmdEsc.split(/\s+/)[0]}\u201d — type </span><span class="t-ok">help</span>`);
+  shTRender();
+}
+function settingsBody() {
+  return `<h3>Appearance</h3><div class="sub">same tokens, two peer themes</div>
+    <div class="set-row"><div><div class="sn">Dark theme</div><div class="sd">Swap the whole desktop palette.</div></div><button class="sw2 on" data-act="theme" role="switch" aria-checked="true"></button></div>
+    <div class="set-row"><div><div class="sn">Reduce motion</div><div class="sd">Honors prefers-reduced-motion.</div></div><button class="sw2" data-act="noop" role="switch" aria-checked="false"></button></div>
+    <div class="set-row"><div><div class="sn">Agent access</div><div class="sd">Requires an explicit broker grant.</div></div><button class="sw2" data-act="agent" disabled style="opacity:.45;cursor:not-allowed"></button></div>`;
+}
+
+function createWin(id) {
+  const app = APPS[id];
+  const el = document.createElement("div");
+  el.className = "window";
+  el.dataset.app = id;
+  const spot = SPOTS[wins.size % SPOTS.length];
+  el.style.left = spot[0] + "%";
+  el.style.top = spot[1] + "%";
+  el.innerHTML = `
+    <div class="titlebar">
+      <span class="app-tile"><svg class="ic"><use href="#${app.icon}"/></svg></span>
+      <span class="ttl">${app.name}</span><span class="doc">${app.doc}</span>
+      <span class="caps">
+        <button class="cap" data-cap="min" title="Minimize"><svg class="ic"><use href="#i-min"/></svg></button>
+        <button class="cap" data-cap="max" title="Maximize or restore"><svg class="ic"><use href="#i-max"/></svg></button>
+        <button class="cap close" data-cap="close" title="Close"><svg class="ic"><use href="#i-close"/></svg></button>
+      </span>
+    </div>
+    <div class="wbody">${app.body()}</div>
+    <span class="rh rh-n" data-dir="n"></span><span class="rh rh-s" data-dir="s"></span>
+    <span class="rh rh-e" data-dir="e"></span><span class="rh rh-w" data-dir="w"></span>
+    <span class="rh rh-ne" data-dir="ne"></span><span class="rh rh-nw" data-dir="nw"></span>
+    <span class="rh rh-se" data-dir="se"></span><span class="rh rh-sw" data-dir="sw"></span>
+    <span class="grip"><i></i><i></i><i></i></span>`;
+
+  el.querySelector(".caps").addEventListener("click", (e) => {
+    const btn = e.target.closest(".cap");
+    if (!btn) return;
+    e.stopPropagation();
+    const act = btn.dataset.cap;
+    if (act === "close") closeWin(id);
+    else if (act === "min") minimizeWin(id);
+    else if (act === "max") toggleMax(id);
+  });
+  el.addEventListener("pointerdown", () => focusWin(id));
+
+  const tb = el.querySelector(".titlebar");
+  tb.addEventListener("dblclick", (e) => { if (!e.target.closest(".cap")) toggleMax(id); });
+  tb.addEventListener("pointerdown", (e) => {
+    if (e.target.closest(".cap")) return;
+    const entry = wins.get(id);
+    const rect = el.getBoundingClientRect();
+    const floatRect = entry.snap && entry.prev ? entry.prev : readRect(el);
+    let cw = rect.width, ch = rect.height;
+    let gx = e.clientX - rect.left, gy = e.clientY - rect.top;
+    tb.setPointerCapture(e.pointerId);
+    let zone = null;
+    const move = (ev) => {
+      if (entry.snap) {
+        const rel = gx / cw;
+        cw = floatRect.w; ch = floatRect.h;
+        gx = cw * rel; gy = Math.min(gy, 19);
+        entry.snap = ""; entry.prev = null;
+        el.style.width = cw + "px"; el.style.height = ch + "px";
+      }
+      const nx = Math.min(Math.max(ev.clientX - gx, -cw + 90), window.innerWidth - 90);
+      const ny = Math.min(Math.max(ev.clientY - gy, 52), window.innerHeight - 100);
+      el.style.left = nx + "px";
+      el.style.top = ny + "px";
+      zone = zoneAt(ev.clientX, ev.clientY);
+      showSnapPreview(zone);
+    };
+    const up = () => {
+      tb.removeEventListener("pointermove", move);
+      tb.removeEventListener("pointerup", up);
+      showSnapPreview(null);
+      if (zone) snapTo(id, zone, floatRect);
+    };
+    tb.addEventListener("pointermove", move);
+    tb.addEventListener("pointerup", up);
+  });
+
+  el.querySelectorAll(".rh").forEach((h) => {
+    h.addEventListener("pointerdown", (e) => startResize(e, el, id, h.dataset.dir));
+  });
+
+  el.querySelector(".wbody").addEventListener("click", (e) => {
+    if (id === "files") {
+      const sfb = e.target.closest("[data-sf]");
+      if (sfb) {
+        if (sfb.dataset.sf === "back" && shFsHist.length) { shFsPath = shFsHist.pop(); shRenderFiles(); }
+        if (sfb.dataset.sf === "crumb") { const i = +sfb.dataset.i; if (i < shFsPath.length - 1) { shFsHist.push([...shFsPath]); shFsPath = shFsPath.slice(0, i + 1); shRenderFiles(); } }
+        return;
+      }
+      const li = e.target.closest(".sh-li");
+      if (li && li.dataset.kind !== "dir") spawnToast("info", li.dataset.name, "Opens in Notes — documents stay session-local.");
+      return;
+    }
+    const b = e.target.closest("[data-act]");
+    if (!b) return;
+    const act = b.dataset.act;
+    const entry = wins.get(id);
+    if (id === "notes" && act === "clear") { const t = el.querySelector("textarea"); t.value = ""; t.dispatchEvent(new Event("input")); }
+    if (id === "notes" && act === "apply") {
+      entry.rev = (entry.rev || 0) + 1;
+      notify("ok", "i-check", "Note applied", `Revision ${entry.rev} is now the applied note.`);
+    }
+    if (id === "counter" && act === "reset") resetCounter();
+    if (act === "theme") toggleTheme();
+    if (act === "noop") { b.classList.toggle("on"); b.setAttribute("aria-checked", b.classList.contains("on")); }
+  });
+  el.querySelector(".wbody").addEventListener("input", (e) => {
+    if (id === "notes" && e.target.matches("textarea")) {
+      el.querySelector(".cc").textContent = `${e.target.value.length} / 96 characters`;
+    }
+  });
+
+  if (id === "files") {
+    el.querySelector(".wbody").addEventListener("dblclick", (e) => {
+      const li = e.target.closest(".sh-li");
+      if (li && li.dataset.kind === "dir") {
+        shFsHist.push([...shFsPath]);
+        shFsPath.push(li.dataset.name.toLowerCase());
+        shRenderFiles();
+      }
+    });
+    shRenderFiles(el);
+  }
+  if (id === "terminal") {
+    el.querySelector(".wbody").addEventListener("keydown", (e) => {
+      if (!e.target.matches("#stInput")) return;
+      if (e.key === "Enter") {
+        const v = e.target.value;
+        e.target.value = "";
+        if (v.trim()) { shTHist.push(v); shTHistIdx = -1; }
+        shTRun(v);
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        if (shTHist.length) { shTHistIdx = shTHistIdx < 0 ? shTHist.length - 1 : Math.max(0, shTHistIdx - 1); e.target.value = shTHist[shTHistIdx]; }
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        if (shTHistIdx >= 0) { shTHistIdx = Math.min(shTHist.length - 1, shTHistIdx + 1); e.target.value = shTHist[shTHistIdx]; }
+      }
+    });
+    shTLines = [];
+    shTRender(el);
+    setTimeout(() => { const i = el.querySelector("#stInput"); if (i) i.focus(); }, 80);
+  }
+  return el;
+}
+
+function launch(id) {
+  const w = wins.get(id);
+  if (w) {
+    if (w.ws !== currentWs) switchWs(w.ws);
+    if (w.minimized) { w.el.classList.remove("min", "minimizing"); w.minimized = false; }
+    w.el.classList.remove("ws-hidden");
+    focusWin(id); updateDock(); return;
+  }
+  const el = createWin(id);
+  $("#windows").appendChild(el);
+  const entry = { el, minimized: false, ws: currentWs, snap: "", prev: null };
+  wins.set(id, entry);
+  if (id === "counter") {
+    entry.count = 0;
+    entry.iv = setInterval(() => {
+      entry.count += 10;
+      const n = el.querySelector(".big-count");
+      if (n) n.textContent = entry.count.toLocaleString();
+      if (entry.count >= 1000 && !entry.m1) {
+        entry.m1 = true;
+        notify("info", "i-clock", "Counter milestone", "1,000 ticks delivered — about 10 seconds.");
+      }
+    }, 100);
+  }
+  focusWin(id);
+  spawnToast("info", "Launched " + APPS[id].name, "Window opened in a fresh session.");
+}
+
+function closeWin(id) {
+  const w = wins.get(id);
+  if (!w) return;
+  if (w.iv) clearInterval(w.iv);
+  w.el.remove();
+  wins.delete(id);
+  if (focusedApp === id) {
+    focusedApp = null;
+    const rest = [...wins.keys()].filter((k) => !wins.get(k).minimized && wins.get(k).ws === currentWs);
+    if (rest.length) focusWin(rest[rest.length - 1]);
+  }
+  updateDock();
+  spawnToast("warn", APPS[id].name + " closed", "Session discarded — nothing is persisted yet.");
+}
+
+function minimizeWin(id) {
+  const w = wins.get(id);
+  if (!w) return;
+  w.minimized = true;
+  w.el.classList.add("minimizing");
+  setTimeout(() => {
+    if (!w.minimized) return;
+    w.el.classList.remove("minimizing");
+    w.el.classList.add("min");
+  }, 150);
+  if (focusedApp === id) {
+    focusedApp = null;
+    const rest = [...wins.keys()].filter((k) => !wins.get(k).minimized && wins.get(k).ws === currentWs);
+    if (rest.length) focusWin(rest[rest.length - 1]);
+  }
+  updateDock();
+}
+
+function focusWin(id) {
+  const w = wins.get(id);
+  if (!w) return;
+  focusedApp = id;
+  for (const [k, v] of wins) v.el.classList.toggle("unfocused", k !== id);
+  w.el.style.zIndex = ++zTop;
+  updateDock();
+}
+
+function updateDock() {
+  document.querySelectorAll(".dock .tile[data-app]").forEach((t) => {
+    const id = t.dataset.app;
+    t.classList.toggle("running", wins.has(id));
+    t.classList.toggle("active", wins.has(id) && focusedApp === id);
+  });
+}
+
+function resetCounter() {
+  const w = wins.get("counter");
+  if (w) { w.count = 0; const n = w.el.querySelector(".big-count"); if (n) n.textContent = "0"; }
+}
+
+/* ================= Toasts + notification center ================= */
+const toastsEl = $("#toasts");
+const feedEl = $("#nList");
+const feed = [];
+let unread = 0, dnd = false;
+
+function spawnToast(kind, title, body) {
+  const icons = { ok: "i-check", warn: "i-warning", err: "i-error", info: "i-info" };
+  while (toastsEl.children.length >= 3) toastsEl.firstChild.remove();
+  const t = document.createElement("div");
+  t.className = `toast ${kind}`;
+  t.innerHTML = `<svg class="ic"><use href="#${icons[kind]}"/></svg>
+    <div><div class="tt">${title}</div><div class="tb">${body}</div></div>
+    <button class="tx" title="Dismiss"><svg class="ic"><use href="#i-close"/></svg></button>`;
+  t.querySelector(".tx").onclick = () => dismiss(t);
+  toastsEl.appendChild(t);
+  setTimeout(() => dismiss(t), 6000);
+  function dismiss(el) { if (!el.isConnected) return; el.classList.add("out"); setTimeout(() => el.remove(), 220); }
+}
+
+function updateBadge() {
+  const b = $("#bellBadge");
+  b.style.display = unread ? "" : "none";
+  b.textContent = unread;
+}
+
+function nowHM() {
+  const d = new Date();
+  return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+}
+
+function notify(kind, icon, title, body) {
+  feed.unshift({ kind, icon, title, body, time: nowHM() });
+  unread++;
+  updateBadge();
+  renderFeed();
+  if (!dnd) spawnToast(kind, title, body);
+}
+
+function renderFeed() {
+  if (!feed.length) {
+    feedEl.innerHTML = `<div class="n-empty">All caught up.<br>Notifications land here.</div>`;
+    return;
+  }
+  feedEl.innerHTML = `<div class="n-sec">Today</div>` + feed.map((n, i) => `
+    <div class="n-item">
+      <span class="n-ic ${n.kind}"><svg class="ic"><use href="#${n.icon}"/></svg></span>
+      <div><div class="n-title">${n.title}</div><div class="n-body">${n.body}</div><div class="n-time">${n.time}</div></div>
+      <button class="n-x" data-x="${i}" title="Dismiss"><svg class="ic"><use href="#i-close"/></svg></button>
+    </div>`).join("");
+}
+feedEl.addEventListener("click", (e) => {
+  const x = e.target.closest("[data-x]");
+  if (!x) return;
+  feed.splice(+x.dataset.x, 1);
+  renderFeed();
+});
+$("#clearAll").onclick = () => { feed.length = 0; renderFeed(); };
+
+/* ================= Panels ================= */
+const panels = { notif: $("#notifPanel"), qs: $("#qsPanel"), tour: $("#tourPanel") };
+let openPanel = null;
+function closePanels() {
+  Object.entries(panels).forEach(([k, p]) => {
+    if (k === "tour" && tourActive) return;
+    p.classList.remove("open");
+    if (openPanel === k) openPanel = null;
+  });
+}
+function togglePanel(name) {
+  const was = openPanel === name;
+  closePanels();
+  if (!was) {
+    panels[name].classList.add("open");
+    openPanel = name;
+    if (name === "notif") { unread = 0; updateBadge(); }
+  }
+}
+$("#btnNotif").onclick = () => { closeMenu(); closePalette(); togglePanel("notif"); };
+$("#clock").onclick = () => { closeMenu(); closePalette(); togglePanel("notif"); };
+$("#btnQS").onclick = () => { closeMenu(); closePalette(); togglePanel("qs"); };
+$("#btnAgent").onclick = () => spawnToast("info", "Agent is idle", "No task granted — the demo agent runs only with -AgentDemo.");
+
+/* ================= Quick settings ================= */
+function toggleTheme() {
+  const toLight = desktop.dataset.theme !== "light";
+  desktop.dataset.theme = toLight ? "light" : "dark";
+  const tile = $("#qsTheme");
+  tile.classList.toggle("on", !toLight);
+  tile.querySelector(".qt-state").textContent = toLight ? "Light" : "Dark";
+  tile.querySelector(".qt-ic use").setAttribute("href", toLight ? "#i-sun" : "#i-moon");
+  document.querySelectorAll('[data-act="theme"]').forEach((sw) => {
+    sw.classList.toggle("on", !toLight);
+    sw.setAttribute("aria-checked", String(!toLight));
+  });
+  spawnToast("ok", toLight ? "Light theme" : "Dark theme", "One token swap, whole desktop.");
+}
+$("#qsTheme").onclick = toggleTheme;
+$("#qsDnd").onclick = () => {
+  dnd = !dnd;
+  $("#qsDnd").classList.toggle("on", dnd);
+  $("#qsDnd").querySelector(".qt-state").textContent = dnd ? "On — toasts muted" : "Off";
+};
+$("#qsNet").onclick = () => {
+  const on = $("#qsNet").classList.toggle("on");
+  $("#qsNet").querySelector(".qt-state").textContent = on ? "mirror-net" : "Off";
+};
+$("#qsBright").addEventListener("input", (e) => { $("#qsBrightV").textContent = e.target.value + "%"; });
+$("#qsVol").addEventListener("input", (e) => { $("#qsVolV").textContent = e.target.value + "%"; });
+$("#qsSettings").onclick = () => { closePanels(); launch("settings"); };
+$("#qsPower").onclick = () => spawnToast("warn", "Power", "Shutdown still lives in the kernel console.");
+
+/* ================= Start menu ================= */
+const menuEl = $("#startmenu");
+let menuOpen = false;
+function openMenu() {
+  closePanels(); closeSwitcher(); closePalette();
+  menuEl.classList.add("open");
+  menuOpen = true;
+}
+function closeMenu() {
+  if (!menuOpen) return;
+  menuEl.classList.remove("open");
+  menuOpen = false;
+}
+$("#dockLauncher").onclick = () => (menuOpen ? closeMenu() : openMenu());
+menuEl.addEventListener("click", (e) => {
+  if (e.target.closest("#smSearch")) { closeMenu(); openPalette(); return; }
+  const appTile = e.target.closest("[data-app]");
+  if (appTile) { closeMenu(); launch(appTile.dataset.app); return; }
+  const doc = e.target.closest("[data-doc]");
+  if (doc) {
+    const d = DOCS[+doc.dataset.doc];
+    closeMenu();
+    launch(d.app);
+    spawnToast("ok", "Opened " + d.name, APPS[d.app].name + " · " + d.size);
+    return;
+  }
+  const foot = e.target.closest("[data-sm]");
+  if (!foot) return;
+  const act = foot.dataset.sm;
+  if (act === "theme") toggleTheme();
+  if (act === "settings") { closeMenu(); launch("settings"); }
+  if (act === "power") spawnToast("warn", "Power", "Shutdown still lives in the kernel console.");
+});
+
+/* ================= Command palette ================= */
+const paletteEl = $("#palette"), lInput = $("#lInput"), lBody = $("#lBody");
+let paletteOpen = false, lSel = 0, lItems = [];
+
+const ACTIONS = [
+  { name: "New note", icon: "i-plus", hint: "Notes", run: () => launch("notes") },
+  { name: "Reset counter", icon: "i-clock", hint: "Counter", run: () => { wins.has("counter") ? resetCounter() : launch("counter"); spawnToast("ok", "Counter reset", "The tick count starts from zero."); } },
+  { name: "Toggle theme", icon: "i-moon", hint: "System", run: toggleTheme },
+  { name: "Run agent task", icon: "i-agent", hint: "Agent", run: () => spawnToast("info", "Agent", "No task granted — the broker is idle.") },
+  { name: "Open settings", icon: "i-settings", hint: "System", run: () => launch("settings") },
+];
+const DOCS = [
+  { name: "gamma.txt", app: "notes", size: "96 B" },
+  { name: "roadmap.md", app: "notes", size: "2.1 KB" },
+  { name: "boot.log", app: "terminal", size: "14 KB" },
+];
+
+function renderLauncher(q) {
+  q = q.trim().toLowerCase();
+  paletteEl.classList.toggle("searching", q.length > 0);
+  const apps = Object.entries(APPS).filter(([, a]) => a.name.toLowerCase().includes(q));
+  const acts = ACTIONS.filter((a) => a.name.toLowerCase().includes(q));
+  const docs = DOCS.filter((d) => d.name.toLowerCase().includes(q));
+  lItems = [];
+  let html = "";
+  if (apps.length) {
+    html += `<div class="l-sec">Apps</div><div class="l-apps">` + apps.map(([id, a]) => {
+      lItems.push({ kind: "app", id });
+      return `<div class="l-app" data-i="${lItems.length - 1}"><span class="a-tile"><svg class="ic"><use href="#${a.icon}"/></svg></span><span class="an">${a.name}</span></div>`;
+    }).join("") + `</div>`;
+  }
+  if (acts.length) {
+    html += `<div class="l-sec">Actions</div>` + acts.map((a) => {
+      lItems.push({ kind: "action", action: a });
+      return `<div class="l-row" data-i="${lItems.length - 1}"><svg class="ic"><use href="#${a.icon}"/></svg>${a.name}<span class="hint">${a.hint}</span></div>`;
+    }).join("");
+  }
+  if (docs.length) {
+    html += `<div class="l-sec">Documents</div>` + docs.map((d) => {
+      lItems.push({ kind: "doc", doc: d });
+      return `<div class="l-row" data-i="${lItems.length - 1}"><svg class="ic"><use href="#i-file"/></svg>${d.name}<span class="hint">${APPS[d.app].name} · ${d.size}</span></div>`;
+    }).join("");
+  }
+  if (!lItems.length) html = `<div class="l-empty">No matches for \u201c${q}\u201d.<br>Try an app, an action, or a document.</div>`;
+  lBody.innerHTML = html;
+  lBody.scrollTop = 0;
+  lSel = 0;
+  paintSel();
+}
+function paintSel() {
+  lBody.querySelectorAll("[data-i]").forEach((el) => el.classList.toggle("sel", +el.dataset.i === lSel));
+  const sel = lBody.querySelector(`[data-i="${lSel}"]`);
+  if (sel) sel.scrollIntoView({ block: "nearest" });
+}
+function activate(item) {
+  closePalette();
+  if (item.kind === "app") launch(item.id);
+  else if (item.kind === "action") item.action.run();
+  else { launch(item.doc.app); spawnToast("ok", "Opened " + item.doc.name, APPS[item.doc.app].name + " · " + item.doc.size); }
+}
+function openPalette() {
+  closePanels(); closeSwitcher(); closeMenu();
+  updateWidgets();
+  paletteEl.classList.add("open");
+  paletteOpen = true;
+  lInput.value = "";
+  renderLauncher("");
+  setTimeout(() => lInput.focus(), 70);
+}
+function closePalette() {
+  if (!paletteOpen) return;
+  paletteEl.classList.remove("open");
+  paletteOpen = false;
+}
+paletteEl.addEventListener("pointerdown", (e) => { if (e.target === paletteEl) closePalette(); });
+lInput.addEventListener("input", () => renderLauncher(lInput.value));
+lInput.addEventListener("keydown", (e) => {
+  if (e.key === "ArrowDown") { e.preventDefault(); lSel = Math.min(lSel + 1, lItems.length - 1); paintSel(); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); lSel = Math.max(lSel - 1, 0); paintSel(); }
+  else if (e.key === "Enter") { e.preventDefault(); if (lItems[lSel]) activate(lItems[lSel]); }
+});
+lBody.addEventListener("click", (e) => {
+  const it = e.target.closest("[data-i]");
+  if (it && lItems[+it.dataset.i]) activate(lItems[+it.dataset.i]);
+});
+
+function updateWidgets() {
+  const d = new Date();
+  $("#wClock").textContent = String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  $("#wDate").textContent = d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+  const cw = wins.get("counter");
+  $("#wTicks").textContent = cw ? (cw.count || 0).toLocaleString() : "—";
+  $("#wCounterState").textContent = cw ? (cw.minimized ? "minimized" : "running") : "not running";
+  $("#wProcs").textContent = wins.size + 2;
+  $("#wTheme").textContent = desktop.dataset.theme;
+  const nw = wins.get("notes");
+  const draft = nw ? nw.el.querySelector("textarea").value.trim() : "";
+  $("#wDraft").textContent = draft || "no draft";
+}
+setInterval(updateWidgets, 500);
+updateWidgets();
+
+/* ================= Window geometry: resize, snap, workspaces ================= */
+function workArea() {
+  return { x: 12, y: 60, w: window.innerWidth - 24, h: window.innerHeight - 60 - 104 };
+}
+function readRect(el) { const r = el.getBoundingClientRect(); return { x: r.left, y: r.top, w: r.width, h: r.height }; }
+function applyRect(el, r) {
+  el.style.left = r.x + "px"; el.style.top = r.y + "px";
+  el.style.width = r.w + "px"; el.style.height = r.h + "px";
+}
+function zoneAt(cx, cy) {
+  const vw = window.innerWidth;
+  if (cx <= 20 && cy <= 90) return "tl";
+  if (cx >= vw - 20 && cy <= 90) return "tr";
+  if (cy <= 10) return "max";
+  if (cx <= 20) return "left";
+  if (cx >= vw - 20) return "right";
+  return null;
+}
+function snapRect(zone) {
+  const wa = workArea();
+  switch (zone) {
+    case "max": return { x: wa.x, y: wa.y, w: wa.w, h: wa.h };
+    case "left": return { x: wa.x, y: wa.y, w: wa.w / 2 - 6, h: wa.h };
+    case "right": return { x: wa.x + wa.w / 2 + 6, y: wa.y, w: wa.w / 2 - 6, h: wa.h };
+    case "tl": return { x: wa.x, y: wa.y, w: wa.w / 2 - 6, h: wa.h / 2 - 6 };
+    case "tr": return { x: wa.x + wa.w / 2 + 6, y: wa.y, w: wa.w / 2 - 6, h: wa.h / 2 - 6 };
+  }
+}
+function showSnapPreview(zone) {
+  const p = $("#snapPrev");
+  if (!zone) { p.style.display = "none"; return; }
+  const r = snapRect(zone);
+  p.style.display = "block";
+  p.style.left = r.x + "px"; p.style.top = r.y + "px";
+  p.style.width = r.w + "px"; p.style.height = r.h + "px";
+}
+function tweenRect(el, r) {
+  el.classList.add("anim");
+  applyRect(el, r);
+  setTimeout(() => el.classList.remove("anim"), 220);
+}
+function snapTo(id, zone, prev) {
+  const entry = wins.get(id);
+  if (!entry) return;
+  const el = entry.el;
+  if (prev) entry.prev = prev;
+  else if (!entry.snap) entry.prev = readRect(el);
+  entry.snap = zone;
+  tweenRect(el, snapRect(zone));
+}
+function toggleMax(id) {
+  const entry = wins.get(id);
+  if (!entry) return;
+  if (entry.snap === "max") {
+    entry.snap = "";
+    if (entry.prev) { tweenRect(entry.el, entry.prev); entry.prev = null; }
+  } else snapTo(id, "max");
+}
+function snapFocused(zone) {
+  const entry = focusedApp && wins.get(focusedApp);
+  if (!entry) return;
+  if (entry.snap === zone && entry.prev) {
+    tweenRect(entry.el, entry.prev);
+    entry.snap = ""; entry.prev = null;
+  } else snapTo(focusedApp, zone);
+}
+
+function startResize(e, el, id, dir) {
+  e.preventDefault(); e.stopPropagation();
+  focusWin(id);
+  const entry = wins.get(id);
+  entry.snap = ""; entry.prev = null;
+  const r = el.getBoundingClientRect();
+  const x0 = r.left, y0 = r.top, w0 = r.width, h0 = r.height;
+  const sx = e.clientX, sy = e.clientY;
+  const move = (ev) => {
+    let x = x0, y = y0, w = w0, h = h0;
+    const dx = ev.clientX - sx, dy = ev.clientY - sy;
+    if (dir.includes("e")) w = w0 + dx;
+    if (dir.includes("w")) { w = w0 - dx; x = x0 + dx; }
+    if (dir.includes("s")) h = h0 + dy;
+    if (dir.includes("n")) { h = h0 - dy; y = y0 + dy; }
+    if (w < 240) { if (dir.includes("w")) x -= 240 - w; w = 240; }
+    if (h < 150) { if (dir.includes("n")) y -= 150 - h; h = 150; }
+    if (x < 0) { if (dir.includes("w")) w += x; x = 0; }
+    if (y < 52) { if (dir.includes("n")) h += y - 52; y = 52; }
+    applyRect(el, { x, y, w, h });
+  };
+  const up = () => {
+    document.removeEventListener("pointermove", move);
+    document.removeEventListener("pointerup", up);
+  };
+  document.addEventListener("pointermove", move);
+  document.addEventListener("pointerup", up);
+}
+
+/* ---- Workspaces ---- */
+let currentWs = 0;
+const WS_COUNT = 3;
+function switchWs(i) {
+  if (i === currentWs) return;
+  currentWs = i;
+  for (const [, w] of wins) {
+    w.el.classList.toggle("ws-hidden", w.ws !== i || w.minimized);
+  }
+  const top = [...wins.entries()]
+    .filter(([, w]) => w.ws === i && !w.minimized)
+    .sort((a, b) => (+b[1].el.style.zIndex || 0) - (+a[1].el.style.zIndex || 0));
+  if (top.length) focusWin(top[0][0]); else { focusedApp = null; updateDock(); }
+  $("#wsLabel").textContent = "W" + (i + 1);
+  document.querySelectorAll("#wsPill .wd").forEach((d, j) => d.classList.toggle("on", j === i));
+  spawnToast("info", "Workspace " + (i + 1), top.length ? "Focused " + APPS[top[0][0]].name + "." : "Empty workspace — launch something.");
+}
+function moveFocusedToWs(dir) {
+  const w = focusedApp && wins.get(focusedApp);
+  if (!w) return;
+  const next = Math.min(WS_COUNT - 1, Math.max(0, w.ws + dir));
+  if (next === w.ws) return;
+  const name = APPS[focusedApp].name;
+  w.ws = next;
+  w.el.classList.add("ws-hidden");
+  focusedApp = null;
+  const rest = [...wins.entries()].filter(([, v]) => v.ws === currentWs && !v.minimized);
+  if (rest.length) focusWin(rest[rest.length - 1][0]); else updateDock();
+  spawnToast("info", name + " → Workspace " + (next + 1), "Ctrl+Alt+" + (next + 1) + " to follow it.");
+}
+$("#wsPill").onclick = () => switchWs((currentWs + 1) % WS_COUNT);
+
+/* ---- Shortcuts overlay ---- */
+let scOpen = false;
+function toggleShortcuts(open) {
+  scOpen = open === undefined ? !scOpen : open;
+  $("#shortcuts").classList.toggle("open", scOpen);
+}
+$("#scClose").onclick = () => toggleShortcuts(false);
+$("#shortcuts").addEventListener("pointerdown", (e) => { if (e.target.id === "shortcuts") toggleShortcuts(false); });
+
+/* ================= Switcher ================= */
+let swOpen = false, swSel = 0, swIds = [];
+function miniFor(id) {
+  if (id === "counter") { const w = wins.get(id); return `<div class="sw-num">${(w && w.count || 0).toLocaleString()}</div><div class="sw-lines"><i style="width:45%"></i></div>`; }
+  if (id === "notes") return `<div class="sw-lines"><i style="width:85%"></i><i style="width:60%"></i><i class="acc" style="width:30%"></i></div>`;
+  if (id === "files") return `<div class="sw-lines"><i style="width:70%"></i><i style="width:70%"></i><i style="width:40%"></i></div>`;
+  if (id === "terminal") return `<div class="sw-lines"><i class="acc" style="width:50%"></i><i style="width:75%"></i><i style="width:30%"></i></div>`;
+  return `<div class="sw-lines"><i style="width:80%"></i><i class="acc" style="width:35%"></i><i style="width:60%"></i></div>`;
+}
+function renderSwitcher() {
+  $("#swCards").innerHTML = swIds.map((id, i) => {
+    const a = APPS[id];
+    return `<div class="sw-card${i === swSel ? " sel" : ""}" data-i="${i}">
+      <div class="sw-thumb"><div class="sw-mini"><div class="sw-mtb"><i></i><i></i><i></i></div>${miniFor(id)}</div></div>
+      <div class="sw-name"><svg class="ic"><use href="#${a.icon}"/></svg>${a.name}</div>
+    </div>`;
+  }).join("");
+}
+function openSwitcher() {
+  swIds = [...wins.entries()].filter(([, w]) => w.ws === currentWs).map(([k]) => k);
+  if (!swIds.length) { spawnToast("info", "No open windows", "Launch an app from the dock or start menu."); return; }
+  closeMenu(); closePalette(); closePanels();
+  const fi = swIds.indexOf(focusedApp);
+  swSel = fi >= 0 ? fi : 0;
+  renderSwitcher();
+  $("#switcher").classList.add("open");
+  swOpen = true;
+}
+function closeSwitcher() { $("#switcher").classList.remove("open"); swOpen = false; }
+function pickSwitcher() {
+  const id = swIds[swSel];
+  closeSwitcher();
+  const w = wins.get(id);
+  if (w) { if (w.minimized) { w.el.classList.remove("min"); w.minimized = false; } focusWin(id); }
+}
+$("#swCards").addEventListener("click", (e) => {
+  const c = e.target.closest(".sw-card");
+  if (!c) return;
+  swSel = +c.dataset.i;
+  pickSwitcher();
+});
+
+/* ================= Global keys + backdrop ================= */
+document.addEventListener("keydown", (e) => {
+  if (scOpen) {
+    if (e.key === "Escape" || e.key === "?") { e.preventDefault(); toggleShortcuts(false); }
+    return;
+  }
+  if (swOpen) {
+    e.preventDefault();
+    if (e.key === "ArrowRight") { swSel = (swSel + 1) % swIds.length; renderSwitcher(); }
+    else if (e.key === "ArrowLeft") { swSel = (swSel - 1 + swIds.length) % swIds.length; renderSwitcher(); }
+    else if (e.key === "Enter") pickSwitcher();
+    else if (e.key === "Escape" || e.key === "`") closeSwitcher();
+    return;
+  }
+  if (e.key === "Escape") {
+    if (handoffOpen) closeHandoff();
+    else if (paletteOpen) closePalette();
+    else if (menuOpen) closeMenu();
+    else closePanels();
+    return;
+  }
+  const tagNow = (document.activeElement && document.activeElement.tagName) || "";
+  if (e.key === "?" && !/INPUT|TEXTAREA/.test(tagNow)) {
+    e.preventDefault();
+    toggleShortcuts(true);
+    return;
+  }
+  if (e.ctrlKey && e.altKey && !paletteOpen && !menuOpen) {
+    if (/^[123]$/.test(e.key)) { e.preventDefault(); switchWs(+e.key - 1); return; }
+    const w = focusedApp && wins.get(focusedApp);
+    if (w) {
+      if (e.key === "ArrowUp") { e.preventDefault(); toggleMax(focusedApp); return; }
+      if (e.key === "ArrowDown") { e.preventDefault(); minimizeWin(focusedApp); return; }
+      if (e.key === "ArrowLeft" && e.shiftKey) { e.preventDefault(); moveFocusedToWs(-1); return; }
+      if (e.key === "ArrowRight" && e.shiftKey) { e.preventDefault(); moveFocusedToWs(1); return; }
+      if (e.key === "ArrowLeft") { e.preventDefault(); snapFocused("left"); return; }
+      if (e.key === "ArrowRight") { e.preventDefault(); snapFocused("right"); return; }
+    }
+    return;
+  }
+  if (e.key === "`" || (e.code === "Space" && e.ctrlKey)) {
+    e.preventDefault();
+    openSwitcher();
+    return;
+  }
+  const tag = (document.activeElement && document.activeElement.tagName) || "";
+  if (!paletteOpen && !menuOpen && !openPanel && e.key === "/" && !/INPUT|TEXTAREA/.test(tag)) {
+    e.preventDefault();
+    openPalette();
+    return;
+  }
+  if (!paletteOpen && !menuOpen && !openPanel && e.key.length === 1 && /\S/.test(e.key) && !e.ctrlKey && !e.metaKey && !/INPUT|TEXTAREA/.test(tag)) {
+    e.preventDefault();
+    openPalette();
+    lInput.value = e.key;
+    renderLauncher(e.key);
+    lInput.focus();
+    return;
+  }
+  if (paletteOpen && e.key.length === 1 && /\S/.test(e.key) && !e.ctrlKey && !e.metaKey && document.activeElement !== lInput) {
+    e.preventDefault();
+    lInput.focus();
+    lInput.value += e.key;
+    renderLauncher(lInput.value);
+  }
+});
+desktop.addEventListener("pointerdown", (e) => {
+  if (e.target.closest(".window, .dock, .topbar, .panel, .palette, .startmenu, .switcher, .toasts, .handoff")) return;
+  closePanels(); closePalette(); closeMenu(); closeHandoff();
+});
+
+/* ================= Guided workflows ================= */
+let tourTimer = null, tourActive = null;
+const TOURS = [
+  { id: "note", title: "Launch & take a note", needs: [], steps: [
+    ["Open the palette", () => openPalette()],
+    ["Launch Notes", () => activate({ kind: "app", id: "notes" })],
+    ["Type “alpha” into the draft", () => { const t = document.querySelector('#windows .window[data-app="notes"] textarea'); t.value = "alpha"; t.dispatchEvent(new Event("input", { bubbles: true})); }],
+    ["Apply — watch the notification", () => { document.querySelector('#windows .window[data-app="notes"] [data-act="apply"]').click(); }],
+  ]},
+  { id: "browse", title: "Browse files & open a document", needs: [], steps: [
+    ["Launch Files", () => launch("files")],
+    ["Drill into Documents", () => { shFsHist.push([...shFsPath]); shFsPath = ["home", "documents"]; shRenderFiles(); }],
+    ["Open gamma.txt", () => spawnToast("ok", "Opened gamma.txt", "Notes · 96 B")],
+  ]},
+  { id: "tile", title: "Tile two windows side by side", needs: ["notes"], steps: [
+    ["Launch Counter", () => launch("counter")],
+    ["Snap Counter to the left half", () => { focusWin("counter"); snapTo("counter", "left"); }],
+    ["Snap Notes to the right half", () => { focusWin("notes"); snapTo("notes", "right"); }],
+  ]},
+  { id: "theme", title: "Change settings & switch workspaces", needs: ["counter"], steps: [
+    ["Switch to the light theme", () => { if (desktop.dataset.theme !== "light") toggleTheme(); }],
+    ["Send Counter to Workspace 2", () => { focusWin("counter"); moveFocusedToWs(1); }],
+    ["Follow it to W2", () => switchWs(1)],
+    ["Return to W1 and dark", () => { switchWs(0); if (desktop.dataset.theme !== "dark") toggleTheme(); }],
+  ]},
+];
+function renderTours() {
+  $("#tourBody").innerHTML = TOURS.map((t) => `
+    <div class="tw-card" data-tour="${t.id}">
+      <div class="tw-head"><span class="tw-title">${t.title}</span><button class="btn b-secondary tw-run" data-run="${t.id}">Run</button></div>
+      <ol class="tw-steps">${t.steps.map((s) => `<li>${s[0]}</li>`).join("")}</ol>
+    </div>`).join("");
+}
+function stopTour() {
+  clearTimeout(tourTimer);
+  tourActive = null;
+  $("#tourStop").style.display = "none";
+  document.querySelectorAll(".tw-card").forEach((c) => c.classList.remove("running"));
+  document.querySelectorAll(".tw-steps li.cur").forEach((li) => li.classList.remove("cur"));
+}
+function runTour(id) {
+  stopTour();
+  const tour = TOURS.find((t) => t.id === id);
+  const card = document.querySelector(`.tw-card[data-tour="${id}"]`);
+  tourActive = id;
+  $("#tourStop").style.display = "";
+  card.classList.add("running");
+  card.classList.remove("done");
+  const lis = card.querySelectorAll(".tw-steps li");
+  lis.forEach((li) => li.classList.remove("done", "cur"));
+  tour.needs.forEach((n) => { if (!wins.has(n)) launch(n); });
+  let i = 0;
+  const step = () => {
+    if (tourActive !== id) return;
+    if (i > 0) { lis[i - 1].classList.remove("cur"); lis[i - 1].classList.add("done"); }
+    if (i >= tour.steps.length) {
+      card.classList.remove("running");
+      card.classList.add("done");
+      tourActive = null;
+      $("#tourStop").style.display = "none";
+      spawnToast("ok", "Workflow complete", tour.title + ".");
+      return;
+    }
+    lis[i].classList.add("cur");
+    tour.steps[i][1]();
+    i++;
+    tourTimer = setTimeout(step, 1000);
+  };
+  step();
+}
+$("#tourStop").onclick = stopTour;
+$("#tourBody").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-run]");
+  if (b) runTour(b.dataset.run);
+});
+$("#btnTour").onclick = () => { closeMenu(); closePalette(); togglePanel("tour"); };
+
+/* ================= Implementation handoff ================= */
+let handoffOpen = false;
+function openHandoff() {
+  closePanels(); closeMenu(); closePalette(); closeSwitcher(); stopTour();
+  $("#handoff").classList.add("open");
+  handoffOpen = true;
+}
+function closeHandoff() {
+  $("#handoff").classList.remove("open");
+  handoffOpen = false;
+}
+$("#btnHandoff").onclick = openHandoff;
+$("#hClose").onclick = closeHandoff;
+$("#handoff").addEventListener("pointerdown", (e) => { if (e.target.id === "handoff") closeHandoff(); });
+
+const TOKEN_SPEC = [
+  ["base", "#F3F5F9", "#0B0F16", "Desktop, app backdrop"],
+  ["surface", "#FFFFFF", "#121826", "Windows, cards, inputs"],
+  ["elevated", "#FFFFFF", "#1A2334", "Menus, toasts, popovers"],
+  ["overlay", "#EEF2F7", "#232E44", "Hover fills"],
+  ["border-subtle", "#E2E8F1", "#26314A", "Card edges, separators"],
+  ["border-strong", "#C6D0DF", "#3B4A6B", "Control outlines, window frames"],
+  ["text-primary", "#0F1726", "#ECF1F9", "Headings, values, body"],
+  ["text-secondary", "#475569", "#A6B2C7", "Descriptions, labels"],
+  ["text-tertiary", "#5D6B82", "#71809A", "Placeholders, captions"],
+  ["accent", "#0B7C6F", "#4FD8C2", "Primary actions, focus, active app"],
+  ["on-accent", "#FFFFFF", "#052B25", "Glyphs on accent fill"],
+  ["accent-subtle", "#E2F3EE", "#123A35", "Tinted tiles, badges"],
+  ["success", "#047857", "#34D399", "Completion"],
+  ["warning", "#B45309", "#FBBF24", "Caution"],
+  ["danger", "#C81E1E", "#F87171", "Errors, destructive"],
+  ["info", "#2563EB", "#60A5FA", "Notices"],
+  ["window-glass", "rgba(255,255,255,.68)", "rgba(18,24,38,.74)", "Frosted window tint"],
+];
+$("#tokenTable").innerHTML = `<tr><th>Token</th><th>Light</th><th>Dark</th><th>Used for</th></tr>` + TOKEN_SPEC.map(([n, l, d, u]) =>
+  `<tr><td class="tk">${n}</td><td class="vl"><span class="dotc" style="background:${l}"></span>${l}</td><td class="vl"><span class="dotc" style="background:${d}"></span>${d}</td><td class="use">${u}</td></tr>`).join("");
+$("#iconGrid").innerHTML = [...document.querySelectorAll("symbol")].map((s) =>
+  `<div class="h-icon"><svg class="ic"><use href="#${s.id}"/></svg><div class="nm">${s.id.replace("i-", "")}</div></div>`).join("");
+
+/* ================= Dock + clock + seed ================= */
+document.querySelector(".dock").addEventListener("click", (e) => {
+  const t = e.target.closest(".tile");
+  if (!t) return;
+  if (t.id === "dockLauncher") return;
+  if (t.id === "dockAgent") { spawnToast("info", "Agent is idle", "No task granted — the broker only runs with -AgentDemo."); return; }
+  if (t.dataset.app) launch(t.dataset.app);
+});
+
+function tickClock() {
+  const d = new Date();
+  $("#clock").textContent = String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+}
+tickClock();
+setInterval(tickClock, 5000);
+
+renderFeed();
+renderTours();
+launch("notes");
+launch("counter");
+setTimeout(() => notify("info", "i-logo", "Welcome to Mirror shell", "Launcher, dock, switcher, notifications, quick settings — all clickable."), 900);
+</script>
+</body>
+</html>

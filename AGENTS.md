@@ -21,7 +21,7 @@ Mirror is an agent harness that is also a complete, fast, independent x86_64 ope
 - Each task runs on its own branch, and only Cameron merges it. Commit to your task branch, never to `main`. Never force-push or rewrite pushed history. Push only when asked.
 - Exception: spec and documentation-only commits (`docs\specs\` and other docs-only changes) go directly to `main` and are pushed, with no task branch.
 - Start the branch from the current `main` and name it `<agent>/<spec>-<short-name>`, where `<agent>` is `claude`, `astra` or `kimi`, for example `claude/0011-toolchain-and-lints`. A task without a spec uses `<agent>/<short-name>`.
-- Kimi's UI branch, `<name supplied by Cameron>`, belongs to Kimi. Other agents never check it out, rebase it, merge it, cherry-pick from it, push to it or delete it.
+- Kimi's UI branch, `design/design-system` (in Kimi's own clone; its designs are in `docs/design/`), belongs to Kimi. Other agents never check it out, rebase it, merge it, cherry-pick from it, push to it or delete it.
 
 ## Build
 Run commands from the repository root in PowerShell.

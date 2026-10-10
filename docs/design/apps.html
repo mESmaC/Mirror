@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mirror Core Apps — concept sample</title>
+<style>
+/* ============================================================
+   Mirror core apps — interactive concept sample
+   Files · Terminal · Settings, each with navigation, loading,
+   empty, and failure states. Single file, no external assets.
+   ============================================================ */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --font-ui: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+  --pg-bg: #0E1219;
+  --pg-text: #D5DCE8;
+  --pg-secondary: #8C99AE;
+  --pg-tertiary: #5C6B84;
+  --pg-accent: #4FD8C2;
+  --pg-border: #232E42;
+}
+
+#page[data-theme="dark"] {
+  --base: #0B0F16; --surface: #121826; --elevated: #1A2334; --overlay: #232E44;
+  --border-subtle: #26314A; --border-strong: #3B4A6B;
+  --text-primary: #ECF1F9; --text-secondary: #A6B2C7; --text-tertiary: #71809A;
+  --accent: #4FD8C2; --accent-hover: #71E3D1; --accent-pressed: #38BFA9; --on-accent: #052B25;
+  --accent-subtle: #123A35; --accent-subtle-text: #7CE7D4;
+  --success: #34D399; --success-bg: #0F2E25;
+  --warning: #FBBF24; --warning-bg: #2E2410;
+  --danger: #F87171; --danger-bg: #381A1F; --on-danger: #2B0B0B;
+  --info: #60A5FA; --info-bg: #16283F;
+  --ring: rgba(79, 216, 194, .32); --focus-ring: #71E3D1;
+  --shadow-1: 0 1px 2px rgba(0,0,0,.35);
+  --shadow-2: 0 4px 14px rgba(0,0,0,.45), 0 1px 3px rgba(0,0,0,.4);
+  --shadow-3: 0 18px 48px rgba(0,0,0,.6), 0 4px 12px rgba(0,0,0,.45);
+  --wallpaper: radial-gradient(900px 460px at 10% -10%, #123A35 0%, transparent 55%),
+               radial-gradient(760px 480px at 108% 112%, #1A2340 0%, transparent 55%),
+               linear-gradient(160deg, #0B0F16 0%, #0E1420 100%);
+  --window-glass: rgba(18, 24, 38, .78);
+  --glass-edge: rgba(255, 255, 255, .06);
+  --sheen: rgba(255, 255, 255, .045);
+}
+#page[data-theme="light"] {
+  --base: #F3F5F9; --surface: #FFFFFF; --elevated: #FFFFFF; --overlay: #EEF2F7;
+  --border-subtle: #E2E8F1; --border-strong: #C6D0DF;
+  --text-primary: #0F1726; --text-secondary: #475569; --text-tertiary: #5D6B82;
+  --accent: #0B7C6F; --accent-hover: #0A6C61; --accent-pressed: #085A50; --on-accent: #FFFFFF;
+  --accent-subtle: #E2F3EE; --accent-subtle-text: #0B5F55;
+  --success: #047857; --success-bg: #E7F7F0;
+  --warning: #B45309; --warning-bg: #FBF0DC;
+  --danger: #C81E1E; --danger-bg: #FCEBEB; --on-danger: #FFFFFF;
+  --info: #2563EB; --info-bg: #EBF1FE;
+  --ring: rgba(11, 124, 111, .32); --focus-ring: #0B7C6F;
+  --shadow-1: 0 1px 2px rgba(15,23,38,.07), 0 1px 3px rgba(15,23,38,.05);
+  --shadow-2: 0 4px 12px rgba(15,23,38,.10), 0 2px 4px rgba(15,23,38,.06);
+  --shadow-3: 0 16px 40px rgba(15,23,38,.16), 0 4px 10px rgba(15,23,38,.08);
+  --wallpaper: radial-gradient(900px 460px at 12% -10%, #D9EDE9 0%, transparent 55%),
+               radial-gradient(760px 480px at 105% 112%, #DDE4F5 0%, transparent 55%),
+               linear-gradient(160deg, #F4F6FA 0%, #E9EEF5 100%);
+  --window-glass: rgba(255, 255, 255, .72);
+  --glass-edge: rgba(255, 255, 255, .7);
+  --sheen: rgba(255, 255, 255, .35);
+}
+
+html, body { height: 100%; }
+body { background: var(--pg-bg); color: var(--pg-text); font-family: var(--font-ui); font-size: 14px; user-select: none; -webkit-user-select: none; }
+textarea, input { user-select: text; -webkit-user-select: text; }
+.wrap { max-width: 1240px; margin: 0 auto; padding: 40px 44px 80px; }
+.mono { font-family: var(--font-mono); }
+.ic { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+
+.pg-head { display: flex; align-items: center; gap: 14px; padding-bottom: 24px; border-bottom: 1px solid var(--pg-border); }
+.pg-head h1 { font-size: 21px; font-weight: 650; letter-spacing: -.01em; color: #F2F6FC; }
+.pg-head .logo { display: flex; align-items: center; gap: 10px; }
+.pg-head .logo .ic { width: 22px; height: 22px; color: var(--pg-accent); }
+.pg-head .tag { font-family: var(--font-mono); font-size: 11px; color: var(--pg-accent); border: 1px solid #1E4B44; background: #10231F; padding: 3px 8px; border-radius: 999px; }
+.pg-head .spacer { flex: 1; }
+.theme-btn { height: 30px; padding: 0 12px; border-radius: 6px; border: 1px solid var(--pg-border); background: transparent; color: var(--pg-text); font-family: var(--font-mono); font-size: 11px; letter-spacing: .08em; cursor: pointer; display: inline-flex; align-items: center; gap: 7px; }
+.theme-btn:hover { background: #131B2A; }
+.theme-btn .ic { width: 13px; height: 13px; color: var(--pg-accent); }
+.intro { color: var(--pg-secondary); max-width: 78ch; margin: 18px 0 0; }
+.intro strong { color: var(--pg-text); font-weight: 600; }
+
+.sec { margin-top: 60px; }
+.sec-head { display: flex; align-items: flex-end; gap: 18px; flex-wrap: wrap; }
+.kicker { font-family: var(--font-mono); font-size: 11px; letter-spacing: .16em; text-transform: uppercase; color: var(--pg-accent); }
+h2 { font-size: 22px; font-weight: 650; letter-spacing: -.01em; color: #F2F6FC; margin: 6px 0 0; }
+.s-lead { color: var(--pg-secondary); max-width: 80ch; margin: 10px 0 20px; }
+.s-lead code, .note code { font-family: var(--font-mono); font-size: .92em; color: #A8E8DB; background: #14202C; padding: 1px 5px; border-radius: 5px; }
+.note { color: var(--pg-tertiary); font-size: 12px; margin-top: 14px; }
+
+.stage { border-radius: 18px; border: 1px solid var(--pg-border); background: var(--wallpaper); padding: 42px 36px; display: flex; justify-content: center; overflow: hidden; }
+
+/* ---------- Shared window chrome (static caps) ---------- */
+.appwin { width: 660px; max-width: 100%; background: var(--window-glass); border: 1px solid var(--border-strong); border-radius: 12px; box-shadow: var(--shadow-3), inset 0 1px 0 var(--glass-edge); overflow: hidden; backdrop-filter: blur(14px) saturate(1.25); -webkit-backdrop-filter: blur(14px) saturate(1.25); color: var(--text-primary); position: relative; container-type: inline-size; }
+.appwin::before { content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; background: linear-gradient(135deg, var(--sheen), transparent 42%); z-index: 7; }
+.titlebar { height: 38px; display: flex; align-items: center; gap: 9px; padding: 0 5px 0 11px; border-bottom: 1px solid var(--border-subtle); user-select: none; position: relative; z-index: 8; }
+.app-tile { width: 20px; height: 20px; border-radius: 6px; background: var(--accent-subtle); color: var(--accent-subtle-text); display: flex; align-items: center; justify-content: center; }
+.app-tile .ic { width: 13px; height: 13px; }
+.titlebar .ttl { font-size: 13px; font-weight: 600; }
+.titlebar .doc { font-size: 12px; color: var(--text-tertiary); }
+.titlebar .caps { margin-left: auto; display: flex; gap: 2px; }
+.cap { width: 38px; height: 28px; border: 0; background: none; border-radius: 6px; color: var(--text-secondary); display: inline-flex; align-items: center; justify-content: center; cursor: default; transition: background .12s, color .12s; }
+.cap .ic { width: 13px; height: 13px; }
+.cap:hover { background: var(--overlay); color: var(--text-primary); }
+.cap.close:hover { background: var(--danger); color: var(--on-danger); }
+
+.swap { transition: opacity .14s ease; }
+.swap.out { opacity: 0; }
+
+/* ---------- Controls reused from the shell ---------- */
+.btn { height: 30px; padding: 0 12px; border-radius: 6px; border: 1px solid transparent; font-family: var(--font-ui); font-size: 12.5px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; cursor: pointer; transition: background .12s, border-color .12s; }
+.btn:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.b-primary { background: var(--accent); color: var(--on-accent); }
+.b-primary:hover { background: var(--accent-hover); }
+.b-ghost { background: transparent; color: var(--text-secondary); }
+.b-ghost:hover { background: var(--overlay); color: var(--text-primary); }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.icon-btn { width: 28px; height: 28px; border: 0; border-radius: 7px; background: none; color: var(--text-secondary); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; transition: background .12s, color .12s; }
+.icon-btn:hover:not(:disabled) { background: var(--overlay); color: var(--text-primary); }
+.icon-btn:disabled { opacity: .35; cursor: not-allowed; }
+.icon-btn .ic { width: 14px; height: 14px; }
+.input { height: 30px; padding: 0 10px; border-radius: 6px; border: 1px solid var(--border-strong); background: color-mix(in srgb, var(--surface) 82%, transparent); color: var(--text-primary); font-family: var(--font-ui); font-size: 12.5px; transition: border-color .12s, box-shadow .12s; }
+.input::placeholder { color: var(--text-tertiary); }
+.input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--ring); }
+.seg { display: inline-flex; background: var(--base); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 2px; gap: 2px; }
+.seg button { border: 0; background: none; padding: 5px 13px; border-radius: 6px; font-family: var(--font-ui); font-size: 12.5px; font-weight: 550; color: var(--text-secondary); cursor: pointer; transition: color .12s; }
+.seg button:hover { color: var(--text-primary); }
+.seg button.on { background: var(--surface); color: var(--text-primary); box-shadow: var(--shadow-1); }
+.sw2 { width: 34px; height: 20px; border-radius: 999px; background: var(--border-strong); position: relative; flex: none; transition: background .15s; cursor: pointer; border: 0; }
+.sw2::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.3); transition: left .15s; }
+.sw2.on { background: var(--accent); }
+.sw2.on::after { left: 16px; }
+.sw2:disabled { opacity: .45; cursor: not-allowed; }
+input[type="range"] { -webkit-appearance: none; appearance: none; flex: 1; height: 4px; border-radius: 2px; background: var(--border-subtle); outline: none; }
+input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: var(--surface); border: 1.5px solid var(--accent); cursor: pointer; }
+.kbd { font-family: var(--font-mono); font-size: 9.5px; border: 1px solid var(--border-strong); border-bottom-width: 2px; border-radius: 5px; padding: 1px 5px; color: var(--text-secondary); }
+.skel { height: 13px; border-radius: 4px; background: linear-gradient(90deg, var(--overlay) 25%, var(--border-subtle) 50%, var(--overlay) 75%); background-size: 200% 100%; animation: shimmer 1.15s linear infinite; }
+@keyframes shimmer { from { background-position: 180% 0; } to { background-position: -20% 0; } }
+@media (prefers-reduced-motion: no-preference) {
+  .spin { animation: rot 1s linear infinite; }
+}
+.spin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--border-subtle); border-top-color: var(--accent); }
+@keyframes rot { to { transform: rotate(360deg); } }
+
+/* ---------- State plates (empty / failure / loading shared) ---------- */
+.state-box { display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 44px 24px; min-height: 264px; }
+.state-ic { width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin-bottom: 13px; background: var(--overlay); color: var(--text-tertiary); }
+.state-ic .ic { width: 24px; height: 24px; }
+.state-ic.err { background: var(--danger-bg); color: var(--danger); }
+.state-ic.ok { background: var(--success-bg); color: var(--success); }
+.state-t { font-size: 14.5px; font-weight: 650; color: var(--text-primary); }
+.state-s { font-size: 12.5px; color: var(--text-secondary); margin-top: 4px; max-width: 42ch; line-height: 1.55; }
+.state-a { display: flex; gap: 8px; margin-top: 16px; }
+
+/* ---------- Files ---------- */
+.f-toolbar { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border-subtle); position: relative; z-index: 6; }
+.crumbs { display: flex; align-items: center; gap: 1px; font-size: 12.5px; margin-left: 4px; overflow: hidden; }
+.crumbs .cb { border: 0; background: none; color: var(--text-secondary); font-family: var(--font-ui); font-size: 12.5px; font-weight: 550; padding: 3px 7px; border-radius: 6px; cursor: pointer; white-space: nowrap; }
+.crumbs .cb:hover { background: var(--overlay); color: var(--text-primary); }
+.crumbs .cb.cur { color: var(--text-primary); font-weight: 650; }
+.crumbs .ic { width: 11px; height: 11px; color: var(--text-tertiary); }
+.f-search { margin-left: auto; width: 150px; }
+.f-body { display: grid; grid-template-columns: 156px 1fr; min-height: 306px; }
+@container (max-width: 540px) { .f-body { grid-template-columns: 1fr; } .f-side { display: none; } }
+.f-side { border-right: 1px solid var(--border-subtle); padding: 9px 8px; }
+.si { display: flex; align-items: center; gap: 9px; padding: 6px 9px; border-radius: 7px; font-size: 12.5px; font-weight: 550; color: var(--text-secondary); cursor: pointer; }
+.si:hover { background: var(--overlay); color: var(--text-primary); }
+.si.on { background: var(--accent-subtle); color: var(--accent-subtle-text); }
+.si .ic { width: 14px; height: 14px; }
+.si-sep { height: 1px; background: var(--border-subtle); margin: 8px 6px; }
+.si-lbl { font-size: 10px; font-weight: 650; letter-spacing: .1em; text-transform: uppercase; color: var(--text-tertiary); padding: 8px 9px 3px; }
+.f-list { padding: 7px 8px; overflow: auto; max-height: 340px; }
+.f-li { display: grid; grid-template-columns: 18px 1fr 62px 72px; gap: 9px; align-items: center; padding: 6px 9px; border-radius: 7px; cursor: pointer; border: 1px solid transparent; }
+.f-li:hover { background: var(--overlay); }
+.f-li.sel { background: var(--accent-subtle); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+.f-li .fi { width: 16px; height: 16px; color: var(--text-secondary); }
+.f-li.dir .fi { color: var(--accent); }
+.f-li .fn { font-size: 12.5px; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.f-li .fsz, .f-li .fm { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-tertiary); text-align: right; }
+.f-head { display: grid; grid-template-columns: 18px 1fr 62px 72px; gap: 9px; padding: 4px 9px 6px; font-size: 10px; font-weight: 650; letter-spacing: .1em; text-transform: uppercase; color: var(--text-tertiary); border-bottom: 1px solid var(--border-subtle); margin-bottom: 4px; }
+.f-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(86px, 1fr)); gap: 6px; padding: 10px; }
+.f-gi { display: flex; flex-direction: column; align-items: center; gap: 7px; padding: 12px 6px 9px; border-radius: 9px; cursor: pointer; border: 1px solid transparent; }
+.f-gi:hover { background: var(--overlay); }
+.f-gi.sel { background: var(--accent-subtle); border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+.f-gi .gt { width: 34px; height: 34px; border-radius: 9px; background: var(--accent-subtle); color: var(--accent-subtle-text); display: flex; align-items: center; justify-content: center; }
+.f-gi .gt .ic { width: 17px; height: 17px; }
+.f-gi .gn { font-size: 11px; color: var(--text-primary); text-align: center; word-break: break-word; }
+.f-status { border-top: 1px solid var(--border-subtle); padding: 6px 12px; font-size: 11px; color: var(--text-tertiary); display: flex; gap: 8px; align-items: center; position: relative; z-index: 6; }
+.f-status .right { margin-left: auto; font-family: var(--font-mono); font-size: 10.5px; }
+
+/* ---------- Terminal ---------- */
+.t-out { font-family: var(--font-mono); font-size: 12px; line-height: 1.8; padding: 13px 15px; height: 318px; overflow: auto; white-space: pre-wrap; word-break: break-word; position: relative; z-index: 6; }
+.t-in { display: flex; align-items: center; gap: 9px; border-top: 1px solid var(--border-subtle); padding: 10px 15px; position: relative; z-index: 6; }
+.t-in .t-p { font-family: var(--font-mono); font-size: 12px; color: var(--accent); flex: none; }
+.t-in input { flex: 1; border: 0; background: none; outline: none; color: var(--text-primary); font-family: var(--font-mono); font-size: 12px; }
+.t-p { color: var(--accent); }
+.t-dim { color: var(--text-tertiary); }
+.t-err { color: var(--danger); }
+.t-ok { color: var(--success); }
+.t-info { color: var(--info); }
+.t-warn { color: var(--warning); }
+.t-line { display: flex; align-items: center; gap: 8px; }
+
+/* ---------- Settings ---------- */
+.s-body { display: grid; grid-template-columns: 176px 1fr; min-height: 330px; }
+@container (max-width: 540px) { .s-body { grid-template-columns: 1fr; } .s-side { display: none; } }
+.s-side { border-right: 1px solid var(--border-subtle); padding: 10px 9px; display: flex; flex-direction: column; gap: 2px; }
+.s-search { margin-bottom: 8px; }
+.s-search .input { width: 100%; height: 28px; font-size: 12px; }
+.s-content { padding: 15px 17px; position: relative; z-index: 6; }
+.s-content h3 { font-size: 14.5px; font-weight: 650; margin-bottom: 2px; }
+.s-content .s-sub { font-size: 11.5px; color: var(--text-tertiary); margin-bottom: 12px; }
+.set-row { display: flex; align-items: center; gap: 12px; padding: 10px 2px; border-bottom: 1px solid var(--border-subtle); }
+.set-row:last-child { border-bottom: 0; }
+.set-row .sn { font-size: 13px; color: var(--text-primary); }
+.set-row .sd { font-size: 11px; color: var(--text-tertiary); margin-top: 1px; }
+.set-row .ctl { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.meter { width: 130px; height: 5px; border-radius: 3px; background: var(--border-subtle); overflow: hidden; }
+.meter i { display: block; height: 100%; border-radius: 3px; background: var(--accent); }
+.err-banner { display: flex; gap: 9px; align-items: flex-start; border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent); background: var(--danger-bg); color: var(--danger); border-radius: 9px; padding: 9px 12px; font-size: 12px; margin-bottom: 12px; line-height: 1.5; }
+.err-banner .ic { width: 14px; height: 14px; flex: none; margin-top: 1px; }
+.s-empty { padding: 34px 20px; }
+
+footer { margin-top: 70px; padding-top: 20px; border-top: 1px solid var(--pg-border); display: flex; gap: 10px; align-items: center; color: var(--pg-tertiary); font-size: 12px; }
+footer .spacer { flex: 1; }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-logo" viewBox="0 0 24 24"><rect x="2.5" y="2.5" width="19" height="19" rx="5.5"/><path d="M6 18 18 6"/><path d="M7.5 12V7.5H12z" fill="currentColor" stroke="none"/><path d="M16.5 12v4.5H12z" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-min" viewBox="0 0 16 16"><path d="M4 8h8"/></symbol>
+    <symbol id="i-max" viewBox="0 0 16 16"><rect x="3.5" y="3.5" width="9" height="9" rx="1.5"/></symbol>
+    <symbol id="i-close" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></symbol>
+    <symbol id="i-notes" viewBox="0 0 16 16"><path d="M4.5 1.5h5l3 3v9a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1v-11a1 1 0 0 1 1-1z"/><path d="M9.5 1.5v3h3"/><path d="M6 9h4.5M6 11.5h4.5"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 1.5"/></symbol>
+    <symbol id="i-files" viewBox="0 0 16 16"><path d="M2 4.5a1 1 0 0 1 1-1h3l1.5 1.5H13a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="1.5"/><path d="M5 6.5 7 8l-2 1.5"/><path d="M8.5 10.5H11"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 16 16"><path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11"/><circle cx="6" cy="4.5" r="1.7"/><circle cx="10" cy="8" r="1.7"/><circle cx="4.5" cy="11.5" r="1.7"/></symbol>
+    <symbol id="i-agent" viewBox="0 0 16 16"><path d="M8 1.8l1.3 4.9 4.9 1.3-4.9 1.3L8 14.2l-1.3-4.9-4.9-1.3 4.9-1.3z"/></symbol>
+    <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4"/><path d="M10.2 10.2 13.5 13.5"/></symbol>
+    <symbol id="i-check" viewBox="0 0 16 16"><path d="M3 8.5l3.2 3L13 4.5"/></symbol>
+    <symbol id="i-warning" viewBox="0 0 16 16"><path d="M8 2.5 14.5 13h-13z"/><path d="M8 6.5v3"/><path d="M8 11h.01"/></symbol>
+    <symbol id="i-error" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M5.8 5.8l4.4 4.4M10.2 5.8l-4.4 4.4"/></symbol>
+    <symbol id="i-info" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 7.5V11"/><path d="M8 5h.01"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></symbol>
+    <symbol id="i-file" viewBox="0 0 16 16"><path d="M4.5 1.5h5l3 3v9a1 1 0 0 1-1 1h-7a1 1 0 0 1-1-1v-11a1 1 0 0 1 1-1z"/><path d="M9.5 1.5v3h3"/></symbol>
+    <symbol id="i-download" viewBox="0 0 16 16"><path d="M8 2.5v7M5.5 7 8 9.5 10.5 7"/><path d="M3 12.5h10"/></symbol>
+    <symbol id="i-image" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><circle cx="5.6" cy="6.4" r="1.1"/><path d="M2.5 11.5l3-3 2.5 2.5 3.5-3.5 2 2"/></symbol>
+    <symbol id="i-disk" viewBox="0 0 16 16"><rect x="1.8" y="5" width="12.4" height="6" rx="1.5"/><path d="M12.2 8h.01"/><path d="M4 8h5"/></symbol>
+    <symbol id="i-back" viewBox="0 0 16 16"><path d="M10 3.5 5.5 8l4.5 4.5"/></symbol>
+    <symbol id="i-fwd" viewBox="0 0 16 16"><path d="M6 3.5 10.5 8 6 12.5"/></symbol>
+    <symbol id="i-chev-r" viewBox="0 0 16 16"><path d="M6 4l4 4-4 4"/></symbol>
+    <symbol id="i-list" viewBox="0 0 16 16"><path d="M5.5 4h8M5.5 8h8M5.5 12h8"/><path d="M2.5 4h.01M2.5 8h.01M2.5 12h.01"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 16 16"><rect x="2.5" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="9" y="2.5" width="4.5" height="4.5" rx="1"/><rect x="2.5" y="9" width="4.5" height="4.5" rx="1"/><rect x="9" y="9" width="4.5" height="4.5" rx="1"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.6"/><path d="M8 1.5v1.8M8 12.7v1.8M1.5 8h1.8M12.7 8h1.8M3.4 3.4l1.3 1.3M11.3 11.3l1.3 1.3M12.6 3.4l-1.3 1.3M4.7 11.3l-1.3 1.3"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 16 16"><path d="M13.6 9.6A6 6 0 0 1 6.4 2.4a6 6 0 1 0 7.2 7.2z"/></symbol>
+    <symbol id="i-kbd" viewBox="0 0 16 16"><rect x="1.5" y="4.5" width="13" height="7.5" rx="1.5"/><path d="M4 7h.01M6.5 7h.01M9 7h.01M11.5 7h.01M4 9.5h.01M11.5 9.5h.01M6 9.5h4"/></symbol>
+    <symbol id="i-power" viewBox="0 0 16 16"><path d="M8 2v5"/><path d="M4.6 4.4a5.6 5.6 0 1 0 6.8 0"/></symbol>
+  </defs>
+</svg>
+
+<div id="page" data-theme="dark">
+<div class="wrap">
+
+<header class="pg-head">
+  <div class="logo">
+    <svg class="ic"><use href="#i-logo"/></svg>
+    <h1>Mirror Core Apps</h1>
+  </div>
+  <span class="tag">v0.1 · review sample</span>
+  <div class="spacer"></div>
+  <button class="theme-btn" id="themeBtn"><svg class="ic"><use href="#i-moon"/></svg><span id="themeLbl">dark</span></button>
+</header>
+
+<p class="intro">
+  Reference designs for the three core apps — <strong>Files</strong>, <strong>Terminal</strong>, and <strong>Settings</strong> —
+  each shown in its four required states: <strong>navigation</strong> (populated and fully interactive), <strong>loading</strong>,
+  <strong>empty</strong>, and <strong>failure</strong>. Switch states with the segmented control, or reach them organically:
+  the Downloads folder is genuinely empty, the fixture disk genuinely fails, and <code>fault</code> in the terminal genuinely errors.
+</p>
+
+<!-- ============================== FILES ============================== -->
+<section class="sec" id="sec-files">
+  <div class="sec-head">
+    <div><div class="kicker">01 — Files</div><h2>File manager</h2></div>
+    <div style="flex:1"></div>
+    <div class="seg" data-seg="files">
+      <button class="on" data-state="nav">Navigation</button>
+      <button data-state="loading">Loading</button>
+      <button data-state="empty">Empty</button>
+      <button data-state="failure">Failure</button>
+    </div>
+  </div>
+  <p class="s-lead">Toolbar with back/forward history, breadcrumb path bar, filter field, and list/grid toggle. Sidebar for places and devices. The list shows name, size, and modified time; folders drill in, the status bar counts items and free space.</p>
+  <div class="stage">
+    <div class="appwin" id="filesWin">
+      <div class="titlebar">
+        <span class="app-tile"><svg class="ic"><use href="#i-files"/></svg></span>
+        <span class="ttl">Files</span><span class="doc" id="filesDoc">— /home</span>
+        <span class="caps">
+          <button class="cap" tabindex="-1"><svg class="ic"><use href="#i-min"/></svg></button>
+          <button class="cap" tabindex="-1"><svg class="ic"><use href="#i-max"/></svg></button>
+          <button class="cap close" tabindex="-1"><svg class="ic"><use href="#i-close"/></svg></button>
+        </span>
+      </div>
+      <div class="swap" id="filesSwap"></div>
+    </div>
+  </div>
+  <p class="note">Try it: double-click folders to navigate, use the breadcrumbs and back button to return. <code>Downloads</code> is empty, <code>block-test.img</code> fails to read, filtering to no match shows the search-empty state.</p>
+</section>
+
+<!-- ============================== TERMINAL ============================== -->
+<section class="sec" id="sec-terminal">
+  <div class="sec-head">
+    <div><div class="kicker">02 — Terminal</div><h2>Console</h2></div>
+    <div style="flex:1"></div>
+    <div class="seg" data-seg="terminal">
+      <button class="on" data-state="nav">Navigation</button>
+      <button data-state="loading">Loading</button>
+      <button data-state="empty">Empty</button>
+      <button data-state="failure">Failure</button>
+    </div>
+  </div>
+  <p class="s-lead">A live prompt over Mirror's diagnostic surface: colored output classes, an inline busy indicator for long commands, errors that explain and recover. History with <code>↑</code>, <code>clear</code> wipes the scrollback, and every line is honest about what the system can actually do.</p>
+  <div class="stage">
+    <div class="appwin" id="termWin">
+      <div class="titlebar">
+        <span class="app-tile"><svg class="ic"><use href="#i-terminal"/></svg></span>
+        <span class="ttl">Terminal</span><span class="doc">— console</span>
+        <span class="caps">
+          <button class="cap" tabindex="-1"><svg class="ic"><use href="#i-min"/></svg></button>
+          <button class="cap" tabindex="-1"><svg class="ic"><use href="#i-max"/></svg></button>
+          <button class="cap close" tabindex="-1"><svg class="ic"><use href="#i-close"/></svg></button>
+        </span>
+      </div>
+      <div class="swap" id="termSwap"></div>
+    </div>
+  </div>
+  <p class="note">Try it: <code>help</code> lists commands; <code>blocks</code> reads the fixture (watch the busy state); <code>fault</code> simulates a contained failure; an unknown command shows the recovery path.</p>
+</section>
+
+<!-- ============================== SETTINGS ============================== -->
+<section class="sec" id="sec-settings">
+  <div class="sec-head">
+    <div><div class="kicker">03 — Settings</div><h2>System settings</h2></div>
+    <div style="flex:1"></div>
+    <div class="seg" data-seg="settings">
+      <button class="on" data-state="nav">Navigation</button>
+      <button data-state="loading">Loading</button>
+      <button data-state="empty">Empty</button>
+      <button data-state="failure">Failure</button>
+    </div>
+  </div>
+  <p class="s-lead">Section navigation on the left, search that genuinely filters, and controls that map to the design system. Agent access stays locked behind a broker grant — requesting one demonstrates the inline failure banner and its retry.</p>
+  <div class="stage">
+    <div class="appwin" id="setWin">
+      <div class="titlebar">
+        <span class="app-tile"><svg class="ic"><use href="#i-settings"/></svg></span>
+        <span class="ttl">Settings</span><span class="doc" id="setDoc">— appearance</span>
+        <span class="caps">
+          <button class="cap" tabindex="-1"><svg class="ic"><use href="#i-min"/></svg></button>
+          <button class="cap" tabindex="-1"><svg class="ic"><use href="#i-max"/></svg></button>
+          <button class="cap close" tabindex="-1"><svg class="ic"><use href="#i-close"/></svg></button>
+        </span>
+      </div>
+      <div class="swap" id="setSwap"></div>
+    </div>
+  </div>
+  <p class="note">Try it: search <code>zzz</code> for the empty state, open <code>Agent access</code> and request a grant for the failure state, and flip <code>Dark theme</code> — it re-themes this whole page.</p>
+</section>
+
+<footer>
+  <svg class="ic" style="color:var(--pg-accent)"><use href="#i-logo"/></svg>
+  Mirror core apps — v0.1 draft for review
+  <span class="spacer"></span>
+  <span class="mono">docs/design/apps.html</span>
+</footer>
+
+</div>
+</div>
+
+<script>
+const $ = (s, r = document) => r.querySelector(s);
+
+/* ================= Theme ================= */
+const page = $("#page");
+function setPageTheme(light) {
+  page.dataset.theme = light ? "light" : "dark";
+  $("#themeLbl").textContent = light ? "light" : "dark";
+  $("#themeBtn").querySelector("use").setAttribute("href", light ? "#i-sun" : "#i-moon");
+}
+$("#themeBtn").onclick = () => setPageTheme(page.dataset.theme !== "light");
+
+/* ================= State machinery ================= */
+function swapTo(swapEl, html) {
+  swapEl.classList.add("out");
+  setTimeout(() => { swapEl.innerHTML = html; swapEl.classList.remove("out"); }, 140);
+}
+const segState = { files: "nav", terminal: "nav", settings: "nav" };
+document.querySelectorAll(".seg").forEach((seg) => {
+  seg.addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-state]");
+    if (!b) return;
+    setSeg(seg.dataset.seg, b.dataset.state);
+  });
+});
+function markSeg(app, state) {
+  const seg = document.querySelector(`.seg[data-seg="${app}"]`);
+  seg.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x.dataset.state === state));
+  segState[app] = state;
+}
+function setSeg(app, state) {
+  markSeg(app, state);
+  if (app === "files") renderFiles(state);
+  if (app === "terminal") renderTerm(state);
+  if (app === "settings") renderSettings(state);
+}
+
+/* ================= Files ================= */
+const FS = {
+  home: { label: "Home", icon: "i-logo", items: [
+    { name: "Documents", kind: "dir" },
+    { name: "Downloads", kind: "dir" },
+    { name: "Images", kind: "dir" },
+    { name: "gamma.txt", kind: "file", size: "96 B", mod: "Oct 8" },
+    { name: "roadmap.md", kind: "file", size: "2.1 KB", mod: "Oct 9" },
+    { name: "boot.log", kind: "file", size: "14 KB", mod: "Oct 9" },
+  ]},
+  documents: { label: "Documents", icon: "i-files", items: [
+    { name: "gamma.txt", kind: "file", size: "96 B", mod: "Oct 8" },
+    { name: "spec-draft.md", kind: "file", size: "4.4 KB", mod: "Oct 9" },
+  ]},
+  downloads: { label: "Downloads", icon: "i-download", items: [] },
+  images: { label: "Images", icon: "i-image", items: [
+    { name: "boot-framebuffer.png", kind: "img", size: "41 KB", mod: "Oct 6" },
+    { name: "native-desktop.png", kind: "img", size: "38 KB", mod: "Oct 7" },
+    { name: "pointer-console.png", kind: "img", size: "36 KB", mod: "Oct 7" },
+  ]},
+};
+let fsPath = ["home"];
+let fsHist = [];
+let fsFwd = [];
+let fsView = "list";
+let fsQuery = "";
+let fsSelected = null;
+let fsBusy = false;
+let fsNoteTimer = null;
+
+function iconFor(item) {
+  if (item.kind === "dir") return "i-files";
+  if (item.kind === "img") return "i-image";
+  return "i-file";
+}
+function filesToolbar(disabled) {
+  return `<div class="f-toolbar">
+    <button class="icon-btn" data-f="back" ${fsHist.length && !disabled ? "" : "disabled"} title="Back"><svg class="ic"><use href="#i-back"/></svg></button>
+    <button class="icon-btn" data-f="fwd" ${fsFwd.length && !disabled ? "" : "disabled"} title="Forward"><svg class="ic"><use href="#i-fwd"/></svg></button>
+    <div class="crumbs">${crumbsHtml(disabled)}</div>
+    <input class="input f-search" placeholder="Filter…" value="${fsQuery}" ${disabled ? "disabled" : ""}>
+    <button class="icon-btn" data-f="view" title="${fsView === "list" ? "Grid view" : "List view"}" ${disabled ? "disabled" : ""}><svg class="ic"><use href="#${fsView === "list" ? "i-grid" : "i-list"}"/></svg></button>
+  </div>`;
+}
+function crumbsHtml(disabled) {
+  const parts = fsPath.map((k) => FS[k].label);
+  return parts.map((p, i) => {
+    const cur = i === parts.length - 1;
+    return `${i ? '<svg class="ic"><use href="#i-chev-r"/></svg>' : ""}<button class="cb${cur ? " cur" : ""}" data-f="crumb" data-i="${i}" ${disabled ? "disabled" : ""}>${p}</button>`;
+  }).join("");
+}
+function filesSidebar(activeKey, deviceOn) {
+  const places = [["home", "Home", "i-logo"], ["documents", "Documents", "i-files"], ["downloads", "Downloads", "i-download"], ["images", "Images", "i-image"]];
+  return `<div class="f-side">
+    <div class="si-lbl">Places</div>
+    ${places.map(([k, n, ic]) => `<div class="si${k === activeKey ? " on" : ""}" data-f="nav" data-k="${k}"><svg class="ic"><use href="#${ic}"/></svg>${n}</div>`).join("")}
+    <div class="si-sep"></div>
+    <div class="si-lbl">Devices</div>
+    <div class="si${deviceOn ? " on" : ""}" data-f="device"><svg class="ic"><use href="#i-disk"/></svg>block-test.img</div>
+  </div>`;
+}
+function filesListHtml() {
+  const key = fsPath[fsPath.length - 1];
+  const folder = FS[key];
+  let items = folder.items;
+  if (fsQuery) items = items.filter((i) => i.name.toLowerCase().includes(fsQuery));
+  if (!folder.items.length) {
+    return emptyPlate("i-download", "This folder is empty", "Files you download will appear here.", `<button class="btn b-ghost" data-f="refresh">Refresh</button>`);
+  }
+  if (!items.length) {
+    return emptyPlate("i-search", `No matches in ${folder.label}`, `Nothing here matches \u201c${fsQuery}\u201d.`, `<button class="btn b-ghost" data-f="clearfilter">Clear filter</button>`);
+  }
+  if (fsView === "grid") {
+    return `<div class="f-grid">${items.map((i) => `
+      <div class="f-gi${fsSelected === i.name ? " sel" : ""}" data-name="${i.name}" data-kind="${i.kind}">
+        <span class="gt"><svg class="ic"><use href="#${iconFor(i)}"/></svg></span>
+        <span class="gn">${i.name}</span>
+      </div>`).join("")}</div>`;
+  }
+  return `<div class="f-head"><span></span><span>Name</span><span style="text-align:right">Size</span><span style="text-align:right">Modified</span></div>
+    ${items.map((i) => `
+    <div class="f-li${i.kind === "dir" ? " dir" : ""}${fsSelected === i.name ? " sel" : ""}" data-name="${i.name}" data-kind="${i.kind}">
+      <svg class="ic fi"><use href="#${iconFor(i)}"/></svg>
+      <span class="fn">${i.name}</span>
+      <span class="fsz">${i.size || "—"}</span>
+      <span class="fm">${i.mod || "—"}</span>
+    </div>`).join("")}`;
+}
+function emptyPlate(icon, t, s, actions) {
+  return `<div class="state-box">
+    <span class="state-ic"><svg class="ic"><use href="#${icon}"/></svg></span>
+    <div class="state-t">${t}</div>
+    <div class="state-s">${s}</div>
+    ${actions ? `<div class="state-a">${actions}</div>` : ""}
+  </div>`;
+}
+function statusHtml(note) {
+  const key = fsPath[fsPath.length - 1];
+  const n = FS[key].items.length;
+  return `<div class="f-status"><span>${note || `${n} item${n === 1 ? "" : "s"}`}</span><span class="right">read-only fixture · 1 MiB</span></div>`;
+}
+function navHtml() {
+  return filesToolbar(false) + `<div class="f-body">${filesSidebar(fsPath[fsPath.length - 1], false)}<div class="f-list" id="fList">${filesListHtml()}</div></div>` + statusHtml();
+}
+function loadingHtml() {
+  const rows = Array.from({ length: 7 }, (_, i) => `<div class="f-li" style="cursor:default"><span class="skel" style="width:14px;height:14px;border-radius:4px"></span><span class="skel" style="width:${52 + ((i * 13) % 30)}%"></span><span class="skel" style="width:34px"></span><span class="skel" style="width:44px"></span></div>`).join("");
+  return filesToolbar(true) + `<div class="f-body">${filesSidebar(fsPath[fsPath.length - 1], false)}<div class="f-list">${rows}</div></div>` + statusHtml("reading…");
+}
+function emptyHtml() {
+  return filesToolbar(false) + `<div class="f-body">${filesSidebar("downloads", false)}<div class="f-list">${emptyPlate("i-download", "This folder is empty", "Files you download will appear here.", `<button class="btn b-ghost" data-f="refresh">Refresh</button>`)}</div></div>` + `<div class="f-status"><span>0 items</span><span class="right">read-only fixture · 1 MiB</span></div>`;
+}
+function failureHtml() {
+  return filesToolbar(false) + `<div class="f-body">${filesSidebar(null, true)}<div class="f-list"><div class="state-box">
+    <span class="state-ic err"><svg class="ic"><use href="#i-error"/></svg></span>
+    <div class="state-t">Couldn't read this device</div>
+    <div class="state-s">block-test.img is a read-only fixture — the block driver reported EIO on sector 1234.</div>
+    <div class="state-a"><button class="btn b-primary" data-f="retry">Retry</button><button class="btn b-ghost" data-f="nav" data-k="home">Back to Home</button></div>
+  </div></div></div>` + `<div class="f-status"><span style="color:var(--danger)">I/O error</span><span class="right">queue stopped · reset required</span></div>`;
+}
+
+function renderFiles(state, fade = true) {
+  const el = $("#filesSwap");
+  const html = state === "nav" ? navHtml() : state === "loading" ? loadingHtml() : state === "empty" ? emptyHtml() : failureHtml();
+  $("#filesDoc").textContent = "— /" + fsPath.map((k) => FS[k].label.toLowerCase()).join("/");
+  if (fade) swapTo(el, html); else el.innerHTML = html;
+}
+function fsNavigate(key, push = true, replace = false) {
+  if (fsBusy) return;
+  const cur = fsPath[fsPath.length - 1];
+  if (key === cur) return;
+  fsBusy = true;
+  if (push) { fsHist.push([...fsPath]); fsFwd = []; }
+  if (replace) fsPath = key === "home" ? ["home"] : ["home", key];
+  else fsPath.push(key);
+  fsQuery = ""; fsSelected = null;
+  renderFiles("loading", false);
+  setTimeout(() => { fsBusy = false; renderFiles("nav"); }, 420);
+}
+function fsNote(text) {
+  const bar = $("#filesSwap .f-status span:first-child");
+  if (!bar) return;
+  bar.textContent = text;
+  clearTimeout(fsNoteTimer);
+  fsNoteTimer = setTimeout(() => { if (segState.files === "nav") renderFiles("nav", false); }, 1600);
+}
+
+$("#filesSwap").addEventListener("click", (e) => {
+  const navBtn = e.target.closest("[data-f]");
+  const row = e.target.closest("[data-name]");
+  if (row && !navBtn) {
+    if (e.detail > 1) return;
+    const was = row.classList.contains("sel");
+    $("#filesSwap").querySelectorAll(".f-li.sel, .f-gi.sel").forEach((r) => r.classList.remove("sel"));
+    if (!was) row.classList.add("sel");
+    fsSelected = was ? null : row.dataset.name;
+    return;
+  }
+  if (!navBtn) return;
+  const act = navBtn.dataset.f;
+  if (act === "nav") { markSeg("files", "nav"); fsNavigate(navBtn.dataset.k, true, true); }
+  if (act === "device") { markSeg("files", "failure"); renderFiles("failure"); }
+  if (act === "crumb") {
+    const i = +navBtn.dataset.i;
+    if (i < fsPath.length - 1) {
+      fsHist.push([...fsPath]);
+      fsPath = fsPath.slice(0, i + 1);
+      fsQuery = ""; fsSelected = null;
+      renderFiles("nav");
+    }
+  }
+  if (act === "back" && fsHist.length) { fsFwd.push([...fsPath]); fsPath = fsHist.pop(); fsQuery = ""; fsSelected = null; renderFiles("nav"); }
+  if (act === "fwd" && fsFwd.length) { fsHist.push([...fsPath]); fsPath = fsFwd.pop(); fsQuery = ""; fsSelected = null; renderFiles("nav"); }
+  if (act === "view") { fsView = fsView === "list" ? "grid" : "list"; renderFiles("nav", false); }
+  if (act === "clearfilter") { fsQuery = ""; renderFiles("nav"); }
+  if (act === "refresh") { fsNote("refreshed — still empty"); }
+  if (act === "retry") {
+    markSeg("files", "loading");
+    renderFiles("loading");
+    setTimeout(() => { markSeg("files", "failure"); renderFiles("failure"); }, 950);
+  }
+});
+$("#filesSwap").addEventListener("dblclick", (e) => {
+  const row = e.target.closest("[data-name]");
+  if (!row) return;
+  if (row.dataset.kind === "dir") {
+    const key = row.dataset.name.toLowerCase();
+    if (FS[key]) { markSeg("files", "nav"); fsNavigate(key); }
+  } else {
+    fsNote(`${row.dataset.name} — opens in Notes`);
+  }
+});
+$("#filesSwap").addEventListener("input", (e) => {
+  if (!e.target.matches(".f-search")) return;
+  fsQuery = e.target.value.trim().toLowerCase();
+  const list = $("#fList");
+  if (list) { list.innerHTML = filesListHtml(); const s = $("#filesSwap .f-status span:first-child"); if (s) s.textContent = `${list.children.length ? "filtered" : "no matches"}`; }
+});
+
+/* ================= Terminal ================= */
+let tLines = [];
+let tHist = [];
+let tHistIdx = -1;
+let tBusy = false;
+
+const T_HELP = `<span class="t-dim">available:</span>  help      status    echo …    blocks    fault    clear`;
+function tPromptEcho(cmd) { return `<span class="t-p">mirror ~ $</span> ${cmd}`; }
+function termOut() { return `<div class="t-out" id="tOut">${tLines.join("\n") || `<span class="t-dim">type </span><span class="t-ok">help</span><span class="t-dim"> to begin — every command here is real.</span>`}</div>`; }
+function termIn(disabled) {
+  return `<div class="t-in"><span class="t-p">mirror ~ $</span><input id="tInput" placeholder="" autocomplete="off" spellcheck="false" ${disabled ? "disabled" : ""}></div>`;
+}
+function renderTerm(state, fade = true) {
+  const el = $("#termSwap");
+  let html;
+  if (state === "nav") html = termOut() + termIn(false);
+  else if (state === "loading") {
+    html = `<div class="t-out"><span class="t-p">mirror ~ $</span> blocks
+<span class="t-dim">claim 1af4:1001 … ok · queue 0 · 8 slots</span>
+<span class="t-line"><span class="spin"></span><span class="t-dim">reading sector 1234 via blkdebug…</span></span></div>` + termIn(true);
+  } else if (state === "empty") {
+    html = termOut() + termIn(false);
+  } else {
+    html = `<div class="t-out"><span class="t-p">mirror ~ $</span> blocks
+<span class="t-dim">claim 1af4:1001 … ok · queue 0 · 8 slots</span>
+<span class="t-err">error: I/O on sector 1234 — EIO from device</span>
+<span class="t-dim">buffer preserved · queue stopped · driver reset required</span>
+<span class="t-ok">hint:</span> <span class="t-dim">run </span>blocks<span class="t-dim"> again after reset, or check </span>status</div>` + termIn(false);
+  }
+  if (fade) swapTo(el, html); else el.innerHTML = html;
+  if (state === "nav" || state === "empty" || state === "failure") {
+    setTimeout(() => { const i = $("#tInput"); if (i) i.focus(); }, 150);
+  }
+}
+function tPrint(lines) {
+  tLines.push(...lines);
+  const out = $("#tOut");
+  if (out) { out.innerHTML = tLines.join("\n"); out.scrollTop = out.scrollHeight; }
+}
+function tRun(cmd) {
+  const out = $("#tOut");
+  if (segState.terminal !== "nav") { tLines = []; markSeg("terminal", "nav"); renderTerm("nav", false); }
+  tPrint([tPromptEcho(cmd.replace(/</g, "&lt;"))]);
+  const [name, ...args] = cmd.trim().split(/\s+/);
+  if (!name) return;
+  if (name === "help") tPrint([T_HELP]);
+  else if (name === "status") tPrint([`<span class="t-dim">ticks</span>=8412  <span class="t-dim">procs</span>=4  <span class="t-dim">mem</span>=62/128 MiB  <span class="t-dim">irq</span>=ok`]);
+  else if (name === "echo") tPrint([args.join(" ").replace(/</g, "&lt;") || `<span class="t-dim">(empty)</span>`]);
+  else if (name === "clear") { tLines = []; tPrint([]); $("#tOut").innerHTML = ""; return; }
+  else if (name === "blocks") {
+    tBusy = true;
+    const inp = $("#tInput");
+    if (inp) inp.disabled = true;
+    tPrint([`<span class="t-dim">claim 1af4:1001 … ok · queue 0 · 8 slots</span>`, `<span class="t-line"><span class="spin"></span><span class="t-dim">reading sector 1234…</span></span>`]);
+    setTimeout(() => {
+      tBusy = false;
+      const lines = tLines;
+      lines.pop();
+      tPrint([`<span class="t-ok">ok</span> <span class="t-dim">sector 1234 verified · 512 B · retries=0</span>`]);
+      renderTerm("nav", false);
+    }, 1100);
+  }
+  else if (name === "fault") tPrint([`<span class="t-err">fault:</span> <span class="t-dim">UD2 in worker thread — contained, process ended</span>`, `<span class="t-dim">peers unaffected · handles reclaimed · exit 35</span>`]);
+  else tPrint([`<span class="t-err">error:</span> <span class="t-dim">unknown command \u201c${name.replace(/</g, "&lt;")}\u201d — type </span><span class="t-ok">help</span>`]);
+}
+$("#termSwap").addEventListener("keydown", (e) => {
+  if (!e.target.matches("#tInput")) return;
+  if (e.key === "Enter") {
+    const v = e.target.value;
+    e.target.value = "";
+    tRun(v);
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    if (!tHist.length) return;
+    tHistIdx = tHistIdx < 0 ? tHist.length - 1 : Math.max(0, tHistIdx - 1);
+    e.target.value = tHist[tHistIdx];
+  } else if (e.key === "ArrowDown") {
+    e.preventDefault();
+    if (tHistIdx < 0) return;
+    tHistIdx = Math.min(tHist.length - 1, tHistIdx + 1);
+    e.target.value = tHist[tHistIdx];
+  }
+});
+$("#termSwap").addEventListener("pointerdown", (e) => {
+  const i = $("#tInput");
+  if (i && !i.disabled && !e.target.closest("button")) setTimeout(() => i.focus(), 0);
+});
+$("#termWin").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && e.target.matches("#tInput")) {
+    const v = e.target.value.trim();
+    if (v) { tHist.push(v); tHistIdx = -1; }
+  }
+});
+
+/* ================= Settings ================= */
+const SET_SECTIONS = [
+  ["appearance", "Appearance", "i-sun"],
+  ["input", "Input", "i-kbd"],
+  ["system", "System", "i-disk"],
+  ["agent", "Agent access", "i-agent"],
+  ["about", "About", "i-info"],
+];
+let setSection = "appearance";
+let setQuery = "";
+let agentFail = false;
+
+function setSidebar() {
+  const items = SET_SECTIONS.filter(([, n]) => n.toLowerCase().includes(setQuery));
+  return `<div class="s-side">
+    <div class="s-search"><input class="input" placeholder="Search settings…" value="${setQuery}"></div>
+    ${items.map(([k, n, ic]) => `<div class="si${k === setSection ? " on" : ""}" data-s="${k}"><svg class="ic"><use href="#${ic}"/></svg>${n}</div>`).join("")}
+  </div>`;
+}
+function setRow(name, desc, ctl) {
+  return `<div class="set-row"><div><div class="sn">${name}</div><div class="sd">${desc}</div></div><div class="ctl">${ctl}</div></div>`;
+}
+function setContent() {
+  if (setQuery && !SET_SECTIONS.filter(([, n]) => n.toLowerCase().includes(setQuery)).length) {
+    return `<div class="s-content"><div class="s-empty">${emptyPlate("i-search", `No settings match \u201c${setQuery}\u201d`, "Try theme, input, system, or agent.", `<button class="btn b-ghost" data-s="clearsearch">Clear search</button>`)}</div></div>`;
+  }
+  let inner = "";
+  if (setSection === "appearance") {
+    inner = `<h3>Appearance</h3><div class="s-sub">Two peer themes over one token set</div>` +
+      setRow("Dark theme", "Swap the whole palette — this flips the review page too.", `<button class="sw2${page.dataset.theme === "dark" ? " on" : ""}" data-s="theme" role="switch" aria-checked="${page.dataset.theme === "dark"}"></button>`) +
+      setRow("Reduce motion", "Honors prefers-reduced-motion across the shell.", `<button class="sw2" data-s="toggle" role="switch" aria-checked="false"></button>`) +
+      setRow("Accent", "One accent — pinned to Mirror teal by principle.", `<span class="kbd">#4FD8C2</span>`);
+  } else if (setSection === "input") {
+    inner = `<h3>Input</h3><div class="s-sub">Keyboard and pointer behavior</div>` +
+      setRow("Key repeat rate", "Delay before a held key repeats.", `<input type="range" min="0" max="100" value="40">`) +
+      setRow("Pointer speed", "Motion multiplier for the desktop cursor.", `<input type="range" min="0" max="100" value="55">`) +
+      setRow("Caps Lock", "Toggles only on a fresh press — never on repeat.", `<button class="sw2 on" data-s="toggle" role="switch" aria-checked="true"></button>`);
+  } else if (setSection === "system") {
+    inner = `<h3>System</h3><div class="s-sub">Live machine resources</div>` +
+      setRow("Memory", "62 MiB of 128 MiB in use.", `<span class="meter"><i style="width:48%"></i></span>`) +
+      setRow("Fixture storage", "1 MiB read-only test disk attached.", `<span class="meter"><i style="width:12%"></i></span>`) +
+      setRow("Restart", "Restarts are a kernel-console operation.", `<button class="btn b-ghost" data-s="restart">Restart…</button>`);
+  } else if (setSection === "agent") {
+    inner = `<h3>Agent access</h3><div class="s-sub">Scoped, revocable capability grants</div>` +
+      (agentFail ? `<div class="err-banner"><svg class="ic"><use href="#i-error"/></svg><div>Grant broker unreachable — this concept runs offline. The agent keeps working with zero authority.</div></div>` : "") +
+      setRow("Desktop operations", "Agents may drive windows and input.", `<button class="sw2" data-s="toggle" disabled></button>`) +
+      setRow("File access", "Read-only, per-directory grants.", `<button class="sw2" data-s="toggle" disabled></button>`) +
+      setRow("Grant broker", "Request an operator grant from the broker.", `<button class="btn b-primary" data-s="grant">${agentFail ? "Try again" : "Request grant"}</button>`);
+  } else {
+    inner = `<h3>About</h3><div class="s-sub">This machine</div>
+      <div class="mono" style="font-size:12px;line-height:2;color:var(--text-secondary)">mirror&nbsp;&nbsp;0.1.0-concept<br>kernel&nbsp;&nbsp;x86_64 · limine 12.9.3<br>display&nbsp;&nbsp;1280×800 · rgbx tiles<br>runtime&nbsp;&nbsp;qemu tcg</div>`;
+  }
+  return `<div class="s-content">${inner}</div>`;
+}
+function settingsSkeleton() {
+  const rows = Array.from({ length: 4 }, (_, i) => `<div class="set-row" style="cursor:default"><div style="flex:1"><div class="skel" style="width:${46 + i * 9}%;margin-bottom:6px"></div><div class="skel" style="width:${68 - i * 7}%"></div></div><div class="ctl"><span class="skel" style="width:34px;height:18px;border-radius:9px"></span></div></div>`).join("");
+  return `<div class="s-content"><div class="skel" style="width:120px;height:15px;margin-bottom:6px"></div><div class="skel" style="width:200px;margin-bottom:14px"></div>${rows}</div>`;
+}
+function renderSettings(state, fade = true) {
+  const el = $("#setSwap");
+  let html;
+  if (state === "loading") html = `<div class="s-body">${setSidebar()}${settingsSkeleton()}</div>`;
+  else if (state === "empty") { setQuery = "zzz"; html = `<div class="s-body">${setSidebar()}${setContent()}</div>`; }
+  else if (state === "failure") { setSection = "agent"; agentFail = true; setQuery = ""; html = `<div class="s-body">${setSidebar()}${setContent()}</div>`; }
+  else html = `<div class="s-body">${setSidebar()}${setContent()}</div>`;
+  $("#setDoc").textContent = "— " + (SET_SECTIONS.find(([k]) => k === setSection) || [0, "settings"])[1].toLowerCase();
+  if (fade) swapTo(el, html); else el.innerHTML = html;
+}
+$("#setSwap").addEventListener("click", (e) => {
+  const nav = e.target.closest("[data-s]");
+  if (!nav) return;
+  const act = nav.dataset.s;
+  if (SET_SECTIONS.some(([k]) => k === act)) {
+    setSection = act;
+    if (act !== "agent") agentFail = false;
+    markSeg("settings", "nav");
+    renderSettings("nav");
+    return;
+  }
+  if (act === "theme") setPageTheme(page.dataset.theme !== "light");
+  if (act === "toggle" && !nav.disabled) { nav.classList.toggle("on"); nav.setAttribute("aria-checked", nav.classList.contains("on")); }
+  if (act === "restart") { nav.textContent = "Ask the console"; setTimeout(() => { nav.textContent = "Restart…"; }, 1600); }
+  if (act === "grant") {
+    markSeg("settings", "loading");
+    renderSettings("loading");
+    setTimeout(() => { agentFail = true; markSeg("settings", "failure"); setSection = "agent"; renderSettings("failure"); }, 900);
+  }
+  if (act === "clearsearch") { setQuery = ""; markSeg("settings", "nav"); renderSettings("nav"); }
+});
+$("#setSwap").addEventListener("input", (e) => {
+  if (!e.target.matches(".s-search .input")) return;
+  setQuery = e.target.value.trim().toLowerCase();
+  const side = $("#setSwap .s-side");
+  if (side) side.outerHTML = setSidebar();
+  const content = $("#setSwap .s-content");
+  if (content) content.outerHTML = setContent();
+  const inp = $("#setSwap .s-search .input");
+  if (inp) { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); }
+});
+
+/* ================= Init ================= */
+renderFiles("nav", false);
+renderTerm("nav", false);
+renderSettings("nav", false);
+</script>
+</body>
+</html>

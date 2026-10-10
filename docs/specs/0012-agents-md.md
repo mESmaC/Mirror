@@ -1,6 +1,6 @@
 # 0012: AGENTS.md shared conventions
 
-Status: done (e6c5ec7, 2026-10-10). Acceptance tests 1-7 pass, and test 8 passes for Claude; its GPT Astra and Kimi K3 runs are manual checks for Cameron. Kimi's UI branch name is still to be supplied; AGENTS.md carries the confirmed placeholder `<name supplied by Cameron>` until then (decisions.md "Pending (resume here)").
+Status: done (e6c5ec7, 2026-10-10). Acceptance tests 1-7 pass, and test 8 passes for Claude; its GPT Astra and Kimi K3 runs are manual checks for Cameron. Kimi's UI branch name, `design/design-system`, replaced the placeholder on 2026-10-10.
 Depends on: none. Precondition: `docs/specs/` is committed to `main` first (confirmed M0 order).
 Ledger: P5b, P1, P2, P3, P6, P7, P7a, P8, P9 (the text also restates G3a, P4, P5a, P5c, S3, S7, S7a, S7b, O1, O6)
 
@@ -26,7 +26,7 @@ A root-level `AGENTS.md` exists, and every agent working on Mirror (Claude, GPT 
 
 ## Interfaces
 Files, all at the repository root:
-- `AGENTS.md` (new): the text below. Lines tagged `[D8]` depend on 0012-D8. Drop the tag when writing the file. Kimi's UI branch appears as the confirmed placeholder `<name supplied by Cameron>` until Cameron supplies the name; replacing it is then a docs-only commit to `main` (P7a, P9).
+- `AGENTS.md` (new): the text below. Lines tagged `[D8]` depend on 0012-D8. Drop the tag when writing the file. Kimi's UI branch appeared as the confirmed placeholder `<name supplied by Cameron>` until Cameron supplied the name; it is now `design/design-system` (docs-only commit to `main`, 2026-10-10, P7a, P9).
 - `CLAUDE.md` (new): exactly `@AGENTS.md` (0012-D4).
 - `readme.md`: replace three single-line paragraphs (0012-D5). No other readme line changes. The replacement wording of all three is confirmed (2026-10-09).
   - readme.md:694, which begins "Port drivers into Mirror through a documented platform adaptation layer.", becomes:
@@ -65,7 +65,7 @@ Mirror is an agent harness that is also a complete, fast, independent x86_64 ope
 - Each task runs on its own branch, and only Cameron merges it. Commit to your task branch, never to `main`. Never force-push or rewrite pushed history. Push only when asked.
 - Exception: spec and documentation-only commits (`docs\specs\` and other docs-only changes) go directly to `main` and are pushed, with no task branch.
 - [D8] Start the branch from the current `main` and name it `<agent>/<spec>-<short-name>`, where `<agent>` is `claude`, `astra` or `kimi`, for example `claude/0011-toolchain-and-lints`. A task without a spec uses `<agent>/<short-name>`.
-- Kimi's UI branch, `<name supplied by Cameron>`, belongs to Kimi. Other agents never check it out, rebase it, merge it, cherry-pick from it, push to it or delete it.
+- Kimi's UI branch, `design/design-system` (in Kimi's own clone; its designs are in `docs/design/`), belongs to Kimi. Other agents never check it out, rebase it, merge it, cherry-pick from it, push to it or delete it.
 
 ## Build
 Run commands from the repository root in PowerShell.
@@ -175,7 +175,7 @@ Lines that later M0 specs make stale. Under P9, each spec updates them in the sa
 None.
 
 ## Open questions
-- Partly resolved (2026-10-09): Kimi's UI branch name. It is not in the local clone, so AGENTS.md carries the confirmed placeholder `<name supplied by Cameron>`. The name itself is still awaited (decisions.md "Pending (resume here)").
+- Resolved (2026-10-10): Kimi's UI branch is `design/design-system`, kept in Kimi's own clone. Its design pages were merged into `docs/design/`.
 - Does each agent's harness load AGENTS.md automatically? Codex does, and the repo has `refs/codex/` checkpoints, which suggests GPT Astra runs under it. Kimi K3's harness is unconfirmed. If it does not, its dispatch prompt must point to AGENTS.md.
 - Resolved (2026-10-09): readme.md:700, which opens with "Porting source" and lists licensing in each driver's assessment, and readme.md:698, which says "port drivers" and "each port", are reworded here along with :694. The replacement wording of all three under Interfaces is confirmed.
 - Resolved (2026-10-09): the AGENTS.md update rule is permanent, not M0-only, and applies per commit (ledger P9). The "Keep this file current" line says so.
