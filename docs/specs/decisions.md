@@ -178,7 +178,7 @@ v1 order. The harness follows the process model (A15), and harness code is writt
 
 State after the 2026-10-09 gap interview, its write-up and its addendum, the 2026-10-10 pin change (P5a: 1.99.0), and the 2026-10-10 VMware addendum (Workstation Pro 26.0.1 checked and powered on).
 
-**Next in the M0 order:** 0014. 0012 is done (e6c5ec7). 0011 is done on branch `claude/0011-toolchain-and-lints` (c26d5c7, 1cdd954, plus its spec update), and both full suites passed on Rust 1.99.0 (2026-10-10). Cameron merges it; once merged, `main` is pinned to 1.99.0 and checked by `Assert-MirrorToolchain`.
+**Next in the M0 order:** 0010. Done and waiting for Cameron to merge, in order, both fast-forward: `claude/0011-toolchain-and-lints` (0011: c26d5c7, 1cdd954 and two spec commits), then `claude/0014-device-profiles` (0014, stacked on it). Both full suites passed on each on Rust 1.99.0 (2026-10-10). 0012 is done (e6c5ec7).
 
 **Confirmed, but not yet written into the spec text:** none. Confirmed decisions that name a spec not yet drafted (for example 0027a, 0033 or 0067) live in this ledger and the README.md spec map until that spec is written.
 

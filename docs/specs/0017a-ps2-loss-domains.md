@@ -40,7 +40,7 @@ A mouse fault or a full mouse ring never changes keyboard state: held modifiers,
 - Shell (`userspace/desktop/src/shell.rs:365-376`): a pointer loss resets capture, buttons and click arming, then sends Reset to each app. A keyboard loss sends apps nothing, because app Reset and Focus clear only pointer and focus state (`userspace/app/src/main.rs:211-220`). Behaviour change: the per-window `pending` reset (shell.rs:369-372) is removed, so a loss no longer drops events already queued for apps.
 - Scratchpad UI (`userspace/desktop/src/ui.rs:176-182`): only a keyboard loss clears the draft and sets the notice. A pointer loss resets buttons and click arming.
 
-**Files touched:** `kernel/src/{ps2,keyboard,mouse,input,main}.rs`, `userspace/desktop/src/{main,shell,ui}.rs`, `readme.md:319` (the global loss barrier becomes per-device loss and coalescing) and `readme.md:494` ("loss records clear every payload field" becomes the device mask).
+**Files touched:** `kernel/src/{ps2,keyboard,mouse,input,main}.rs`, `userspace/desktop/src/{main,shell,ui}.rs`, `readme.md:321` (the global loss barrier becomes per-device loss and coalescing) and `readme.md:496` ("loss records clear every payload field" becomes the device mask).
 
 ## Acceptance tests
 Boot-smoke self-tests; the existing markers must still print.
@@ -64,5 +64,5 @@ Manual check on VMware Workstation. The VM boots 0015a's disk image with the set
 No crates. QEMU (`.tools/qemu`, GPL-2.0) is already used. The manual check needs VMware Workstation (proprietary, no cost), installed: Workstation Pro 26.0.1 (26H1u1) build 25688693 (2026-10-10).
 
 ## Open questions
-1. Resolved 2026-10-09: absolute pointing is spec 0017c (ledger S1d), the VMware vmmouse protocol in M0, so the pointer is not grabbed. QEMU q35 enables `vmport` (and its vmmouse) by default, and `run.ps1:320` turns it off only for `-NoKeyboard`, so 0017c tests the protocol in QEMU.
+1. Resolved 2026-10-09: absolute pointing is spec 0017c (ledger S1d), the VMware vmmouse protocol in M0, so the pointer is not grabbed. QEMU q35 enables `vmport` (and its vmmouse) by default, and `run.ps1:323` turns it off only for `-NoKeyboard`, so 0017c tests the protocol in QEMU.
 2. Follow-up suggestion: move the keyboard and mouse decoders into a `no_std` crate with host cargo tests. This spec keeps boot-smoke tests only.

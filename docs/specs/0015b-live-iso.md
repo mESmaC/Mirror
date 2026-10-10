@@ -47,7 +47,7 @@ Limine scans the El Torito image first, which has no config, and then the whole 
   - `-Iso` requires `-DeviceProfile LegacyVirtio`. With no modern virtio-blk boot disk, the legacy fixture is the only device that satisfies the smoke assert (`kernel/src/main.rs:202-205`). 0014 already rejects `LegacyVirtio` with `-NoTestDisk`.
   - `-Iso` rejects any `-Fault` other than `None`, plus `-LegacyPic` and `-PitTimer`, because those need a kernel command line.
   - The kernel skips ATAPI ports (`ahci.rs:238-245`), so AHCI reports `MIRROR_AHCI_SKIPPED reason=no_disk` (`main.rs:847`).
-- `common.ps1`: `Assert-MirrorDriverCatalog` gets a parameter for the expected number of modern VirtIO devices, which today is fixed at 1 (`common.ps1:112-115`). `run.ps1:519` passes 0 for `-Iso` and 1 otherwise. `run.ps1:648-650` is unchanged, because the legacy fixture satisfies it.
+- `common.ps1`: `Assert-MirrorDriverCatalog` gets a parameter for the expected number of modern VirtIO devices, which today is fixed at 1 (`common.ps1:114-126`). `run.ps1:521` passes 0 for `-Iso` and 1 otherwise. `run.ps1:650-652` is unchanged, because the legacy fixture satisfies it.
 - `test.ps1`: adds one `-Iso` smoke case per build profile under `LegacyVirtio`, two boots in all. 0014's computed boot count includes them.
 - `package.ps1` (0015a): also copies `mirror.iso` to `build/dist/`.
 - `docs/vm-settings.md` (0015-D11): add the ISO steps. Remove the disk (delete the `sata0:0` lines, or set `sata0:0.present = "FALSE"`) and attach `build/dist/mirror.iso` on a SATA CD-ROM: `sata0:1.present = "TRUE"`, `sata0:1.deviceType = "cdrom-image"`, `sata0:1.fileName = "<abs>\build\dist\mirror.iso"`. Keep every other reference setting.

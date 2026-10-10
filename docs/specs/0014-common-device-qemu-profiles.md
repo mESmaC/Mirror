@@ -1,6 +1,6 @@
 # 0014: Common device-set QEMU profiles
 
-Status: confirmed (2026-10-09)
+Status: done (2026-10-10, branch `claude/0014-device-profiles`: d04e9fc). All acceptance tests pass. Both suites report 118 smoke boots plus the captures. The six `LegacyVirtio` cases match the pre-change `MIRROR_BLOCK_` lines in both builds. No V1 stderr log has "has no peer". `scripts/test.ps1` took 11m48s, against 12m30s before the change. The Interfaces section keeps its pre-change citations.
 Depends on: 0012 and 0011, which land first in the M0 order (this spec updates the AGENTS.md lines it changes). 0010, 0015a, 0015b, 0013, 0016a/b, 0017a/b, 0017c and 0019 land later and build on these profiles, as does 0018's QEMU lane.
 Ledger: S1, S1a, S1b, G3a (related: S1c, S1d, S5, P3, P8)
 
