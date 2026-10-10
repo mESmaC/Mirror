@@ -2,7 +2,7 @@
 
 Status: confirmed (2026-10-09)
 Depends on: 0012 (lands first in the M0 order; this spec updates the AGENTS.md lines it changes). 0016b, which lands later, also edits `userspace/init/src/main.rs` (see Coordination).
-Ledger: P5a (related: P3, P5b, P7, P8)
+Ledger: P5a (related: P3, P5b, P7, P8, P9, S12)
 
 ## Goal
 
@@ -15,6 +15,7 @@ Every build and test uses Rust 1.96.0. The scripts refuse a different compiler, 
 - Linting `#[cfg(test)]` code. Clippy runs without `--tests` (`scripts/test.ps1:17-19`).
 - Pinning QEMU or OVMF versions, adding a build-identity banner, and fixing the `-Tkernel/linker.ld` rustflags trap in `.cargo/config.toml:4-8`.
 - Testing an MSRV older than the pinned toolchain.
+- The `rust-src` component and `build-std`. Spec 0028 (ledger S12) adds them later, on this same pinned compiler, to rebuild `core` and `alloc` for Mirror's userspace target. There is no second toolchain.
 
 ## Decisions
 
@@ -33,7 +34,10 @@ Every build and test uses Rust 1.96.0. The scripts refuse a different compiler, 
 **Current state (verified at HEAD 4614249).**
 - `rust-toolchain.toml:2` is `channel = "stable"`, and `scripts/test.ps1:17-19` runs clippy with `-D warnings`.
 - `readme.md:13` says "declared minimum 1.88; latest validation uses 1.96.0". `Cargo.toml:8` declares `rust-version = "1.88"`, and nothing tests it.
-- The only installed toolchain is `stable-x86_64-pc-windows-msvc`, which is `rustc 1.96.0 (ac68faa20 2026-05-25)`.
+- Two environments:
+  - The environment that produced commits 3a84077 through 4614249 had one installed toolchain, `stable-x86_64-pc-windows-msvc`, which was `rustc 1.96.0 (ac68faa20 2026-05-25)`. "Latest validation uses 1.96.0" (`readme.md:13`) refers to it.
+  - Cameron's development machine has stable `rustc 1.99.0` (since 2026-10-08). There, on 2026-10-09 with the code at 4614249, both clippy commands fail with `-D warnings` on the new lint `clippy::chunks_exact_to_as_chunks` at `kernel/src/usb.rs:538` (`bytes[6..].chunks_exact(3)`). Everything else passes: rustfmt, the 52 host tests, the 120 smoke boots and the debug and release captures.
+  - Pinning 1.96.0 makes rustup install it on the development machine, and the acceptance tests run there on 1.96.0. A later bump to a toolchain with that lint fixes `usb.rs:538` in step 3 of the bump procedure.
 - There is no `[workspace.lints]` table and no `clippy.toml`, so clippy's default comment-placement rules apply.
 - The lint tables differ by crate:
   - Both lints are denied in `kernel/Cargo.toml:27-31`, `userspace/agent/Cargo.toml:17-21`, `userspace/app/Cargo.toml:17-21` and `userspace/desktop/Cargo.toml:18-22`.
@@ -62,7 +66,7 @@ Every build and test uses Rust 1.96.0. The scripts refuse a different compiler, 
 - `scripts/build.ps1` and `scripts/test.ps1` call the preflight first, right after `Push-Location` (`build.ps1:12`, `test.ps1:11`). Every cargo invocation in the scripts goes through one of these two files (`run.ps1:251` and `capture.ps1:15` call `build.ps1`). 0018's new `scripts/perf.ps1` calls the same preflight before it builds its host tool.
 - `scripts/test.ps1:22-23`: move the log-directory setup to just after the preflight and ahead of `cargo fmt` (line 13). If the directory exists, remove it recursively, then recreate it.
 - `readme.md:13`: replace the version clause with "Rust 1.96.0, pinned in `rust-toolchain.toml`".
-- `AGENTS.md` (written by 0012, which lands first): the unsafe rule says clippy enforces it in every crate, dropping the "not on yet" clause for `mirror-init` and `mirror-sync`, and the test-log line says `test.ps1` clears its log directory at start (D7) instead of "never cleared".
+- `AGENTS.md` (written by 0012, which lands first; updated in the same commit, P9): the toolchain line names the 1.96.0 pin and the `Assert-MirrorToolchain` preflight, the unsafe rule says clippy enforces it in every crate, dropping the "not on yet" clause for `mirror-init` and `mirror-sync`, and the test-log line says `test.ps1` clears its log directory at start (D7) instead of "never cleared".
 
 **Violations the uniform policy surfaces.** These counts come from reading each `unsafe` site. Clippy was not run.
 - `mirror-sync`: 0. All four sites have `SAFETY` comments (`crates/sync/src/lib.rs:108, 156, 254, 262`).
@@ -90,6 +94,8 @@ Every build and test uses Rust 1.96.0. The scripts refuse a different compiler, 
 
 ## Acceptance tests
 
+All tests run on Cameron's development machine, on the 1.96.0 toolchain that the pin installs (test 1 shows it is active), not on its stable 1.99.0, whose clippy fails test 5 at `kernel/src/usb.rs:538` (see Current state).
+
 1. **Pin.** From the repository root, `rustup show active-toolchain` prints `1.96.0-x86_64-pc-windows-msvc (overridden by '...\rust-toolchain.toml')`.
 2. **Preflight (host only).**
    - From the repository root, `. scripts/common.ps1; Assert-MirrorToolchain` returns without error.
@@ -110,15 +116,15 @@ Every build and test uses Rust 1.96.0. The scripts refuse a different compiler, 
    - Create `build/test-logs/stale.serial.log` and add a trailing space to any `.rs` line. `scripts/test.ps1` fails at the formatting check, and `stale.serial.log` is gone. Revert the edit.
    - After a full default pass, no file under `build/test-logs` has a `LastWriteTime` earlier than the run's start. The file count equals what the script copies (276 at the time of writing: 2 profiles x (60 cases x 2 logs + 18 capture files)).
    - The eight stale files present today are gone: `debug-small-*` (four files, Oct 8) and `{debug,release}-Xhci-ConnectedKeyboard.*` (four files, Oct 9).
-9. **Docs.** `readme.md:13` names 1.96.0 as pinned and no longer mentions 1.88. `AGENTS.md` no longer says the log directories are never cleared or that the unsafe lint is off in `mirror-init` and `mirror-sync`.
+9. **Docs.** `readme.md:13` names 1.96.0 as pinned and no longer mentions 1.88. `AGENTS.md` names the 1.96.0 pin and the preflight, and no longer says the log directories are never cleared or that the unsafe lint is off in `mirror-init` and `mirror-sync`.
 
 ## Dependencies
 
-No crates. Tool: the Rust 1.96.0 toolchain through rustup (rustc, cargo, rustfmt, clippy; MIT OR Apache-2.0). It is the version already validated locally, but only `stable` is installed today, so the first build after the pin downloads `1.96.0-x86_64-pc-windows-msvc` once (minimal profile plus the components and target from `rust-toolchain.toml`). This needs network access once.
+No crates. Tool: the Rust 1.96.0 toolchain through rustup (rustc, cargo, rustfmt, clippy; MIT OR Apache-2.0). It is the version commits 3a84077 through 4614249 were validated on. Cameron's development machine has only stable 1.99.0, so there the first build after the pin downloads `1.96.0-x86_64-pc-windows-msvc` once (minimal profile plus the components and target from `rust-toolchain.toml`). This needs network access once. The `rust-src` component is not added here (0028, S12).
 
 ## Open questions
 
 Follow-ups outside this spec's scope; each would be its own owner decision and none blocks this spec:
-- Should a later spec lint test code (`clippy --tests`) on the host target? Today the `#[cfg(test)]` modules in the protocol, ACPI and sync crates are not linted.
+- Should a later spec lint test code (`clippy --tests`) on the host target? Today the `#[cfg(test)]` modules in the protocol, ACPI and sync crates are not linted. It is on the README's unscheduled follow-ups list.
 - Should the workspace table grow later, for example with `clippy::multiple_unsafe_ops_per_block` or `clippy::unnecessary_safety_comment`?
-- Suggested follow-up spec: record and check the QEMU and OVMF versions, and print a build-identity line (git hash, profile, features) that `run.ps1 -NoBuild` verifies. Both are infra review findings. 0012 suggests the same follow-up; write it once.
+- Suggested follow-up: record and check the QEMU and OVMF versions (on the README's unscheduled follow-ups list), and print a build-identity line (git hash, profile, features) that `run.ps1 -NoBuild` verifies. Build identity now belongs to spec 0067 (ledger G9); a `-NoBuild` check would build on it. 0012 suggests the same follow-up; write it once.

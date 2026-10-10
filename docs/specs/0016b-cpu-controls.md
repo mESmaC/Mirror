@@ -1,7 +1,7 @@
 # 0016b: CPU controls and vulnerability reporting
 
 Status: confirmed (2026-10-09)
-Depends on: 0015a, only for the manual VMware/VirtualBox check (it boots the disk image); the code and QEMU tests depend on no other spec. In the M0 order it lands after 0013 and 0016a, though it does not need 0016a (see Interfaces), and before 0017a.
+Depends on: 0015a, only for the manual VMware check (it boots the disk image); the code and QEMU tests depend on no other spec. In the M0 order it lands after 0013 and 0016a, though it does not need 0016a (see Interfaces), and before 0017a.
 Ledger: S9, A9 (supports), A11 (relates), S6a (prepares 0021), G3a (test platforms)
 
 ## Goal
@@ -26,10 +26,10 @@ Serial markers prove each property on every online CPU. These are defence-in-dep
 | 0016-D2 | Enable UMIP when reported, so user SGDT/SIDT/SLDT/SMSW/STR raise #GP(0). Rationale: it costs nothing now, and a later compatibility layer that needs these instructions can emulate them in the #GP path, as Linux does. | confirmed (2026-10-09) |
 | 0016-D3 | Force EFER.SCE=0 on every CPU, so a user `syscall` raises #UD and is contained as an ordinary user fault. 0021 sets SCE only together with STAR/LSTAR/SFMASK. Rationale: no code programs the SYSCALL MSRs, so an inherited SCE=1 would enter CPL0 at whatever LSTAR the firmware left. | confirmed (2026-10-09) |
 | 0016-D5 | v1 speculative-execution policy, per ledger S9: detect and report only. The kernel reads the CPU vendor and IA32_ARCH_CAPABILITIES (RDCL_NO, MDS_NO), logs the exposure, and applies no KPTI or VERW. A KPTI/MDS spec is a prerequisite before any third-party native code runs. Rationale: only Mirror-built native code runs inside Mirror in v1 (external agents connect through the Agent API), and KPTI adds a CR3 switch to every entry and exit. | confirmed (2026-10-09, ledger S9) |
-| 0016-D6 | The default QEMU smoke CPU becomes `qemu64,+smep,+smap` in run.ps1 and capture.ps1. A new run.ps1 switch, `-BaselineCpu`, keeps plain `qemu64` for one Normal boot per build profile. Rationale: the whole fault battery then runs with the protections VMware and VirtualBox give on current hosts. | confirmed (2026-10-09) |
+| 0016-D6 | The default QEMU smoke CPU becomes `qemu64,+smep,+smap` in run.ps1 and capture.ps1. A new run.ps1 switch, `-BaselineCpu`, keeps plain `qemu64` for one Normal boot per build profile. Rationale: the whole fault battery then runs with the protections VMware gives on current hosts. (Amended 2026-10-09: VirtualBox dropped, G3a amended.) | confirmed (2026-10-09) |
 
 Decision in 0016a that also governs this spec:
-- 0016-D7: automated acceptance runs in QEMU; VMware (primary) and VirtualBox are checked by hand (ledger G3a).
+- 0016-D7: automated acceptance runs in QEMU; VMware is checked by hand (ledger G3a, amended 2026-10-09: VirtualBox dropped).
 
 ## Interfaces
 Line references are at HEAD 4614249; earlier M0 specs shift some of them. Work order: items 1-5. Each item is its own commit and runs the targeted `run.ps1` cases for what it touches. The full `scripts/test.ps1` runs in debug and release when the spec is complete (ledger P8). This spec does not need 0016a, which the README orders first. Both add `SmokeMode` fatal modes, run.ps1 fatal-set entries and `Slot` fields, so whichever lands second merges with the first. 0011 lands earlier, so the new `unsafe` blocks in init carry `// SAFETY:` comments.
@@ -64,7 +64,7 @@ Line references are at HEAD 4614249; earlier M0 specs shift some of them. Work o
 3. KernelSmep and KernelSmap each print `MIRROR_TEST_EXPECT_FATAL vector=14`, then `MIRROR_EXCEPTION vector=14` with `error=0x11` (present, instruction fetch) and `error=0x1` (present, read) respectively. Each has cr2 equal to the probe address and exits 35 (arch.rs:141-148).
 4. UserSyscall gives `MIRROR_USER_FAULT_CONTAINED vector=6 error=0x0` and recovers normally (exit 33). UserUmip gives `vector=13 error=0x0`. It joins the `-ExtendedCpu` battery (test.ps1:71) if Open question 1 finds that `max` reports `cpuid_umip=1`; otherwise it stays out of the automated suite.
 5. Every smoke boot prints exactly one `MIRROR_CPU_VULN` line in the format above. When SMAP is active, it also prints `MIRROR_ENTRY_AC_OK` with `user_ac` of 1 or more.
-6. Manual check, after 0015a: boot the disk image in VMware Workstation and VirtualBox with the reference settings in `docs/vm-settings.md` (0015-D11), serial output to a file. The shell works, and each vCPU prints one `MIRROR_CPU_HARDENING` line whose smep, smap and umip equal its `cpuid_` values. Record those lines and the `MIRROR_CPU_VULN` line as input for the S9 KPTI/MDS spec. On a Broadwell/Zen or newer host, `cpuid_smep=0` is recorded as a hypervisor finding.
+6. Manual check, after 0015a: boot the disk image in VMware Workstation with the reference settings in `docs/vm-settings.md` (0015-D11), serial output to a file. The shell works, and each vCPU prints one `MIRROR_CPU_HARDENING` line whose smep, smap and umip equal its `cpuid_` values. Record those lines and the `MIRROR_CPU_VULN` line as input for the S9 KPTI/MDS spec. On a Broadwell/Zen or newer host, `cpuid_smep=0` is recorded as a hypervisor finding.
 
 ## Dependencies
 None. No crates. The pinned QEMU 11.1.0 (.tools/qemu/VERSION) and OVMF suffice: QEMU TCG emulates SMEP, SMAP, CLAC and STAC.

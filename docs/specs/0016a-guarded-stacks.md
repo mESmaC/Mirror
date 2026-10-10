@@ -1,8 +1,8 @@
 # 0016a: Guarded stacks
 
 Status: confirmed (2026-10-09)
-Depends on: 0015a, only for the manual VMware/VirtualBox check (it boots the disk image); the code and QEMU tests depend on no other spec. In the M0 order it lands after 0013, so that check runs with 0013's firmware and PCI tolerance in place, and before 0016b.
-Ledger: A9 (supports), G3a (test platforms)
+Depends on: 0015a, only for the manual VMware check (it boots the disk image); the code and QEMU tests depend on no other spec. In the M0 order it lands after 0013, so that check runs with 0013's firmware and PCI tolerance in place, and before 0016b.
+Ledger: A9 (supports), G3a (test platforms), S17 (supersedes D4 for the panic path)
 
 ## Goal
 No kernel stack on any CPU can overflow silently into neighbouring kernel data, and NMI and #MC never run on the stack they interrupted. When this spec is done:
@@ -14,7 +14,7 @@ Serial markers prove each property on every online CPU. This is defence in depth
 
 ## Non-goals
 - SMEP, SMAP, UMIP, EFER.SCE and the CPU vulnerability report (0016b).
-- Non-fatal NMI handling, which waits for the first feature that sends NMIs, such as a watchdog or a crash IPI (D4). MCA bank decoding.
+- Non-fatal NMI handling, which waits for the first feature that needs a CPU to continue after an NMI, such as a watchdog (D4). The panic-time NMI stop of the other CPUs (ledger S17) is implemented in 0051. MCA bank decoding.
 - Catch-all IDT stubs, EOI of unexpected vectors, not blaming user processes for EXT=1 faults (interrupts.rs:901), and LINT1 NMI on the BSP only (APs program LINT1 from the MADT today, apic.rs:570-574). These belong to 0055.
 - A #DB IST (0021). Per-thread kernel stacks (0050): 0050 allocates them after the root is sealed, when `map_kernel_page` refuses new leaves (paging.rs:606-608), so it needs a shootdown-aware guarded mapping path. `stacks.rs` gives it only the layout rules.
 - Changing Limine's stack request (boot.rs:52). It stays as it is, and its region stays reserved and idle (see Open questions).
@@ -22,8 +22,8 @@ Serial markers prove each property on every online CPU. This is defence in depth
 ## Decisions
 | ID | Decision | Status |
 | --- | --- | --- |
-| 0016-D4 | NMI and #MC get dedicated IST stacks on every CPU (IST2 and IST3) and stay fatal: diagnose and halt, as today. CR4.MCE is set when reported, so a machine check reaches the handler instead of shutting the CPU down. Rationale: no current feature uses NMIs, so non-fatal handling waits for one (watchdog, crash IPI). | confirmed (2026-10-09) |
-| 0016-D7 | Automated acceptance runs in QEMU. VMware (primary) and VirtualBox are checked by hand. | confirmed (ledger G3a) |
+| 0016-D4 | NMI and #MC get dedicated IST stacks on every CPU (IST2 and IST3) and stay fatal: diagnose and halt, as today. CR4.MCE is set when reported, so a machine check reaches the handler instead of shutting the CPU down. Rationale: no current feature uses NMIs, so non-fatal handling waits for one (watchdog, crash IPI). (Amended 2026-10-09: superseded for the panic path by ledger S17. On panic the panicking CPU stops the others with an NMI IPI, the crash-IPI case this decision deferred; 0051 implements it, including the NMI handler's panic-stop path. This spec's NMI and #MC handling is unchanged.) | confirmed (2026-10-09) |
+| 0016-D7 | Automated acceptance runs in QEMU. VMware is checked by hand. (Amended 2026-10-09: VirtualBox dropped, G3a amended.) | confirmed (ledger G3a) |
 
 ## Interfaces
 Line references are at HEAD 4614249; earlier M0 specs shift some of them. Work order: items 1-5. Each item is its own commit and runs the targeted `run.ps1` cases for what it touches. The full `scripts/test.ps1` runs in debug and release when the spec is complete (ledger P8).
@@ -66,7 +66,7 @@ Line references are at HEAD 4614249; earlier M0 specs shift some of them. Work o
 4. KernelStackOverflow prints `MIRROR_TEST_EXPECT_FATAL vector=8`, then `MIRROR_EXCEPTION vector=8 error=0x0` with cr2 inside the 4 KiB page at `rsp0_guard`. QEMU exits with 35 (isa-debug-exit value 0x11, arch.rs:141-148), and no `MIRROR_BOOT_OK` appears.
 5. The 2-, 4- and 8-CPU runs bring every AP online with the new slot layout. `MIRROR_SMP_GUARD_OK` and the SmpUnmap and SmpTlbTimeout modes still pass.
 6. Measurement: `nm -S target/x86_64-unknown-none/release/mirror-kernel` lists no `SECONDARY_DOUBLE_FAULT_STACKS` or `userspace::KERNEL_STACK` symbol. Today they occupy 0xfc000 and 0x10000 bytes of .bss.
-7. Manual check, after 0015a: boot the disk image in VMware Workstation and VirtualBox with the reference settings in `docs/vm-settings.md` (0015-D11), serial output to a file. The shell works, and each vCPU prints one `MIRROR_CPU_STACKS` line with `ist=3` and `mce` equal to `cpuid_mce`.
+7. Manual check, after 0015a: boot the disk image in VMware Workstation with the reference settings in `docs/vm-settings.md` (0015-D11), serial output to a file. The shell works, and each vCPU prints one `MIRROR_CPU_STACKS` line with `ist=3` and `mce` equal to `cpuid_mce`.
 
 ## Dependencies
 None. No crates. The pinned QEMU 11.1.0 (.tools/qemu/VERSION) and OVMF suffice. Test 6 uses GNU nm (binutils, GPL-3.0-or-later), a host-only tool already installed with MinGW; it is neither shipped nor linked.

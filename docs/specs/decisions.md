@@ -1,7 +1,7 @@
 # Decision ledger
 
 Status: `confirmed` = Cameron explicitly chose it. `proposed` = inferred by Claude, awaiting Cameron's verification. `open` = undecided.
-Source interview: 2026-10-09.
+Source interviews: the 2026-10-09 spec interview, then the 2026-10-09 gap interview, which settled 48 spec gaps. Rows the gap interview changed carry a dated note (Amended, Reworded or Confirmed 2026-10-09). It added G8d-G12, A5a, A8a, A9a, A11a, A13a, A16b, A17a, A18-A21, I4c, I4d, I12-I15, S1c, S1d, S2b, S6e, S6f, S11-S20 and O7. Its addendum (also 2026-10-09) confirmed the rewording of S7b, renamed M0-M8 to their new scope and moved the entropy spec into M2 as 0036.
 
 ## Goal and scope (G)
 
@@ -10,51 +10,71 @@ Source interview: 2026-10-09.
 | G1 | The 6-month proof is that Mirror is daily-drivable. | confirmed |
 | G2 | The first user is Cameron, as a power user. | confirmed |
 | G3 | The daily-drive target is VMs (portable across Cameron's systems, no dependence on one physical box). Real hardware comes after v1. | confirmed |
-| G3a | VMware is the primary daily-drive hypervisor. VirtualBox is also supported. QEMU is the automated test platform. | confirmed |
+| G3a | VMware is the only VM target before physical hardware, and the primary daily-drive and development setup. QEMU is the automated test platform. VirtualBox is not a target. (Amended 2026-10-09: VirtualBox dropped.) | confirmed |
 | G4 | v1 must-haves: persistent files, network and internet, terminal with native CLI tools, AI agent. | confirmed |
-| G5 | Outside v1: web browser (arrives via compatibility layers, never written from scratch), dev tools such as git and compilers, Windows and Linux app compatibility, GPU, unified capacity tiering, inference-aware scheduling, physical hardware, cloud agent desktops. | confirmed |
+| G5 | Outside v1: web browser (arrives via compatibility layers, never written from scratch), dev tools such as git and compilers, Windows and Linux app compatibility, GPU, unified capacity tiering, inference-aware scheduling, physical hardware, cloud agent desktops, ChatGPT sign-in. (Amended 2026-10-09: ChatGPT sign-in added, see I2 and O4.) | confirmed |
 | G6 | Eventual daily use: code/dev, browsing plus AI, local models, specific Windows apps. | confirmed |
 | G7 | v1 performance gates: boot to desktop, idle memory, input latency, agent action latency, measured against Linux and Windows in the same VM. | confirmed |
 | G8 | Storage pooling gets a v1 slice across two or more virtual disks. | confirmed |
 | G8a | The v1 pool is RAID-1-like (mirrored) for redundancy, not striped. | confirmed |
 | G8b | The pool is a block layer beneath the filesystem. Every write goes to all members; reads are spread across members, so each disk connection serves as its own bandwidth pipe. A failed member degrades the pool without losing data. | confirmed |
 | G8c | Long-term preferred hardware is several NVMe drives plus a hard drive for important storage. This is future context for pooling and tiering, not a v1 requirement. | confirmed |
+| G8d | The mirrored pool behaves like Linux md RAID-1: a write-intent bitmap so an unclean shutdown resyncs only dirty regions; member superblocks with the pool ID and an event counter so a stale member is detected and rejoins through resync; a degraded pool is shown on the desktop and in the system log; replace-and-rebuild is in v1; pools are created inside Mirror by a pool tool on empty VMDKs made host-side; the ESP is copied to every member so any disk can boot. | confirmed |
+| G9 | Data layout and updates. The boot disk holds only the ESP and the Mirror system image and can be replaced wholesale. User data, settings, the audit log, the keyring and model weights live on the mirrored pool disks. A host-side tool applies updates with the VM off; the previous kernel stays as a boot-menu fallback; on-disk formats carry version fields. In-OS self-update comes after v1 (S2a unchanged). The disk update path and build identity leave the deferred list (spec 0067). | confirmed |
+| G10 | v1 app set: a GUI text editor with typed document operations (the target for gates 3 and 4), a file manager, settings, a system and task monitor, the terminal and the assistant panel. Kimi's UI apps get numbered specs. 0081's native tools cover file operations (list, copy, move, remove, make directory, show, find, search), fetch/put, pool and disk administration, date and time, network diagnostics, process tools, and audit and policy commands. | confirmed |
+| G11 | The daily-drive VM is 20 GB RAM and 12 vCPUs with NAT networking, on Cameron's 32 GB, 20-core host (Core Ultra 7 265F: AVX2, no AVX-512). The profile lives in docs/vm-settings.md (0067). | confirmed |
+| G12 | Modern-OS baseline. Where the specs are silent on a capability every modern OS has (display resolutions, absolute pointing, clipboard, time, shutdown, login and so on), Mirror provides it, and the missing spec is a gap to fill. (Cameron, 2026-10-09: "1920x1080 and larger resolutions will be supported, just like any modern OS. And if that is not specced, then it should be.") | confirmed |
 
 ## Agent harness (A)
 
 | ID | Decision | Status |
 | --- | --- | --- |
 | A1 | Agent computer use is typed operations first, with a screen/input fallback for apps that lack typed operations. | confirmed |
-| A1a | The fallback is designed now and ships with the compatibility layers. No v1 app needs it. | confirmed |
+| A1a | The fallback is designed now, in a design-only spec (0039) written before 0044 and 0047, so M3 does not rule it out. It ships with the compatibility layers. No v1 app needs it. (Amended 2026-10-09: design-only spec 0039 added.) | confirmed |
 | A2 | v1 modes: human only, together, agent alone (local). Cloud agent desktops come later. | confirmed |
 | A3 | Typed operations never touch the human's focus or input. Human and agent each have their own input seat (cursor, focus, keyboard) and never fight for control. The human can interact with the agent's window while watching it work. | confirmed |
 | A3a | In v1 the agent's cursor visualizes typed operations: it moves to the element an operation targets. Real synthetic clicks belong to the fallback (A1a). | confirmed |
 | A4 | Grant sources: live human approval, saved human policies, agent to sub-agent delegation (attenuating only), apps sharing their own objects. | confirmed |
 | A5 | Default agent authority is configurable. v1 ships two presets: read-only and full access. | confirmed |
+| A5a | During development the full-access preset equals root, for testing. The v1 ceiling (which powers stay human-seat-only) is open question O7 and is decided before v1 acceptance. 0041 keeps presets as capability bundles so a ceiling can be added without an ABI change. | confirmed |
 | A6 | Presets are bundles of kernel-enforced capabilities, never a global mode flag. | confirmed |
 | A7 | There are no hard-coded "always confirm" action classes. Confirmation rules are configurable policy, tuned by experiment and the audit logs. | confirmed |
-| A8 | Audit log: immutable. Neither humans nor agents can edit it; both can view it. The user sets its TTL and expiry is the only way entries leave. TTL changes are themselves logged. Optional retention copies go to local or cloud storage. | confirmed |
-| A9 | Immutable core: compiled into the kernel and protected against runtime tampering in v1. It holds audit integrity, the capability core and its ceilings, human override, and input provenance (contents may change). No signing path runs code in it, and the user experience cannot reach it. It does not limit root's normal authority. | confirmed |
+| A8 | Audit log: immutable. Neither humans nor agents can edit it; both can view it. The user sets its TTL and expiry is the only way entries leave. TTL changes are themselves logged. Optional retention copies go to local or cloud storage. (Clarified 2026-10-09 by A8a: a TTL change applies only to new entries, a full log refuses agent actions, and cloud retention copies come after v1.) | confirmed |
+| A8a | Audit semantics (clarifies A8). A TTL change applies only to entries written after it. When the log is full, agent actions are refused until space frees and the human is notified; human actions are never blocked. Entries hold digests and references, with secrets redacted at write time. "Immutable" means runtime prevention plus tamper evidence: a SHA-256 hash chain anchored in the immutable core, so offline edits are detected, not prevented. Retention copies go to local storage in v1, cloud after v1. The TTL counts against a persisted monotonic counter (S15). | confirmed |
+| A9 | Immutable core: compiled into the kernel and protected against runtime tampering in v1. It holds audit integrity, the capability core and its ceilings, human override, and input provenance (contents may change). No signing path runs code in it, and the user experience cannot reach it. It does not limit root's normal authority. (Amended 2026-10-09: the core also holds the trusted approval path, see A9a.) | confirmed |
+| A9a | The trusted approval path is part of the immutable core: a compositor-owned prompt that apps and agents cannot draw or imitate (UAC secure-desktop style), answerable only from the human seat. It exists from M3 (0049); the 0083 panel hosts it from M7. | confirmed |
 | A10 | Experiment builds: a compile-time profile leaves out the immutable core and makes its rules runtime-configurable. A persistent marker appears on screen and in every audit entry. | confirmed |
 | A11 | v1 principals: one owner, who is root (a full capability bundle, below the immutable core), plus agent principals. More human accounts come later. | confirmed |
+| A11a | v1 has an owner login screen like other OSes, with optional auto-login. The 0018 baselines keep auto-login. | confirmed |
 | A12 | There is one Agent API. The built-in assistant is a client of it, and external agents connect through the same API under the same policy. | confirmed |
 | A13 | The Agent API uses a Mirror-native protocol, with an MCP adapter for interop. | confirmed |
+| A13a | External agents. The Agent API listens only on the VM's host-facing interface (host-only or NAT-forwarded, not the LAN by default). An agent enrolls with a pairing code shown on Mirror's screen and approved through the trusted prompt (A9a), and gets its own principal and a revocable token. The default preset is read-only. TLS uses a Mirror-generated identity. The MCP adapter exposes Mirror as an MCP server. | confirmed |
 | A14 | The human talks to and supervises the agent through an assistant panel that opens and closes at will. | confirmed |
 | A15 | The harness is built early, right after the kernel object and process model. The audit log stays in memory until the filesystem exists. | confirmed |
 | A16 | Credentials use a standard keyring plus broker. | confirmed |
 | A16a | The broker makes provider calls itself, so agent processes never see raw keys or tokens. They hold only a capability to request completions. | confirmed |
+| A16b | The keyring is encrypted at rest with a key derived from the owner password (Argon2id) and unlocked at login. With auto-login it asks for the password on first use. | confirmed |
 | A17 | The shell is typed and agent-native: commands are typed operations from the same registry agents use, with structured output. | confirmed |
+| A17a | Shell sessions. Tools return typed results that the shell renders, and may also write a text stream for progress and interactive use. Input and window size travel over the session channel. Ctrl-C sends a cancel message to the running operation, with kill as the fallback. Exit status is part of the typed result. Defined in 0080, before 0081 and 0082. | confirmed |
+| A18 | Agent tasks. A task is an object owned by a principal; live-approved grants are scoped to the task. Conversations (CLM context) and task state persist across reboot. Saved policies persist; live-approved grants end at reboot, so tasks come back paused for the human to resume. | confirmed |
+| A19 | Operation contract. Apps publish an accessibility-style element tree (like UI Automation or AT-SPI), and each typed operation names its target element; the agent cursor (A3a) and the semantic index (I11) use it. Operations can stream progress and are cancelled by message, with kill as the fallback. I5 validation lives in the Agent API broker (0045), so cloud, local and MCP calls all pass it; 0094 keeps only engine monitoring hooks. | confirmed |
+| A20 | Clipboard. Each seat has its own clipboard. An agent reading or writing the human's clipboard is a grantable, audited capability. Pasted text carries its origin tag (I10). Host-guest copy and paste works in v1 through the VMware guest RPC channel. | confirmed |
+| A21 | Persisted settings. Policies, A7 rules, presets, saved grants, principals with stable IDs, the TTL and provider/model choices persist in one typed settings store on the pool. It is a protected OS object written only through human-seat typed operations (during development, full access = root may write it too, A5a). Every change is audited. | confirmed |
 
 ## Inference (I)
 
 | ID | Decision | Status |
 | --- | --- | --- |
 | I1 | Both cloud and local inference ship in v1. | confirmed |
-| I2 | v1 providers: OpenAI API key, ChatGPT sign-in, Anthropic API key, any OpenAI-compatible URL. | confirmed |
+| I2 | v1 providers: OpenAI API key, Anthropic API key, any OpenAI-compatible URL. OpenAI-compatible endpoints may use plain HTTP to private addresses (for example LM Studio or Ollama on the host) and user-added CAs. ChatGPT sign-in comes after v1 (O4). (Amended 2026-10-09: ChatGPT sign-in moved after v1; private endpoints added.) | confirmed |
 | I3 | Local inference is Mirror's own engine, using Colibri as a reference. It runs CPU-only in the VM. | confirmed |
 | I4 | The first model family is Qwen3 MoE, following Colibri's Qwen3.6 engine: Qwen3.6-35B-A3B (thinking and tools) and Qwen3-Coder-30B-A3B (tools). Tool calling is required for the agent. OLMoE is excluded because it has no tool calling. | confirmed |
 | I4a | Expert tiering lives in the engine in v1, as in Colibri: an engine-owned expert cache reads weights from ext2 files on demand across the mirrored pool. OS-managed residency (unified capacity) stays post-v1, with this cache as its first consumer. | confirmed |
-| I4b | Sizing: the host has 32-48 GB RAM, so the daily-drive VM gets about 20-24 GB. The model is partly resident, and expert streaming from disk is required. | confirmed |
+| I4b | Sizing: the host has 32 GB RAM and 20 cores (G11), and the daily-drive VM is 20 GB RAM and 12 vCPUs. The model is partly resident, and expert streaming from disk is required. (Amended 2026-10-09: concrete host and VM size, G11.) | confirmed |
+| I4c | Architecture facts (from the official config.json files): Qwen3.6-35B-A3B is a hybrid, 40 layers, of which 30 are Gated DeltaNet linear attention (fixed-size recurrent state) and 10 are full attention with a KV cache; 256 experts with 8 active; 248K vocabulary; a vision encoder. Qwen3-Coder-30B-A3B is plain GQA attention on all 48 layers, 128 experts, 151K vocabulary. Measure first: I8 and I10a stay as written, and 0093 opens with a measurement spike comparing reuse quality and latency on both models (using 0104's benchmark) before I8 and I10a are amended. | confirmed |
+| I4d | The v1 engine is text-only and skips Qwen3.6's vision encoder. Vision arrives with the A1a fallback after v1. | confirmed |
+| I5 | Engine safety: agent operations are managed at kernel level, the OS validates every tool call against the registry and the active grant, and the engine has built-in monitoring hooks. | confirmed |
+| I6 | Local inference makes three kernel features v1 requirements: XSAVE/AVX2 user state, userspace on all CPUs, and multi-GB per-process memory. | confirmed |
 | I7 | Sharded models in v1: the engine loads models split across many weight files. Disk placement belongs to the storage pool (mirrored in v1), not the engine. | confirmed |
 | I8 | TurboQuant KV-cache compression in v1, about 3-4 bits per value, starting with the PolarQuant stage as Colibri does (rotation plus polar quantization, no calibration). | confirmed |
 | I8a | Which TurboQuant stages ship is decided by measured quality: whichever configuration doesn't hurt quality on Mirror's own benchmark. PolarQuant alone is the starting point; QJL is enabled only if measurements show it helps, since an independent replication found it can hurt. | confirmed |
@@ -64,9 +84,11 @@ Source interview: 2026-10-09.
 | I11 | TurboQuant is an OS-wide facility, used wherever approximate vectors are acceptable: all model KV caches (a shared library or service, not one engine's private code), an OS semantic index (files, apps, UI trees, audit history), agent memory, and later the capacity tiers. | confirmed |
 | I11a | Both the OS semantic index and agent memory ship in v1, which adds an embedding model to the v1 engine. | confirmed |
 | I11b | Hard rule: TurboQuant, which is lossy, is never used for exact data: file contents, process memory, the page cache, or audit log contents. It applies only to vectors where approximation is acceptable. | confirmed |
-| I11c | The embedding model is the Qwen3-Embedding family, which shares the Qwen3 architecture with the I4 engine. | proposed |
-| I5 | Engine safety: agent operations are managed at kernel level, the OS validates every tool call against the registry and the active grant, and the engine has built-in monitoring hooks. | confirmed |
-| I6 | Local inference makes three kernel features v1 requirements: XSAVE/AVX2 user state, userspace on all CPUs, and multi-GB per-process memory. | confirmed |
+| I11c | The embedding model is the Qwen3-Embedding family. Qwen3-Embedding is dense Qwen3 and shares Qwen3-Coder-30B-A3B's 151K tokenizer and attention graph, so the engine reuses that path. (Confirmed 2026-10-09 with corrected rationale.) | confirmed |
+| I12 | Model store. Weights are converted host-side into a Mirror-native layout with one file per expert group, optimized for I4a streaming. Quantization is chosen by measured quality (0104). Weights arrive through VMware shared folders or an in-Mirror resumable HTTPS download, and are verified against a hash manifest pinned in the repo, built from the publisher's hashes and covering the converted files. 0093 owns the expert cache; 0061/0062 get a read-throughput floor set from the engine's measured need. | confirmed |
+| I13 | Index and memory privacy. One index, with results filtered at query time by the asking principal's grants. The indexer is a system service with its own read-only grant and never returns content a principal could not read directly. Origin tags (I10) carry through memory and index results into an agent's context. Content can be marked local-only, and the completion capability refuses to send it to cloud providers. | confirmed |
+| I14 | Routing and spend. The owner picks a default provider and model per kind of task. If a cloud provider is unreachable, the assistant offers local inference instead. Completion capabilities carry token or cost budgets per task and per day; rate limits are retried with backoff. | confirmed |
+| I15 | AI acceptance. v1 acceptance (0199) adds floors for local inference (time to first token, decode speed) on the daily VM (G11), and measures input latency while local inference runs. Floor values are set after the first 0093 measurements, like O3. An AI evaluation spec (0104) defines Mirror's benchmark used by I8a and the 0093 spike. | confirmed |
 
 ## Capacity and data movement (C)
 
@@ -74,33 +96,48 @@ Source interview: 2026-10-09.
 | --- | --- | --- |
 | C1 | Dijkstra (and its widest-path variant for bulk transfers) is the router: it picks the route for transfers between memory and storage locations. It is not the placement policy that decides what lives where, what to evict, or when to move. | confirmed |
 | C2 | Three layers: a telemetry map of devices and links, a router, and a cost-aware placement policy that uses the router's cost as its eviction price, with concurrent transfers split by bandwidth. | confirmed |
-| C3 | v1 records device and link telemetry through spec 0019 (Mirror perf instrumentation and telemetry, reworded 2026-10-09 from "the performance harness, spec 0018") but builds no router, so the placement policy has real data when the unified-capacity pillar arrives. | confirmed |
+| C3 | v1 records device and link telemetry through spec 0019 (Mirror perf instrumentation and telemetry, reworded 2026-10-09 from "the performance harness, spec 0018") but builds no router, so the placement policy has real data when the unified-capacity pillar arrives. Telemetry records persist to the pool once the filesystem exists (0066); before that, serial capture during perf runs. (Amended 2026-10-09: telemetry persistence added.) | confirmed |
 | C4 | The router is built once the hardware has two or more genuinely different transfer paths. | confirmed |
 
 ## System (S)
 
 | ID | Decision | Status |
 | --- | --- | --- |
-| S1 | The v1 drivers target the device set that VMware, VirtualBox and QEMU all emulate. VirtIO is not a v1 target. | confirmed |
-| S1a | The v1 device set is AHCI SATA storage (NVMe later), an Intel e1000-family NIC, PS/2 keyboard and mouse, and the UEFI boot framebuffer for display (VMware SVGA II later). The QEMU test profiles switch to this set. | confirmed |
+| S1 | The v1 drivers target the device set that VMware and QEMU both emulate. VirtIO is not a v1 target. (Amended 2026-10-09: VirtualBox dropped.) | confirmed |
+| S1a | The v1 device set is AHCI SATA storage (NVMe later), an Intel e1000-family NIC, PS/2 keyboard and mouse with the VMware vmmouse absolute-pointer extension (S1d), the UEFI boot framebuffer at boot plus the VMware SVGA II adapter for any-size display and live resize (S1c), and the VMware guest RPC channel for host clipboard and shared folders (A20, S20). The QEMU test profiles switch to this set where QEMU emulates it: `-vga std` stays until 0069 decides on SVGA II, and the guest RPC channel (0087) has no QEMU model and is checked by hand on VMware. (Amended 2026-10-09: SVGA II moved into v1; vmmouse and the guest channel added; the last sentence names the parts QEMU does not emulate.) | confirmed |
 | S1b | Clarifies S1a: in QEMU tests the boot image may sit on a virtio-blk device that only firmware reads. Mirror never binds it, and in the V1 profile Mirror's drivers see only the v1 device set. The LegacyVirtio regression profile keeps binding a legacy virtio-blk fixture until 0062 (0014-D5). | confirmed |
-| S10 | A time source other than the HPET (calibrated TSC or ACPI PM timer), for VMs such as a default VirtualBox VM with the HPET off, belongs to spec 0055. Until then, the reference VM settings (0015a, docs/vm-settings.md) enable the HPET. | confirmed |
+| S1c | Display. Mirror supports any resolution, 1920x1080 and larger, and the resolution follows the VMware window on live resize through the SVGA II driver (0069). The compositor handles any size and live mode changes; the kernel's 1280x800 desktop cap goes (0027a). The 0018 reference VM runs at 1920x1080. | confirmed |
+| S1d | Absolute pointing in M0 through the VMware vmmouse protocol (spec 0017c), testable in QEMU through vmport. 0018 sends absolute VNC pointer coordinates with no homing step. USB HID pointing comes with physical hardware after v1. | confirmed |
 | S2 | The filesystem is ext2 first, then ext3 journaling. A native filesystem comes later. | confirmed |
 | S2a | v1 does not write FAT32. The boot partition is produced by host tooling. | confirmed |
+| S2b | Daily-driving persistent files waits for ext3 journaling (0065). During the ext2 phase a boot-time filesystem checker runs after an unclean shutdown. | confirmed |
 | S3 | Dependencies are decided case by case, favoring native unless it badly hurts the schedule. Each spec lists its crates and their licenses. | confirmed |
 | S4 | The general scheduler becomes work-conserving and gets basic priority classes (interactive above normal above background) in v1, replacing the hard 32%-of-one-core cap. This is ordinary OS scheduling, not the inference-aware pillar; it protects the input-latency gate while a local model runs. | confirmed |
-| S5 | Two boot artifacts: a disk image (GPT: FAT32 boot partition plus ext2 root) for development, and a bootable ISO. Both run in VMware and VirtualBox, and the disk image is also used for QEMU tests. They replace the host-directory-only boot. | confirmed |
+| S5 | Two boot artifacts: a disk image (GPT: FAT32 boot partition plus ext2 root) for development, and a bootable ISO. Both run in VMware, and the disk image is also used for QEMU tests. They replace the host-directory-only boot. (Amended 2026-10-09: VirtualBox dropped.) | confirmed |
 | S5a | The v1 ISO boots Mirror live. An installer that writes a disk from inside Mirror needs FAT32 writes (S2a), so it comes after v1. | confirmed |
 | S6 | ABI reset, done before more code depends on the current ABI. | confirmed |
 | S6a | Fast SYSCALL entry with 6 register arguments and a per-process personality selector (native, later Linux and Windows tables). INT 0x80 stays as a legacy shim. | confirmed |
 | S6b | Kernel object model: reference-counted objects with rights, handle transfer over channels, channel creation on demand, and waiting on many objects at once. It replaces the fixed 8 handles and 2 channels. | confirmed |
 | S6c | Shared memory objects that can be mapped between processes (surfaces, large buffers, model weights), replacing copy-everything syscalls. | confirmed |
 | S6d | Window, app-launch and desktop policy moves out of kernel syscalls into a userspace compositor protocol. | confirmed |
+| S6e | Revocation (extends S6b). Each grant is a revocable kernel object. Every handle derived or transferred from it points back to it; revoking the grant invalidates all of them and unmaps any 0025 shared-memory mappings made through it. Pause is a kernel suspend in 0030 (SIGSTOP/NtSuspendProcess semantics), so a paused agent cannot act on handles it already holds. | confirmed |
+| S6f | 0027 splits. 0027a (M1): the compositor protocol over 0025 shared memory, any display size and live resize, a clipboard object, and a versioned input envelope with seat and provenance fields from day one; app launch keeps a kernel call for now; it keeps 0019-D6's frame and shell_ready hooks. 0027b (M2, after 0030/0031): app launch moves to userspace, completing S6d. 0084 later replaces only the envelope's payload and lands before 0082 and 0083. | confirmed |
 | S7 | Boot hygiene: init's test battery and production asserts on test fixtures move behind `boot-smoke`, and serial logging of user content and console-text test oracles move behind `boot-smoke` or `test-trace`. A normal boot can never panic on a test outcome or leak typed text. (Reworded 2026-10-09 per spec 0010-D2.) | confirmed |
 | S7a | Three kernel build flavors: default (clean, what you daily-drive), `test-trace` (default plus test serial markers, used by captures), and `boot-smoke` (includes test-trace, plus the full self-test and fault battery). | confirmed |
-| S7b | In default builds, serial output never depends on user input. The one exception is opt-in timing markers enabled by the `mirror.perf=` boot option (spec 0018-D9), which carry no user content. | confirmed |
+| S7b | In default builds, serial output never carries user content (typed text, document or file contents, clipboard data). Content-free lifecycle and device markers (0010's "unchanged in every flavor" list, such as `MIRROR_APP_*`, `MIRROR_SHELL_CLEANUP_OK`, `MIRROR_CONSOLE_READY` and `MIRROR_CONSOLE_INPUT_LOST`) may print in response to user actions. Timing markers that depend on input appear only with a valid `mirror.perf=` token (0018-D9). (Reworded 2026-10-09, gap interview: lifecycle and device markers carry no user content; replaces "never depends on user input".) | confirmed |
+| S8 | A native userspace runtime comes before native tools: `mirror-sys` (one shared table of syscall numbers and errors) and `mirror-rt` (allocator, handle types, threads, panic output). A Rust `std` port for Mirror's userspace target (S12) is part of v1 and lands before the native tools (0081). (Amended 2026-10-09: `std` moved from "later" into v1.) | confirmed |
 | S9 | v1 speculative-execution policy: CPU vulnerability status is detected and reported, with no KPTI. This rests on the premise that only Mirror-built native code runs inside Mirror in v1 (external agents connect through the Agent API). A KPTI/MDS mitigation spec is a prerequisite before any third-party native code runs. | confirmed |
-| S8 | A native userspace runtime comes before native tools: `mirror-sys` (one shared table of syscall numbers and errors) and `mirror-rt` (allocator, handle types, threads, panic output). A Rust `std` port follows later. | confirmed |
+| S10 | A time source other than the HPET (calibrated TSC or ACPI PM timer), for VMs or hardware without a usable HPET, belongs to spec 0055. Until then, the reference VMware VM settings (0015a, docs/vm-settings.md) enable the HPET explicitly. (Amended 2026-10-09: VirtualBox example removed.) | confirmed |
+| S11 | Text. UTF-8 in every ABI string, typed operation and shell output. v1 has a full modern text stack: OpenType vector fonts with a rasterizer, font fallback covering Latin, Greek, Cyrillic, CJK and emoji, complex-script shaping, and non-US keyboard layouts with dead keys. One shared text spec (0086, with Kimi), ordered before 0082, 0083 and 0085. Native vs crate per S3. | confirmed |
+| S12 | Userspace target. Mirror's own hard-float userspace target (SSE2 baseline, AVX2 by runtime dispatch). `core` and `alloc` are rebuilt with build-std on the pinned compiler (P5a) using `RUSTC_BOOTSTRAP=1`, the way the Linux kernel uses unstable features on a pinned stable rustc; the toolchain adds the `rust-src` component; no second toolchain. The kernel target is unchanged. Spec 0028 (M1). | confirmed |
+| S13 | Service model. The block layer, filesystems and the network stack run as restartable userspace services under 0032. Each process gets a namespace of handles at spawn, limited by its principal's grants. When a service restarts, clients' old channels fail with a defined error and they reconnect through their namespace. Spec 0033 (M2). | confirmed |
+| S14 | Crypto and entropy. One shared `no_std` crypto crate on RustCrypto primitives plus rustls for TLS (no C toolchain), spec 0035 (M2, must land before 0043). SHA-256 for the audit chain. The kernel CSPRNG (spec 0036, M2, before 0040) is seeded from RDSEED/RDRAND, timing jitter and a seed persisted across boots. QEMU test CPUs add `+rdrand,+rdseed`. The Mozilla root store ships with Mirror and updates with OS updates. (Amended 2026-10-09: the CSPRNG spec moved from M4 to M2, beside 0035, and was renumbered 0036 to match M2's range.) | confirmed |
+| S15 | Wall clock. Read the RTC (or UEFI GetTime) at boot as UTC, which is VMware's default for non-Windows guests; kernel time is UTC. SNTP once the network is up (0072). IANA time zones in v1 for display. Only the human seat sets the clock. The audit TTL counts against a persisted monotonic counter. Spec 0056 (M4); 0020 reserves the realtime-clock and random-bytes calls. | confirmed |
+| S16 | ACPI and power. A pure-Rust AML interpreter (candidate: rust-osdev's `acpi` crate, MIT/Apache-2.0; final pick per S3) provides `_S5` power-off, `_PRT` interrupt routing (e1000/AHCI INTx) and the power button. Reboot tries the FADT reset register, then the keyboard controller, then port 0xCF9, then a triple fault. Orderly shutdown stops services through 0032, syncs filesystems and marks the pool clean. Specs 0057 (ACPI namespace) and 0058 (shutdown and reboot), M4, before M5 stores data. | confirmed |
+| S17 | Crashes and system log. On panic, the other CPUs stop by NMI (revisits 0016-D4; 0051 implements), a crash screen shows the reason and a backtrace (frame pointers kept in release builds), and a crash record is saved and moved into the system log on the next boot. Development builds halt; release builds auto-reboot (configurable). A system log (kernel ring buffer plus per-service channels) moves off the deferred list into M2 (spec 0034); it persists once the filesystem exists, is readable by the owner and by agents only with a grant, and follows S7's no-user-content rule. | confirmed |
+| S18 | Memory policy. A fixed reserve for the kernel, compositor, shell and system services that nothing else can consume. The engine and indexer run in S4's background class, get pressure notifications and shrink their caches (expert cache, KV) first. Out-of-memory victim order: background work, then agent tasks, then normal apps; never the compositor, shell or system services. Grants can carry per-agent memory limits. Extends 0054. | confirmed |
+| S19 | Network. DHCPv4 with a static override, IPv6 with SLAAC, DNS servers from DHCP. The daily VM uses NAT. Spec 0074, before 0073: an HTTP/1.1 client and server (the server for the Agent API listener), SSE and JSON, crates per S3. | confirmed |
+| S20 | Files in and out. In-guest fetch and put commands over HTTPS (0081, using 0074), plus VMware shared folders (HGFS over the guest RPC channel, spec 0087). Outbound transfer by agents is a grantable, audited capability (0075). | confirmed |
 
 ## Process (P)
 
@@ -113,7 +150,7 @@ Source interview: 2026-10-09.
 | P5a | Pin the Rust toolchain to 1.96.0 and bump it deliberately. | confirmed |
 | P5b | Add an `AGENTS.md` that every agent reads: spec rules, test commands, coding conventions, references policy. | confirmed |
 | P5c | Gradually split the readme into `docs/` (building, testing, architecture, ABI), leaving a short readme. | confirmed |
-| P6 | References policy: the local reference trees (linux, nt5src, freebsd-src, colibri) are best-practice references only, and Mirror code is written independently against Mirror's own interfaces. They live on the development machine; exact paths vary by machine, so agents ask Cameron for a tree's location rather than assuming one. readme.md:694 ("reuse device-specific source where licensing permits") is reworded to match. | confirmed |
+| P6 | References policy: the local reference trees (linux, nt5src, freebsd-src, colibri) are best-practice references only, and Mirror code is written independently against Mirror's own interfaces. They live on the development machine; exact paths vary by machine, so agents ask Cameron for a tree's location rather than assuming one. readme.md:694 ("reuse device-specific source where licensing permits") is reworded to match. (Amended 2026-10-09: readme.md:698 ("port drivers for named physical hardware", "each port has a bounded interface") and readme.md:700 ("Porting source does not mean ...") are reworded with it, spec 0012-D5; the replacement wording of all three lines is confirmed.) | confirmed |
 | P7 | Each agent task runs on its own branch, and Cameron merges it. No force-pushes or rewriting of pushed history. Push only when asked. | confirmed |
 | P7a | Exception to P7: spec and documentation commits (`docs/specs/` and other docs-only changes) go directly to `main` and are pushed, with no task branch. | confirmed |
 | P9 | Permanent rule: every spec or change that alters something AGENTS.md describes updates those AGENTS.md lines in the same commit. | confirmed |
@@ -125,33 +162,42 @@ v1 order. The harness follows the process model (A15), and harness code is writt
 
 | ID | Milestone | Status |
 | --- | --- | --- |
-| M0 | Hygiene, VM boot images, performance baselines | confirmed |
-| M1 | ABI reset and `mirror-sys`/`mirror-rt` | confirmed |
-| M2 | Processes and service manager | confirmed |
-| M3 | Agent harness core | confirmed |
-| M4 | SMP userspace, scheduler, AVX2, large memory | confirmed |
-| M5 | Storage: runtime drivers, mirrored pool, ext2 then ext3 | confirmed |
-| M6 | Network: e1000, TCP/IP, DNS, TLS, plus the MCP adapter | confirmed |
-| M7 | Typed shell, native tools, assistant panel | confirmed |
-| M8 | AI: keyring broker, providers, Mirror's inference engine, built-in assistant | confirmed |
+| M0 | Hygiene, VM boot images, absolute pointing, performance baselines | confirmed (renamed 2026-10-09) |
+| M1 | ABI reset: `mirror-sys`/`mirror-rt`, kernel objects, compositor protocol, userspace target | confirmed (renamed 2026-10-09) |
+| M2 | Processes, services and namespaces, system log, crypto and entropy | confirmed (renamed 2026-10-09) |
+| M3 | Agent harness core: principals and login, grants, audit, operations, Agent API, tasks, approvals | confirmed (renamed 2026-10-09) |
+| M4 | SMP userspace, scheduler, AVX2, large memory, ACPI power, wall clock | confirmed (renamed 2026-10-09) |
+| M5 | Storage: runtime drivers, mirrored pool, ext2 then ext3, settings store, VM layout and updates, SVGA II display | confirmed (renamed 2026-10-09) |
+| M6 | Network: e1000, TCP/IP with DHCP, DNS, TLS, HTTP, remote agent access, MCP adapter | confirmed (renamed 2026-10-09) |
+| M7 | Typed shell, native tools, text stack, apps, guest services, `std` port, assistant panel | confirmed (renamed 2026-10-09) |
+| M8 | AI: keyring broker, providers, evaluation, model store, inference engine, built-in assistant | confirmed (renamed 2026-10-09) |
 | M9 | Performance gates pass, completing v1 | confirmed |
 
 ## Pending (resume here)
 
-State at the end of the 2026-10-09 session.
+State after the 2026-10-09 gap interview, its write-up and its addendum.
 
-**Confirmed, but not yet written into the spec text:**
-- 0012: AGENTS.md names Kimi's UI branch with a placeholder ("name supplied by Cameron"). 0012 also rewords readme.md:700 to match P6, along with :694. The AGENTS.md update rule is permanent (P9). 0012-D8 (branch naming `<agent>/<spec>-<short-name>`) is already marked confirmed in the spec.
+**Confirmed, but not yet written into the spec text:** none. Confirmed decisions that name a spec not yet drafted (for example 0027a, 0033 or 0067) live in this ledger and the README.md spec map until that spec is written.
 
-**Still awaiting Cameron's decision (spec 0019, all proposed):**
-- 0019-D3: gate every perf line, milestones included, behind a valid `mirror.perf=` token. This narrows confirmed 0018-D9 and changes 0018's marker contract, so it needs re-confirmation together with them.
-- Whether to split 0019 into 0019a (perf markers) and 0019b (C3 telemetry), since it is about three pages.
-- 0019-D12: VMware token delivery through a perf copy of the disk image, or through a boot menu entry.
-- 0019-D9: M0 telemetry benchmarks of memory plus AHCI depth-1 reads, or memory only.
-- The rest of 0019 (D4 grammar, D5 TSC entry timing, D6 syscall-observed frame and shell_ready, D7 deferred input ring, D8 text telemetry records, D10 serial-only output, D11 the perf-protocol crate), each with the reviewer's recommendation in the spec.
-- Optional: an "unscheduled follow-ups" list in README.md so deferred items aren't lost. These include the KPTI/MDS spec (S9), an NX direct map and Limine lower-half audit, non-fatal NMI, build identity with QEMU/OVMF version checks, per-case work directories for a parallel test suite, VirtualBox baselines, a typed test-event channel, a default-build destination for user-program diagnostics, the live ISO root filesystem, the disk update path, and clippy --tests.
+**Still awaiting Cameron's decision:**
+1. 0012: Kimi's UI branch name. AGENTS.md keeps the placeholder "name supplied by Cameron" until then.
+2. Spec 0019 (all proposed; D3-D12 unchanged by the gap interview):
+   - 0019-D3: gate every perf line, milestones included, behind a valid `mirror.perf=` token. This narrows confirmed 0018-D9 and changes 0018's marker contract, so it needs re-confirmation together with them.
+   - Whether to split 0019 into 0019a (perf markers) and 0019b (C3 telemetry), since it is about three pages.
+   - 0019-D12: VMware token delivery through a perf copy of the disk image, or through a boot menu entry. Either way the perf boot entry sets 1920x1080 through Limine's `resolution:` option (confirmed 2026-10-09, 0015a).
+   - 0019-D9: M0 telemetry benchmarks of memory plus AHCI depth-1 reads, or memory only.
+   - 0019-D10 (serial-only output in M0) overlaps amended C3 (serial capture before 0066, persistence in 0066), so C3 may now settle it. Cameron confirms it with the 0019 round.
+   - The rest of 0019 (D4 grammar, D5 TSC entry timing, D6 syscall-observed frame and shell_ready, D7 deferred input ring, D8 text telemetry records, D11 the perf-protocol crate), each with the reviewer's recommendation in the spec.
+   - 0019 open question 6 (added 2026-10-09): where flip calibration runs in boot-smoke builds, where `run_init` (`main.rs:303`) runs before the `after_userspace` rendezvous (`main.rs:311`).
+   - 0019 open question 7 (added 2026-10-09): with 0017c's vmmouse active, a click arrives in vmmouse DATA, not in the PS/2 packet, so D7's start rule needs a vmmouse case.
+3. 0017c open question 1: setting `monitor_control.restrict_backdoor = "TRUE"`, which limits the VMware backdoor to CPL0. It stays proposed until manual check 7 shows that the option exists on current Workstation and that vmmouse still works with it. If adopted, it applies only to Mirror's VMs (0015a's reference VM and 0018's Mirror VM), and 0018-D3 lists it as an accepted exception, because VMware Tools in the baselines needs user-mode backdoor access.
+4. O7: the v1 full-access ceiling, decided before v1 acceptance.
 
-**Owner actions before M0 manual checks:** install VMware Workstation and VirtualBox on the desktop, and set up `.tools/qemu` and OVMF there (they are gitignored).
+**Spec-map placements Claude inferred** (for Cameron's awareness, not blocking): S2b's boot-time ext2 checker in 0064; the per-CPU SYSCALL entry rework in 0050.
+
+**Owner actions before M0 manual checks:** install VMware Workstation on the development machine (VirtualBox is no longer needed). `.tools/qemu` and OVMF already exist there (they are gitignored).
+
+**Deferred work:** the unscheduled follow-ups list (deferred items not yet in a milestone) now lives in README.md, beside the "After v1" list.
 
 ## Open questions (O)
 
@@ -160,6 +206,7 @@ State at the end of the 2026-10-09 session.
 | O1 | Resolved: Colibri is github.com/JustVugg/colibri (Apache-2.0), cloned on the development machine (see P6 for paths). |
 | O2 | Which specific Windows apps Cameron returns to Windows for (the post-v1 compatibility target list). |
 | O3 | Performance gate target numbers, set after baseline measurements of Linux and Windows in the same VM. |
-| O4 | ChatGPT sign-in: which OAuth or device flows OpenAI supports for third-party clients. Needs research. |
+| O4 | Post-v1: ChatGPT sign-in. Mirror has no browser, so any flow finishes on another device (device code or pasted redirect), and eligibility may depend on Mirror's license and distribution model (P4). Research before the post-v1 spec. (Reworded 2026-10-09: ChatGPT sign-in moved after v1, see I2.) |
 | O5 | Resolved: see I4, I4a, I4b. |
 | O6 | Resolved: FreeBSD is github.com/freebsd/freebsd-src, cloned on the development machine (see P6 for paths). |
+| O7 | The v1 full-access ceiling (A5a): which powers stay human-seat-only (audit TTL and settings, policies and A7 rules, granting and override, keyring contents, raw block and pool devices, the audit, policy and keyring stores), the network egress scope of each preset, and the read-only preset's network rights. Decide before v1 acceptance. |

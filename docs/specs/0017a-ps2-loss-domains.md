@@ -1,24 +1,24 @@
 # 0017a: PS/2 loss domains, mouse coalescing and resync
 
 Status: confirmed (2026-10-09)
-Depends on: 0013 and 0015a, only for the manual VMware/VirtualBox check (it boots 0015a's disk image); the QEMU tests need neither. In the M0 order this spec lands before 0017b, and both edit `kernel/src/ps2.rs`.
-Ledger: S1a, G1, G3a, G7 (related: S7b)
+Depends on: 0013 and 0015a, only for the manual VMware check (it boots 0015a's disk image); the QEMU tests need neither. In the M0 order this spec lands before 0017b, and both edit `kernel/src/ps2.rs`. 0017c (absolute pointing) follows both.
+Ledger: S1a, G1, G3a, G7 (related: S7b, S1d)
 
 ## Goal
-A mouse fault or a full mouse ring never changes keyboard state: held modifiers, Caps Lock, the next keystroke and an unsent console line or Scratchpad draft all survive. A keyboard fault never discards pointer events. While the shell is starved, mouse motion is coalesced instead of overflowing the ring, and a mouse whose packet framing slipped resynchronizes after a 500 ms gap. This protects daily use (G1) and the input-latency gate (G7) on the v1 device set (S1a) in VMware and VirtualBox (G3a). Init timing and order are 0017b.
+A mouse fault or a full mouse ring never changes keyboard state: held modifiers, Caps Lock, the next keystroke and an unsent console line or Scratchpad draft all survive. A keyboard fault never discards pointer events. While the shell is starved, mouse motion is coalesced instead of overflowing the ring, and a mouse whose packet framing slipped resynchronizes after a 500 ms gap. This protects daily use (G1) and the input-latency gate (G7) on the v1 device set (S1a) in VMware (G3a). Init timing and order are 0017b.
 
 ## Non-goals
 - Keyboard LED sync (0xED) and lock-state agreement with the VM: spec 0084. Mirror never sends 0xED today, so a keyboard loss, which still clears Caps Lock, can leave the VM's LED disagreeing until 0084. After D3 a mouse loss no longer does this.
-- Keycodes, shortcuts, new keys, wheel and extra buttons, the window-protocol key event, USB HID and a device-independent input layer (all 0084). Input provenance and seats (0047).
-- Absolute pointing (VMware backdoor, VirtualBox mouse integration): a follow-up suggestion (see Open questions).
+- Keycodes, shortcuts, new keys, wheel and extra buttons, the window-protocol key event and a device-independent input layer (all 0084). Input provenance and seats (0047). USB HID is outside the v1 device set (S1a); USB HID pointing comes with physical hardware after v1 (S1d).
+- Absolute pointing through the VMware vmmouse protocol: spec 0017c (ledger S1d). The relative PS/2 mouse this spec handles stays the fallback.
 - Scheduler changes. The 32-of-100-tick service throttle (`kernel/src/userspace.rs:39-40`) belongs to 0052 (ledger S4).
 - Init timeouts, the controller self-test, scan-set selection and init order (0017b).
 
 ## Decisions
 | ID | Decision | Status |
 | --- | --- | --- |
-| 0017-D1 | v1 keyboard and pointer input is the PS/2 keyboard and mouse behind the i8042. | confirmed (ledger S1a) |
-| 0017-D2 | VMware (primary) and VirtualBox are checked by hand; QEMU runs the automated tests. | confirmed (ledger G3a) |
+| 0017-D1 | v1 keyboard and pointer input is the PS/2 keyboard and mouse behind the i8042. (Amended 2026-10-09 with S1a: the mouse gains the VMware vmmouse absolute-pointer extension, spec 0017c; relative PS/2 stays the fallback.) | confirmed (ledger S1a) |
+| 0017-D2 | VMware is checked by hand; QEMU runs the automated tests. (Amended 2026-10-09: VirtualBox dropped, G3a amended.) | confirmed (ledger G3a) |
 | 0017-D3 | Loss is tracked per device. A keyboard loss resets only keyboard state (held keys, Caps Lock, recovery gate). A mouse loss resets only pointer state. Each loss is a marker in its own device's stream, ordered against the other device by the shared sequence. It never discards the other device's queued events. Rationale: a mouse-only loss drops no keyboard byte, and every KeyEvent already carries a full modifier snapshot. Rejected alternative: keep the global barrier (`kernel/src/ps2.rs:185-188`). | confirmed (2026-10-09) |
 | 0017-D4 | The KIND_LOST record (kind 3) keeps its kind and carries a device mask in word 2: bit 0 keyboard, bit 1 pointer. The mask is nonzero and all other bits are zero. The session's initial record sets both bits. Rationale: one additive field in a record format that 0084 replaces. Rejected alternative: add a new kind 4 for pointer loss. | confirmed (2026-10-09) |
 | 0017-D6 | When the 64-entry mouse ring is full, a packet with the same button levels as the newest queued event is added into it (checked i16 sum), and the merged event takes the new packet's sequence. A button change or an i16 overflow on a full ring is a pointer loss. Rationale: delivery stays 1:1 except under starvation, and starvation loses no motion. Rejected alternative: always merge same-button motion into an unconsumed tail. | confirmed (2026-10-09) |
@@ -57,12 +57,12 @@ Boot-smoke self-tests; the existing markers must still print.
 4. Desktop smoke: shell.rs:1023 `policy_checks` (`run.ps1 -Smoke`, gated by MIRROR_SHELL_TESTS_OK) checks that a pointer-only loss keeps a queued key for the focused app. ui.rs:507 `self_test` (`-Smoke -AgentDemo`, gated by MIRROR_DESKTOP_TESTS_OK) checks that a pointer-only loss keeps the draft and a keyboard loss clears it, as ui.rs:553-556 already expects.
 5. Before merge (ledger P8): `scripts/test.ps1` and `scripts/test.ps1 -AgentDemo` pass, since the Scratchpad is agent-demo code. This spec adds no smoke boots.
 
-Manual check on VMware Workstation and VirtualBox. Each VM boots 0015a's disk image with the settings 0015a documents, and uses a PS/2 keyboard and a PS/2 mouse with no USB mouse or tablet (VirtualBox: `VBoxManage modifyvm <vm> --mouse ps2 --keyboard ps2`):
+Manual check on VMware Workstation. The VM boots 0015a's disk image with the settings 0015a documents, and uses a PS/2 keyboard and a PS/2 mouse with no USB controller, so no USB mouse or tablet:
 6. In the default shell, focus Notes, turn Caps Lock on and type `a`. Drag the other window by its title bar in fast circles for 10 s, release, and type `b` in Notes. Expected: Notes shows `AB` with nothing dropped, and the dragged window ends where the pointer was released.
 
 ## Dependencies
-No crates. QEMU (`.tools/qemu`, GPL-2.0) is already used. The manual check needs VMware Workstation (proprietary, no cost) and the VirtualBox 7.x base package (GPL-3.0). Neither is installed at its default path on the current development host.
+No crates. QEMU (`.tools/qemu`, GPL-2.0) is already used. The manual check needs VMware Workstation (proprietary, no cost), which is not installed at its default path on the current development host.
 
 ## Open questions
-1. Follow-up suggestion: a spec for absolute pointing in VMs (VMware backdoor, VirtualBox mouse integration), so the pointer is not grabbed. QEMU q35 enables `vmport` (and its vmmouse) by default, and `run.ps1:320` turns it off only for `-NoKeyboard`, so QEMU could cover the backdoor in tests.
+1. Resolved 2026-10-09: absolute pointing is spec 0017c (ledger S1d), the VMware vmmouse protocol in M0, so the pointer is not grabbed. QEMU q35 enables `vmport` (and its vmmouse) by default, and `run.ps1:320` turns it off only for `-NoKeyboard`, so 0017c tests the protocol in QEMU.
 2. Follow-up suggestion: move the keyboard and mouse decoders into a `no_std` crate with host cargo tests. This spec keeps boot-smoke tests only.

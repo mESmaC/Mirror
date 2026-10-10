@@ -1,11 +1,11 @@
 # 0017b: PS/2 init timing and order
 
 Status: confirmed (2026-10-09)
-Depends on: 0017a (M0 order only; both edit `kernel/src/ps2.rs`). The manual VMware/VirtualBox check also needs 0013 and 0015a's disk image; the QEMU tests need neither.
-Ledger: S1a, G1, G3a (related: G7, S7a)
+Depends on: 0017a (M0 order only; both edit `kernel/src/ps2.rs`). The manual VMware check also needs 0013 and 0015a's disk image; the QEMU tests need neither. 0017c (absolute pointing) follows this spec.
+Ledger: S1a, G1, G3a (related: G7, S7a, S10)
 
 ## Goal
-PS/2 init waits are bounded by elapsed time (HPET, else PIT) using the Linux budgets, instead of by a count of status reads whose duration depends on how fast the platform answers port I/O. Init no longer runs the controller self-test, and a scancode buffered at boot can no longer disable the keyboard. The keyboard and mouse come up on every cold boot in VMware and VirtualBox (stock VirtualBox VMs have HPET disabled), and a silent device costs a bounded delay that serial reports. This keeps input usable for daily use (G1) on the v1 device set (S1a) and bounds the init cost inside boot-to-desktop (G7). Loss handling is 0017a.
+PS/2 init waits are bounded by elapsed time (HPET, else PIT) using the Linux budgets, instead of by a count of status reads whose duration depends on how fast the platform answers port I/O. Init no longer runs the controller self-test, and a scancode buffered at boot can no longer disable the keyboard. The keyboard and mouse come up on every cold boot in VMware, a silent device costs a bounded delay that serial reports, and the PIT keeps the waits bounded where no HPET is usable (S10). This keeps input usable for daily use (G1) on the v1 device set (S1a) and bounds the init cost inside boot-to-desktop (G7). Loss handling is 0017a.
 
 ## Non-goals
 - Per-device loss, mouse coalescing and framing resync (0017a).
@@ -16,13 +16,13 @@ PS/2 init waits are bounded by elapsed time (HPET, else PIT) using the Linux bud
 ## Decisions
 | ID | Decision | Status |
 | --- | --- | --- |
-| 0017-D5 | Init waits are bounded by elapsed time: HPET (`clock::snapshot`) when it is published, else polled PIT channel 0. An iteration backstop is kept. Budgets follow Linux: controller IBF/OBF 500 ms (linux `drivers/input/serio/i8042.c:230-249` with `i8042.h:34`), device ACK 200 ms, reset ACK 1000 ms, response 500 ms, reset BAT 4000 ms (`libps2.c:320, 338`). Rationale: init runs with IF clear (ps2.rs:218), so ticks do not advance, and stock VirtualBox VMs have HPET disabled. Rejected alternative: keep iteration counts and raise them about 40x. | confirmed (2026-10-09) |
+| 0017-D5 | Init waits are bounded by elapsed time: HPET (`clock::snapshot`) when it is published, else polled PIT channel 0. An iteration backstop is kept. Budgets follow Linux: controller IBF/OBF 500 ms (linux `drivers/input/serio/i8042.c:230-249` with `i8042.h:34`), device ACK 200 ms, reset ACK 1000 ms, response 500 ms, reset BAT 4000 ms (`libps2.c:320, 338`). Rationale: init runs with IF clear (ps2.rs:218), so ticks do not advance, and a VM or machine without a usable HPET has no other time source until 0055 (S10). Rejected alternative: keep iteration counts and raise them about 40x. (Amended 2026-10-09: VirtualBox example removed, G3a amended.) | confirmed (2026-10-09) |
 | 0017-D8 | Init skips the controller self-test (0xAA) and keeps the port tests (0xAB, 0xA9). Rationale: Linux on x86 runs it at probe only when `i8042.reset` is forced (`i8042.c:57, 1541`), and in Mirror it can only abort init or reset the config. Rejected alternative: keep it. | confirmed (2026-10-09) |
-| 0017-D9 | Keep untranslated Set 2 with the F0 00 readback. A failed readback still skips the keyboard with a reason. A translated Set 1 fallback is deferred to the post-v1 hardware work (G3). Rationale: VMs are the v1 target, and a Set 1 path needs a second decode table. If test 6 shows VMware or VirtualBox failing the readback, the rejected alternative becomes required. Rejected alternative: add the translated Set 1 fallback now. | confirmed (2026-10-09) |
+| 0017-D9 | Keep untranslated Set 2 with the F0 00 readback. A failed readback still skips the keyboard with a reason. A translated Set 1 fallback is deferred to the post-v1 hardware work (G3). Rationale: VMs are the v1 target, and a Set 1 path needs a second decode table. If test 6 shows VMware failing the readback, the rejected alternative becomes required. Rejected alternative: add the translated Set 1 fallback now. (Amended 2026-10-09: VirtualBox dropped, G3a amended.) | confirmed (2026-10-09) |
 
 Decisions in 0017a that also govern this spec:
-- 0017-D1: v1 keyboard and pointer input is the PS/2 keyboard and mouse behind the i8042 (ledger S1a).
-- 0017-D2: VMware (primary) and VirtualBox are checked by hand; QEMU runs the automated tests (ledger G3a).
+- 0017-D1: v1 keyboard and pointer input is the PS/2 keyboard and mouse behind the i8042 (ledger S1a, amended 2026-10-09: the mouse gains the vmmouse extension, spec 0017c).
+- 0017-D2: VMware is checked by hand; QEMU runs the automated tests (ledger G3a, amended 2026-10-09: VirtualBox dropped).
 
 ## Interfaces
 **Init timing** (`kernel/src/timer.rs`, `ps2.rs`)
@@ -53,11 +53,11 @@ QEMU integration (`scripts/run.ps1`, `scripts/test.ps1`):
 4. `-Fault Ps2StaleScancode`: MIRROR_KEYBOARD_READY, MIRROR_MOUSE_READY and `MIRROR_PS2_INJECTED stale=1`. The implementer lands the fault before the reorder and records that it then gives `MIRROR_KEYBOARD_SKIPPED reason=Configuration`.
 5. `scripts/test.ps1` runs cases 3 (both clocks) and 4 in each profile, which adds 3 smoke boots per profile. Before merge (ledger P8), the full `scripts/test.ps1` passes.
 
-Manual check on VMware Workstation and VirtualBox. Each VM boots 0015a's disk image with the reference settings in `docs/vm-settings.md` (0015-D11), which turn VirtualBox's HPET on, and uses a PS/2 keyboard and a PS/2 mouse with no USB mouse or tablet (VirtualBox: `VBoxManage modifyvm <vm> --mouse ps2 --keyboard ps2`):
-6. Over 10 cold boots per hypervisor, the serial log shows `MIRROR_KEYBOARD_READY ... set=2`, MIRROR_MOUSE_READY, no MIRROR_PS2_TIMEOUT, and `MIRROR_PS2_INIT elapsed_ms` < 1000 with clock=hpet. VirtualBox then repeats the 10 boots with `VBoxManage modifyvm <vm> --hpet off`, its default, as 0013 test 15 does, and shows the same with clock=pit. Record every value.
+Manual check on VMware Workstation. The VM boots 0015a's disk image with the reference settings in `docs/vm-settings.md` (0015-D11), which enable VMware's HPET explicitly (S10), and uses a PS/2 keyboard and a PS/2 mouse with no USB controller, so no USB mouse or tablet:
+6. Over 10 cold boots in VMware, the serial log shows `MIRROR_KEYBOARD_READY ... set=2`, MIRROR_MOUSE_READY, no MIRROR_PS2_TIMEOUT, and `MIRROR_PS2_INIT elapsed_ms` < 1000 with clock=hpet. Record every value. The PIT path is covered in QEMU by test 3's `-NoHpet` case.
 
 ## Dependencies
-No crates. QEMU (`.tools/qemu`, GPL-2.0) is already used. The manual check needs VMware Workstation (proprietary, no cost) and the VirtualBox 7.x base package (GPL-3.0). Neither is installed at its default path on the current development host.
+No crates. QEMU (`.tools/qemu`, GPL-2.0) is already used. The manual check needs VMware Workstation (proprietary, no cost), which is not installed at its default path on the current development host.
 
 ## Open questions
-1. External fact, checked by test 6: whether VMware and VirtualBox pass the F0 00 readback. If either fails, D9's rejected alternative (the translated Set 1 fallback) becomes required. That changes a confirmed decision, so it goes back to Cameron first (README rule 5), and the Set 1 work then joins this spec.
+1. External fact, checked by test 6: whether VMware passes the F0 00 readback. If it fails, D9's rejected alternative (the translated Set 1 fallback) becomes required. That changes a confirmed decision, so it goes back to Cameron first (README rule 5), and the Set 1 work then joins this spec.

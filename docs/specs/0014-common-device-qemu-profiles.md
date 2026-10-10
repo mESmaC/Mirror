@@ -1,12 +1,12 @@
 # 0014: Common device-set QEMU profiles
 
 Status: confirmed (2026-10-09)
-Depends on: 0012 and 0011, which land first in the M0 order (this spec updates the AGENTS.md lines it changes). 0010, 0015a, 0015b, 0013, 0016a/b, 0017a/b and 0019 land later and build on these profiles, as does 0018's QEMU lane.
-Ledger: S1, S1a, S1b, G3a (related: S5, P3, P8)
+Depends on: 0012 and 0011, which land first in the M0 order (this spec updates the AGENTS.md lines it changes). 0010, 0015a, 0015b, 0013, 0016a/b, 0017a/b, 0017c and 0019 land later and build on these profiles, as does 0018's QEMU lane.
+Ledger: S1, S1a, S1b, G3a (related: S1c, S1d, S5, P3, P8)
 
 ## Goal
 
-Every automated QEMU boot uses a named device profile. The profiles are defined once in `scripts/common.ps1` and shared by `run.ps1` and `capture.ps1`. The default profile, `V1`, presents the v1 device set:
+Every automated QEMU boot uses a named device profile. The profiles are defined once in `scripts/common.ps1` and shared by `run.ps1` and `capture.ps1`. The default profile, `V1`, presents these v1 devices (0014-D1):
 - the q35 built-in ICH9 AHCI controller, with the 1 MiB test fixture as a SATA disk;
 - an Intel 82545EM e1000 NIC;
 - the i8042 PS/2 keyboard and mouse;
@@ -19,8 +19,8 @@ Smoke cases, manual `run.ps1` boots and the debug and release normal-kernel capt
 - The e1000 driver, link bring-up and packet I/O. Those belong to spec 0070 (M6). This spec only attaches the NIC and asserts that PCI discovery finds it.
 - Changing the boot medium (0014-D7, S1b). The disk image and the QEMU boot switch belong to 0015a; the live ISO and its `-Iso` case belong to 0015b.
 - An AHCI write path (0062) and a runtime driver model (0060).
-- PCI and firmware fixes for VMware and VirtualBox (0013), and PS/2 robustness (0017a, 0017b).
-- Changing the display adapter, and any SVGA II work (post-v1 per S1a).
+- PCI and firmware fixes for VMware (0013), and PS/2 robustness (0017a, 0017b).
+- Changing the display adapter, and any SVGA II work. Since S1a's 2026-10-09 amendment the VMware SVGA II adapter is in the v1 device set, and its driver is 0069 (S1c). These profiles keep `-vga std` (see Open questions).
 - Parallel test execution, CI (deferred, ledger P3) and a harness rewrite. Clearing stale, renamed logs from `build/test-logs` is 0011-D7.
 - xHCI/USB cases. They stay as variants on top of `V1`, because USB input is not in the v1 device set.
 
@@ -28,10 +28,10 @@ Smoke cases, manual `run.ps1` boots and the debug and release normal-kernel capt
 
 | ID | Decision | Status |
 | --- | --- | --- |
-| 0014-D1 | The QEMU test profiles use the v1 device set: AHCI SATA storage, an Intel e1000-family NIC, PS/2 keyboard and mouse, and the UEFI boot framebuffer. | confirmed (ledger S1a) |
+| 0014-D1 | The QEMU test profiles use the v1 device set: AHCI SATA storage, an Intel e1000-family NIC, PS/2 keyboard and mouse, and the UEFI boot framebuffer. (Amended 2026-10-09: S1a now also lists the VMware SVGA II adapter (S1c, spec 0069), the vmmouse absolute-pointer extension (S1d, spec 0017c) and the VMware guest RPC channel (A20, S20, spec 0087), and its last sentence reads: "The QEMU test profiles switch to this set where QEMU emulates it: `-vga std` stays until 0069 decides on SVGA II, and the guest RPC channel (0087) has no QEMU model and is checked by hand on VMware." These profiles keep `-vga std`. q35's default `vmport`, which `run.ps1:320` turns off only for `-NoKeyboard`, already presents QEMU's vmmouse.) | confirmed (ledger S1a) |
 | 0014-D2 | VirtIO is not a v1 target, so the default profile attaches no VirtIO test fixture. | confirmed (ledger S1, S1a) |
-| 0014-D3 | VMware is the primary daily-drive hypervisor and VirtualBox is also supported. QEMU is the automated test platform. | confirmed (ledger G3a) |
-| 0014-D4 | The standard NIC is the Intel 82545EM (8086:100F), attached in QEMU as `-device e1000-82545em`. Rationale: it is the only e1000-family model that all three hypervisors emulate (VMware `e1000`, VirtualBox "PRO/1000 MT Server", QEMU `e1000-82545em`). Main alternative: QEMU's plain `e1000`, which is the 82540EM (8086:100E). VirtualBox uses it by default as "PRO/1000 MT Desktop", but VMware does not offer it. VirtualBox does not emulate the 82574L (`e1000e`). | confirmed (2026-10-09) |
+| 0014-D3 | VMware is the only VM target before physical hardware, and the primary daily-drive and development setup. QEMU is the automated test platform. VirtualBox is not a target. (Amended 2026-10-09: VirtualBox dropped, G3a amended.) | confirmed (ledger G3a) |
+| 0014-D4 | The standard NIC is the Intel 82545EM (8086:100F), attached in QEMU as `-device e1000-82545em`. Rationale: it is the model VMware presents as its default `e1000` adapter (VMware's `e1000e` is the 82574L), and QEMU emulates it as `e1000-82545em`. Main alternative: QEMU's plain `e1000`, which is the 82540EM (8086:100E); VMware does not offer it. (Amended 2026-10-09: VirtualBox removed from the rationale, G3a amended; the rationale now names VMware's default adapter and its `e1000e` alternative.) | confirmed (2026-10-09) |
 | 0014-D5 | Keep the legacy VirtIO block cases as a `LegacyVirtio` profile with 6 cases per build profile, until 0062 adds AHCI write and flush cases. Rationale: AHCI has no write path (`kernel/src/main.rs:796`), so these cases are the suite's only write, flush, write-error and dirty-shutdown checks (`run.ps1:641`). Alternative: retire them now, which saves about 100 s per suite run and leaves that gap open until 0062. | confirmed (2026-10-09) |
 | 0014-D6 | Assert e1000 detection on the host, using the existing unmatched catalog record (`driver=none match=none`). `kernel/src/drivers.rs` gets no e1000 candidate until the 0070 driver exists. Rationale: a candidate means that an implementation recognizes the device (`kernel/src/drivers.rs:3-6`). Alternative: add an `e1000` candidate now, so that the catalog and the `devices` console page name the NIC. | confirmed (2026-10-09) |
 | 0014-D7 | The boot medium stays as it is until 0015a replaces it: the host ESP over read-only vvfat on a modern-only virtio-blk device. Mirror never drives that device; only the firmware reads it, which ledger S1b records as consistent with S1/S1a. Rationale: 0015a's GPT image (ledger S5) replaces this medium anyway, and the smoke kernel asserts that the VirtIO boot disk exists (`kernel/src/main.rs:202-205`). Moving the ESP to AHCI now would need a writable overlay for QEMU's ATA model (`run.ps1:353-354`), and it would add a second ATA disk to the driver's port selection (`kernel/src/ahci.rs:238-242`). Alternative: block 0014 until 0015a lands. | confirmed (2026-10-09) |
@@ -57,25 +57,25 @@ Smoke cases, manual `run.ps1` boots and the debug and release normal-kernel capt
 
 **Profiles.** The two profiles differ only in the storage fixture.
 
-| Element | `V1` (default) | `LegacyVirtio` | VMware reference | VirtualBox reference |
-| --- | --- | --- | --- | --- |
-| Machine | `q35,accel=tcg`, i8042 and HPET on | same | EFI firmware | EFI firmware |
-| Storage fixture | fresh `build/ahci-test.img`, `ide-hd,bus=ide.0,rerror=report` | legacy `virtio-blk-pci,disable-modern=on,disable-legacy=off` | SATA (AHCI) disk | AHCI controller |
-| NIC | `-netdev user,id=mirror-net,restrict=on` and `-device e1000-82545em,netdev=mirror-net,romfile=` | same | `ethernet0.virtualDev = "e1000"` | `--nic-type1 82545EM` |
-| Keyboard and mouse | q35 i8042 PS/2 | same | PS/2 | `--keyboard ps2 --mouse ps2` |
-| Display | `-vga std`, OVMF GOP | same | SVGA II, GOP | VMSVGA, GOP |
-| Boot medium | modern virtio-blk, read only by firmware (0014-D7, S1b): vvfat ESP, then 0015a's image | same | 0015a VMDK or 0015b ISO | 0015a VMDK or 0015b ISO |
+| Element | `V1` (default) | `LegacyVirtio` | VMware reference |
+| --- | --- | --- | --- |
+| Machine | `q35,accel=tcg`, i8042 and HPET on | same | EFI firmware |
+| Storage fixture | fresh `build/ahci-test.img`, `ide-hd,bus=ide.0,rerror=report` | legacy `virtio-blk-pci,disable-modern=on,disable-legacy=off` | SATA (AHCI) disk |
+| NIC | `-netdev user,id=mirror-net,restrict=on` and `-device e1000-82545em,netdev=mirror-net,romfile=` | same | `ethernet0.virtualDev = "e1000"` |
+| Keyboard and mouse | q35 i8042 PS/2 | same | PS/2 |
+| Display | `-vga std`, OVMF GOP | same | SVGA II; Mirror uses the GOP framebuffer until 0069 |
+| Boot medium | modern virtio-blk, read only by firmware (0014-D7, S1b): vvfat ESP, then 0015a's image | same | 0015a VMDK or 0015b ISO |
 
 NIC and variant details:
 - `-nic none` stays in place to suppress QEMU's default NIC.
 - The user-mode backend prevents QEMU's "has no peer" warning, and `restrict=on` keeps the guest off the host network.
 - `romfile=` keeps the iPXE option ROM out of firmware startup.
-- The variant switches (`-NoTestDisk`, `-NoKeyboard`, `-NoDisplayDevice`, `-NoHpet`, `-Xhci*`, `-ExtendedCpu`, `-LegacyPic`, `-PitTimer`, `-CpuCount`) apply on top of either profile.
+- The variant switches (`-NoTestDisk`, `-NoKeyboard`, `-NoDisplayDevice`, `-NoHpet`, `-Xhci*`, `-ExtendedCpu`, `-LegacyPic`, `-PitTimer`, `-CpuCount`) apply on top of either profile. 0017c later adds `-NoVmport`.
 
 Later M0 specs on these profiles:
 - 0015a replaces the vvfat ESP with its disk image on the same firmware-only virtio-blk device (0015-D10, S1b), in both profiles. The catalog's one-modern-VirtIO rule (`common.ps1:78`) and `run.ps1:648-650` are unchanged by it.
 - 0015b's `-Iso` case attaches the ISO as an ATAPI CD on `ide.2`, which the AHCI driver skips (`kernel/src/ahci.rs:238-245`). It has no modern virtio-blk boot disk, so only the legacy fixture satisfies the smoke assert (`kernel/src/main.rs:202-205`): `-Iso` requires `-DeviceProfile LegacyVirtio`, and the `test.ps1` `-Iso` case runs under that profile, on top of its six cases. 0015b owns these script changes.
-- The VMware and VirtualBox columns are the reference settings for 0015a's manual VMware and VirtualBox boot check, and 0015a's VM settings doc holds the full settings. That check also confirms this device set in each serial log: one `driver=ahci-sata` record, one `id=8086:100f class=02:00:00` record, and `MIRROR_KEYBOARD_READY`, `MIRROR_MOUSE_READY` and `MIRROR_FRAMEBUFFER_READY`.
+- The VMware column holds the reference settings for 0015a's manual VMware boot check, and 0015a's VM settings doc holds the full settings. That check also confirms this device set in the serial log: one `driver=ahci-sata` record, one `id=8086:100f class=02:00:00` record, and `MIRROR_KEYBOARD_READY`, `MIRROR_MOUSE_READY` and `MIRROR_FRAMEBUFFER_READY`.
 
 **Script changes.**
 - `common.ps1`:
@@ -145,7 +145,7 @@ None: no crates and no new tools. The profiles use the QEMU 11.1.0 already in `.
 
 ## Open questions
 
-- For 0070: should the driver also accept the 82540EM (8086:100E)? It is QEMU's plain `e1000` and VirtualBox's default "PRO/1000 MT Desktop", and it shares the 8254x register model. If so, 0070 adds one `V1` variant case that uses that model.
+- For 0070: should the driver also accept the 82540EM (8086:100E)? It is QEMU's plain `e1000`, and it shares the 8254x register model. If so, 0070 adds one `V1` variant case that uses that model.
 - For 0062: delete the `LegacyVirtio` profile, or replace its cases, when it adds AHCI write and flush cases (0014-D5). 0015b's `-Iso` case also runs under that profile, so 0062 must rehome it too; under `V1` it needs the smoke assert at `kernel/src/main.rs:202-205` to accept a boot with no VirtIO block device.
-- Display: this spec keeps `-vga std`. A later spec could switch to QEMU's `-vga vmware`, an SVGA II model (`vgabios-vmware.bin` ships locally), to resemble VMware more closely. The kernel uses only the GOP framebuffer, so no v1 code depends on this choice.
-- Suggested follow-up spec: per-case work directories, so that cases can run in parallel. Fixed paths force serial runs: `run.ps1:308-316`, `:357` and `common.ps1:707`. Parallel runs are the main way to cut the 20-minute suite time.
+- For 0069: this spec keeps `-vga std`. The VMware SVGA II adapter joined the v1 device set when S1a was amended (2026-10-09, S1c), and 0069 drives it for mode setting and live resize. Until 0069 the kernel uses only the GOP framebuffer, so no M0 code depends on the QEMU display choice. Should 0069 switch the profiles to QEMU's `-vga vmware`, an SVGA II model (`vgabios-vmware.bin` ships locally), or add it as a `V1` variant case?
+- Suggested follow-up spec: per-case work directories, so that cases can run in parallel. Fixed paths force serial runs: `run.ps1:308-316`, `:357` and `common.ps1:707`. Parallel runs are the main way to cut the 20-minute suite time. README.md lists it under the unscheduled follow-ups.

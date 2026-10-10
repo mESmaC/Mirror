@@ -6,7 +6,7 @@ Ledger: S5, S5a, S2a, G3a (related: S1b, S7a, P3)
 
 ## Goal
 
-`scripts/build.ps1` also writes `build/mirror.iso`, a UEFI-bootable live CD. Limine loads the kernel and the four native modules from the disc into memory, so Mirror runs with no disk. `tools/mirror-image` writes the ISO9660 and El Torito structures natively. A `run.ps1 -Iso` smoke case under the `LegacyVirtio` profile boots the ISO in QEMU in both build profiles, and the ISO boots to the Mirror shell in VMware Workstation and VirtualBox with the reference settings in `docs/vm-settings.md`.
+`scripts/build.ps1` also writes `build/mirror.iso`, a UEFI-bootable live CD. Limine loads the kernel and the four native modules from the disc into memory, so Mirror runs with no disk. `tools/mirror-image` writes the ISO9660 and El Torito structures natively. A `run.ps1 -Iso` smoke case under the `LegacyVirtio` profile boots the ISO in QEMU in both build profiles, and the ISO boots to the Mirror shell in VMware Workstation with the reference settings in `docs/vm-settings.md`.
 
 ## Non-goals
 
@@ -22,11 +22,11 @@ Ledger: S5, S5a, S2a, G3a (related: S1b, S7a, P3)
 | 0015-D2 | The ISO boots Mirror live, with no installer in v1. Mirror never writes the FAT32 partition; host tooling produces it. | confirmed (ledger S5a, S2a) |
 
 Decisions in 0015a that also govern this spec:
-- 0015-D1: two artifacts, a disk image and a bootable ISO, both running in VMware and VirtualBox (ledger S5).
-- 0015-D3: VMware is primary, VirtualBox is also supported, QEMU runs the tests (ledger G3a).
+- 0015-D1: two artifacts, a disk image and a bootable ISO, both running in VMware (ledger S5; amended 2026-10-09, VirtualBox dropped).
+- 0015-D3: VMware is the only VM target before physical hardware, and QEMU runs the tests (ledger G3a; amended 2026-10-09, VirtualBox dropped).
 - 0015-D4: the ISO9660/El Torito writer is hand-written in `tools/mirror-image`.
 - 0015-D8: UEFI only, so the ISO has no BIOS boot entry.
-- 0015-D11: the manual checks use the reference VMs in `docs/vm-settings.md`.
+- 0015-D11: the manual checks use the reference VMware VM settings in `docs/vm-settings.md` (amended 2026-10-09, VirtualBox dropped).
 
 ## Interfaces
 
@@ -74,7 +74,7 @@ Line numbers are at HEAD 4614249. 0014, 0010 and 0015a land first and shift them
    - the ISO size;
    - the full `test.ps1` wall time before and after.
 6. Manual check, VMware Workstation. Use 0015a's reference settings with the disk removed and `build/dist/mirror.iso` on a SATA CD-ROM. It boots through Limine to the Mirror shell and passes the serial and input checks of 0015a check 9.
-7. Manual check, VirtualBox: the same, with the ISO on the SATA (AHCI) controller.
+7. (removed: VirtualBox dropped)
 
 As in 0015a, firmware must start Limine from the El Torito image, and Limine must load the kernel and modules from the disc. Later failures in firmware tables or PCI discovery go to 0013, with the serial log kept in `build/vm-logs/`.
 
@@ -83,9 +83,9 @@ As in 0015a, firmware must start Limine from the El Torito image, and Limine mus
 - No new crates. The ISO9660/El Torito writer is hand-written (0015-D4).
 - From the pinned Limine v12.9.3 release (BSD-2-Clause, `build.ps1:48-49`): `limine-uefi-cd.bin`, `LICENSE` and `3RDPARTY.md`.
 - QEMU 11.1.0 in `.tools/qemu` (GPL-2.0), already used for tests.
-- Manual checks only: VMware Workstation Pro and VirtualBox at the reference versions in `docs/vm-settings.md`.
+- Manual checks only: VMware Workstation Pro at the reference version in `docs/vm-settings.md`.
 
 ## Open questions
 
-1. Follow-up spec, after M5: once the system needs a root filesystem, the live ISO needs one too, for example an ext2 image loaded into a RAM disk as a Limine module. This spec does not decide how.
+1. Follow-up spec, after M5: once the system needs a root filesystem, the live ISO needs one too, for example an ext2 image loaded into a RAM disk as a Limine module. This spec does not decide how. README.md lists it under the unscheduled follow-ups.
 2. Follow-up for 0062: when it retires `LegacyVirtio` (0014-D5), it must rehome the `-Iso` case. Under `V1`, the smoke assert at `kernel/src/main.rs:202-205` must then accept a boot with no VirtIO block device.
