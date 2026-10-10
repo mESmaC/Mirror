@@ -25,25 +25,25 @@ Mirror is an agent harness that is also a complete, fast, independent x86_64 ope
 
 ## Build
 Run commands from the repository root in PowerShell.
-- `.\scripts\build.ps1 [-Release] [-Smoke] [-AgentDemo]` builds the four userspace programs and the kernel and stages `build\esp\`. `-Smoke` and `-AgentDemo` enable the kernel features `boot-smoke` and `agent-demo`.
-- The ledger (S7a) defines three kernel flavors: default (clean, for daily use), `test-trace` (adds test serial markers, for captures; spec 0010 adds it) and `boot-smoke` (`test-trace` plus the self-test and fault battery).
+- `.\scripts\build.ps1 [-Release] [-Trace] [-Smoke] [-AgentDemo]` builds the four userspace programs and the kernel and stages `build\esp\`. `-Trace`, `-Smoke` and `-AgentDemo` enable the kernel features `test-trace`, `boot-smoke` and `agent-demo`.
+- The ledger (S7a) defines three kernel flavors: default (clean, for daily use), `test-trace` (adds test serial markers, for captures) and `boot-smoke` (`test-trace` plus the self-test and fault battery). Only `boot-smoke` runs init's test battery and the test-fixture checks; default and trace kernels start the shell directly.
 - Trap: `.cargo\config.toml` links every `x86_64-unknown-none` crate with `kernel\linker.ld`. `build.ps1` overrides this per program through `CARGO_ENCODED_RUSTFLAGS`: the program's own `userspace\<pkg>\linker.ld`, the small code model, and release LTO off. Never build userspace with `cargo build --workspace` or `cargo build -p mirror-<pkg>`: the images come out wrongly linked. `cargo check` and `cargo clippy` are safe because they do not link.
 - Use Rust 1.99.0, pinned in `rust-toolchain.toml`. `build.ps1` and `test.ps1` first run the `Assert-MirrorToolchain` preflight (`scripts\common.ps1`). It fails unless `rustc --version` reports the pinned version and the workspace `rust-version` in `Cargo.toml` is its major.minor, because a `RUSTUP_TOOLCHAIN` variable, a `rustup override` or another `rustc` on `PATH` silently replaces the pin. Change the pin only in a dedicated bump commit that changes both values, following the bump procedure in spec 0011.
 
 ## Test
-- `.\scripts\test.ps1` is the full suite: rustfmt `--check`, host unit tests, and clippy `-D warnings` with no features and with all features. Then, for debug and for release, a smoke build, every smoke boot and a normal-boot capture. It takes about 20 minutes and stops at the first failure. `test.ps1 -AgentDemo` reruns the whole suite with `agent-demo`, about 20 minutes more.
+- `.\scripts\test.ps1` is the full suite: rustfmt `--check`, host unit tests, and clippy `-D warnings` with no features, with `--features test-trace` and with all features. Then, for debug and for release: a smoke build and every smoke boot; a trace build and its normal-boot capture; a default build; a binary scan of the trace and default `kernel.elf` for strings each flavor must or must not contain; and, without `-AgentDemo`, the hygiene capture. It takes about 20 minutes and stops at the first failure. `test.ps1 -AgentDemo` reruns the whole suite with `agent-demo`, about 20 minutes more.
 - Host tests need an explicit target because the default target is bare metal: `cargo test --locked -p <crate> --target x86_64-pc-windows-msvc`. This needs the MSVC build tools. Only the `crates\` packages have host tests.
 - One boot: `.\scripts\run.ps1 -Smoke [-Release] [-DeviceProfile <V1|LegacyVirtio>] [-Fault <Name>]`. `V1`, the default, attaches the v1 devices: the AHCI test disk, an e1000 NIC, PS/2 and VGA. `LegacyVirtio` attaches the legacy VirtIO test disk instead, and the `Block*` faults need it. Without `-Smoke` it boots interactively and never exits on its own, so always pass `-Smoke`. Pass `-NoBuild` only if the staged kernel already matches the requested profile and features. Nothing checks this.
-- `.\scripts\capture.ps1` boots a normal kernel, drives it with QMP input and checks screenshots.
+- `.\scripts\capture.ps1` builds a trace kernel (`build.ps1 -Trace`), boots it, drives it with QMP input and checks screenshots. With `-NoBuild` the staged kernel must be a trace build; without `MIRROR_TRACE_ON` the capture fails fast. `capture.ps1 -NoBuild -Hygiene` instead probes a staged default kernel without `agent-demo`: no trace or init markers, no fixture checks, and no serial output after typing or pointer moves.
 - Run the build, run, capture and test scripts one at a time, across all agents and terminals. They share `build\` (the staged ESP and its `limine.conf`, firmware variables, serial logs), so a second command silently corrupts the first.
 - QEMU and OVMF are found in `.tools\qemu\` or on `PATH`, or set through `QEMU_PATH`, `OVMF_CODE` and `OVMF_VARS`.
 - A failed boot leaves its output in `build\serial.log` and `build\qemu.stderr.log`. `test.ps1` clears its log directory, `build\test-logs\` (or `build\test-agent-logs\` with `-AgentDemo`), when it starts, then copies in only passing cases, so after a failed run it holds just the cases that passed before the failure.
 
 ### When to test
 - Before each commit, run the targeted cases for what it touches. `test.ps1` lists every case; copy the matching commands from it:
-  - Any Rust change: `cargo fmt --all -- --check` and both clippy commands. A change under `crates\` also runs that crate's host tests.
+  - Any Rust change: `cargo fmt --all -- --check` and the three clippy commands. A change under `crates\` also runs that crate's host tests.
   - Kernel or userspace code: `build.ps1 -Smoke`, then `run.ps1 -Smoke -NoBuild` with no `-Fault`, plus every case whose switches or `-Fault` name exercise the touched code (for example the `-Xhci` cases for xHCI code, or the `LegacyVirtio` cases for VirtIO block code). To find them, search `run.ps1` and `common.ps1` for the markers that code prints. Add `-AgentDemo` to the build and runs if you touched agent-demo code.
-  - Desktop, console, input or display code: also `build.ps1`, then `capture.ps1 -NoBuild -CpuCount 4`.
+  - Desktop, console, input or display code: also `build.ps1 -Trace`, then `capture.ps1 -NoBuild -CpuCount 4`; then `build.ps1`, then `capture.ps1 -NoBuild -Hygiene -CpuCount 4`.
   - A script change: the cases that execute the changed lines.
   - Docs only: nothing to run.
 - When the spec is complete, run the full `test.ps1` before Cameron merges the branch, plus `test.ps1 -AgentDemo` if you touched agent-demo code.
@@ -53,14 +53,15 @@ Run commands from the repository root in PowerShell.
 - Fail closed. Fully validate untrusted input before acting on it: ELF images, firmware tables, device descriptors, syscall arguments and the boot command line. Reject anything unknown or malformed, and bound every loop and wait.
 - Roll back on failure. An operation that fails partway undoes its partial effects before it returns the error. A smoke test proves this, usually by comparing allocated frames before and after.
 - DMA buffers have no `Drop`. Release them only after the device is reset or quiesced, and quarantine them if that fails. Report cleanup in markers such as `dma_reclaimed=1`.
-- Never add serial output that carries user content (typed text, file data, pointer state), or a per-input marker, to a default build. Gate it behind `boot-smoke` until spec 0010 adds `test-trace`.
+- Never add serial output that carries user content (typed text, key codes, file or document data, pointer state), or a per-input marker, to a default build. Gate it behind `test-trace`, which `boot-smoke` implies. The one exception (ledger S7b) is the opt-in timing markers enabled by a valid `mirror.perf=` boot token (spec 0019); they carry no user content. Content-free lifecycle and device markers may print after user actions.
+- Put test batteries and checks on test-fixture data behind `boot-smoke`, so a default build never panics on a test outcome or on disk contents.
 
 ## Serial markers
-- The kernel reports results as single serial lines of the form `MIRROR_<AREA>_<EVENT> key=value ...`. Userspace console output is escaped and prefixed with `user: `, so userspace cannot forge a marker.
+- The kernel reports results as single serial lines of the form `MIRROR_<AREA>_<EVENT> key=value ...`. In trace and smoke builds, userspace console output is escaped and prefixed with `user: `, so userspace cannot forge a marker; default builds print none of it.
 - The marker-family checks in `scripts\common.ps1` (driver catalog, xHCI, USB, AHCI, clock) are closed-world:
   - an unknown name in a checked family fails the run;
   - each expected marker appears exactly once, with its full field list, in the checked order.
-- The generic marker lists in `scripts\run.ps1` (`$markers`) and `scripts\capture.ps1` check presence only. They miss duplicates, extra fields and order.
+- The generic marker lists in `scripts\run.ps1` (`$markers`) and `scripts\capture.ps1` check presence only (capture also requires the init battery's markers to be absent). They miss duplicates, extra fields and order.
 - `run.ps1` rejects a scenario-specific marker in every other scenario.
 - So a new or changed marker needs the matching assertion change in the same commit. Values derived from other fields are recomputed in the script, never trusted as reported.
 

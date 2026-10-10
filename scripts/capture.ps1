@@ -3,6 +3,7 @@ param(
     [switch]$NoBuild,
     [switch]$Release,
     [switch]$AgentDemo,
+    [switch]$Hygiene,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
@@ -12,7 +13,13 @@ param(
 
 . (Join-Path $PSScriptRoot 'common.ps1')
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
-if (-not $NoBuild) { & (Join-Path $PSScriptRoot 'build.ps1') -Release:$Release -AgentDemo:$AgentDemo }
+if ($Hygiene -and $AgentDemo) {
+    throw '-Hygiene probes the default kernel without agent-demo (spec 0010, acceptance test 3).'
+}
+# Captures synchronize on the test-trace console oracles, so they boot a trace
+# kernel. The hygiene probe boots the default kernel, which prints neither those
+# oracles nor user content (spec 0010).
+if (-not $NoBuild) { & (Join-Path $PSScriptRoot 'build.ps1') -Release:$Release -Trace:(-not $Hygiene) -AgentDemo:$AgentDemo }
 $qemu = Get-MirrorQemu -RequestedPath $QemuPath -RepositoryRoot $repositoryRoot
 $qemuDirectory = Split-Path -Parent $qemu
 $codePath = Get-MirrorFirmware -RequestedPath $FirmwareCode -QemuDirectory $qemuDirectory -Names @('edk2-x86_64-code.fd', 'OVMF_CODE.fd', 'OVMF_CODE.4m.fd') -ParameterName 'FirmwareCode'
@@ -25,9 +32,13 @@ foreach ($relativePath in @('EFI/BOOT/BOOTX64.EFI', 'kernel.elf', 'init.elf', 'd
     }
 }
 Copy-Item -LiteralPath (Join-Path $repositoryRoot 'boot/limine.conf') -Destination (Join-Path $espDirectory 'limine.conf') -Force
+if ($Hygiene -and [System.IO.File]::ReadAllText((Join-Path $espDirectory 'limine.conf')) -match 'mirror\.perf=') {
+    throw 'The hygiene probe boots without a mirror.perf= token, so the timing-marker exception (spec 0010-D4) stays off.'
+}
 $varsPath = Join-Path $buildDirectory 'capture.vars.fd'
 Copy-Item -LiteralPath $varsTemplate -Destination $varsPath -Force
-$serialLog = Join-Path $buildDirectory 'normal-boot.serial.log'
+$captureName = if ($Hygiene) { 'hygiene-boot' } else { 'normal-boot' }
+$serialLog = Join-Path $buildDirectory "$captureName.serial.log"
 $screenshot = Join-Path $buildDirectory 'normal-boot.png'
 $consoleScreenshot = Join-Path $buildDirectory 'normal-console.png'
 $pointerScreenshot = Join-Path $buildDirectory 'normal-pointer.png'
@@ -268,6 +279,224 @@ function Wait-MirrorPointer {
 
 . (Join-Path $PSScriptRoot 'capture-shell.ps1')
 
+function Wait-MirrorKernelFlavor {
+    param([System.Diagnostics.Process]$Process)
+    # test-trace kernels print MIRROR_TRACE_ON before PCI discovery (spec 0010).
+    # Decide the flavor at PCI discovery, before any input, so a wrong staged
+    # kernel fails fast instead of timing out on an oracle it never prints.
+    $deadline = [System.Diagnostics.Stopwatch]::StartNew()
+    do {
+        if ($Process.HasExited) { throw 'Kernel exited before PCI discovery.' }
+        $serial = Read-MirrorSerial
+        if ($serial -match '(?m)^(?:MIRROR_PANIC|MIRROR_EXCEPTION)(?:\s|:|$)') {
+            throw "Kernel failed before PCI discovery. See $serialLog."
+        }
+        if ($serial -match '(?m)^MIRROR_PCI_READY(?:\s|$)') {
+            $traced = $serial -match '(?m)^MIRROR_TRACE_ON(?:\s|$)'
+            if ($Hygiene -and $traced) {
+                throw 'The hygiene probe needs the default kernel, but this kernel printed MIRROR_TRACE_ON. Run scripts/build.ps1 without -Trace or -Smoke.'
+            }
+            if (-not $Hygiene -and -not $traced) {
+                throw 'Captures need a trace kernel, but this kernel printed no MIRROR_TRACE_ON before PCI discovery. Run scripts/build.ps1 -Trace.'
+            }
+            return
+        }
+        if ($deadline.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw "Kernel did not reach PCI discovery. See $serialLog." }
+        Start-Sleep -Milliseconds 50
+    } while ($true)
+}
+
+function Get-MirrorSerialLength {
+    # Bytes, not decoded characters: the hygiene windows must stay byte-for-byte empty.
+    $stream = [System.IO.File]::Open($serialLog, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try { return $stream.Length }
+    finally { $stream.Dispose() }
+}
+
+function Wait-MirrorStableScreen {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$Path,
+        [string]$DifferentFrom
+    )
+    # Stable means two screendumps 1 s apart are identical, within 10 s (spec
+    # 0010, acceptance test 3). With -DifferentFrom, a stable screen that still
+    # equals that earlier one keeps waiting: the input under test must change it.
+    $reference = if ($DifferentFrom) { (Get-FileHash -LiteralPath $DifferentFrom).Hash } else { $null }
+    $previous = Join-Path $buildDirectory 'hygiene-previous.png'
+    $unchanged = $false
+    $elapsed = [System.Diagnostics.Stopwatch]::StartNew()
+    Save-MirrorScreenshot $Process $previous
+    do {
+        Start-Sleep -Seconds 1
+        if ($Process.HasExited) { throw 'Kernel exited during the hygiene probe.' }
+        Save-MirrorScreenshot $Process $Path
+        $hash = (Get-FileHash -LiteralPath $Path).Hash
+        $stable = $hash -eq (Get-FileHash -LiteralPath $previous).Hash
+        if ($stable -and $hash -ne $reference) { return }
+        $unchanged = $stable
+        Copy-Item -LiteralPath $Path -Destination $previous -Force
+    } while ($elapsed.Elapsed.TotalSeconds -lt 10)
+    if ($unchanged) { throw "The screen stayed identical to $DifferentFrom for 10 s, so the input never reached the guest." }
+    throw "The screen did not settle within 10 s ($Path)."
+}
+
+function Invoke-MirrorHygieneInput {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$Target,
+        [string]$Text,
+        [switch]$Submit
+    )
+    # Acceptance test 3, step 3 (and its repeat in step 4). A change between
+    # stable screens proves the keys and the pointer motion reached the guest;
+    # the serial log must not grow by a single byte meanwhile.
+    $before = Join-Path $buildDirectory "hygiene-$Target-before.png"
+    $typed = Join-Path $buildDirectory "hygiene-$Target-typed.png"
+    $moved = Join-Path $buildDirectory "hygiene-$Target-pointer.png"
+    Wait-MirrorStableScreen $Process $before
+    $length = Get-MirrorSerialLength
+    Send-MirrorText $Process $Text
+    if ($Submit) { Send-MirrorKey $Process 'ret' }
+    Wait-MirrorStableScreen $Process $typed -DifferentFrom $before
+    Send-MirrorPointerMotion $Process 100 (-100)
+    Wait-MirrorStableScreen $Process $moved -DifferentFrom $typed
+    $grown = (Get-MirrorSerialLength) - $length
+    if ($grown -ne 0) {
+        throw "The default kernel wrote $grown serial byte(s) while $Target received typed text and pointer motion. See $serialLog."
+    }
+}
+
+function Invoke-MirrorHygieneProbe {
+    param([System.Diagnostics.Process]$Process)
+    # Spec 0010, acceptance test 3, on a default kernel with the decoy AHCI fixture.
+    # Step 1: boot completes without a panic, trace output or the init battery.
+    $deadline = [System.Diagnostics.Stopwatch]::StartNew()
+    do {
+        if ($Process.HasExited) { throw 'Kernel exited before MIRROR_BOOT_OK.' }
+        $serial = Read-MirrorSerial
+        if ($serial -match '(?m)^(?:MIRROR_PANIC|MIRROR_EXCEPTION|PANIC|EXCEPTION)(?:\s|:|$)') {
+            throw "The default kernel panicked or faulted while booting with the decoy fixture. See $serialLog."
+        }
+        if ($serial -match '(?m)^MIRROR_BOOT_OK(?:\s|$)') { break }
+        if ($deadline.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw "The default kernel did not report MIRROR_BOOT_OK. See $serialLog." }
+        Start-Sleep -Milliseconds 100
+    } while ($true)
+    Assert-MirrorTraceMarker -Serial $serial -Expected $false
+    if ([regex]::Matches($serial, '(?m)^MIRROR_AHCI_PROBE_OK fixture=0 reads=1\r?$').Count -ne 1) {
+        throw "The default kernel must probe the decoy with one sector-0 read (MIRROR_AHCI_PROBE_OK fixture=0 reads=1). See $serialLog."
+    }
+    if ($serial -match '(?m)^MIRROR_USERSPACE_OK(?:\s|$)') {
+        throw "The default kernel ran the init battery. See $serialLog."
+    }
+
+    # Step 2: launch Notes through the shell's launcher (capture-shell.ps1). The
+    # default shell prints no readiness or pointer oracle, so each attempt clamps
+    # the pointer at (0,0) and clicks, until the content-free lifecycle marker.
+    $bootScreen = Join-Path $buildDirectory 'hygiene-boot.png'
+    Save-MirrorScreenshot $Process $bootScreen
+    $image = [System.IO.File]::ReadAllBytes($bootScreen)
+    if ([System.Text.Encoding]::ASCII.GetString($image, 12, 4) -cne 'IHDR') {
+        throw 'The first screendump has no PNG IHDR header.'
+    }
+    $width = ([int64]$image[16] -shl 24) -bor ([int64]$image[17] -shl 16) -bor ([int64]$image[18] -shl 8) -bor [int64]$image[19]
+    $height = ([int64]$image[20] -shl 24) -bor ([int64]$image[21] -shl 16) -bor ([int64]$image[22] -shl 8) -bor [int64]$image[23]
+    if ($width -ne 1280 -or $height -ne 800) {
+        throw "The hygiene probe requires a 1280x800 display; got ${width}x$height."
+    }
+    $launched = $false
+    for ($attempt = 0; $attempt -lt 10 -and -not $launched; $attempt++) {
+        Send-MirrorPointerMotion $Process (-2560) (-1600)
+        Send-MirrorPointerMotion $Process 64 776
+        Send-MirrorPointerButton $Process 'left' $true
+        Start-Sleep -Milliseconds 40
+        Send-MirrorPointerButton $Process 'left' $false
+        $clicked = [System.Diagnostics.Stopwatch]::StartNew()
+        do {
+            if ($Process.HasExited) { throw 'Kernel exited during the launcher click.' }
+            $serial = Read-MirrorSerial
+            if ($serial -match '(?m)^(?:MIRROR_PANIC|MIRROR_EXCEPTION|MIRROR_USER_FAULT)(?:\s|:|$)') {
+                throw "Kernel or shell faulted during the launcher click. See $serialLog."
+            }
+            $starts = [regex]::Matches($serial, '(?m)^MIRROR_APP_STARTED(?:\s|$)').Count
+            if ($starts -gt 0) {
+                # A second start, or a start of another kind, fails the probe.
+                if ($starts -ne 1 -or [regex]::Matches($serial, '(?m)^MIRROR_APP_STARTED pid=[1-9][0-9]* kind=0\r?$').Count -ne 1) {
+                    throw "The launcher must start exactly one Notes application (MIRROR_APP_STARTED pid=N kind=0). See $serialLog."
+                }
+                $launched = $true
+                break
+            }
+            Start-Sleep -Milliseconds 100
+        } while ($clicked.Elapsed.TotalSeconds -lt 3)
+    }
+    if (-not $launched) { throw "Notes did not start after 10 launcher clicks. See $serialLog." }
+
+    # Step 3: Notes receives the sentinel and pointer motion with empty serial.
+    Invoke-MirrorHygieneInput $Process 'notes' 'zqxjvw'
+
+    # Step 4: Esc ends the shell session; repeat on the kernel console.
+    $offset = (Read-MirrorSerial).Length
+    Send-MirrorKey $Process 'esc'
+    Wait-MirrorDesktopMessage $Process '(?m)^MIRROR_SHELL_CLEANUP_OK(?:\s|$)' $offset
+    Wait-MirrorDesktopMessage $Process '(?m)^MIRROR_CONSOLE_READY(?:\s|$)' $offset
+    Invoke-MirrorHygieneInput $Process 'console' 'echo zqxjvw' -Submit
+}
+
+function Assert-MirrorHygieneLog {
+    param([string]$Serial)
+    # Step 5: the whole log holds no typed text, no user output, no per-input
+    # markers and no shell or desktop oracles, plus the step 1 and 2 invariants.
+    if ($Serial.IndexOf('zqxjvw', [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        throw "The default kernel leaked the typed sentinel to serial. See $serialLog."
+    }
+    foreach ($pattern in @(
+            '(?m)^user: ',
+            '(?m)^MIRROR_CONSOLE_(?:COMMAND|UPDATED|INPUT irq)',
+            '(?m)^MIRROR_POINTER_(?:UPDATED|CLICK)',
+            '(?m)^MIRROR_(?:SHELL|DESKTOP)_(?:READY|FRAME)',
+            'Mirror (?:init|app|shell|desktop|agent):',
+            '(?m)^(?:MIRROR_PANIC|MIRROR_EXCEPTION|PANIC|EXCEPTION)(?:\s|:|$)',
+            '(?m)^MIRROR_USERSPACE_OK(?:\s|$)')) {
+        $count = [regex]::Matches($Serial, $pattern).Count
+        if ($count -ne 0) { throw "The default kernel printed $count line(s) matching '$pattern'. See $serialLog." }
+    }
+    Assert-MirrorTraceMarker -Serial $Serial -Expected $false
+    if ([regex]::Matches($Serial, '(?m)^MIRROR_APP_STARTED(?:\s|$)').Count -ne 1 -or
+        [regex]::Matches($Serial, '(?m)^MIRROR_APP_STARTED pid=[1-9][0-9]* kind=0\r?$').Count -ne 1) {
+        throw "The hygiene probe must start exactly one Notes application. See $serialLog."
+    }
+    foreach ($marker in @('MIRROR_BOOT_OK', 'MIRROR_SHELL_CLEANUP_OK', 'MIRROR_CONSOLE_READY')) {
+        if ([regex]::Matches($Serial, "(?m)^$marker(?:\s|$)").Count -ne 1) {
+            throw "The hygiene probe requires exactly one $marker. See $serialLog."
+        }
+    }
+}
+
+function Complete-MirrorCapture {
+    param([System.Diagnostics.Process]$Process)
+    # QMP permits quit to terminate before returning a response. Require clean
+    # process exit below rather than interpreting that allowed EOF as failure.
+    $Process.StandardInput.WriteLine('{"execute":"quit"}')
+    $Process.StandardInput.Flush()
+    if (-not $Process.WaitForExit(5000)) { throw 'QEMU did not exit after the capture.' }
+    $Process.WaitForExit()
+    if ($Process.ExitCode -ne 0) { throw "QEMU capture exited with code $($Process.ExitCode)." }
+    # Read the complete log after exit, so later input cannot hide an AP failure.
+    # These are trace or default builds; smoke-only self-tests and injected faults are absent.
+    $serial = Read-MirrorSerial
+    if ($Hygiene) { Assert-MirrorHygieneLog $serial }
+    else { Assert-MirrorTraceMarker -Serial $serial -Expected $true }
+    Assert-MirrorCaptureSmp -Serial $serial -RequestedCpus $CpuCount
+    if ((Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash -ne $testDiskHash) {
+        throw 'The read-only block fixture was modified during the capture.'
+    }
+    if ((Get-Item -LiteralPath $fixtureImage).Length -ne 1048576 -or
+        (Get-FileHash -LiteralPath $fixtureImage -Algorithm SHA256).Hash -ne $fixtureHash) {
+        throw 'The AHCI read-only probe modified its disposable disk image during the capture.'
+    }
+}
+
 $qemuArguments = @(
     '-machine', 'q35,accel=tcg', '-cpu', 'qemu64', '-m', '256', '-smp', "$CpuCount",
     '-display', 'none', '-vga', 'std', '-monitor', 'none', '-qmp', 'stdio',
@@ -283,9 +512,27 @@ $qemuArguments = @(
 $deviceArguments = Get-MirrorDeviceArguments -Profile V1 -RepositoryRoot $repositoryRoot
 $testDisk = Get-MirrorTestDisk -RepositoryRoot $repositoryRoot
 $testDiskHash = (Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash
+$fixtureImage = $deviceArguments.FixtureImage
+$fixtureHash = $testDiskHash
+if ($Hygiene) {
+    # Acceptance test 3 replaces build/ahci-test.img with a decoy: the fixture with
+    # file offset 612 (sector 1, byte 100) inverted. Sector 0 keeps the fixture
+    # signature, so a kernel that still recognized fixtures would accept the decoy
+    # and then panic in its data check.
+    $decoy = [System.IO.File]::ReadAllBytes($testDisk)
+    if ($decoy.Length -ne 1048576 -or ($decoy[8..15] -join ',') -ne '77,73,82,82,79,82,0,1') {
+        throw 'The block fixture lacks its sector-0 signature.'
+    }
+    $decoy[612] = [byte]($decoy[612] -bxor 0xff)
+    $fixtureImage = Join-Path $buildDirectory 'ahci-decoy.img'
+    [System.IO.File]::WriteAllBytes($fixtureImage, $decoy)
+    $decoyHash = [System.Security.Cryptography.SHA256]::Create()
+    try { $fixtureHash = [BitConverter]::ToString($decoyHash.ComputeHash($decoy)).Replace('-', '') }
+    finally { $decoyHash.Dispose() }
+}
 $qemuArguments += $deviceArguments.NicArguments
 $qemuArguments += @(
-    '-drive', "if=none,id=mirror-test,format=raw,readonly=off,file=$(ConvertTo-QemuOptionValue $deviceArguments.FixtureImage)",
+    '-drive', "if=none,id=mirror-test,format=raw,readonly=off,file=$(ConvertTo-QemuOptionValue $fixtureImage)",
     '-device', $deviceArguments.FixtureDevice
 )
 if (Test-Path -LiteralPath (Join-Path $qemuDirectory 'share') -PathType Container) {
@@ -311,6 +558,13 @@ try {
     $greeting = Read-MirrorQmp $process
     if (-not $greeting.PSObject.Properties['QMP']) { throw 'Missing QMP greeting.' }
     Invoke-MirrorQmp $process 'qmp_capabilities'
+    Wait-MirrorKernelFlavor $process
+    if ($Hygiene) {
+        Invoke-MirrorHygieneProbe $process
+        Complete-MirrorCapture $process
+        Write-Host "Default kernel hygiene probe passed: decoy fixture probed, no user content or per-input markers on serial (cpus=$CpuCount). Images: $buildDirectory"
+        return
+    }
     if (-not $AgentDemo) {
         Invoke-MirrorShellCapture $process
     } else {
@@ -424,8 +678,12 @@ try {
         if ($elapsed.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw "Normal boot timed out. See $serialLog." }
         Start-Sleep -Milliseconds 100
     } while ($true)
-    foreach ($marker in @('MIRROR_BOOT_OK', 'MIRROR_USERSPACE_OK scenario=0', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_SCHEDULER_OK processes=2', 'MIRROR_IPC_OK messages=3', 'MIRROR_PCI_READY', 'MIRROR_FRAMEBUFFER_READY', 'MIRROR_FRAMEBUFFER_PRESENTED', 'MIRROR_AHCI_READY', 'MIRROR_AHCI_READ_OK', 'MIRROR_AHCI_CLEANUP_OK', 'MIRROR_BLOCK_SKIPPED', 'MIRROR_KEYBOARD_READY', 'MIRROR_MOUSE_READY', 'MIRROR_POINTER_READY', 'MIRROR_USER_SURFACE_OK', 'MIRROR_USER_SURFACE_CLEANUP_OK handles_reclaimed=1')) {
+    foreach ($marker in @('MIRROR_BOOT_OK', 'MIRROR_PCI_READY', 'MIRROR_FRAMEBUFFER_READY', 'MIRROR_FRAMEBUFFER_PRESENTED', 'MIRROR_AHCI_READY', 'MIRROR_AHCI_PROBE_OK fixture=0 reads=1', 'MIRROR_AHCI_CLEANUP_OK', 'MIRROR_BLOCK_SKIPPED', 'MIRROR_KEYBOARD_READY', 'MIRROR_MOUSE_READY', 'MIRROR_POINTER_READY')) {
         if ($serial -notmatch "(?m)^$marker(?:\s|$)") { throw "Normal boot missing $marker. See $serialLog." }
+    }
+    # Trace kernels run no init battery and recognize no fixture (spec 0010).
+    foreach ($marker in @('MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_SCHEDULER_OK', 'MIRROR_IPC_OK', 'MIRROR_USER_SURFACE_OK', 'MIRROR_USER_SURFACE_CLEANUP_OK', 'MIRROR_USER_CLOCK_OK', 'MIRROR_AHCI_READ_OK')) {
+        if ($serial -match "(?m)^$marker(?:\s|$)") { throw "Trace boot unexpectedly reported $marker. See $serialLog." }
     }
     if ($serial -match '(?m)^MIRROR_FRAMEBUFFER_SKIPPED(?:\s|$)') { throw 'Normal boot skipped framebuffer output.' }
     Save-MirrorScreenshot $process $screenshot
@@ -526,23 +784,7 @@ try {
     if ((Get-FileHash -LiteralPath $devicesScreenshot).Hash -eq (Get-FileHash -LiteralPath $devicesSecondScreenshot).Hash) {
         throw 'Device catalog pagination did not change the visible fallback console.'
     }
-    # QMP permits quit to terminate before returning a response. Require clean
-    # process exit below rather than interpreting that allowed EOF as failure.
-    $process.StandardInput.WriteLine('{"execute":"quit"}')
-    $process.StandardInput.Flush()
-    if (-not $process.WaitForExit(5000)) { throw 'QEMU did not exit after the capture.' }
-    $process.WaitForExit()
-    if ($process.ExitCode -ne 0) { throw "QEMU capture exited with code $($process.ExitCode)." }
-    # Read the complete log after exit, so later input cannot hide an AP failure.
-    # These are normal builds; smoke-only self-tests and injected faults are absent.
-    Assert-MirrorCaptureSmp -Serial (Read-MirrorSerial) -RequestedCpus $CpuCount
-    if ((Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash -ne $testDiskHash) {
-        throw 'The read-only block fixture was modified during the capture.'
-    }
-    if ((Get-Item -LiteralPath $deviceArguments.FixtureImage).Length -ne 1048576 -or
-        (Get-FileHash -LiteralPath $deviceArguments.FixtureImage -Algorithm SHA256).Hash -ne $testDiskHash) {
-        throw 'The AHCI read-only probe modified its disposable disk image during the capture.'
-    }
+    Complete-MirrorCapture $process
     Write-Host "Native desktop and fallback console captures passed (agent-demo=$AgentDemo, cpus=$CpuCount). Images: $buildDirectory"
 }
 finally {
@@ -552,7 +794,7 @@ finally {
             $process.WaitForExit()
         }
         if ($null -ne $stderr) {
-            [System.IO.File]::WriteAllText((Join-Path $buildDirectory 'normal-boot.stderr.log'), $stderr.GetAwaiter().GetResult())
+            [System.IO.File]::WriteAllText((Join-Path $buildDirectory "$captureName.stderr.log"), $stderr.GetAwaiter().GetResult())
         }
     }
     $process.Dispose()

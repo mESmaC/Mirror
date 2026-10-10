@@ -23,10 +23,15 @@ const STACK_BASE: u64 = 0x7fff_0000;
 const STACK_TOP: u64 = 0x8000_0000;
 const KERNEL_STACK_SIZE: usize = 64 * 1024;
 const MAX_WRITE: usize = 256;
+#[cfg(feature = "boot-smoke")]
 const CHECKS_PASSED: &[u8] = b"Mirror init: userspace checks passed\n";
+#[cfg(feature = "boot-smoke")]
 const IPC_CHECKS_PASSED: &[u8] = b"Mirror init: IPC checks passed\n";
+#[cfg(feature = "boot-smoke")]
 const SURFACE_CHECKS_PASSED: &[u8] = b"Mirror init: surface checks passed\n";
+#[cfg(feature = "boot-smoke")]
 const SURFACE_DENIED_CHECKS: &[u8] = b"Mirror init: surface denied\n";
+#[cfg(feature = "boot-smoke")]
 const PROCESS_COUNT: usize = 2;
 const QUANTUM_TICKS: u64 = 2;
 // Finite init probes include register/preemption loops and 21 thread creations.
@@ -38,10 +43,15 @@ const MAX_SLEEP_TICKS: u64 = 1000;
 const RECEIVE_TIMEOUT: u64 = 100;
 const SERVICE_ALLOWANCE: u64 = 32;
 const SERVICE_PERIOD: u64 = 100;
+#[cfg(feature = "test-trace")]
 const DESKTOP_READY: &[u8] = b"Mirror desktop: ready\n";
+#[cfg(feature = "test-trace")]
 const DESKTOP_FRAME: &[u8] = b"Mirror desktop: frame\n";
+#[cfg(feature = "test-trace")]
 const DESKTOP_CHECKS: &[u8] = b"Mirror desktop: checks passed\n";
+#[cfg(feature = "test-trace")]
 const AGENT_READY: &[u8] = b"Mirror agent: ready\n";
+#[cfg(feature = "test-trace")]
 const AGENT_CHECKS: &[u8] = b"Mirror agent: checks passed\n";
 
 #[repr(C, align(16))]
@@ -214,66 +224,107 @@ enum CpuPolicy {
     Application(ServicePolicy),
 }
 
+// Fields gated on `boot-smoke` are bookkeeping that only init's self-test
+// battery reads. Fields gated on `test-trace` feed only trace markers. Neither
+// exists in a default kernel (spec 0010).
 struct Process<'kernel> {
     pid: u64,
     space: UserAddressSpace<'kernel>,
     vm: vm::Vm,
     direct_map: u64,
+    #[cfg(feature = "boot-smoke")]
     vm_checks: bool,
+    #[cfg(feature = "boot-smoke")]
     demand_faults: u64,
+    #[cfg(feature = "boot-smoke")]
     copy_faults: u64,
     threads: [Option<Thread>; thread_abi::MAX_THREADS],
     current_thread: usize,
     next_thread: usize,
+    #[cfg(feature = "boot-smoke")]
     thread_checks: bool,
+    #[cfg(feature = "boot-smoke")]
     threads_created: u64,
+    #[cfg(feature = "boot-smoke")]
     threads_joined: u64,
+    #[cfg(feature = "boot-smoke")]
     threads_exited: u64,
+    #[cfg(feature = "boot-smoke")]
     threads_cancelled: u64,
+    #[cfg(feature = "boot-smoke")]
     thread_preemptions: u64,
     next_waiter: usize,
+    #[cfg(feature = "boot-smoke")]
     sync_checks: bool,
+    #[cfg(feature = "boot-smoke")]
     sync_waits: u64,
+    #[cfg(feature = "boot-smoke")]
     sync_wakes: u64,
+    #[cfg(feature = "boot-smoke")]
     sync_timeouts: u64,
+    #[cfg(feature = "boot-smoke")]
     sync_invalidations: u64,
+    #[cfg(feature = "boot-smoke")]
     sync_cancelled: u64,
+    #[cfg(feature = "boot-smoke")]
     tls_checks: bool,
+    #[cfg(feature = "boot-smoke")]
     clock_checks: bool,
+    #[cfg(feature = "boot-smoke")]
     clock_unavailable: bool,
+    #[cfg(feature = "boot-smoke")]
     fpu_checks: bool,
+    #[cfg(feature = "boot-smoke")]
     fpu_preemption_start: Option<usize>,
+    #[cfg(feature = "boot-smoke")]
     fpu_preemptions: usize,
     outcome: Option<Outcome>,
+    #[cfg(feature = "boot-smoke")]
     checks_passed: bool,
+    #[cfg(feature = "boot-smoke")]
     bad_pointers: usize,
+    #[cfg(feature = "boot-smoke")]
     unknown_calls: usize,
     dispatches: usize,
+    #[cfg(feature = "boot-smoke")]
     yields: usize,
+    #[cfg(feature = "boot-smoke")]
     sleeps: usize,
     charged_ticks: u64,
     policy: CpuPolicy,
     throttles: u64,
     preemptions: usize,
+    #[cfg(feature = "boot-smoke")]
     post_checks_preemptions: usize,
     handles: HandleTable,
     boot_handles: [u64; 6],
     handles_closed: bool,
+    #[cfg(feature = "boot-smoke")]
     ipc_checks: bool,
     ipc_sent: usize,
     ipc_received: usize,
+    #[cfg(feature = "boot-smoke")]
     ipc_waits: usize,
+    #[cfg(feature = "boot-smoke")]
     ipc_closed_wakes: usize,
+    #[cfg(feature = "boot-smoke")]
     ipc_timeouts: usize,
+    #[cfg(feature = "boot-smoke")]
     surface_checks: bool,
+    #[cfg(feature = "boot-smoke")]
     surface_denied_checks: bool,
+    #[cfg(feature = "boot-smoke")]
     surface_info_reads: u64,
     surface_tiles: u64,
     surface_pixels: u64,
+    #[cfg(feature = "boot-smoke")]
     foreign_surface: u64,
+    #[cfg(feature = "boot-smoke")]
     foreign_surface_denials: u8,
+    #[cfg(feature = "test-trace")]
     desktop_ready: bool,
     desktop_checks: bool,
+    #[cfg(feature = "test-trace")]
     desktop_revision: u64,
     agent_ready: bool,
     agent_checks: bool,
@@ -304,11 +355,14 @@ impl Process<'_> {
         assert!(self.outcome.is_none());
         self.outcome = Some(outcome);
         for thread in self.threads.iter_mut().flatten() {
-            if !matches!(thread.state, State::Exited(_)) {
-                self.threads_cancelled += 1;
-            }
-            if matches!(thread.state, State::Waiting(_)) {
-                self.sync_cancelled += 1;
+            #[cfg(feature = "boot-smoke")]
+            {
+                if !matches!(thread.state, State::Exited(_)) {
+                    self.threads_cancelled += 1;
+                }
+                if matches!(thread.state, State::Waiting(_)) {
+                    self.sync_cancelled += 1;
+                }
             }
             thread.state = State::Finished;
         }
@@ -338,36 +392,31 @@ impl Process<'_> {
     }
 }
 
+/// Run init's self-test battery. Only smoke kernels run init: default and
+/// trace kernels start the shell, or the agent-demo desktop, as the first
+/// userspace process instead (spec 0010-D3).
+#[cfg(feature = "boot-smoke")]
 pub fn run_init(
     kernel: &PageTables,
     frames: &mut FrameAllocator<'_>,
     bytes: &[u8],
     direct_map: u64,
     scenario: u64,
-    display: Option<&mut framebuffer::Driver<'_>>,
+    mut display: Option<&mut framebuffer::Driver<'_>>,
 ) {
     assert!(!arch::interrupts_enabled());
     let image = elf::parse(bytes).expect("invalid native init ELF");
-    #[cfg(feature = "boot-smoke")]
-    {
-        capability::self_test();
-        crate::ipc::self_test();
-        service_policy_self_test();
-        assert!(!deadline_reached(4, 5));
-        assert!(deadline_reached(5, 5));
-        assert!(deadline_reached(6, 5));
-        assert!(!deadline_reached(u64::MAX - 2, 3));
-        assert!(!deadline_reached(2, 3));
-        assert!(deadline_reached(3, u64::MAX - 2));
-        test_load_rollback(kernel, frames, bytes, &image, direct_map);
-        vm::self_test(kernel, frames, direct_map);
-    }
-    #[cfg(feature = "boot-smoke")]
-    let mut display = display;
-    #[cfg(feature = "boot-smoke")]
-    let first_display = display.as_deref_mut();
-    #[cfg(not(feature = "boot-smoke"))]
-    let first_display = display;
+    capability::self_test();
+    crate::ipc::self_test();
+    service_policy_self_test();
+    assert!(!deadline_reached(4, 5));
+    assert!(deadline_reached(5, 5));
+    assert!(deadline_reached(6, 5));
+    assert!(!deadline_reached(u64::MAX - 2, 3));
+    assert!(!deadline_reached(2, 3));
+    assert!(deadline_reached(3, u64::MAX - 2));
+    test_load_rollback(kernel, frames, bytes, &image, direct_map);
+    vm::self_test(kernel, frames, direct_map);
     run_pair(
         kernel,
         frames,
@@ -375,9 +424,8 @@ pub fn run_init(
         &image,
         direct_map,
         scenario,
-        first_display,
+        display.as_deref_mut(),
     );
-    #[cfg(feature = "boot-smoke")]
     // Relaunch from the same ELF after teardown. Fresh BSS and successful entry
     // exercise frame reuse and continuation recovery after both exit and fault.
     run_pair(kernel, frames, bytes, &image, direct_map, 0, display);
@@ -443,63 +491,101 @@ fn create_process<'kernel>(
         space,
         vm: vm::Vm::new(),
         direct_map,
+        #[cfg(feature = "boot-smoke")]
         vm_checks: false,
+        #[cfg(feature = "boot-smoke")]
         demand_faults: 0,
+        #[cfg(feature = "boot-smoke")]
         copy_faults: 0,
         threads: core::array::from_fn(|index| {
             (index == 0).then(|| Thread::new(image.entry, STACK_TOP - 8, argument))
         }),
         current_thread: 0,
         next_thread: 0,
+        #[cfg(feature = "boot-smoke")]
         thread_checks: false,
+        #[cfg(feature = "boot-smoke")]
         threads_created: 1,
+        #[cfg(feature = "boot-smoke")]
         threads_joined: 0,
+        #[cfg(feature = "boot-smoke")]
         threads_exited: 0,
+        #[cfg(feature = "boot-smoke")]
         threads_cancelled: 0,
+        #[cfg(feature = "boot-smoke")]
         thread_preemptions: 0,
         next_waiter: 0,
+        #[cfg(feature = "boot-smoke")]
         sync_checks: false,
+        #[cfg(feature = "boot-smoke")]
         sync_waits: 0,
+        #[cfg(feature = "boot-smoke")]
         sync_wakes: 0,
+        #[cfg(feature = "boot-smoke")]
         sync_timeouts: 0,
+        #[cfg(feature = "boot-smoke")]
         sync_invalidations: 0,
+        #[cfg(feature = "boot-smoke")]
         sync_cancelled: 0,
+        #[cfg(feature = "boot-smoke")]
         tls_checks: false,
+        #[cfg(feature = "boot-smoke")]
         clock_checks: false,
+        #[cfg(feature = "boot-smoke")]
         clock_unavailable: false,
+        #[cfg(feature = "boot-smoke")]
         fpu_checks: false,
+        #[cfg(feature = "boot-smoke")]
         fpu_preemption_start: None,
+        #[cfg(feature = "boot-smoke")]
         fpu_preemptions: 0,
         outcome: None,
+        #[cfg(feature = "boot-smoke")]
         checks_passed: false,
+        #[cfg(feature = "boot-smoke")]
         bad_pointers: 0,
+        #[cfg(feature = "boot-smoke")]
         unknown_calls: 0,
         dispatches: 0,
+        #[cfg(feature = "boot-smoke")]
         yields: 0,
+        #[cfg(feature = "boot-smoke")]
         sleeps: 0,
         charged_ticks: 0,
         policy: CpuPolicy::Probe,
         throttles: 0,
         preemptions: 0,
+        #[cfg(feature = "boot-smoke")]
         post_checks_preemptions: 0,
         handles: HandleTable::new(),
         boot_handles: [0; 6],
         handles_closed: false,
+        #[cfg(feature = "boot-smoke")]
         ipc_checks: false,
         ipc_sent: 0,
         ipc_received: 0,
+        #[cfg(feature = "boot-smoke")]
         ipc_waits: 0,
+        #[cfg(feature = "boot-smoke")]
         ipc_closed_wakes: 0,
+        #[cfg(feature = "boot-smoke")]
         ipc_timeouts: 0,
+        #[cfg(feature = "boot-smoke")]
         surface_checks: false,
+        #[cfg(feature = "boot-smoke")]
         surface_denied_checks: false,
+        #[cfg(feature = "boot-smoke")]
         surface_info_reads: 0,
         surface_tiles: 0,
         surface_pixels: 0,
+        #[cfg(feature = "boot-smoke")]
         foreign_surface: 0,
+        #[cfg(feature = "boot-smoke")]
         foreign_surface_denials: 0,
+        #[cfg(feature = "test-trace")]
         desktop_ready: false,
         desktop_checks: false,
+        #[cfg(feature = "test-trace")]
         desktop_revision: 0,
         agent_ready: false,
         agent_checks: false,
@@ -524,6 +610,7 @@ fn create_process<'kernel>(
     Ok(process)
 }
 
+#[cfg(feature = "boot-smoke")]
 fn run_pair(
     kernel: &PageTables,
     frames: &mut FrameAllocator<'_>,
@@ -943,7 +1030,10 @@ fn complete_memory(
                 )
             };
             if result.is_ok() {
-                process.demand_faults += 1;
+                #[cfg(feature = "boot-smoke")]
+                {
+                    process.demand_faults += 1;
+                }
                 process.thread_mut().state = State::Ready;
             } else {
                 // Unresolvable demand faults retain the original diagnostic,
@@ -975,7 +1065,10 @@ fn complete_memory(
                 process.thread_mut().state = State::Ready;
                 return;
             }
-            process.copy_faults += 1;
+            #[cfg(feature = "boot-smoke")]
+            {
+                process.copy_faults += 1;
+            }
             let mut frame = process.thread().context.frame;
             let outcome = dispatch_syscall(process, &mut frame);
             process.thread_mut().context.frame = frame;
@@ -1539,7 +1632,10 @@ fn wake_threads(
             }
             State::Waiting(pending) if pending.expired(now) => {
                 complete_wait(process.thread_mut(), -110);
-                process.sync_timeouts += 1;
+                #[cfg(feature = "boot-smoke")]
+                {
+                    process.sync_timeouts += 1;
+                }
             }
             State::Receiving(pending) => {
                 let mut result = receive(
@@ -1551,9 +1647,13 @@ fn wake_threads(
                 );
                 if result == -11 && deadline_reached(now, pending.deadline) {
                     result = -110;
-                    process.ipc_timeouts += 1;
+                    #[cfg(feature = "boot-smoke")]
+                    {
+                        process.ipc_timeouts += 1;
+                    }
                 }
                 if result != -11 {
+                    #[cfg(feature = "boot-smoke")]
                     if result == -32 {
                         process.ipc_closed_wakes += 1;
                     }
@@ -1589,6 +1689,9 @@ fn wake_threads(
                 if result == -11 && deadline_reached(now, pending.deadline) {
                     result = -110;
                     process.input_timeouts += 1;
+                    // Whether this prints depends on input timing, so it is a
+                    // per-input marker and only trace kernels print it (0010).
+                    #[cfg(feature = "test-trace")]
                     if matches!(process.policy, CpuPolicy::Desktop(_))
                         && process.input_timeouts == 1
                     {
@@ -1651,7 +1754,10 @@ fn wait_word(process: &mut Process<'_>, frame: &TrapFrame) -> Result<State, i64>
     if frame.rdx == 0 {
         return Err(-110);
     }
-    process.sync_waits += 1;
+    #[cfg(feature = "boot-smoke")]
+    {
+        process.sync_waits += 1;
+    }
     Ok(State::Waiting(PendingWait {
         address: frame.rdi,
         deadline: (frame.rdx != thread_abi::WAIT_FOREVER)
@@ -1695,14 +1801,20 @@ fn wake_word(process: &mut Process<'_>, frame: &TrapFrame) -> Result<u64, i64> {
         }
         if pending.expired(now) {
             complete_wait(thread, -110);
-            process.sync_timeouts += 1;
+            #[cfg(feature = "boot-smoke")]
+            {
+                process.sync_timeouts += 1;
+            }
         } else if woken < frame.rsi {
             complete_wait(thread, 0);
             woken += 1;
             process.next_waiter = (index + 1) % process.threads.len();
         }
     }
-    process.sync_wakes += woken;
+    #[cfg(feature = "boot-smoke")]
+    {
+        process.sync_wakes += woken;
+    }
     Ok(woken)
 }
 
@@ -1715,7 +1827,10 @@ fn invalidate_waits(process: &mut Process<'_>, address: u64, length: u64) {
             && (address..end).contains(&pending.address)
         {
             complete_wait(thread, -14);
-            process.sync_invalidations += 1;
+            #[cfg(feature = "boot-smoke")]
+            {
+                process.sync_invalidations += 1;
+            }
         }
     }
 }
@@ -1744,7 +1859,10 @@ fn complete_joins(process: &mut Process<'_>) {
         joiner.context.frame.rdx = status;
         joiner.state = State::Ready;
         process.threads[index] = None;
-        process.threads_joined += 1;
+        #[cfg(feature = "boot-smoke")]
+        {
+            process.threads_joined += 1;
+        }
     }
 }
 
@@ -1780,7 +1898,10 @@ fn create_thread(process: &mut Process<'_>, frame: &TrapFrame) -> Result<u64, i6
     thread.context.frame.gs_base = start.gs;
     let tid = thread.id;
     process.threads[index] = Some(thread);
-    process.threads_created += 1;
+    #[cfg(feature = "boot-smoke")]
+    {
+        process.threads_created += 1;
+    }
     Ok(tid)
 }
 
@@ -1804,7 +1925,10 @@ fn join_thread(process: &mut Process<'_>, frame: &mut TrapFrame) -> Result<Optio
     if let State::Exited(status) = target.state {
         frame.rdx = status;
         process.threads[index] = None;
-        process.threads_joined += 1;
+        #[cfg(feature = "boot-smoke")]
+        {
+            process.threads_joined += 1;
+        }
         return Ok(None);
     }
     // A bounded wait-for walk rejects cycles before claiming the target. All
@@ -2087,6 +2211,7 @@ fn release_finished_handles(processes: &mut [Process<'_>], ipc: &mut Ipc) {
     }
 }
 
+#[cfg(feature = "boot-smoke")]
 fn validate_process(process: &Process<'_>, scenario: u64) {
     let available = crate::clock::is_available();
     assert!(
@@ -2197,7 +2322,6 @@ fn validate_process(process: &Process<'_>, scenario: u64) {
     );
     match (scenario, process.outcome.expect("missing process outcome")) {
         (0 | 8 | 9, Outcome::Exit(0)) => {}
-        #[cfg(feature = "boot-smoke")]
         (18, Outcome::Exit(0)) => {
             assert_eq!(
                 process.threads_cancelled, 0,
@@ -2205,7 +2329,6 @@ fn validate_process(process: &Process<'_>, scenario: u64) {
             );
             serial::println!("MIRROR_THREAD_LAST_EXIT_OK");
         }
-        #[cfg(feature = "boot-smoke")]
         (19, Outcome::Exit(0)) => {
             assert!(
                 process.sync_cancelled > 0,
@@ -2217,11 +2340,9 @@ fn validate_process(process: &Process<'_>, scenario: u64) {
             );
             serial::println!("MIRROR_THREAD_PROCESS_EXIT_OK");
         }
-        #[cfg(feature = "boot-smoke")]
         (6, Outcome::InvalidStack(0x0000_8000_0000_0000)) => {
             serial::println!("MIRROR_USER_RETURN_REJECTED rsp=0x800000000000");
         }
-        #[cfg(feature = "boot-smoke")]
         (7, Outcome::BudgetExhausted) => {
             assert_eq!(process.charged_ticks, USER_TICK_BUDGET);
             assert!(
@@ -2234,7 +2355,6 @@ fn validate_process(process: &Process<'_>, scenario: u64) {
                 process.charged_ticks
             );
         }
-        #[cfg(feature = "boot-smoke")]
         (
             probe,
             Outcome::Fault {
@@ -2505,6 +2625,33 @@ fn receive_input(
     input::EVENT_SIZE as i64
 }
 
+/// Init's console-text oracles. Only smoke kernels run init (spec 0010-D3).
+#[cfg(feature = "boot-smoke")]
+fn match_init_oracles(process: &mut Process<'_>, message: &[u8]) {
+    process.checks_passed |= message == CHECKS_PASSED;
+    process.vm_checks |= message == b"Mirror init: VM checks passed\n";
+    process.tls_checks |= message == b"Mirror init: TLS checks passed\n";
+    process.clock_checks |= message == b"Mirror init: clock checks passed\n";
+    process.clock_unavailable |= message == b"Mirror init: clock unavailable\n";
+    process.thread_checks |= message == b"Mirror init: thread checks passed\n";
+    process.sync_checks |= message == b"Mirror init: synchronization checks passed\n";
+    if message == b"Mirror init: FPU preemption begin\n" {
+        process.fpu_preemption_start = Some(process.preemptions);
+    }
+    if message == b"Mirror init: FPU checks passed\n" {
+        process.fpu_checks = true;
+        process.fpu_preemptions = process
+            .fpu_preemption_start
+            .map_or(0, |start| process.preemptions.saturating_sub(start));
+    }
+    process.ipc_checks |= message == IPC_CHECKS_PASSED;
+    process.surface_checks |= message == SURFACE_CHECKS_PASSED;
+    process.surface_denied_checks |= message == SURFACE_DENIED_CHECKS;
+}
+
+/// Shell, desktop and agent console-text oracles and their markers. Only trace
+/// kernels match console text (spec 0010-D4).
+#[cfg(feature = "test-trace")]
 fn service_message(process: &mut Process<'_>, message: &[u8]) {
     if matches!(process.policy, CpuPolicy::Shell(_)) {
         if message == b"Mirror shell: ready\n" && !process.desktop_ready {
@@ -2569,11 +2716,7 @@ fn service_message(process: &mut Process<'_>, message: &[u8]) {
     }
 }
 
-fn require_surface(
-    process: &mut Process<'_>,
-    handle: u64,
-    operation: u8,
-) -> Result<Option<u64>, i64> {
+fn require_surface(process: &Process<'_>, handle: u64) -> Result<Option<u64>, i64> {
     match process.handles.require(handle, capability::WRITE) {
         Ok(capability) if capability.object == Object::Surface => Ok(None),
         Ok(Capability {
@@ -2581,19 +2724,27 @@ fn require_surface(
             ..
         }) if pid == process.pid => Ok(Some(pid)),
         Ok(_) => Err(-13),
-        Err(error) => {
-            if error == CapError::BadHandle && handle != 0 && handle == process.foreign_surface {
-                process.foreign_surface_denials |= operation;
-            }
-            Err(cap_error(error))
-        }
+        Err(error) => Err(cap_error(error)),
+    }
+}
+
+/// Init's peer must try, and be denied, its owner's exact surface token. Record
+/// each surface operation that rejected that token as a bad handle.
+#[cfg(feature = "boot-smoke")]
+fn note_foreign_surface(process: &mut Process<'_>, handle: u64, error: i64, operation: u8) {
+    if error == cap_error(CapError::BadHandle) && handle != 0 && handle == process.foreign_surface {
+        process.foreign_surface_denials |= operation;
     }
 }
 
 fn surface_info(process: &mut Process<'_>, handle: u64, address: u64, length: u64) -> i64 {
-    let application = match require_surface(process, handle, 1) {
+    let application = match require_surface(process, handle) {
         Ok(application) => application,
-        Err(error) => return error,
+        Err(error) => {
+            #[cfg(feature = "boot-smoke")]
+            note_foreign_surface(process, handle, error, 1);
+            return error;
+        }
     };
     if length != surface::INFO_SIZE as u64 {
         return -22;
@@ -2616,14 +2767,21 @@ fn surface_info(process: &mut Process<'_>, handle: u64, address: u64, length: u6
     if unsafe { process.space.copy_to_user(address, &bytes) }.is_err() {
         return -14;
     }
-    process.surface_info_reads += 1;
+    #[cfg(feature = "boot-smoke")]
+    {
+        process.surface_info_reads += 1;
+    }
     surface::INFO_SIZE as i64
 }
 
 fn surface_present(process: &mut Process<'_>, handle: u64, address: u64, length: u64) -> i64 {
-    let application = match require_surface(process, handle, 2) {
+    let application = match require_surface(process, handle) {
         Ok(application) => application,
-        Err(error) => return error,
+        Err(error) => {
+            #[cfg(feature = "boot-smoke")]
+            note_foreign_surface(process, handle, error, 2);
+            return error;
+        }
     };
     if !(16..=surface::MAX_PACKET as u64).contains(&length) {
         return -22;
@@ -2945,42 +3103,32 @@ fn dispatch_syscall(process: &mut Process<'_>, frame: &mut TrapFrame) -> Syscall
                 }
                 .is_err()
                 {
-                    process.bad_pointers += 1;
+                    #[cfg(feature = "boot-smoke")]
+                    {
+                        process.bad_pointers += 1;
+                    }
                     result = -14;
                     return;
                 }
-                // Diagnostic console ABI accepts UTF-8 and escapes controls so
-                // an application cannot manufacture kernel result log lines.
-                if let Ok(message) = core::str::from_utf8(&buffer[..length]) {
-                    serial::println!("user: {}", message.escape_debug());
-                    process.checks_passed |= &buffer[..length] == CHECKS_PASSED;
-                    process.vm_checks |= &buffer[..length] == b"Mirror init: VM checks passed\n";
-                    process.tls_checks |= &buffer[..length] == b"Mirror init: TLS checks passed\n";
-                    process.clock_checks |=
-                        &buffer[..length] == b"Mirror init: clock checks passed\n";
-                    process.clock_unavailable |=
-                        &buffer[..length] == b"Mirror init: clock unavailable\n";
-                    process.thread_checks |=
-                        &buffer[..length] == b"Mirror init: thread checks passed\n";
-                    process.sync_checks |=
-                        &buffer[..length] == b"Mirror init: synchronization checks passed\n";
-                    if &buffer[..length] == b"Mirror init: FPU preemption begin\n" {
-                        process.fpu_preemption_start = Some(process.preemptions);
+                // The diagnostic console ABI accepts UTF-8 only. Trace kernels
+                // echo it, escaping controls so an application cannot
+                // manufacture kernel result log lines, and match it against
+                // the test oracles. Default kernels keep every check and the
+                // result but print and match nothing: their serial output
+                // never carries user content (spec 0010-D4).
+                result = match core::str::from_utf8(&buffer[..length]) {
+                    #[cfg(feature = "test-trace")]
+                    Ok(message) => {
+                        serial::println!("user: {}", message.escape_debug());
+                        #[cfg(feature = "boot-smoke")]
+                        match_init_oracles(process, &buffer[..length]);
+                        service_message(process, &buffer[..length]);
+                        length as i64
                     }
-                    if &buffer[..length] == b"Mirror init: FPU checks passed\n" {
-                        process.fpu_checks = true;
-                        process.fpu_preemptions = process
-                            .fpu_preemption_start
-                            .map_or(0, |start| process.preemptions.saturating_sub(start));
-                    }
-                    process.ipc_checks |= &buffer[..length] == IPC_CHECKS_PASSED;
-                    process.surface_checks |= &buffer[..length] == SURFACE_CHECKS_PASSED;
-                    process.surface_denied_checks |= &buffer[..length] == SURFACE_DENIED_CHECKS;
-                    service_message(process, &buffer[..length]);
-                    result = length as i64;
-                } else {
-                    result = -22;
-                }
+                    #[cfg(not(feature = "test-trace"))]
+                    Ok(_) => length as i64,
+                    Err(_) => -22,
+                };
             }
             2 => result = timer::ticks() as i64,
             clock_abi::SYS_CLOCK_GET => {
@@ -3006,7 +3154,10 @@ fn dispatch_syscall(process: &mut Process<'_>, frame: &mut TrapFrame) -> Syscall
             }
             4 => {
                 result = 0;
-                process.yields += 1;
+                #[cfg(feature = "boot-smoke")]
+                {
+                    process.yields += 1;
+                }
                 suspension = Some(State::Ready);
             }
             5 => {
@@ -3015,10 +3166,16 @@ fn dispatch_syscall(process: &mut Process<'_>, frame: &mut TrapFrame) -> Syscall
                 } else {
                     result = 0;
                     if frame.rdi == 0 {
-                        process.yields += 1;
+                        #[cfg(feature = "boot-smoke")]
+                        {
+                            process.yields += 1;
+                        }
                         suspension = Some(State::Ready);
                     } else {
-                        process.sleeps += 1;
+                        #[cfg(feature = "boot-smoke")]
+                        {
+                            process.sleeps += 1;
+                        }
                         suspension = Some(State::Sleeping(timer::ticks().wrapping_add(frame.rdi)));
                     }
                 }
@@ -3038,7 +3195,10 @@ fn dispatch_syscall(process: &mut Process<'_>, frame: &mut TrapFrame) -> Syscall
                 result =
                     with_ipc(|ipc| receive(process, ipc, frame.rdi, frame.rsi, frame.rdx as usize));
                 if frame.rax == 10 && result == -11 {
-                    process.ipc_waits += 1;
+                    #[cfg(feature = "boot-smoke")]
+                    {
+                        process.ipc_waits += 1;
+                    }
                     suspension = Some(State::Receiving(PendingReceive {
                         handle: frame.rdi,
                         address: frame.rsi,
@@ -3216,7 +3376,10 @@ fn dispatch_syscall(process: &mut Process<'_>, frame: &mut TrapFrame) -> Syscall
                 if frame.rsi != 0 || frame.rdx != 0 {
                     result = -22;
                 } else {
-                    process.threads_exited += 1;
+                    #[cfg(feature = "boot-smoke")]
+                    {
+                        process.threads_exited += 1;
+                    }
                     let last = process
                         .threads
                         .iter()
@@ -3258,7 +3421,12 @@ fn dispatch_syscall(process: &mut Process<'_>, frame: &mut TrapFrame) -> Syscall
             thread_abi::SYS_WAKE_U32 => {
                 result = wake_word(process, frame).map_or_else(|error| error, |count| count as i64);
             }
-            _ => process.unknown_calls += 1,
+            _ => {
+                #[cfg(feature = "boot-smoke")]
+                {
+                    process.unknown_calls += 1;
+                }
+            }
         }
     })();
     frame.rax = result as u64;
@@ -3293,18 +3461,21 @@ pub(crate) fn timer_tick(frame: &mut TrapFrame) {
                 process.throttles += 1;
             }
             process.preemptions += 1;
-            if process
-                .threads
-                .iter()
-                .flatten()
-                .filter(|thread| !matches!(thread.state, State::Exited(_)))
-                .count()
-                > 1
+            #[cfg(feature = "boot-smoke")]
             {
-                process.thread_preemptions += 1;
-            }
-            if process.checks_passed {
-                process.post_checks_preemptions += 1;
+                if process
+                    .threads
+                    .iter()
+                    .flatten()
+                    .filter(|thread| !matches!(thread.state, State::Exited(_)))
+                    .count()
+                    > 1
+                {
+                    process.thread_preemptions += 1;
+                }
+                if process.checks_passed {
+                    process.post_checks_preemptions += 1;
+                }
             }
             preempt = true;
         }

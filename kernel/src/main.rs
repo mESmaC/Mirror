@@ -51,6 +51,10 @@ pub extern "C" fn _start() -> ! {
     arch::disable_interrupts();
     serial::init();
     serial::println!("Mirror kernel 0.1.0 | x86_64");
+    // Trace and smoke kernels announce their test serial output once, before
+    // PCI discovery. A default kernel never prints it (spec 0010).
+    #[cfg(feature = "test-trace")]
+    serial::println!("MIRROR_TRACE_ON");
     interrupts::init();
     fpu::init();
     interrupts::tls_ready();
@@ -248,7 +252,7 @@ pub extern "C" fn _start() -> ! {
         ),
     }
     #[cfg(not(feature = "boot-smoke"))]
-    probe_block_device(&devices, &mut frames, boot.direct_map_offset, false);
+    probe_block_device(&devices, &mut frames, boot.direct_map_offset);
 
     let input_devices = ps2::init();
     let keyboard_ready = match input_devices.keyboard {
@@ -286,28 +290,26 @@ pub extern "C" fn _start() -> ! {
     #[cfg(feature = "boot-smoke")]
     kernel_vm::heap_window_self_test(&tables, &mut frames, boot.direct_map_offset);
     grow_kernel_heap(&tables, &mut frames, boot.direct_map_offset, "boot");
-    let scenario = {
-        #[cfg(feature = "boot-smoke")]
-        {
-            if let boot::SmokeMode::User(value) = boot::smoke_mode() {
-                value
-            } else {
-                0
-            }
-        }
-        #[cfg(not(feature = "boot-smoke"))]
-        {
+    // Only smoke kernels run init's self-test battery. Default and trace
+    // kernels start the shell, or the agent-demo desktop, as the first
+    // userspace process (spec 0010-D3). The rendezvous and heap-growth phase
+    // below run in every flavor.
+    #[cfg(feature = "boot-smoke")]
+    {
+        let scenario = if let boot::SmokeMode::User(value) = boot::smoke_mode() {
+            value
+        } else {
             0
-        }
-    };
-    userspace::run_init(
-        &tables,
-        &mut frames,
-        boot.init,
-        boot.direct_map_offset,
-        scenario,
-        display.as_mut(),
-    );
+        };
+        userspace::run_init(
+            &tables,
+            &mut frames,
+            boot.init,
+            boot.direct_map_offset,
+            scenario,
+            display.as_mut(),
+        );
+    }
     smp::rendezvous("after_userspace", 4);
     grow_kernel_heap(
         &tables,
@@ -410,6 +412,10 @@ pub extern "C" fn _start() -> ! {
 
     #[cfg(not(feature = "boot-smoke"))]
     {
+        // After the shell or desktop exits, the tick count dates the user's
+        // exit keystroke. Input-dependent timing stays out of default kernels
+        // (spec 0010-D4).
+        #[cfg(feature = "test-trace")]
         serial::println!("Mirror idle: timer ticks={}", timer::ticks());
         if keyboard_ready || mouse_ready {
             run_console(&mut display, mouse_ready, &mut input_consumer, &devices);
@@ -497,11 +503,16 @@ fn run_console(
         "MIRROR_CONSOLE_READY input=ps2 display={}",
         u8::from(display.is_some())
     );
+    // Per-input markers and their bookkeeping exist only in trace kernels. A
+    // default kernel prints nothing in response to typing or pointer motion
+    // (spec 0010-D4).
+    #[cfg(feature = "test-trace")]
     let mut revision = 0_u64;
     loop {
         let mut dirty = false;
         let mut redraw_content = false;
         let mut pointer_changed = false;
+        #[cfg(feature = "test-trace")]
         let mut pointer_buttons = None;
         let mut full_batch = true;
         // Keep work per pass bounded. IRQs may append while an event is handled,
@@ -527,6 +538,7 @@ fn run_console(
                 ps2::InputEvent::Key(event) => {
                     if let Some(action) = console.process(event) {
                         redraw_content |= matches!(action, console::Action::Submitted { .. });
+                        #[cfg(feature = "test-trace")]
                         action.log();
                         dirty = true;
                     }
@@ -534,13 +546,17 @@ fn run_console(
                 ps2::InputEvent::Mouse(event) => {
                     let update = pointer.apply(event);
                     pointer_changed |= update.moved;
-                    pointer_buttons = Some(event.buttons);
+                    #[cfg(feature = "test-trace")]
+                    {
+                        pointer_buttons = Some(event.buttons);
+                    }
                     let (x, y) = pointer.position();
                     if update.left_pressed
                         && let Some(display) = display
                         && let Some(caret) = display.console_caret_at(&console, x, y)
                     {
                         dirty |= console.place_cursor(caret);
+                        #[cfg(feature = "test-trace")]
                         serial::println!("MIRROR_POINTER_CLICK x={} y={} caret={}", x, y, caret);
                     }
                 }
@@ -569,15 +585,19 @@ fn run_console(
                     drawn_cursor = Some((x, y));
                 }
             }
-            revision = revision.wrapping_add(1);
-            serial::println!(
-                "MIRROR_CONSOLE_UPDATED revision={} display={} irq={}",
-                revision,
-                u8::from(display.is_some()),
-                keyboard::irq_count()
-            );
+            #[cfg(feature = "test-trace")]
+            {
+                revision = revision.wrapping_add(1);
+                serial::println!(
+                    "MIRROR_CONSOLE_UPDATED revision={} display={} irq={}",
+                    revision,
+                    u8::from(display.is_some()),
+                    keyboard::irq_count()
+                );
+            }
             arch::disable_interrupts();
         }
+        #[cfg(feature = "test-trace")]
         if let Some(buttons) = pointer_buttons {
             let (x, y) = pointer.position();
             serial::println!(
@@ -792,8 +812,9 @@ fn report_usb_device(descriptors: &xhci::UsbDescriptors) -> Result<(), usb::Desc
 }
 
 /// Probe the standard SATA interface before sharing the kernel page tables.
-/// Arbitrary media receive one identification read; only the known disposable
-/// fixture receives extended checks. The driver exposes no disk-write command.
+/// Every disk receives one sector-0 read. Only smoke kernels recognize the
+/// known disposable fixture and give it extended checks; default and trace
+/// kernels compare nothing (spec 0010-D5). The driver has no disk-write command.
 fn probe_ahci_device(
     devices: &pci::Inventory,
     boot: &boot::BootInfo,
@@ -804,16 +825,8 @@ fn probe_ahci_device(
 ) {
     let baseline = frames.stats().expect("frame accounting").allocated_frames;
     let table_baseline = tables.owned_table_count();
-    let inject_error = {
-        #[cfg(feature = "boot-smoke")]
-        {
-            matches!(boot::smoke_mode(), boot::SmokeMode::AhciIoError)
-        }
-        #[cfg(not(feature = "boot-smoke"))]
-        {
-            false
-        }
-    };
+    #[cfg(feature = "boot-smoke")]
+    let inject_error = matches!(boot::smoke_mode(), boot::SmokeMode::AhciIoError);
     // SAFETY: BSP, IF=0, active private kernel root and exclusive allocator.
     // No AP, user root, IRQ handler, or other driver owns this SATA controller.
     let opened = unsafe { ahci::Driver::open(devices, boot, topology, hpet, tables, frames) };
@@ -838,6 +851,7 @@ fn probe_ahci_device(
     let mut driver = match opened {
         Ok(Some(driver)) => driver,
         Ok(None) => {
+            #[cfg(feature = "boot-smoke")]
             assert!(!inject_error, "AHCI error test requires a disk");
             assert_eq!(
                 frames.stats().unwrap().allocated_frames,
@@ -858,13 +872,18 @@ fn probe_ahci_device(
         capacity,
         driver.port()
     );
+    #[cfg(feature = "boot-smoke")]
     let result = check_ahci_data(&mut driver, inject_error);
+    #[cfg(not(feature = "boot-smoke"))]
+    let result = driver.read_sector(0, &mut [0_u8; ahci::SECTOR_SIZE]);
     match result {
+        #[cfg(feature = "boot-smoke")]
         Ok(true) => serial::println!(
             "MIRROR_AHCI_READ_OK sectors={} reads=262 bounds_rejected=2",
             capacity
         ),
-        Ok(false) => serial::println!("MIRROR_AHCI_PROBE_OK fixture=0 reads=1"),
+        // Smoke: any disk but the fixture. Default and trace: every disk.
+        Ok(_) => serial::println!("MIRROR_AHCI_PROBE_OK fixture=0 reads=1"),
         Err(error) => serial::println!("MIRROR_AHCI_FAILED phase=read error={:?}", error),
     }
     // SAFETY: No other caller retains controller or DMA access. Shutdown must
@@ -882,6 +901,7 @@ fn probe_ahci_device(
     serial::println!("MIRROR_AHCI_CLEANUP_OK dma_reclaimed=1");
 }
 
+#[cfg(feature = "boot-smoke")]
 fn check_ahci_data(driver: &mut ahci::Driver, inject_error: bool) -> Result<bool, ahci::AhciError> {
     let mut bytes = [0_u8; 512];
     driver.read_sector(0, &mut bytes)?;
@@ -923,11 +943,14 @@ fn check_ahci_data(driver: &mut ahci::Driver, inject_error: bool) -> Result<bool
     Ok(true)
 }
 
+/// Every VirtIO disk receives one sector-0 read. Only smoke kernels recognize
+/// the fixture and check its data; default and trace kernels compare nothing
+/// (spec 0010-D5).
 fn probe_block_device(
     devices: &pci::Inventory,
     frames: &mut memory::FrameAllocator<'_>,
     direct_map: u64,
-    inject_error: bool,
+    #[cfg(feature = "boot-smoke")] inject_error: bool,
 ) {
     let baseline = frames.stats().expect("frame accounting").allocated_frames;
     // SAFETY: IF is clear; this boot path alone claims the device. Firmware has
@@ -938,6 +961,7 @@ fn probe_block_device(
     } {
         Ok(Some(driver)) => driver,
         Ok(None) => {
+            #[cfg(feature = "boot-smoke")]
             assert!(!inject_error, "block error probe requires its test disk");
             assert_eq!(frames.stats().unwrap().allocated_frames, baseline);
             serial::println!("MIRROR_BLOCK_SKIPPED reason=no_supported_device");
@@ -957,7 +981,10 @@ fn probe_block_device(
         u8::from(driver.is_read_only()),
         u8::from(driver.supports_flush())
     );
+    #[cfg(feature = "boot-smoke")]
     let result = check_block_data(&mut driver, inject_error);
+    #[cfg(not(feature = "boot-smoke"))]
+    let result = driver.read_sector(0, &mut [0_u8; block::SECTOR_SIZE]);
     // SAFETY: IF is clear; no users or handlers retain this device/buffers.
     // Shutdown must observe reset completion before releasing its DMA pages;
     // an unconfirmed reset deliberately quarantines the allocations instead.
@@ -973,19 +1000,22 @@ fn probe_block_device(
     );
     serial::println!("MIRROR_BLOCK_CLEANUP_OK dma_reclaimed=1");
     match result {
+        #[cfg(feature = "boot-smoke")]
         Ok(Some(reads)) => serial::println!(
             "MIRROR_BLOCK_READ_OK sectors={} reads={} queue={} bounds_rejected=2",
             capacity,
             reads,
             queue_size
         ),
-        Ok(None) => serial::println!("MIRROR_BLOCK_PROBE_OK fixture=0 reads=1"),
+        // Smoke: any disk but the fixture. Default and trace: every disk.
+        Ok(_) => serial::println!("MIRROR_BLOCK_PROBE_OK fixture=0 reads=1"),
         Err(error) => serial::println!("MIRROR_BLOCK_FAILED phase=read error={}", error),
     }
 }
 
 /// Read arbitrary disks only for identification; extensive data checks run only
 /// on the dedicated fixture produced by scripts/common.ps1, never on a filesystem.
+#[cfg(feature = "boot-smoke")]
 fn check_block_data(
     driver: &mut block::Driver,
     inject_error: bool,
@@ -1043,6 +1073,7 @@ fn check_block_data(
     Ok(Some(reads))
 }
 
+#[cfg(feature = "boot-smoke")]
 fn check_fixture_sector(sector: u64, bytes: &[u8; 512]) {
     assert_eq!(&bytes[..8], &sector.to_le_bytes(), "wrong sector returned");
     assert_eq!(&bytes[8..16], b"MIRROR\0\x01", "fixture signature mismatch");

@@ -545,6 +545,7 @@ pub fn keyboard_irq_count() -> u64 {
 }
 
 /// Delivered handlers, possibly empty or raised by an initialization ACK.
+#[cfg(feature = "test-trace")]
 pub fn mouse_irq_count() -> u64 {
     MOUSE_IRQS.load(Ordering::Relaxed)
 }

@@ -61,6 +61,9 @@ pub struct BootInfo {
     /// Limine base revision 3 returns a physical address, not an HHDM pointer.
     pub rsdp_physical: Option<u64>,
     pub processors: Option<&'static limine::response::MpResponse>,
+    /// Only smoke kernels run init (spec 0010-D3). Every flavor still requires
+    /// the module, so all flavors boot from the same staged ESP.
+    #[cfg(feature = "boot-smoke")]
     pub init: &'static [u8],
     pub desktop: &'static [u8],
     pub agent: &'static [u8],
@@ -102,6 +105,8 @@ pub fn info() -> BootInfo {
         // reported length; reserved module pages remain live for the kernel.
         *slot = Some(unsafe { core::slice::from_raw_parts(module.addr(), length) });
     }
+    #[cfg(not(feature = "boot-smoke"))]
+    assert!(init.is_some(), "missing native init");
     BootInfo {
         memory_map: MEMORY_MAP.get_response().expect("missing memory map"),
         direct_map_offset: HHDM.get_response().expect("missing direct map").offset(),
@@ -109,6 +114,7 @@ pub fn info() -> BootInfo {
             .get_response()
             .map(|response| response.address() as u64),
         processors: MP.get_response(),
+        #[cfg(feature = "boot-smoke")]
         init: init.expect("missing native init"),
         desktop: desktop.expect("missing native desktop"),
         agent: agent.expect("missing native agent"),

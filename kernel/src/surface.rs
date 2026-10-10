@@ -25,6 +25,8 @@ pub struct Session<'borrow, 'fb> {
 }
 
 impl<'borrow, 'fb> Session<'borrow, 'fb> {
+    /// Init's small probe surface. Only smoke kernels run init (spec 0010-D3).
+    #[cfg(feature = "boot-smoke")]
     pub fn new(driver: &'borrow mut Driver<'fb>) -> Result<Self, SurfaceError> {
         Self::with_extent(driver, 256, 128)
     }

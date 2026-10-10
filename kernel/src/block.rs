@@ -440,6 +440,9 @@ impl Driver {
     }
     /// This driver has submitted a write not yet covered by a successful flush.
     /// A false value describes this session, not inherited device cache state.
+    /// Only smoke kernels write, and only to their disposable fixture: default
+    /// and trace kernels probe with one read (spec 0010-D5).
+    #[cfg(feature = "boot-smoke")]
     pub fn needs_flush(&self) -> bool {
         self.dirty
     }
@@ -461,6 +464,7 @@ impl Driver {
     /// Submit one copied sector. Completion does not establish persistence;
     /// explicitly flush after the writes that must become stable. An error may
     /// leave media changed. No ambiguous write is automatically retried.
+    #[cfg(feature = "boot-smoke")]
     pub fn write_sector(
         &mut self,
         sector: u64,
@@ -471,6 +475,7 @@ impl Driver {
 
     /// Complete the device's negotiated cache-flush command. Only success
     /// clears this session's dirty state; an error leaves durability unknown.
+    #[cfg(feature = "boot-smoke")]
     pub fn flush(&mut self) -> Result<(), BlockError> {
         self.request(Operation::Flush, 0, None)
     }

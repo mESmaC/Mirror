@@ -268,6 +268,8 @@ pub(crate) fn discard_input() {
 
 /// Delivered IRQ12 count, including possible empty/command-ACK deliveries.
 /// Decoded input evidence must also include actual motion or button events.
+/// Only trace markers report it (spec 0010-D4).
+#[cfg(feature = "test-trace")]
 pub fn irq_count() -> u64 {
     ps2::mouse_irq_count()
 }

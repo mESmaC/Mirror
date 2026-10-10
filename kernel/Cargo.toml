@@ -21,7 +21,8 @@ mirror-acpi = { path = "../crates/acpi" }
 mirror-clock-protocol = { path = "../crates/clock-protocol" }
 
 [features]
-boot-smoke = []
+test-trace = []
+boot-smoke = ["test-trace"]
 agent-demo = []
 
 [lints]

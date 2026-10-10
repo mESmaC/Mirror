@@ -106,7 +106,9 @@ pub enum Action {
 
 impl Action {
     /// Call outside IRQ handlers after processing a real queued input event.
-    #[cfg(not(feature = "boot-smoke"))]
+    /// Only trace kernels log commands: the record carries typed text, which a
+    /// default kernel never writes to serial (spec 0010-D4).
+    #[cfg(all(feature = "test-trace", not(feature = "boot-smoke")))]
     pub fn log(&self) {
         if let Self::Submitted { operation, text } = self {
             crate::serial::println!(

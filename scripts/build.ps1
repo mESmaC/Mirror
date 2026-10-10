@@ -2,6 +2,7 @@
 param(
     [switch]$Release,
     [switch]$Smoke,
+    [switch]$Trace,
     [switch]$AgentDemo
 )
 
@@ -36,7 +37,10 @@ try {
     }
     $cargoArguments = @('build', '--locked', '-p', 'mirror-kernel', '--target', 'x86_64-unknown-none')
     if ($Release) { $cargoArguments += '--release' }
+    # The three kernel flavors of ledger S7a (spec 0010): default (no features),
+    # trace (test-trace) and smoke (boot-smoke, which implies test-trace).
     if ($Smoke) { $cargoArguments += @('--features', 'boot-smoke') }
+    if ($Trace) { $cargoArguments += @('--features', 'test-trace') }
     if ($AgentDemo) { $cargoArguments += @('--features', 'agent-demo') }
     & cargo @cargoArguments
     if ($LASTEXITCODE -ne 0) { throw "Kernel build failed with exit code $LASTEXITCODE." }
@@ -85,7 +89,8 @@ try {
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "target/x86_64-unknown-none/$profile/mirror-agent") -Destination (Join-Path $espDirectory 'agent.elf') -Force
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "target/x86_64-unknown-none/$profile/mirror-app") -Destination (Join-Path $espDirectory 'app.elf') -Force
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'boot/limine.conf') -Destination (Join-Path $espDirectory 'limine.conf') -Force
-    Write-Host "Mirror $profile kernel and native programs staged in $espDirectory (agent-demo=$AgentDemo)"
+    $flavor = if ($Smoke) { 'smoke' } elseif ($Trace) { 'trace' } else { 'default' }
+    Write-Host "Mirror $profile $flavor kernel and native programs staged in $espDirectory (agent-demo=$AgentDemo)"
 }
 finally {
     Pop-Location

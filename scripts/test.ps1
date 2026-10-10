@@ -19,6 +19,36 @@ function Save-MirrorSmokeLogs {
     $script:smokeBoots++
 }
 
+function Assert-MirrorKernelImage {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('Default', 'Trace')][string]$Flavor,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+    # Spec 0010, acceptance test 4: a byte search of the staged kernel. Latin-1
+    # maps every byte to one character, so an ordinal search is a byte search.
+    $image = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes((Join-Path $repositoryRoot 'build/esp/kernel.elf')))
+    if ($Flavor -eq 'Default') {
+        # MIRROR_PERF_ strings (spec 0019) are allowed under 0010-D4's exception.
+        $required = @()
+        $forbidden = @('MIRROR_TRACE_ON', 'MIRROR_CONSOLE_COMMAND operation=', 'MIRROR_POINTER_UPDATED', 'MIRROR_POINTER_CLICK', 'MIRROR_SHELL_FRAME', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'Mirror shell: ready', 'MIRROR_USERSPACE_OK', 'Mirror init: VM checks passed', 'fixture data mismatch', 'unexpected budget exhaustion')
+    }
+    else {
+        $required = @('MIRROR_TRACE_ON', 'MIRROR_SHELL_FRAME')
+        $forbidden = @('MIRROR_USERSPACE_OK', 'fixture data mismatch')
+    }
+    foreach ($text in $required) {
+        if ($image.IndexOf($text, [StringComparison]::Ordinal) -lt 0) {
+            throw "The $Label $($Flavor.ToLowerInvariant()) kernel image lacks '$text'."
+        }
+    }
+    foreach ($text in $forbidden) {
+        if ($image.IndexOf($text, [StringComparison]::Ordinal) -ge 0) {
+            throw "The $Label $($Flavor.ToLowerInvariant()) kernel image contains '$text'."
+        }
+    }
+    Write-Host "The $Label $($Flavor.ToLowerInvariant()) kernel image passed its string scan."
+}
+
 Push-Location -LiteralPath $repositoryRoot
 try {
     Assert-MirrorToolchain
@@ -40,6 +70,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Native protocol, synchronization, and ACPI parser tests failed.' }
     & cargo clippy --locked --workspace -- -D warnings
     if ($LASTEXITCODE -ne 0) { throw 'Normal kernel Clippy check failed.' }
+    & cargo clippy --locked -p mirror-kernel --features test-trace -- -D warnings
+    if ($LASTEXITCODE -ne 0) { throw 'Trace kernel Clippy check failed.' }
     & cargo clippy --locked --workspace --all-features -- -D warnings
     if ($LASTEXITCODE -ne 0) { throw 'Smoke kernel Clippy check failed.' }
 
@@ -139,7 +171,9 @@ try {
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -NoKeyboard -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
         Save-MirrorSmokeLogs "$profile-NoKeyboard"
 
-        & (Join-Path $PSScriptRoot 'build.ps1') -Release:$release -AgentDemo:$AgentDemo
+        # Captures drive a trace kernel: its console-text oracles are their
+        # synchronization points (spec 0010).
+        & (Join-Path $PSScriptRoot 'build.ps1') -Trace -Release:$release -AgentDemo:$AgentDemo
         & (Join-Path $PSScriptRoot 'capture.ps1') -NoBuild -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
         foreach ($artifact in @('serial.log', 'stderr.log', 'png')) {
             Copy-Item -LiteralPath (Join-Path $repositoryRoot "build/normal-boot.$artifact") -Destination (Join-Path $logDirectory "$profile-console.$artifact") -Force
@@ -154,11 +188,25 @@ try {
         foreach ($artifact in $applicationArtifacts) {
             Copy-Item -LiteralPath (Join-Path $repositoryRoot "build/$artifact") -Destination (Join-Path $logDirectory "$profile-$artifact") -Force
         }
+        $imageLabel = if ($AgentDemo) { "$profile agent-demo" } else { $profile }
+        Assert-MirrorKernelImage -Flavor Trace -Label $imageLabel
+
+        # The default flavor must hold no trace or smoke strings, and without
+        # agent-demo it must pass the QEMU hygiene probe (spec 0010).
+        & (Join-Path $PSScriptRoot 'build.ps1') -Release:$release -AgentDemo:$AgentDemo
+        Assert-MirrorKernelImage -Flavor Default -Label $imageLabel
+        if (-not $AgentDemo) {
+            & (Join-Path $PSScriptRoot 'capture.ps1') -NoBuild -Hygiene -CpuCount 4 -Release:$release -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+            foreach ($artifact in @('hygiene-boot.serial.log', 'hygiene-boot.stderr.log', 'hygiene-boot.png', 'hygiene-notes-before.png', 'hygiene-notes-typed.png', 'hygiene-notes-pointer.png', 'hygiene-console-before.png', 'hygiene-console-typed.png', 'hygiene-console-pointer.png')) {
+                Copy-Item -LiteralPath (Join-Path $repositoryRoot "build/$artifact") -Destination (Join-Path $logDirectory "$profile-$artifact") -Force
+            }
+        }
     }
 
     # Leave the boot tree ready for a normal run after the test cases finish.
     & (Join-Path $PSScriptRoot 'build.ps1')
-    Write-Host "All $smokeBoots kernel/userspace/device smoke cases and debug/release desktop/console captures passed. Logs: $logDirectory"
+    $captureSummary = if ($AgentDemo) { 'trace captures and kernel image scans' } else { 'trace captures, kernel image scans and hygiene probes' }
+    Write-Host "All $smokeBoots kernel/userspace/device smoke cases and debug/release $captureSummary passed. Logs: $logDirectory"
 }
 finally {
     Pop-Location

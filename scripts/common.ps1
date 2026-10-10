@@ -301,11 +301,18 @@ function Assert-MirrorAhciMarkers {
         [string]$FaultMode = 'None'
     )
 
+    if (-not $Smoke -and $FaultMode -ne 'None') {
+        throw 'Fault injection exists only in smoke kernels.'
+    }
+    # Smoke kernels recognize the fixture and run the full read workload. Trace
+    # and default kernels only read sector 0 and compare nothing (spec 0010-D5),
+    # so their workload marker is PROBE_OK and READ_OK is unexpected.
+    $workload = if ($Smoke) { 'MIRROR_AHCI_READ_OK' } else { 'MIRROR_AHCI_PROBE_OK' }
     $expected = @{}
     if ($Smoke) { $expected.MIRROR_AHCI_TESTS_OK = '' }
     if ($Attached) {
         $expected.MIRROR_AHCI_READY = 'sectors=2048 readonly=1 port=0'
-        $expected.MIRROR_AHCI_READ_OK = 'sectors=2048 reads=262 bounds_rejected=2'
+        $expected[$workload] = if ($Smoke) { 'sectors=2048 reads=262 bounds_rejected=2' } else { 'fixture=0 reads=1' }
         $expected.MIRROR_AHCI_CLEANUP_OK = 'dma_reclaimed=1'
         if ($FaultMode -eq 'AhciIoError') {
             $expected.MIRROR_AHCI_IO_ERROR_OK = 'retry=1 output_preserved=1'
@@ -332,7 +339,7 @@ function Assert-MirrorAhciMarkers {
     }
     if ($Attached) {
         $ready = $Serial.IndexOf('MIRROR_AHCI_READY ', [StringComparison]::Ordinal)
-        $reads = $Serial.IndexOf('MIRROR_AHCI_READ_OK ', [StringComparison]::Ordinal)
+        $reads = $Serial.IndexOf("$workload ", [StringComparison]::Ordinal)
         $cleanup = $Serial.IndexOf('MIRROR_AHCI_CLEANUP_OK ', [StringComparison]::Ordinal)
         if ($reads -le $ready -or $cleanup -le $reads) {
             throw 'AHCI reads must follow device readiness and precede DMA cleanup.'
@@ -352,6 +359,31 @@ function Assert-MirrorAhciMarkers {
     }
 }
 
+function Assert-MirrorTraceMarker {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [Parameter(Mandatory = $true)][bool]$Expected
+    )
+
+    # test-trace kernels (trace and smoke) print one bare MIRROR_TRACE_ON in
+    # _start before PCI discovery. Default kernels never print it (spec 0010).
+    $names = [regex]::Matches($Serial, '(?m)^MIRROR_TRACE_ON(?:\s|$)')
+    if (-not $Expected) {
+        if ($names.Count -ne 0) {
+            throw 'A default kernel must not print MIRROR_TRACE_ON; this is a trace or smoke build.'
+        }
+        return
+    }
+    $records = [regex]::Matches($Serial, '(?m)^MIRROR_TRACE_ON\r?$')
+    if ($names.Count -ne 1 -or $records.Count -ne 1) {
+        throw 'A test-trace kernel must print exactly one bare MIRROR_TRACE_ON line.'
+    }
+    $pci = [regex]::Match($Serial, '(?m)^MIRROR_PCI_READY(?:\s|$)')
+    if ($pci.Success -and $records[0].Index -ge $pci.Index) {
+        throw 'MIRROR_TRACE_ON must precede PCI discovery.'
+    }
+}
+
 function Assert-MirrorClock {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,
@@ -365,7 +397,9 @@ function Assert-MirrorClock {
         throw 'Clock activation fault injection requires smoke with HPET present.'
     }
     $available = -not $WithoutHpet -and -not $injected
-    $userCount = if ($Smoke) { 4 } else { 2 }
+    # Smoke runs both init processes twice. Trace and default kernels run no
+    # init program (spec 0010-D3), so they report no user clock checks.
+    $userCount = if ($Smoke) { 4 } else { 0 }
     $expected = @{
         MIRROR_ACPI_HPET_READY = [int](-not $WithoutHpet)
         MIRROR_ACPI_HPET_SKIPPED = [int]$WithoutHpet
@@ -573,7 +607,8 @@ function Assert-MirrorHeapGrowth {
     $cpus = if ($UseLegacyPic) { 1 } else { $RequestedCpus }
     $rounds = if ($Smoke) { 4 } else { 1 }
     # Each run_pair reports both processes; smoke repeats the workload once.
-    $userCount = if ($Smoke) { 4 } else { 2 }
+    # Trace and default kernels run no init program (spec 0010-D3).
+    $userCount = if ($Smoke) { 4 } else { 0 }
     $initial = [regex]::Matches($Serial, '(?m)^MIRROR_HEAP_READY size=1048576 free=1048576\r?$')
     $sharedPattern = '(?m)^MIRROR_SHARED_VM_READY pages=512 cpus={0} rounds={1} reclaimed=3 borrowed_root=1\r?$' -f $cpus, $rounds
     $shared = [regex]::Matches($Serial, $sharedPattern)
@@ -597,8 +632,11 @@ function Assert-MirrorHeapGrowth {
         if ($used -gt $phase.Size -or $free -ne ($phase.Size - $used)) {
             throw 'Heap growth accounting does not match the committed capacity.'
         }
-        if (($phase.Name -eq 'boot' -and $records[0].Index -ge $user[0].Index) -or
-            ($phase.Name -eq 'after_userspace' -and $records[0].Index -le $user[$userCount - 1].Index)) {
+        # Without an init workload there is nothing to bracket; the phase order
+        # above still places both commits after the shared-window checks.
+        if ($userCount -gt 0 -and
+            (($phase.Name -eq 'boot' -and $records[0].Index -ge $user[0].Index) -or
+            ($phase.Name -eq 'after_userspace' -and $records[0].Index -le $user[$userCount - 1].Index))) {
             throw 'Heap commits must bracket the native userspace workload.'
         }
         if ($Smoke) {

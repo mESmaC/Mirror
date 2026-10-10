@@ -2,6 +2,7 @@
 param(
     [switch]$Release,
     [switch]$Smoke,
+    [switch]$Trace,
     [switch]$NoBuild,
     [switch]$Graphical,
     [switch]$AgentDemo,
@@ -251,7 +252,7 @@ $codePath = Get-MirrorFirmware -RequestedPath $FirmwareCode -QemuDirectory $qemu
 $varsTemplate = Get-MirrorFirmware -RequestedPath $FirmwareVars -QemuDirectory $qemuDirectory -Names @('edk2-i386-vars.fd', 'OVMF_VARS.fd', 'OVMF_VARS.4m.fd') -ParameterName 'FirmwareVars'
 
 if (-not $NoBuild) {
-    & (Join-Path $PSScriptRoot 'build.ps1') -Release:$Release -Smoke:$Smoke -AgentDemo:$AgentDemo
+    & (Join-Path $PSScriptRoot 'build.ps1') -Release:$Release -Smoke:$Smoke -Trace:$Trace -AgentDemo:$AgentDemo
 }
 
 $buildDirectory = Join-Path $repositoryRoot 'build'
@@ -522,6 +523,8 @@ try {
     Assert-MirrorAhciMarkers -Serial $serial -Attached $ahciFixture -Smoke $true -FaultMode $Fault
     Assert-MirrorXhciMarkers -Serial $serial -Attached ([bool]$Xhci) -UsbDevice $usbFixture -WithoutHpet ([bool]$NoHpet) -Smoke $true -FaultMode $Fault
     Assert-MirrorUsbMarkers -Serial $serial -Attached ([bool]$Xhci) -UsbDevice $usbFixture -FullSpeed ([bool]$XhciFullSpeed) -WithoutHpet ([bool]$NoHpet) -Smoke $true -FaultMode $Fault
+    # boot-smoke implies test-trace, so every smoke log carries one MIRROR_TRACE_ON.
+    Assert-MirrorTraceMarker -Serial $serial -Expected $true
     $markers += 'MIRROR_USER_SYNC_OK'
     if (@([regex]::Matches($serial, '(?m)^user: Mirror init: synchronization checks passed\\n\r?$')).Count -ne 4) {
         throw 'Both native processes must complete their synchronization checks before and after teardown/relaunch.'
