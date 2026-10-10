@@ -1,16 +1,16 @@
 # 0012: AGENTS.md shared conventions
 
-Status: draft (all decisions confirmed; three confirmed text changes pending, see decisions.md "Pending spec edits")
+Status: draft (all decisions confirmed)
 Depends on: none. Precondition: `docs/specs/` is committed to `main` first (confirmed M0 order).
-Ledger: P5b, P1, P2, P3, P6, P7, P7a, P8 (the text also restates P4, P5a, P5c, S3, S7, S7a, S7b, O1, O6)
+Ledger: P5b, P1, P2, P3, P6, P7, P7a, P8, P9 (the text also restates P4, P5a, P5c, S3, S7, S7a, S7b, O1, O6)
 
 ## Goal
-A root-level `AGENTS.md` exists, and every agent working on Mirror (Claude, GPT Astra, Kimi K3) reads it first. In under 120 lines it tells an agent with no prior context where the goal and ledger live, how the spec process gates work, how to build and test without corrupting shared state, which tests to run when, which coding conventions the code already follows, the references policy, and how branches work. A root `CLAUDE.md` imports it, and the readme's driver-porting paragraph is reworded to match the references policy (P6). The full AGENTS.md text is below. No code changes. In the confirmed M0 order, 0012 lands first, right after `docs/specs/` is committed, and each later M0 spec updates the AGENTS.md lines it changes.
+A root-level `AGENTS.md` exists, and every agent working on Mirror (Claude, GPT Astra, Kimi K3) reads it first. In under 120 lines it tells an agent with no prior context where the goal and ledger live, how the spec process gates work, how to build and test without corrupting shared state, which tests to run when, which coding conventions the code already follows, the references policy, and how branches work. A root `CLAUDE.md` imports it, and the readme's two driver-porting paragraphs (readme.md:694 and :700) are reworded to match the references policy (P6). The full AGENTS.md text is below. No code changes. In the confirmed M0 order, 0012 lands first, right after `docs/specs/` is committed, and each later M0 spec updates the AGENTS.md lines it changes.
 
 ## Non-goals
 - Fixing the traps the text documents: the workspace linker flags, the missing lock on `build/`, the uncleared log directories (0011-D7 clears them), and the unchecked `-NoBuild` staging. Follow-up specs fix the rest.
 - Pinning the toolchain or adding workspace lints (0011). Moving the test battery and user-content logging behind `boot-smoke` and `test-trace` (0010).
-- Rewording any readme paragraph other than readme.md:694. Splitting readme.md (P5c), CI (P3), LICENSE or CONTRIBUTING (P4), and architecture or ABI docs.
+- Rewording any readme paragraph other than readme.md:694 and :700. Splitting readme.md (P5c), CI (P3), LICENSE or CONTRIBUTING (P4), and architecture or ABI docs.
 
 ## Decisions
 | ID | Decision | Status |
@@ -19,18 +19,24 @@ A root-level `AGENTS.md` exists, and every agent working on Mirror (Claude, GPT 
 | 0012-D2 | AGENTS.md restates the spec process: specs live in `docs/specs/`, and nothing is built from `proposed` or `open` decisions. | confirmed (ledger P1) |
 | 0012-D3 | AGENTS.md restates the roles and workflow: Cameron dispatches, Claude proposes side tasks on request, Kimi stays on UI. Work is mostly one agent at a time, with no CI. | confirmed (ledger P2, P3) |
 | 0012-D4 | Add a root `CLAUDE.md` whose only content is the import line `@AGENTS.md`. Claude Code loads CLAUDE.md automatically, and an import avoids keeping a second copy in sync. | confirmed (2026-10-09) |
-| 0012-D5 | References policy: the local trees are best-practice references only, and Mirror code is written independently against Mirror's own interfaces. Their paths vary by machine, so agents ask Cameron for a tree's location rather than assuming one. This spec rewords readme.md:694 ("Reuse device-specific source where licensing permits") to match. | confirmed (2026-10-09, ledger P6) |
+| 0012-D5 | References policy: the local trees are best-practice references only, and Mirror code is written independently against Mirror's own interfaces. Their paths vary by machine, so agents ask Cameron for a tree's location rather than assuming one. This spec rewords readme.md:694 ("Reuse device-specific source where licensing permits") and readme.md:700 ("Porting source does not mean ...", which lists licensing in each driver's assessment) to match. | confirmed (2026-10-09, ledger P6) |
 | 0012-D6 | Each agent task runs on its own branch, and Cameron merges it. Agents never force-push or rewrite pushed history, and push only when asked. Exception: spec and documentation-only commits (`docs/specs/` and other docs-only changes) go directly to `main` and are pushed, with no task branch. | confirmed (2026-10-09, ledger P7, P7a) |
 | 0012-D7 | Each commit runs the targeted test cases for what it touches, chosen by the rule under "When to test" below. The full `scripts/test.ps1` (plus `-AgentDemo` when agent-demo code is touched) runs when a spec is complete, before its branch is merged. | confirmed (2026-10-09, ledger P8) |
 | 0012-D8 | Task branches start from the current `main` and are named `<agent>/<spec>-<short-name>`, where `<agent>` is `claude`, `astra` or `kimi` (for example `claude/0011-toolchain-and-lints`). A task without a spec uses `<agent>/<short-name>`. Kimi's existing UI branch keeps its name. Rationale: Cameron can tell who made a branch and which spec it implements without opening it, and a cold-start agent needs no extra instruction. Alternative: each dispatch prompt names the branch and its base. | confirmed (2026-10-09) |
+| 0012-D9 | AGENTS.md is kept current permanently, not only during M0: every spec or change that alters something AGENTS.md describes updates those lines in the same commit. | confirmed (2026-10-09, ledger P9) |
 
 ## Interfaces
 Files, all at the repository root:
 - `AGENTS.md` (new): the text below. Lines tagged `[D8]` depend on 0012-D8. Drop the tag when writing the file.
 - `CLAUDE.md` (new): exactly `@AGENTS.md` (0012-D4).
-- `readme.md`: replace the single-line paragraph at readme.md:694, which begins "Port drivers into Mirror through a documented platform adaptation layer.", with this paragraph (0012-D5). No other readme line changes.
+- `readme.md`: replace two single-line paragraphs (0012-D5). No other readme line changes.
+  - readme.md:694, which begins "Port drivers into Mirror through a documented platform adaptation layer.", becomes:
 
   > Build drivers on a documented platform adaptation layer: Mirror's own interfaces for MMIO, DMA mappings and buffer lifetimes, interrupts, allocation, synchronization, timers, and work queues. Each driver is written independently against those interfaces. Other operating systems' drivers, including the local reference trees, serve as best-practice references for device behavior, initialization order, and error handling. Device discovery, power management, firmware loading, and recovery also need explicit integration.
+
+  - readme.md:700, which begins "Porting source does not mean Mirror can directly load", becomes:
+
+  > Writing drivers against Mirror's own interfaces does not mean Mirror can directly load Linux kernel modules or closed-source Windows/Linux binary drivers. Existing modules depend on their original kernel's ABI and internal behavior. Each candidate device requires an assessment of hardware documentation, firmware, reference implementations, and dependencies before it becomes part of the support plan.
 
 ````markdown
 # AGENTS.md
@@ -56,7 +62,7 @@ Mirror is an agent harness that is also a complete, fast, independent x86_64 ope
 - Each task runs on its own branch, and only Cameron merges it. Commit to your task branch, never to `main`. Never force-push or rewrite pushed history. Push only when asked.
 - Exception: spec and documentation-only commits (`docs\specs\` and other docs-only changes) go directly to `main` and are pushed, with no task branch.
 - [D8] Start the branch from the current `main` and name it `<agent>/<spec>-<short-name>`, where `<agent>` is `claude`, `astra` or `kimi`, for example `claude/0011-toolchain-and-lints`. A task without a spec uses `<agent>/<short-name>`.
-- Kimi's UI branch belongs to Kimi. Other agents never check it out, rebase it, merge it, cherry-pick from it, push to it or delete it.
+- Kimi's UI branch, `<name supplied by Cameron>`, belongs to Kimi. Other agents never check it out, rebase it, merge it, cherry-pick from it, push to it or delete it.
 
 ## Build
 Run commands from the repository root in PowerShell.
@@ -111,7 +117,7 @@ The local reference trees (linux, nt5src, freebsd-src and colibri) are best-prac
 
 ## Docs
 - `readme.md` is being split into `docs\` gradually. Put new long-form material under `docs\`, and keep edits to `readme.md` short.
-- Keep this file current: a change to a command, path or convention described here updates the matching lines in the same branch.
+- Keep this file current, always: a change to a command, path or convention described here updates the matching lines in the same commit.
 ````
 
 Facts the text relies on (checked at HEAD 4614249):
@@ -137,11 +143,11 @@ Lines that later M0 specs make stale. Each spec updates them on its own branch:
 - 0013, 0016a, 0017a and 0017b add cases and fault names through the procedure above and are not expected to change AGENTS.md lines.
 
 ## Acceptance tests
-1. `AGENTS.md` exists at the repository root and `(Get-Content AGENTS.md).Count` is at most 120. The text matches the version above, adjusted only if 0012-D8 is rejected.
+1. `AGENTS.md` exists at the repository root and `(Get-Content AGENTS.md).Count` is at most 120. The text matches the version above, with Kimi's branch name filled in. If Cameron has not supplied it when 0012 lands, the placeholder stays and the gap is noted in the commit message.
 2. Every path it names exists: `Test-Path` succeeds for `scripts\{build,run,test,capture,common}.ps1`, `.cargo\config.toml`, `kernel\linker.ld`, `userspace\{init,desktop,agent,app}\linker.ld`, `kernel\src\boot.rs`, `rust-toolchain.toml` and `docs\specs\{0000-north-star,decisions,README}.md`. The text names no reference-tree path (ledger P6). `Select-String` finds `-Smoke`, `-Release`, `-NoBuild`, `-Fault`, `-AgentDemo` and `-Xhci` in `scripts\run.ps1`, `-NoBuild` and `-CpuCount` in `scripts\capture.ps1`, and `QEMU_PATH`, `OVMF_CODE` and `OVMF_VARS` in `scripts\run.ps1` and `scripts\test.ps1`.
 3. The AGENTS.md References section contains none of the words license, legal, copyright, provenance, clean-room or leak.
-4. readme edit: line 694 of `readme.md` equals the replacement paragraph above, `(Get-Content readme.md).Count` is unchanged (800 at HEAD 4614249), `Select-String readme.md -Pattern 'licensing permits'` finds nothing, and the new paragraph contains none of the words in test 3.
-5. This spec changes only documentation, so under ledger P7a it is committed directly to `main`, after the commit that adds `docs/specs/`, and pushed, with no task branch. `git show --stat` for that commit lists only `AGENTS.md`, `CLAUDE.md` and `readme.md` (one line changed).
+4. readme edit: lines 694 and 700 of `readme.md` equal the two replacement paragraphs above, `(Get-Content readme.md).Count` is unchanged (800 at HEAD 4614249), `Select-String readme.md -Pattern 'licensing permits','Porting source'` finds nothing, and neither new paragraph contains any of the words in test 3.
+5. This spec changes only documentation, so under ledger P7a it is committed directly to `main`, after the commit that adds `docs/specs/`, and pushed, with no task branch. `git show --stat` for that commit lists only `AGENTS.md`, `CLAUDE.md` and `readme.md` (two lines changed).
 6. `CLAUDE.md` contains exactly `@AGENTS.md`. In a fresh Claude Code session at the root, the question "Which script must build userspace?" gets the answer `scripts\build.ps1` with no file-read tool call in the transcript.
 7. Per P8, the full `scripts\test.ps1` passes once the spec is complete. No code changes, so this also records the M0 baseline.
 8. Manual cold-start check for each agent (Claude, GPT Astra, Kimi K3). In a fresh session that has read only AGENTS.md, each question gets the expected answer:
@@ -158,10 +164,8 @@ Lines that later M0 specs make stale. Each spec updates them on its own branch:
 None.
 
 ## Open questions
-- Kimi's UI branch name. It is not in the local clone. The name should go into AGENTS.md.
+- Kimi's UI branch name, which Cameron supplies. It is not in the local clone.
 - Does each agent's harness load AGENTS.md automatically? Codex does, and the repo has a `refs/codex/` checkpoint, which suggests GPT Astra runs under it. Kimi K3's harness is unconfirmed. If it does not, its dispatch prompt must point to AGENTS.md.
-- readme.md:700 still opens with "Porting source" and lists licensing in each driver's assessment. P6 names only :694, so this spec leaves :700 for the P5c split unless Cameron wants it reworded here.
-- The AGENTS.md "Keep this file current" line states the confirmed M0 rule (each spec updates the AGENTS.md lines it changes) with no end date. Cameron to confirm it continues after M0.
 - Follow-up specs:
   - (a) Remove the linker trap, for example by moving the kernel linker flags out of the workspace-wide target rustflags.
   - (b) Add a lock file on `build/` so that concurrent script runs fail fast.

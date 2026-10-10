@@ -12,7 +12,7 @@ Planned specs, not yet drafted. Each one is sized for one agent and cites the le
 **M0: Hygiene, VM targets, baselines**
 - 0010 Boot hygiene: test battery and fixture asserts behind `boot-smoke`, user-content logging and test oracles behind `test-trace`, opt-in perf exception (S7, S7a, S7b)
 - 0011 Toolchain pin, workspace lints, and test-log clearing (P5a)
-- 0012 AGENTS.md, CLAUDE.md, and the readme references wording (P5b, P6, P7, P7a, P8)
+- 0012 AGENTS.md, CLAUDE.md, and the readme references wording (P5b, P6, P7, P7a, P8, P9)
 - 0013 Firmware and PCI tolerance for VMware/VirtualBox: duplicate NMI records, HPET register width, per-entry ACPI table handling, the 32-function PCI cap
 - 0014 Common device-set QEMU profiles: AHCI, e1000 (82545EM), PS/2, framebuffer; LegacyVirtio profile until 0062 (S1a, S1b)
 - 0015a Disk image: GPT, FAT32 ESP, minimal ext2 root, VMDK, QEMU boot switch, VM settings doc (S5, S2, S1b)

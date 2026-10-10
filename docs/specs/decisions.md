@@ -138,10 +138,10 @@ v1 order. The harness follows the process model (A15), and harness code is writt
 
 ## Pending (resume here)
 
-State at the end of the 2026-10-09 session.
+State as of 2026-10-10. The confirmed 0012 text changes (Kimi branch placeholder, readme.md:700 rewording, permanent update rule as 0012-D9) are now in the spec.
 
-**Confirmed, but not yet written into the spec text:**
-- 0012: AGENTS.md names Kimi's UI branch with a placeholder ("name supplied by Cameron"). 0012 also rewords readme.md:700 to match P6, along with :694. The AGENTS.md update rule is permanent (P9). 0012-D8 (branch naming `<agent>/<spec>-<short-name>`) is already marked confirmed in the spec.
+**Awaiting Cameron's input (spec 0012, otherwise ready):**
+- The name of Kimi's UI branch, for the AGENTS.md placeholder. 0012 can land without it; the placeholder stays until supplied.
 
 **Still awaiting Cameron's decision (spec 0019, all proposed):**
 - 0019-D3: gate every perf line, milestones included, behind a valid `mirror.perf=` token. This narrows confirmed 0018-D9 and changes 0018's marker contract, so it needs re-confirmation together with them.
