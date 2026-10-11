@@ -37,7 +37,7 @@ M0 execution order (confirmed): commit `docs/specs`, then 0012 first. Then 0011,
 - 0026 `mirror-rt`: entry, allocator, handles, threads, panic output (S8)
 - 0027a Compositor protocol: shared-memory surfaces, any display size and live resize, clipboard object, versioned input envelope with seat and provenance (S6d, S6f, S1c, S11, A20; coordinate with Kimi)
 - 0028 Userspace target: hard-float, SSE2 baseline, AVX2 by runtime dispatch, build-std on the pinned compiler (S12, S8)
-- 0029 UI tokens on the current renderer: Kimi's design tokens on today's shell, apps and boot screen (P2a, G12; side spec, before 0027a)
+- 0029 UI tokens on the current renderer: Kimi's design tokens on today's shell, apps and boot screen (P2a, G12, A3b; side spec, before 0027a)
 
 **M2: Processes, services, system log, crypto and entropy**
 - 0027b App launch out of the kernel, completing S6d (S6d, S6f; after 0030 and 0031)
@@ -58,7 +58,7 @@ M0 execution order (confirmed): commit `docs/specs`, then 0012 first. Then 0011,
 - 0044 Typed operation registry (A1, A17); element trees, streaming and cancel (A19)
 - 0045 Agent API, native protocol (A12, A13); I5 validation for every client (A19, I5)
 - 0046 Human override: pause, stop, revoke (A9); pause = kernel suspend (S6e)
-- 0047 Dual input seats, provenance, agent cursor (A3, A3a); per-seat clipboards (A20)
+- 0047 Dual input seats, provenance, agent cursor (A3, A3a, A3b); per-seat clipboards (A20)
 - 0048 Agent tasks: task objects, task-scoped grants, persistence and paused resume (A18)
 - 0049 Trusted approval surface (A9a, A4; with Kimi)
 

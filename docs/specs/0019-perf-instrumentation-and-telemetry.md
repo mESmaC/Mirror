@@ -73,7 +73,7 @@ Each `MIRROR_PERF_T` event prints at most once, in this order. A milestone that 
 3. `input`: after PS/2 init and IRQ enabling (`main.rs:257-283`).
 4. `userspace`: the kernel first resumes the shell, or the agent-demo desktop. In default and trace builds this is the first user process (0010-D3).
 5. `frame`: that process's first successful display-surface present (`userspace.rs:2803-2808`).
-6. `shell_ready`: that process's first input syscall after `frame` (15 or 16 on the Input object, `userspace.rs:3230-3256`). Shell: `shell.rs:867-871`. Desktop: `userspace/desktop/src/main.rs:332-342`; its input checks at `:151-174` precede `frame` and do not count.
+6. `shell_ready`: that process's first input syscall after `frame` (15 or 16 on the Input object, `userspace.rs:3230-3256`). Shell: `shell.rs:1028-1032`. Desktop: `userspace/desktop/src/main.rs:333-343`; its input checks at `:151-174` precede `frame` and do not count.
 
 ### Memory samples (0018-D6)
 

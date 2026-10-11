@@ -35,6 +35,7 @@ Source interviews: the 2026-10-09 spec interview, then the 2026-10-09 gap interv
 | A2 | v1 modes: human only, together, agent alone (local). Cloud agent desktops come later. | confirmed |
 | A3 | Typed operations never touch the human's focus or input. Human and agent each have their own input seat (cursor, focus, keyboard) and never fight for control. The human can interact with the agent's window while watching it work. | confirmed |
 | A3a | In v1 the agent's cursor visualizes typed operations: it moves to the element an operation targets. Real synthetic clicks belong to the fallback (A1a). | confirmed |
+| A3b | The pointer is a CUA-style arrowhead without a tail, after the Cua driver cursor (trycua/cua), drawn by the kernel console and the desktop from one bitmap (0029-D12). Cua-style cursor motion, and more Cua-style support, come later with the agent cursor (0047, A3a). (Cameron, 2026-10-10: "I want the cursor to be a CUA style cursor … Just the cursor itself. The arrow without a tail. Later on we can add more cua style support.") | confirmed |
 | A4 | Grant sources: live human approval, saved human policies, agent to sub-agent delegation (attenuating only), apps sharing their own objects. | confirmed |
 | A5 | Default agent authority is configurable. v1 ships two presets: read-only and full access. | confirmed |
 | A5a | During development the full-access preset equals root, for testing. The v1 ceiling (which powers stay human-seat-only) is open question O7 and is decided before v1 acceptance. 0041 keeps presets as capability bundles so a ceiling can be added without an ABI change. | confirmed |
@@ -180,7 +181,7 @@ v1 order. The harness follows the process model (A15), and harness code is writt
 
 State after the 2026-10-09 gap interview, its write-up and its addendum, the 2026-10-10 pin change (P5a: 1.99.0), and the 2026-10-10 VMware addendum (Workstation Pro 26.0.1 checked and powered on).
 
-**Next:** spec 0029 (UI tokens on the current renderer, confirmed 2026-10-10), all but D9, right after Cameron merges the 0010 stack; then the M0 order continues with 0015a. 0029-D9 lands together with 0017c. Waiting for Cameron to merge: `claude/0010-boot-hygiene`, which carries 0011, 0014 and 0010 (one merge; main has moved, so it is a normal merge, checked conflict-free). 0012 is done (e6c5ec7).
+**Next:** a roadmap re-plan. On 2026-10-10 Cameron questioned UI work on today's renderer and asked to get Mirror to a modern OS first; a gap audit of the code against a modern OS and Kimi's design is running, and its proposed reordering of M0-M7 goes to Cameron for confirmation. Until Cameron confirms a new order, the confirmed order stands and continues with 0015a. 0029 part 1 is done on `claude/0029-ui-tokens` (2654a75, plus its spec update), waiting for Cameron's merge; whether 0029-D9 still lands with 0017c is part of the re-plan. 0011, 0014 and 0010 are merged into local `main` (a8a2581, not yet pushed). 0012 is done (e6c5ec7).
 
 **Confirmed, but not yet written into the spec text:** none. Confirmed decisions that name a spec not yet drafted (for example 0027a, 0033 or 0067) live in this ledger and the README.md spec map until that spec is written.
 

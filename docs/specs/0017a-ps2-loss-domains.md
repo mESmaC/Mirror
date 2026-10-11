@@ -37,8 +37,8 @@ A mouse fault or a full mouse ring never changes keyboard state: held modifiers,
 **Consumers**
 - Kernel console (`kernel/src/main.rs:531-537`): a keyboard loss calls only `console.input_lost()` (console.rs:191-195); a pointer loss calls only `pointer.input_lost()` (pointer.rs:64-67). The marker becomes `MIRROR_CONSOLE_INPUT_LOST device=keyboard|pointer`, which `capture.ps1:198` and `:269` still match. It carries no user content and stays in every build flavor, as 0010 lists it (S7b).
 - Desktop decoder (`userspace/desktop/src/main.rs:128-131`): returns `Event::Lost { keyboard, pointer }` and rejects mask 0 or any bit above bit 1. main.rs:179 expects the initial mask 3.
-- Shell (`userspace/desktop/src/shell.rs:365-376`): a pointer loss resets capture, buttons and click arming, then sends Reset to each app. A keyboard loss sends apps nothing, because app Reset and Focus clear only pointer and focus state (`userspace/app/src/main.rs:211-220`). Behaviour change: the per-window `pending` reset (shell.rs:369-372) is removed, so a loss no longer drops events already queued for apps.
-- Scratchpad UI (`userspace/desktop/src/ui.rs:176-182`): only a keyboard loss clears the draft and sets the notice. A pointer loss resets buttons and click arming.
+- Shell (`userspace/desktop/src/shell.rs:432-443`): a pointer loss resets capture, buttons and click arming, then sends Reset to each app. A keyboard loss sends apps nothing, because app Reset and Focus clear only pointer and focus state (`userspace/app/src/main.rs:211-220`). Behaviour change: the per-window `pending` reset (shell.rs:436-439) is removed, so a loss no longer drops events already queued for apps.
+- Scratchpad UI (`userspace/desktop/src/ui.rs:185-191`): only a keyboard loss clears the draft and sets the notice. A pointer loss resets buttons and click arming.
 
 **Files touched:** `kernel/src/{ps2,keyboard,mouse,input,main}.rs`, `userspace/desktop/src/{main,shell,ui}.rs`, `readme.md:332` (the global loss barrier becomes per-device loss and coalescing) and `readme.md:507` ("loss records clear every payload field" becomes the device mask).
 
@@ -54,7 +54,7 @@ Boot-smoke self-tests; the existing markers must still print.
    - A button change on a full ring, or an i16 overflow, produces a loss.
    - Header 0x09, then the test tick advanced by 51, then `08 05 00`: the result is dx=5, buttons 0. With an advance of 49, the bytes complete the stale packet `09 08 05` instead.
 3. `input::self_test` (MIRROR_INPUT_TESTS_OK): keyboard, pointer and initial records encode to `[1,3,1,..]`, `[1,3,2,..]` and `[1,3,3,..]`.
-4. Desktop smoke: shell.rs:1023 `policy_checks` (`run.ps1 -Smoke`, gated by MIRROR_SHELL_TESTS_OK) checks that a pointer-only loss keeps a queued key for the focused app. ui.rs:507 `self_test` (`-Smoke -AgentDemo`, gated by MIRROR_DESKTOP_TESTS_OK) checks that a pointer-only loss keeps the draft and a keyboard loss clears it, as ui.rs:553-556 already expects.
+4. Desktop smoke: shell.rs:1211 `policy_checks` (`run.ps1 -Smoke`, gated by MIRROR_SHELL_TESTS_OK) checks that a pointer-only loss keeps a queued key for the focused app. ui.rs:551 `self_test` (`-Smoke -AgentDemo`, gated by MIRROR_DESKTOP_TESTS_OK) checks that a pointer-only loss keeps the draft and a keyboard loss clears it, as ui.rs:597-600 already expects.
 5. Before merge (ledger P8): `scripts/test.ps1` and `scripts/test.ps1 -AgentDemo` pass, since the Scratchpad is agent-demo code. This spec adds no smoke boots.
 
 Manual check on VMware Workstation. The VM boots 0015a's disk image with the settings 0015a documents, and uses a PS/2 keyboard and a PS/2 mouse with no USB controller, so no USB mouse or tablet:

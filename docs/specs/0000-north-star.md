@@ -1,7 +1,7 @@
 # 0000: North star
 
 Status: confirmed (2026-10-09)
-Ledger: G1, G2, G3, G3a, G4, G5, G6, G7, G8, G8a, G8b, G8c, G8d, G9, G10, G11, G12; A1, A1a, A2, A3, A3a, A4, A5, A5a, A6, A7, A8, A8a, A9, A9a, A10, A11, A11a, A12, A13, A13a, A14, A15, A16, A16a, A16b, A17, A17a, A18, A19, A20, A21; I1, I2, I3, I4, I4a, I4b, I4c, I4d, I5, I6, I7, I8, I8a, I9, I10, I10a, I11, I11a, I11b, I11c, I12, I13, I14, I15; S1, S1a, S1c, S1d, S2, S2b, S4, S11, S15, S16, S19, S20; C1, C2, C3, C4; M0, M1, M2, M3, M4, M5, M6, M7, M8, M9
+Ledger: G1, G2, G3, G3a, G4, G5, G6, G7, G8, G8a, G8b, G8c, G8d, G9, G10, G11, G12; A1, A1a, A2, A3, A3a, A3b, A4, A5, A5a, A6, A7, A8, A8a, A9, A9a, A10, A11, A11a, A12, A13, A13a, A14, A15, A16, A16a, A16b, A17, A17a, A18, A19, A20, A21; I1, I2, I3, I4, I4a, I4b, I4c, I4d, I5, I6, I7, I8, I8a, I9, I10, I10a, I11, I11a, I11b, I11c, I12, I13, I14, I15; S1, S1a, S1c, S1d, S2, S2b, S4, S11, S15, S16, S19, S20; C1, C2, C3, C4; M0, M1, M2, M3, M4, M5, M6, M7, M8, M9
 
 ## What Mirror is
 

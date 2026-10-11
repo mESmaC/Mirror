@@ -36,7 +36,7 @@ In VMware the pointer is not grabbed: Mirror's cursor follows the host pointer i
 - `mouse.rs`: `State` gains a doorbell mode, set by `vmmouse::init`, in which `State::accept` (`mouse.rs:154-182`) drains. The ring holds `PositionEvent { x: u16, y: u16, buttons: u8 }` beside `MouseEvent`; `ps2::InputEvent` (`ps2.rs:157-162`) gains `Position`.
 - Kernel console (`main.rs:546-562`): new `Pointer::place(x, y, buttons)` maps to framebuffer pixels and shares click arming with `apply` (`pointer.rs:42-62`). `MIRROR_POINTER_UPDATED` (`main.rs:601-610`) is unchanged.
 - `input::Session::new` (`input.rs:20-33`) takes the framebuffer width and height and the desktop rectangle in framebuffer pixels, from `surface::Session::desktop` in `run_desktop` and `run_shell` (`userspace.rs:1228-1229`, `:2032-2033`); `encode` (`input.rs:54-104`) emits kind 4.
-- Desktop: `decode_event` (`userspace/desktop/src/main.rs:95-134`) accepts kind 4 and rejects nonzero words 3-5 and out-of-surface positions. The shell (`shell.rs:401-421`) and Scratchpad (`ui.rs:245-262`) set the position directly and keep click arming. App pointer records are unchanged.
+- Desktop: `decode_event` (`userspace/desktop/src/main.rs:95-134`) accepts kind 4 and rejects nonzero words 3-5 and out-of-surface positions. The shell (`shell.rs:468-488`) and Scratchpad (`ui.rs:255-272`) set the position directly and keep click arming. App pointer records are unchanged.
 - Smoke fault (boot-smoke only, S7a): `mirror.test=vmmouse-error` (`SmokeMode::VmmouseError`). After READY, init reads DATA from the empty queue, which QEMU answers by disabling the device, then runs one drain as a doorbell would.
 
 **Scripts** (on 0014's profiles)
