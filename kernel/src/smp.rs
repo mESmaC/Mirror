@@ -13,7 +13,7 @@ use crate::{
     fpu, interrupts,
     memory::{FrameAllocator, PAGE_SIZE},
     paging::{self, PageTables},
-    serial, timer,
+    serial, stacks, timer,
 };
 use core::{
     arch::{asm, x86_64::__cpuid},
@@ -341,53 +341,26 @@ fn allocate_stacks(
     tables: &mut PageTables,
     frames: &mut FrameAllocator<'_>,
 ) -> Result<(), &'static str> {
-    let mut mapped = 0;
-    let result = (|| {
-        for slot in 1..count {
-            for guard in [stack_bottom(slot) - PAGE_SIZE, stack_top(slot)] {
-                if tables
-                    .translate(guard)
-                    .map_err(|_| "stack_guard_invalid")?
-                    .is_some()
-                {
-                    return Err("stack_guard_mapped");
+    for slot in 1..count {
+        // SAFETY: The BSP runs with IF=0 on the active root and owns the
+        // allocator. No AP was released and the root is not yet published, so
+        // kernel mappings are unsealed. Only this slot uses its arena range.
+        match unsafe { stacks::map_guarded(tables, frames, stack_bottom(slot), STACK_PAGES) } {
+            Ok(top) => assert_eq!(top, stack_top(slot), "AP stack layout"),
+            Err(reason) => {
+                // map_guarded already rolled back its own pages.
+                for mapped in 1..slot {
+                    // SAFETY: Same BSP ownership. This slot's stack was mapped
+                    // above and no AP was released to run on it.
+                    unsafe {
+                        stacks::unmap_guarded(tables, frames, stack_bottom(mapped), STACK_PAGES)
+                    };
                 }
-            }
-            for page in 0..STACK_PAGES {
-                let physical = frames.allocate().ok_or("stack_out_of_frames")?;
-                let address = stack_bottom(slot) + page as u64 * PAGE_SIZE;
-                // SAFETY: BSP owns the fresh frame, inactive stack range and
-                // allocator. This happens before any root/AP publication.
-                if unsafe { tables.map_page(address, physical, frames) }.is_err() {
-                    // SAFETY: Failed leaf insertion never transfers frame ownership.
-                    unsafe { frames.deallocate(physical) }.expect("unused AP stack frame");
-                    return Err("stack_mapping_failed");
-                }
-                mapped += 1;
-                // SAFETY: Full exclusively owned page, newly mapped writable.
-                unsafe {
-                    (address as *mut u8).write_bytes(0, PAGE_SIZE as usize);
-                }
-            }
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        for page in 0..mapped {
-            let address =
-                stack_bottom(page / STACK_PAGES + 1) + (page % STACK_PAGES) as u64 * PAGE_SIZE;
-            // SAFETY: No AP was released; only successful new leaves are removed.
-            unsafe {
-                let physical = tables
-                    .unmap_page(address)
-                    .expect("AP stack rollback mapping");
-                frames
-                    .deallocate(physical)
-                    .expect("AP stack rollback frame");
+                return Err(reason);
             }
         }
     }
-    result
+    Ok(())
 }
 
 unsafe extern "C" fn secondary_entry(cpu: &Cpu) -> ! {

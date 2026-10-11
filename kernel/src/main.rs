@@ -32,6 +32,7 @@ mod pointer;
 mod ps2;
 mod serial;
 mod smp;
+mod stacks;
 mod surface;
 mod timer;
 mod usb;
@@ -211,6 +212,9 @@ pub extern "C" fn _start() -> ! {
         interrupts::self_test();
         // SAFETY: This is the active, exclusively owned hierarchy and allocator.
         unsafe { paging::self_test(&mut tables, &mut frames) };
+        // SAFETY: Same exclusive hierarchy and allocator, before sealing. The
+        // paging test has run and nothing else uses the scratch pages.
+        unsafe { stacks::self_test(&mut tables, &mut frames) };
         heap::self_test();
         timer::self_test();
         clock::self_test();
