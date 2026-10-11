@@ -118,6 +118,14 @@ mirror_exception_common:
     wrmsr
     # Rust requires DF=0. IRET restores the interrupted RFLAGS, including DF.
     cld
+    # With SMAP on, Rust also runs with AC=0, or an entry from CPL3 with AC set
+    # would let the kernel touch user pages. IRET restores AC too. The BSP sets
+    # this byte before any CPU enables SMAP, and only when its CPUID reports
+    # SMAP, where CLAC is defined (hardening.rs). No code is patched.
+    cmp byte ptr [rip + MIRROR_SMAP_ACTIVE], 0
+    je 2f
+    clac
+2:
     mov rdi, rsp
     # R12 is callee-saved and its interrupted value is already on the stack.
     # Keep the exact frame address while independently aligning the call.

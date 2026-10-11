@@ -1,11 +1,13 @@
 //! Per-CPU supervisor protections (spec 0016b).
 //!
-//! Every CPU enables SMEP and UMIP exactly where its CPUID reports them and
-//! forces EFER.SCE off, so a user `syscall` raises #UD until the SYSCALL entry
-//! programs its MSRs (0016-D1 to D3). SMAP is detected here but stays off until
-//! the common exception entry clears RFLAGS.AC. Each setting is verified by
-//! reading the register back. An AP whose CPUID set differs from the BSP's fails
-//! startup.
+//! Every CPU enables SMEP, SMAP and UMIP exactly where its CPUID reports them
+//! and forces EFER.SCE off, so a user `syscall` raises #UD until the SYSCALL
+//! entry programs its MSRs (0016-D1 to D3). While SMAP is on, the kernel runs
+//! with RFLAGS.AC clear: each CPU clears AC before enabling SMAP, the common
+//! exception entry executes CLAC once the BSP has set `MIRROR_SMAP_ACTIVE`, and
+//! the kernel continuation after a user return starts with AC clear. Each
+//! setting is verified by reading the register back. An AP whose CPUID set
+//! differs from the BSP's fails startup.
 //!
 //! CR4 and EFER: Intel SDM vol. 3A, sections 2.5 and 2.2.1; SMEP and SMAP:
 //! section 4.6; CPUID leaf 7: vol. 2A, CPUID.
@@ -17,7 +19,7 @@ use core::arch::{
     asm,
     x86_64::{__cpuid, __cpuid_count},
 };
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::{arch, interrupts, serial};
 
@@ -26,6 +28,7 @@ const CR4_SMEP: u64 = 1 << 20;
 const CR4_SMAP: u64 = 1 << 21;
 const EFER: u32 = 0xc000_0080;
 const EFER_SCE: u64 = 1 << 0;
+const RFLAGS_AC: u64 = 1 << 18;
 const CPUID_7_EBX_SMEP: u32 = 1 << 7;
 const CPUID_7_EBX_SMAP: u32 = 1 << 20;
 const CPUID_7_ECX_UMIP: u32 = 1 << 2;
@@ -34,6 +37,14 @@ const CPUID_7_ECX_UMIP: u32 = 1 << 2;
 /// hold its `Controls`.
 const PUBLISHED: u8 = 1 << 7;
 static BSP_CONTROLS: AtomicU8 = AtomicU8::new(0);
+
+/// Read by `mirror_exception_common` (interrupts.S), which executes CLAC on
+/// every entry while it is set. Only the BSP sets it, in `init`, before any CPU
+/// enables SMAP and only when its own CPUID reports SMAP, where CLAC is
+/// defined. A CPU enables SMAP only while it is set, and an AP whose SMAP
+/// support differs from the BSP's fails startup (0016-D1). No code is patched.
+#[unsafe(no_mangle)]
+static MIRROR_SMAP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// The protections one CPU's CPUID reports.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -57,12 +68,15 @@ impl Controls {
         }
     }
 
-    /// The CR4 bits this CPU enables. SMAP stays clear until the common
-    /// exception entry clears AC.
-    fn enabled_cr4(self) -> u64 {
+    /// The CR4 bits this CPU enables. SMAP also needs the entry stub's CLAC,
+    /// which `smap_active` reports.
+    fn enabled_cr4(self, smap_active: bool) -> u64 {
         let mut bits = 0;
         if self.smep {
             bits |= CR4_SMEP;
+        }
+        if self.smap && smap_active {
+            bits |= CR4_SMAP;
         }
         if self.umip {
             bits |= CR4_UMIP;
@@ -92,6 +106,8 @@ pub(crate) fn init() {
         0,
         "CPU controls already configured"
     );
+    // From here on every entry clears AC, before any CPU enables SMAP.
+    MIRROR_SMAP_ACTIVE.store(Controls::detect().smap, Ordering::SeqCst);
     let controls = configure_current().expect("CPU control setup failed");
     BSP_CONTROLS.store(controls.bits() | PUBLISHED, Ordering::Release);
 }
@@ -102,11 +118,12 @@ pub(crate) fn bsp_controls() -> Option<Controls> {
     (bits & PUBLISHED != 0).then(|| Controls::from_bits(bits))
 }
 
-/// Configure only the executing CPU: set CR4.SMEP and CR4.UMIP exactly where
-/// CPUID reports them, keep CR4.SMAP clear and clear EFER.SCE, then read both
-/// registers back. Every other bit keeps its value. Returns the CPUID set.
-/// Failures are returned without logging, so an AP can call this before its
-/// own stacks are mapped.
+/// Configure only the executing CPU: set CR4.SMEP, CR4.SMAP and CR4.UMIP
+/// exactly where CPUID reports them and clear EFER.SCE, then read CR4 and EFER
+/// back. SMAP is set only while `MIRROR_SMAP_ACTIVE` is, after clearing AC, and
+/// AC is read back too. Every other bit keeps its value. Returns the CPUID
+/// set. Failures are returned without logging, so an AP can call this before
+/// its own stacks are mapped.
 pub(crate) fn configure_current() -> Result<Controls, &'static str> {
     if !interrupts::is_initialized() {
         return Err("CPU controls require the IDT");
@@ -115,20 +132,32 @@ pub(crate) fn configure_current() -> Result<Controls, &'static str> {
         return Err("CPU controls require IF=0");
     }
     let controls = Controls::detect();
+    let smap = controls.smap && MIRROR_SMAP_ACTIVE.load(Ordering::Acquire);
+    if smap {
+        // SAFETY: CPL0, and CPUID reports SMAP, so CLAC is defined whatever
+        // CR4 holds. It changes only RFLAGS.AC, which compiled code never
+        // relies on.
+        unsafe { asm!("clac", options(nomem, nostack)) };
+    }
     let cr4 = read_cr4();
-    let expected = (cr4 & !(CR4_SMEP | CR4_SMAP | CR4_UMIP)) | controls.enabled_cr4();
+    let expected = (cr4 & !(CR4_SMEP | CR4_SMAP | CR4_UMIP)) | controls.enabled_cr4(smap);
     if expected != cr4 {
         // SAFETY: CPL0 with IF clear. CPUID reports each bit being set, so the
         // write cannot fault, and clearing an unreported bit writes the zero it
         // must already hold. Every other bit keeps the value just read. SMEP
-        // only stops supervisor instruction fetches from user pages, and UMIP
-        // only affects CPL3. Kernel code never runs from a user page: Limine's
-        // root, which the BSP and an AP may still be using, and Mirror's
-        // roots map the kernel supervisor-only.
+        // and SMAP only stop supervisor instruction fetches from, and data
+        // accesses with AC clear to, user pages, and UMIP only affects CPL3.
+        // The kernel neither runs from nor touches a user page through its
+        // user address: Limine's root, which the BSP and an AP may still be
+        // using, and Mirror's roots map the kernel supervisor-only, and user
+        // memory is reached through the direct map after a page walk.
         unsafe { asm!("mov cr4, {}", in(reg) expected, options(nostack, preserves_flags)) };
     }
     if read_cr4() != expected {
         return Err("CPU retained unexpected CR4 protections");
+    }
+    if smap && alignment_check_set() {
+        return Err("CPU kept RFLAGS.AC set with SMAP on");
     }
 
     let efer = read_efer();
@@ -164,6 +193,13 @@ pub(crate) fn report(cpu: usize, cr4: u64, efer: u64, controls: Controls) {
         u8::from(controls.smap),
         u8::from(controls.umip)
     );
+}
+
+fn alignment_check_set() -> bool {
+    let flags: u64;
+    // SAFETY: PUSHFQ/POP are balanced on the current, mapped stack.
+    unsafe { asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags)) };
+    flags & RFLAGS_AC != 0
 }
 
 pub(crate) fn read_cr4() -> u64 {

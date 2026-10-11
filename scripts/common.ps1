@@ -447,11 +447,10 @@ function Assert-MirrorHardening {
     # Spec 0016b. After SMP startup every flavor prints one MIRROR_CPU_HARDENING
     # line per online CPU in slot order, the BSP first, all with EFER.SCE clear.
     # smep, smap and umip must equal CR4 bits 20, 21 and 11, recomputed here
-    # from cr4. Each CPU sets SMEP and UMIP exactly where its CPUID reports
-    # them. SMAP stays clear until the common exception entry clears AC. An AP
-    # whose CPUID set differs from the BSP's fails startup, so every line
-    # reports the same set. QEMU's max model reports SMEP and SMAP and qemu64
-    # reports neither, as $SmepSmap says.
+    # from cr4. Each CPU sets SMEP, SMAP and UMIP exactly where its CPUID
+    # reports them. An AP whose CPUID set differs from the BSP's fails startup,
+    # so every line reports the same set. QEMU's max model reports SMEP and
+    # SMAP and qemu64 reports neither, as $SmepSmap says.
     $records = [regex]::Matches($Serial, '(?m)^MIRROR_CPU_HARDENING cpu=(\d+) cr4=(0x[0-9a-f]+) smep=([01]) smap=([01]) umip=([01]) sce=0 cpuid_smep=([01]) cpuid_smap=([01]) cpuid_umip=([01])\r?$')
     if ($records.Count -ne $OnlineCpus -or [regex]::Matches($Serial, '(?m)^MIRROR_CPU_HARDENING(?:\s|$)').Count -ne $OnlineCpus) {
         throw "Mirror must report CPU protections with EFER.SCE clear for exactly $OnlineCpus online CPU(s)."
@@ -472,9 +471,10 @@ function Assert-MirrorHardening {
                 throw "CPU $cpu reported a protection that its CR4 value does not hold."
             }
         }
-        if ($record.Groups[3].Value -ne $record.Groups[6].Value -or $record.Groups[4].Value -ne '0' -or
-            $record.Groups[5].Value -ne $record.Groups[8].Value) {
-            throw "CPU $cpu must set SMEP and UMIP exactly where CPUID reports them, and keep SMAP clear."
+        foreach ($group in 3..5) {
+            if ($record.Groups[$group].Value -ne $record.Groups[$group + 3].Value) {
+                throw "CPU $cpu must set SMEP, SMAP and UMIP exactly where CPUID reports them."
+            }
         }
         foreach ($group in 6..8) {
             if ($record.Groups[$group].Value -ne $records[0].Groups[$group].Value) {
