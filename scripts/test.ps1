@@ -29,13 +29,14 @@ function Assert-MirrorKernelImage {
     $image = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes((Join-Path $repositoryRoot 'build/esp/kernel.elf')))
     if ($Flavor -eq 'Default') {
         # MIRROR_PERF_ strings (spec 0019) are allowed under 0010-D4's exception.
-        # Every flavor reports its guarded stacks and CPU protections; only
-        # smoke kernels probe the NMI and #MC IST stacks (specs 0016a, 0016b).
-        $required = @('MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING')
+        # Every flavor reports its guarded stacks, CPU protections and
+        # speculative-execution exposure; only smoke kernels probe the NMI and
+        # #MC IST stacks (specs 0016a, 0016b).
+        $required = @('MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN')
         $forbidden = @('MIRROR_IST_OK', 'MIRROR_TRACE_ON', 'MIRROR_CONSOLE_COMMAND operation=', 'MIRROR_POINTER_UPDATED', 'MIRROR_POINTER_CLICK', 'MIRROR_SHELL_FRAME', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'Mirror shell: ready', 'MIRROR_USERSPACE_OK', 'Mirror init: VM checks passed', 'fixture data mismatch', 'unexpected budget exhaustion')
     }
     else {
-        $required = @('MIRROR_TRACE_ON', 'MIRROR_SHELL_FRAME', 'MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING')
+        $required = @('MIRROR_TRACE_ON', 'MIRROR_SHELL_FRAME', 'MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN')
         $forbidden = @('MIRROR_USERSPACE_OK', 'fixture data mismatch', 'MIRROR_IST_OK')
     }
     foreach ($text in $required) {

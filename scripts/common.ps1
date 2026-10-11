@@ -487,6 +487,47 @@ function Assert-MirrorHardening {
     }
 }
 
+function Assert-MirrorCpuVulnerability {
+    param([Parameter(Mandatory = $true)][string]$Serial)
+
+    # Spec 0016b. Every flavor prints one MIRROR_CPU_VULN line for the BSP after
+    # the per-CPU protection reports, and applies no mitigation (0016-D5). The
+    # verdicts are recomputed here from the vendor and arch_caps: AMD is not
+    # affected by Meltdown or MDS, Intel without IA32_ARCH_CAPABILITIES is
+    # affected by both, and any other vendor is unknown. Intel with the MSR
+    # depends on its RDCL_NO and MDS_NO bits, which the line does not carry, so
+    # only a known verdict is required there. QEMU's qemu64 and max models both
+    # identify as AuthenticAMD, set the CPUID hypervisor bit and do not report
+    # IA32_ARCH_CAPABILITIES.
+    $records = [regex]::Matches($Serial, '(?m)^MIRROR_CPU_VULN vendor=(intel|amd|other) hypervisor=([01]) arch_caps=([01]) meltdown=(affected|not_affected|unknown) mds=(affected|not_affected|unknown) mitigation=none\r?$')
+    if ($records.Count -ne 1 -or [regex]::Matches($Serial, '(?m)^MIRROR_CPU_VULN(?:\s|$)').Count -ne 1) {
+        throw 'Mirror must report its speculative-execution exposure exactly once, with no mitigation.'
+    }
+    $record = $records[0]
+    $protections = [regex]::Matches($Serial, '(?m)^MIRROR_CPU_HARDENING(?:\s|$)')
+    if ($protections.Count -eq 0 -or $record.Index -le $protections[$protections.Count - 1].Index) {
+        throw 'The speculative-execution report must follow the per-CPU protection reports.'
+    }
+    $vendor = $record.Groups[1].Value
+    $verdicts = @($record.Groups[4].Value, $record.Groups[5].Value)
+    $expected = switch ($vendor) {
+        'amd' { @('not_affected', 'not_affected') }
+        'other' { @('unknown', 'unknown') }
+        default { if ($record.Groups[3].Value -eq '0') { @('affected', 'affected') } else { $null } }
+    }
+    if ($null -ne $expected) {
+        if ($verdicts[0] -ne $expected[0] -or $verdicts[1] -ne $expected[1]) {
+            throw "vendor=$vendor arch_caps=$($record.Groups[3].Value) must report meltdown=$($expected[0]) mds=$($expected[1])."
+        }
+    }
+    elseif ($verdicts -contains 'unknown') {
+        throw 'An Intel CPU with IA32_ARCH_CAPABILITIES must report a known Meltdown and MDS verdict.'
+    }
+    if ($vendor -ne 'amd' -or $record.Groups[2].Value -ne '1' -or $record.Groups[3].Value -ne '0') {
+        throw "QEMU's CPU models must report vendor=amd hypervisor=1 arch_caps=0."
+    }
+}
+
 function Assert-MirrorClock {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,

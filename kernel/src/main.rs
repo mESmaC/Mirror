@@ -346,10 +346,12 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
     unsafe { tables.prepare_shared_window(&mut frames) }.expect("shared kernel window");
     smp::init(&boot, topology.as_ref(), &mut tables, &mut frames);
     // Every flavor reports each online CPU's stacks, then the BSP region,
-    // then each online CPU's protections.
+    // then each online CPU's protections and the BSP's speculative-execution
+    // exposure.
     smp::report_stacks();
     stacks::report(&tables);
     smp::report_hardening();
+    hardening::report_vulnerabilities();
     kernel_vm::init(&tables, &mut frames, boot.direct_map_offset);
     #[cfg(feature = "boot-smoke")]
     kernel_vm::heap_window_self_test(&tables, &mut frames, boot.direct_map_offset);
