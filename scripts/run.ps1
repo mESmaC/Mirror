@@ -548,6 +548,9 @@ try {
     # Every online CPU reports its guarded stacks; -LegacyPic keeps the APs
     # offline, so only the BSP reports (spec 0016a).
     $rsp0Guard = Assert-MirrorStacks -Serial $serial -OnlineCpus $(if ($LegacyPic) { 1 } else { $CpuCount }) -Smoke $true
+    # Every online CPU also reports its protections (spec 0016b). QEMU's max
+    # model reports SMEP and SMAP; qemu64 reports neither.
+    Assert-MirrorHardening -Serial $serial -OnlineCpus $(if ($LegacyPic) { 1 } else { $CpuCount }) -SmepSmap ([bool]$ExtendedCpu)
     Assert-MirrorHeapGrowth -Serial $serial -RequestedCpus $CpuCount -Smoke $true -UseLegacyPic ([bool]$LegacyPic)
     Assert-MirrorDriverCatalog -Serial $serial -Smoke $true -LegacyDisk ($DeviceProfile -eq 'LegacyVirtio' -and -not $NoTestDisk) -XhciAttached ([bool]$Xhci)
     if ($CrowdedPci) {

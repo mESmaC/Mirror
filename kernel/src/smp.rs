@@ -10,7 +10,7 @@
 use crate::{
     apic, arch,
     boot::BootInfo,
-    fpu, interrupts,
+    fpu, hardening, interrupts,
     memory::{FrameAllocator, PAGE_SIZE},
     paging::{self, PageTables},
     serial, stacks, timer,
@@ -19,7 +19,7 @@ use core::{
     arch::{asm, x86_64::__cpuid},
     cell::UnsafeCell,
     marker::PhantomData,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 use limine::mp::{Cpu, ResponseFlags};
 use mirror_acpi::Topology;
@@ -56,10 +56,13 @@ struct Slot {
     stack_top: AtomicU64,
     actual_stack: AtomicU64,
     actual_root: AtomicU64,
-    // CR4 as the AP saw it once its descriptors, FPU controls and root were
-    // installed, and its own CPUID MCE bit, for the BSP's per-CPU report.
+    // CR4 and EFER as the AP saw them once its descriptors, FPU controls, CPU
+    // protections and root were installed, and its own CPUID MCE bit and
+    // protection set (hardening::Controls), for the BSP's per-CPU reports.
     actual_cr4: AtomicU64,
+    actual_efer: AtomicU64,
     cpuid_mce: AtomicBool,
+    controls: AtomicU8,
     command: AtomicU64,
     operation: AtomicU32,
     argument: AtomicU64,
@@ -83,7 +86,9 @@ impl Slot {
             actual_stack: AtomicU64::new(0),
             actual_root: AtomicU64::new(0),
             actual_cr4: AtomicU64::new(0),
+            actual_efer: AtomicU64::new(0),
             cpuid_mce: AtomicBool::new(false),
+            controls: AtomicU8::new(0),
             command: AtomicU64::new(0),
             operation: AtomicU32::new(0),
             argument: AtomicU64::new(0),
@@ -333,6 +338,27 @@ pub fn report_stacks() {
     }
 }
 
+/// After startup, report every online CPU's protections, the BSP first, as
+/// `MIRROR_CPU_HARDENING`. The BSP reads its own CR4 and EFER; an AP's come
+/// from its slot, with the CPUID set it recorded.
+pub fn report_hardening() {
+    assert!(!arch::interrupts_enabled() && !is_secondary());
+    let bsp = hardening::bsp_controls().expect("BSP CPU controls");
+    hardening::report(0, hardening::read_cr4(), hardening::read_efer(), bsp);
+    // COUNT stays 0 when SMP was skipped, so only the BSP reports.
+    let count = COUNT.load(Ordering::Relaxed);
+    for (index, slot) in SLOTS.iter().enumerate().take(count).skip(1) {
+        if slot.state.load(Ordering::Acquire) == ONLINE {
+            hardening::report(
+                index,
+                slot.actual_cr4.load(Ordering::Relaxed),
+                slot.actual_efer.load(Ordering::Relaxed),
+                hardening::Controls::from_bits(slot.controls.load(Ordering::Relaxed)),
+            );
+        }
+    }
+}
+
 fn prepare(
     boot: &BootInfo,
     topology: Option<&Topology>,
@@ -462,6 +488,16 @@ unsafe extern "C" fn secondary_entry(cpu: &Cpu) -> ! {
     if fpu::init_secondary().is_err() {
         fail(index, 3);
     }
+    // Still on Limine's stack and root, whose kernel mappings are
+    // supervisor-only, so SMEP and UMIP change nothing here. Every CPU must
+    // report the BSP's protections (0016-D1).
+    let Ok(controls) = hardening::configure_current() else {
+        fail(index, 11);
+    };
+    if hardening::bsp_controls() != Some(controls) {
+        fail(index, 12);
+    }
+    slot.controls.store(controls.bits(), Ordering::Relaxed);
     // SAFETY: The BSP published the retained root and matching PAT. Descriptors
     // are installed, IF=0, and Limine's stack survives the copied bootstrap map.
     if unsafe {
@@ -491,6 +527,7 @@ extern "C" fn secondary_main(index: usize) -> ! {
         asm!("mov {}, cr3", out(reg) root, options(nomem, nostack, preserves_flags));
         asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
     }
+    let efer = hardening::read_efer();
     if !(stack_bottom(index)..stack_top(index)).contains(&stack)
         || root != ROOT.load(Ordering::Relaxed)
     {
@@ -508,6 +545,7 @@ extern "C" fn secondary_main(index: usize) -> ! {
     slot.actual_stack.store(stack, Ordering::Relaxed);
     slot.actual_root.store(root, Ordering::Relaxed);
     slot.actual_cr4.store(cr4, Ordering::Relaxed);
+    slot.actual_efer.store(efer, Ordering::Relaxed);
     slot.cpuid_mce
         .store(interrupts::cpuid_mce(), Ordering::Relaxed);
     // Cancellation is terminal: a late AP may never resurrect an offline slot.

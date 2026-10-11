@@ -437,6 +437,56 @@ function Assert-MirrorStacks {
     return $guard
 }
 
+function Assert-MirrorHardening {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [Parameter(Mandatory = $true)][int]$OnlineCpus,
+        [Parameter(Mandatory = $true)][bool]$SmepSmap
+    )
+
+    # Spec 0016b. After SMP startup every flavor prints one MIRROR_CPU_HARDENING
+    # line per online CPU in slot order, the BSP first, all with EFER.SCE clear.
+    # smep, smap and umip must equal CR4 bits 20, 21 and 11, recomputed here
+    # from cr4. Each CPU sets SMEP and UMIP exactly where its CPUID reports
+    # them. SMAP stays clear until the common exception entry clears AC. An AP
+    # whose CPUID set differs from the BSP's fails startup, so every line
+    # reports the same set. QEMU's max model reports SMEP and SMAP and qemu64
+    # reports neither, as $SmepSmap says.
+    $records = [regex]::Matches($Serial, '(?m)^MIRROR_CPU_HARDENING cpu=(\d+) cr4=(0x[0-9a-f]+) smep=([01]) smap=([01]) umip=([01]) sce=0 cpuid_smep=([01]) cpuid_smap=([01]) cpuid_umip=([01])\r?$')
+    if ($records.Count -ne $OnlineCpus -or [regex]::Matches($Serial, '(?m)^MIRROR_CPU_HARDENING(?:\s|$)').Count -ne $OnlineCpus) {
+        throw "Mirror must report CPU protections with EFER.SCE clear for exactly $OnlineCpus online CPU(s)."
+    }
+    $startup = [regex]::Matches($Serial, '(?m)^MIRROR_SMP_(?:READY|SKIPPED)(?:\s|$)')
+    if ($startup.Count -ne 1 -or $records[0].Index -le $startup[0].Index) {
+        throw 'The per-CPU protection reports must follow SMP startup.'
+    }
+    $expected = if ($SmepSmap) { '1' } else { '0' }
+    for ($cpu = 0; $cpu -lt $OnlineCpus; $cpu++) {
+        $record = $records[$cpu]
+        if ([int]$record.Groups[1].Value -ne $cpu) {
+            throw 'The per-CPU protection reports must list cpu=0..N-1 in order.'
+        }
+        $cr4 = [Convert]::ToUInt64($record.Groups[2].Value.Substring(2), 16)
+        foreach ($field in @(@{ Group = 3; Bit = 20 }, @{ Group = 4; Bit = 21 }, @{ Group = 5; Bit = 11 })) {
+            if ($record.Groups[$field.Group].Value -ne [string](($cr4 -shr $field.Bit) -band 1)) {
+                throw "CPU $cpu reported a protection that its CR4 value does not hold."
+            }
+        }
+        if ($record.Groups[3].Value -ne $record.Groups[6].Value -or $record.Groups[4].Value -ne '0' -or
+            $record.Groups[5].Value -ne $record.Groups[8].Value) {
+            throw "CPU $cpu must set SMEP and UMIP exactly where CPUID reports them, and keep SMAP clear."
+        }
+        foreach ($group in 6..8) {
+            if ($record.Groups[$group].Value -ne $records[0].Groups[$group].Value) {
+                throw "CPU $cpu reported CPUID protections that differ from the BSP's."
+            }
+        }
+        if ($record.Groups[6].Value -ne $expected -or $record.Groups[7].Value -ne $expected) {
+            throw "CPU $cpu must report cpuid_smep=$expected cpuid_smap=$expected on this CPU model."
+        }
+    }
+}
+
 function Assert-MirrorClock {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,

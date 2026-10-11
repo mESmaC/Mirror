@@ -18,6 +18,7 @@ mod drivers;
 mod elf;
 mod fpu;
 mod framebuffer;
+mod hardening;
 mod heap;
 mod input;
 mod interrupts;
@@ -58,6 +59,7 @@ pub extern "C" fn _start() -> ! {
     serial::println!("MIRROR_TRACE_ON");
     interrupts::init();
     fpu::init();
+    hardening::init();
     interrupts::tls_ready();
     #[cfg(feature = "boot-smoke")]
     fpu::self_test();
@@ -343,9 +345,11 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
     // user root has been released. Runtime leaf changes keep these tables pinned.
     unsafe { tables.prepare_shared_window(&mut frames) }.expect("shared kernel window");
     smp::init(&boot, topology.as_ref(), &mut tables, &mut frames);
-    // Every flavor reports each online CPU's stacks, then the BSP region.
+    // Every flavor reports each online CPU's stacks, then the BSP region,
+    // then each online CPU's protections.
     smp::report_stacks();
     stacks::report(&tables);
+    smp::report_hardening();
     kernel_vm::init(&tables, &mut frames, boot.direct_map_offset);
     #[cfg(feature = "boot-smoke")]
     kernel_vm::heap_window_self_test(&tables, &mut frames, boot.direct_map_offset);

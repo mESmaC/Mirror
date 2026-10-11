@@ -75,6 +75,8 @@ function Assert-MirrorCaptureSmp {
     Assert-MirrorUsbMarkers -Serial $Serial -Attached $false -Smoke $false
     # Trace and default kernels report every CPU's guarded stacks too (spec 0016a).
     $null = Assert-MirrorStacks -Serial $Serial -OnlineCpus $RequestedCpus -Smoke $false
+    # And every CPU's protections (spec 0016b); qemu64 reports neither SMEP nor SMAP.
+    Assert-MirrorHardening -Serial $Serial -OnlineCpus $RequestedCpus -SmepSmap $false
     if ($Serial -match '(?m)^MIRROR_(?:SMP_SKIPPED|SMP_CPU_FAILED|SMP_GUARD_OK|SMP_UNMAP_OK|SMP_TLB_TIMEOUT_ARMED|SHARED_TIMEOUT_\w+|SHARED_VM_SKIPPED|SHARED_OFFLINE_OK)(?:\s|$)') {
         throw 'Normal capture skipped SMP, lost a CPU, or ran an injected guard fault.'
     }
