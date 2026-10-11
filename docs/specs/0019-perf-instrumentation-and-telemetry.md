@@ -51,7 +51,7 @@ item       = "boot" / "1" / "flip" / "telemetry" / "agent"
 ### Line format
 
 - Each line is `MIRROR_PERF_<FAMILY>` followed by space-separated `name=value` fields. A value is a decimal `u64`, `none`, or an identifier this spec names, compiled into the kernel. Lines that can follow user input (`INPUT`, `MEM`) hold only decimals and `none` (0010 acceptance 3.6).
-- `ns` is HPET time since `clock::init`, from `clock::snapshot` (`clock.rs:295-316`), or `none` after `MIRROR_CLOCK_SKIPPED`. Every timestamp and every emitter runs on the BSP with IF clear.
+- `ns` is HPET time since `clock::init`, from `clock::snapshot` (`clock.rs:314-335`), or `none` after `MIRROR_CLOCK_SKIPPED`. Every timestamp and every emitter runs on the BSP with IF clear.
 
 | Line | Needs | When |
 | --- | --- | --- |
@@ -68,7 +68,7 @@ item       = "boot" / "1" / "flip" / "telemetry" / "agent"
 
 Each `MIRROR_PERF_T` event prints at most once, in this order. A milestone that never happens is not printed: `clock` without HPET, `display` without a framebuffer, `frame` and `shell_ready` without a shell.
 
-1. `clock ns=0 since_entry_ns=<n|none>`: HPET zero (`clock.rs:228`), printed just before the next milestone, which supplies D5's second TSC/HPET pair. `since_entry_ns` is `none` without a TSC (CPUID.01H:EDX[4]).
+1. `clock ns=0 since_entry_ns=<n|none>`: HPET zero (`clock.rs:247`), printed just before the next milestone, which supplies D5's second TSC/HPET pair. `since_entry_ns` is `none` without a TSC (CPUID.01H:EDX[4]).
 2. `display`: at `MIRROR_FRAMEBUFFER_READY` (`main.rs:164`).
 3. `input`: after PS/2 init and IRQ enabling (`main.rs:257-283`).
 4. `userspace`: the kernel first resumes the shell, or the agent-demo desktop. In default and trace builds this is the first user process (0010-D3).

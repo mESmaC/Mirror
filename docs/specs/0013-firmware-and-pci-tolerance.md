@@ -1,6 +1,14 @@
 # 0013: Firmware and PCI tolerance for VMware
 
-Status: confirmed (2026-10-09; D9 added, D3 and D5 relabeled as general hardening, and the VMware evidence recorded 2026-10-10 after the Workstation Pro 26.0.1 check)
+Status: done (2026-10-11, branch `claude/0013-firmware-pci`: 6145476). All acceptance tests pass. Host tests: mirror-acpi 31, including the D8 fixtures. `scripts/test.ps1` took 15m33s and `-AgentDemo` 20m30s (120 smoke boots each, with `-CrowdedPci`, which failed on the old kernel with `retained=32 omitted=7` and no AHCI). Test 14: 10 boots at 1 vCPU and 10 at 4 in a VM created by Workstation (`vmcli VM Create -c other-64` plus `docs/vm-settings.md`), every expectation met in every boot. Test 16's record is under Open question 1. The Interfaces keep their HEAD 4614249 line numbers. (Confirmed 2026-10-09; D9 added, D3 and D5 relabeled as general hardening, and the VMware evidence recorded 2026-10-10 after the Workstation Pro 26.0.1 check; D10 added 2026-10-11.)
+
+Implementation notes (2026-10-11):
+- D4: a dropped CPU record that reuses a kept CPU's UID or APIC ID still fails with `Duplicate`. Two dropped records are not compared with each other, because neither is used and the check would be quadratic (Cameron, 2026-10-11).
+- D6: `MIRROR_ACPI_TABLE_SKIPPED` reports only an entry whose signature cannot be read. Null and repeated entries are skipped silently, and its `index` is the entry's position among the distinct addresses `addresses()` returns, not its raw RSDT/XSDT slot.
+- D10: the IS error bits are checked after the BSY/DRQ wait, as D10 says, so a fatal IS error with BSY stuck reports after `REQUEST_NS`. Errors seen while CI is still set report at once, as before.
+- `MIRROR_CLOCK_ID_MISMATCH` prints only after the hardware value passes `capabilities`; a rejected HPET shows only its skip reason.
+- `run.ps1` computes `-CrowdedPci`'s expected function count from q35's layout, so a device-profile change updates that formula. `capture.ps1` does not check the new `MIRROR_ACPI_READY` counters; `run.ps1` does, as the Interfaces say.
+- The D8 fixtures are in `crates/acpi/fixtures/vmware-26.0.1/{1vcpu,4vcpu}/` with a `capture.txt` each, and `crates/acpi/fixtures/.gitattributes` marks `*.bin` binary.
 Depends on: 0014, whose `V1` profile and computed boot count the QEMU cases use. 0015a, only for the manual VMware checks (tests 14 and 16) and its VM settings doc. The code and host tests depend on nothing.
 Ledger: G3a, S1, S1a, S10 (related: G3, S1b, P9)
 
@@ -137,6 +145,13 @@ No crates. Tools:
      - places the RSDP, XSDT, MADT and HPET in memory that Limine reports as ACPI reclaimable, ACPI NVS or bootloader reclaimable (acpi.rs:270-273 refuses everything else). Verified on the firmware side: the RSDP, RSDT, XSDT and every table except FACS and OEMD share one EfiACPIReclaimMemory buffer below 4 GiB, and FACS and OEMD are in ACPI NVS. That Limine reports this type as ACPI reclaimable is inferred.
    - VMware's HPET has a 64-bit counter and a period of 1-100 ns. Verified: GCAP_ID 0x0429B17F_8086AF01, which means REV_ID 1, bit 14 clear, 16 timers, a 64-bit counter and a period of 69,841,279 fs (14.31818 MHz). The table has address 0xFED00000, minimum tick 14318, page protection 1 and an all-zero GAS. Its block ID comes from a VMX value and is expected to be 0x8086af01, as an ESXi guest showed. The firmware publishes the table only when the VM has an HPET: new VMs at virtual hardware 8 and later get `hpet0.present = "TRUE"`, but vmware-vmx treats a missing key as FALSE.
    - Firmware leaves each AHCI controller with memory decode on, MSI off, a 32-bit non-prefetchable ABAR and power state D0 (pci.rs:509-511, 516, 537-541). Not settled statically; test 14 and the D8 capture's `lspci -nn -vv` show it.
+
+   Recorded 2026-10-11 (test 16), on Workstation Pro 26.0.1 build 25688693, virtual hardware 22, EFI ROM VMW201.00V.25600138.B64.2607151225, ULM, in a VM created by `vmcli VM Create -c other-64` plus `docs/vm-settings.md`, with `numvcpus` 1 and 4 and `cpuid.coresPerSocket` and `vcpu.hotadd` unset:
+   - No nonzero `MIRROR_ACPI_READY` counter, and no `MIRROR_CLOCK_ID_MISMATCH`.
+   - `MIRROR_APIC_IOAPIC_ID index=0 firmware=1 hardware=0` at 1 vCPU and `firmware=4 hardware=0` at 4. The CPU slot count equals `numvcpus`, so `nmi_unmatched=0`: the 128 slots seen elsewhere need CPU hot-add, which this VM does not enable.
+   - VMware hands off in xAPIC mode (`MIRROR_APIC_READY mode=xapic`), so the x2APIC branch (0055, and RD11 in `roadmap-replan.md`) is not needed.
+   - Every other informational value matches: `ioapics=1`; the HPET at 0xfed00000 with block ID 0x8086af01, a 69,841,279 fs period, 16 timers and a 64-bit counter; `MIRROR_PCI_READY functions=42 bridges=34`, with the AHCI controller at 02:01.0 (15ad:07e0, class 01:06:01) and the NIC at 02:00.0 (8086:100f), both on bus 02.
+   - The D8 capture's config-space dumps, read after Linux bound its drivers, show the AHCI ABAR as 32-bit non-prefetchable at 0xfd850000 and power state D0. Mirror's own boots accepted the firmware's handoff state (`MIRROR_AHCI_READY`).
 
    A finding that contradicts an interrupt-controller assumption (PCAT_COMPAT, x2APIC handoff) goes to 0055. (Amended 2026-10-09: the VirtualBox layouts and the 32-bit VirtualBox HPET risk are dropped with VirtualBox, G3a amended.) (Amended 2026-10-10: the IOAPIC ID finding is the exception. It contradicts the unstated assumption that the register matches the MADT, and Cameron placed the fix here as D9, because every VMware boot depends on it.)
 2. Resolved 2026-10-09 by ledger S10: a time source other than the HPET (calibrated TSC or ACPI PM timer), for VMs or hardware without a usable HPET, belongs to 0055. Until then the reference VMware VM enables the HPET explicitly (0015a, docs/vm-settings.md). Until 0055, a boot without an HPET has no clock for SYS_CLOCK_GET, the AHCI and SMP deadlines, or xHCI device attach (xhci.rs:405-408).

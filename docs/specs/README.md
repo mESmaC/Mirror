@@ -21,7 +21,7 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 **Phase 0: Mirror boots well in VMware**
 - 0015a Disk image: GPT, FAT32 ESP, minimal ext2 root, VMDK, QEMU boot switch, VM settings doc (S5, S2, S1b). Done (2026-10-11)
 - NEW: vmrun lane: headless VMware boot, restart and suspend/resume checks (right after 0015a if confirmed by then, otherwise after 0013)
-- 0013 Firmware and PCI tolerance for VMware: per-slot MADT capacity, the 32-function PCI cap, IOAPIC ID tolerance (0013-D9) and per-entry root-table handling; duplicate-NMI and HPET-descriptor leniency (0013-D3, D5) as general hardening
+- 0013 Firmware and PCI tolerance for VMware: per-slot MADT capacity, the 32-function PCI cap, IOAPIC ID tolerance (0013-D9) and per-entry root-table handling; duplicate-NMI and HPET-descriptor leniency (0013-D3, D5) as general hardening. Done (2026-10-11)
 - Docs-only: the G11 daily VM (12 vCPUs, 20 GB, NAT) in `docs/vm-settings.md` (RD16)
 - 0016a Hardening: guarded boot-CPU stacks, NMI/#MC stacks
 - 0016b Hardening: SMEP/SMAP/UMIP, EFER.SCE, CPU vulnerability reporting (S9)
@@ -30,7 +30,7 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 - 0017c Absolute pointing on VMware: vmmouse protocol (S1a, S1d)
 - 0058a (split): reboot without AML (FADT reset register, then 8042, then 0xCF9, then triple fault) and a console `restart` command
 - 0018 Performance baseline harness: the four gates, measured on Linux and Windows VMs in the host's ULM monitor mode (G7, G7a, O3). Its Linux and Windows baseline track runs in parallel; its Mirror rows follow Phase 4
-- If 0013 shows VMware handing off in x2APIC mode, 0055a moves here (RD11). If 0017c check 7 needs a Tools-running state, 0087a moves here (RD10).
+- 0013 showed VMware handing off in xAPIC mode (2026-10-11), so 0055a stays in Phase 1 (RD11). If 0017c check 7 needs a Tools-running state, 0087a moves here (RD10).
 
 **Phase 1: Kernel core, built once**
 - 0019a (split): perf markers: boot milestones, idle memory, the input-to-present trace and a `burn` perf item (0019 split, Pending item 1 and RD8)
@@ -170,7 +170,7 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 - 0015b Live ISO and its test case (S5, S5a). Moved here on 2026-10-11 (RD1); re-drafted and re-confirmed before this phase
 - 0199 Performance gates and daily-drive checklist; local-inference floors and input latency under inference (G7, G7a, I15)
 
-Execution order (confirmed 2026-10-11): Phase 0 runs 0015a (done), then 0013, then 0016a, 0016b, 0017a, 0017b and 0017c, one at a time, each updating the AGENTS.md lines it changes in the same commit (P9). The vmrun lane, the G11 docs commit and 0058a join Phase 0 once confirmed (RD1, RD16). 0018's baseline track runs in parallel. Later phases run in the order listed, except where a line's own note orders it after a later line (0095 runs after 0098). Done earlier: 0012, 0011, 0014, 0010 and side spec 0029.
+Execution order (confirmed 2026-10-11): Phase 0 runs 0015a (done), then 0013 (done), then 0016a, 0016b, 0017a, 0017b and 0017c, one at a time, each updating the AGENTS.md lines it changes in the same commit (P9). The vmrun lane, the G11 docs commit and 0058a join Phase 0 once confirmed (RD1, RD16). 0018's baseline track runs in parallel. Later phases run in the order listed, except where a line's own note orders it after a later line (0095 runs after 0098). Done earlier: 0012, 0011, 0014, 0010 and side spec 0029.
 
 **Specs the re-plan splits**, with their original scope (split specs keep their decision IDs, rule 1):
 - 0019 Mirror perf instrumentation and telemetry: kernel side of 0018-D9 and device/link telemetry (S7b, C3)

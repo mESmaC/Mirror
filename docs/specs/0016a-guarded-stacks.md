@@ -15,7 +15,7 @@ Serial markers prove each property on every online CPU. This is defence in depth
 ## Non-goals
 - SMEP, SMAP, UMIP, EFER.SCE and the CPU vulnerability report (0016b).
 - Non-fatal NMI handling, which waits for the first feature that needs a CPU to continue after an NMI, such as a watchdog (D4). The panic-time NMI stop of the other CPUs (ledger S17) is implemented in 0051. MCA bank decoding.
-- Catch-all IDT stubs, EOI of unexpected vectors, not blaming user processes for EXT=1 faults (interrupts.rs:901), and LINT1 NMI on the BSP only (APs program LINT1 from the MADT today, apic.rs:570-574). These belong to 0055.
+- Catch-all IDT stubs, EOI of unexpected vectors, not blaming user processes for EXT=1 faults (interrupts.rs:901), and LINT1 NMI on the BSP only (APs program LINT1 from the MADT today, apic.rs:595-599). These belong to 0055.
 - A #DB IST (0021). Per-thread kernel stacks (0050): 0050 allocates them after the root is sealed, when `map_kernel_page` refuses new leaves (paging.rs:606-608), so it needs a shootdown-aware guarded mapping path. `stacks.rs` gives it only the layout rules.
 - Changing Limine's stack request (boot.rs:52). It stays as it is, and its region stays reserved and idle (see Open questions).
 
@@ -55,13 +55,13 @@ Line references are at HEAD 4614249; earlier M0 specs shift some of them. Work o
    - A new fatal mode, `kernel-stack-overflow`, in `SmokeMode` (boot.rs:152-223), handled next to the existing ones (main.rs:393-401). It prints `MIRROR_TEST_EXPECT_FATAL vector=8`, sets RSP to the RSP0 stack top minus 2 KiB, then repeats `sub rsp, 4096` and `mov qword ptr [rsp], 0`. The write that reaches the guard page faults with RSP inside that page, so pushing the #PF frame faults again and the CPU raises #DF on IST1.
 
    Scripts and docs:
-   - run.ps1 gets `-Fault KernelStackOverflow` and adds it to its fatal set (run.ps1:480) with vector 8 and `error=0x0`, which its fatal-diagnostic regex (run.ps1:800-806) already expects. It checks that cr2 lies in the page at `rsp0_guard`. On every smoke boot it checks the `MIRROR_CPU_STACKS` lines, `MIRROR_STACKS_READY` and `MIRROR_IST_OK`.
+   - run.ps1 gets `-Fault KernelStackOverflow` and adds it to its fatal set (run.ps1:490) with vector 8 and `error=0x0`, which its fatal-diagnostic regex (run.ps1:846-852) already expects. It checks that cr2 lies in the page at `rsp0_guard`. On every smoke boot it checks the `MIRROR_CPU_STACKS` lines, `MIRROR_STACKS_READY` and `MIRROR_IST_OK`.
    - test.ps1 adds KernelStackOverflow to the main battery (test.ps1:103).
    - readme.md line 7 says every CPU has guarded stacks.
 
 ## Acceptance tests
 1. `scripts/test.ps1` passes in debug and release with KernelStackOverflow included.
-2. Every smoke boot prints one `MIRROR_CPU_STACKS` line per online CPU, cpu=0..N-1: CpuCount lines on APIC runs, and one line on `-LegacyPic` runs, where SMP is skipped (run.ps1:59-71). Every line shows `ist=3`, and its `mce` equals its `cpuid_mce`.
+2. Every smoke boot prints one `MIRROR_CPU_STACKS` line per online CPU, cpu=0..N-1: CpuCount lines on APIC runs, and one line on `-LegacyPic` runs, where SMP is skipped (run.ps1:60-72). Every line shows `ist=3`, and its `mce` equals its `cpuid_mce`.
 3. Every smoke boot prints `MIRROR_IST_OK nmi=2 mc=3` and exactly one `MIRROR_STACKS_READY` line in the format above.
 4. KernelStackOverflow prints `MIRROR_TEST_EXPECT_FATAL vector=8`, then `MIRROR_EXCEPTION vector=8 error=0x0` with cr2 inside the 4 KiB page at `rsp0_guard`. QEMU exits with 35 (isa-debug-exit value 0x11, arch.rs:141-148), and no `MIRROR_BOOT_OK` appears.
 5. The 2-, 4- and 8-CPU runs bring every AP online with the new slot layout. `MIRROR_SMP_GUARD_OK` and the SmpUnmap and SmpTlbTimeout modes still pass.
