@@ -1,6 +1,13 @@
 # 0016a: Guarded stacks
 
-Status: confirmed (2026-10-09)
+Status: done (2026-10-11, branch `claude/0016a-guarded-stacks`: items 1-5 in 9b0bbcf, 76e2606, 4764c45, 4b6ed35 and 36f4631, review fixes in 533f44a). All acceptance tests pass. `scripts/test.ps1` and `-AgentDemo` each ran 122 smoke boots, KernelStackOverflow included: it gives vector 8 with cr2 0xffffd100000427f8, inside the page at `rsp0_guard`, and exit 35. Every CPU line shows `ist=3 mce=1 cpuid_mce=1` at 1, 2, 4 and 8 CPUs. `nm -S` on the release kernel lists neither removed symbol, and .bss is now 26,232 bytes. Test 7 ran in VMware, in a Workstation-created VM with two boots each at 1 and 4 vCPUs: every boot printed one `MIRROR_CPU_STACKS` line per vCPU with `ist=3 mce=1 cpuid_mce=1`, `MIRROR_STACKS_READY`, and the shell started; the keyboard is 0017b's. The Interfaces keep their HEAD 4614249 line numbers. (Confirmed 2026-10-09.)
+
+Implementation notes (2026-10-11):
+- `map_guarded` is an `unsafe fn`, because its callers own the mapping preconditions. It limits a stack to 64 pages and fails with the new reason `stack_layout_invalid`. `map_set` maps a set of stacks and `map_sets` a run of sets, each rolling back on failure, and `smp::allocate_stacks` uses `map_sets`. A boot-smoke `stacks::self_test` checks bad placements, zeroing, guard refusal and rollback with exact frame counts.
+- The window before `activate_secondary` (item 3): from the IDT load on, only a #DF triple-faults. An NMI or #MC pushes to the unmapped IST2 or IST3 page and raises a #PF, which `secondary_fault` records as vector 14. Item 3's "triple-faults" holds for #DF only.
+- `cpu=` is the slot index; with every AP online it runs 0..N-1. `ist=` is measured, as the number of TSS IST1-3 fields whose readback equals the CPU's guarded tops. The scripts require `cpuid_mce=1` on QEMU's CPU models, stricter than `mce` equal to `cpuid_mce`.
+- `capture.ps1` also checks the stack markers on trace and default boots. `test.ps1`'s image scan requires `MIRROR_CPU_STACKS` and `MIRROR_STACKS_READY` in trace and default kernels and forbids `MIRROR_IST_OK` there.
+- The BSP region packs into 102 pages, and each AP slot takes 36. `MIRROR_FRAME_POOL allocated=` grows by the stack frames; nothing asserts it. `MIRROR_IDT_READY` still prints `double_fault_ist=1`.
 Depends on: 0015a, only for the manual VMware check (it boots the disk image); the code and QEMU tests depend on no other spec. In the M0 order it lands after 0013, so that check runs with 0013's firmware and PCI tolerance in place, and before 0016b.
 Ledger: A9 (supports), G3a (test platforms), S17 (supersedes D4 for the panic path)
 
