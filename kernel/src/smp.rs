@@ -26,8 +26,8 @@ use mirror_acpi::Topology;
 
 const MAX_CPUS: usize = 64;
 const STACK_PAGES: usize = 16;
-const STACK_ARENA: u64 = 0xffff_d100_0000_0000;
-const STACK_STRIDE: u64 = (STACK_PAGES as u64 + 2) * PAGE_SIZE;
+// AP slots follow the BSP region of the stack arena (stacks.rs).
+const STACK_STRIDE: u64 = stacks::span(STACK_PAGES);
 const IPI_VECTOR: u8 = 240;
 const WAIT_TICKS: u64 = 500;
 const ABSENT: u32 = 0;
@@ -184,7 +184,7 @@ fn validate_identities(
 }
 
 fn stack_bottom(slot: usize) -> u64 {
-    STACK_ARENA + (slot - 1) as u64 * STACK_STRIDE + PAGE_SIZE
+    stacks::AP_BASE + (slot - 1) as u64 * STACK_STRIDE + PAGE_SIZE
 }
 fn stack_top(slot: usize) -> u64 {
     stack_bottom(slot) + STACK_PAGES as u64 * PAGE_SIZE
@@ -1197,6 +1197,9 @@ fn self_test() {
         assert!(stack_bottom(index).is_multiple_of(PAGE_SIZE));
         if index > 1 {
             assert_eq!(stack_bottom(index) - stack_top(index - 1), 2 * PAGE_SIZE);
+        } else {
+            // Slot 1's lower guard is the first page after the BSP region.
+            assert_eq!(stack_bottom(index) - PAGE_SIZE, stacks::AP_BASE);
         }
     }
     let state = AtomicU32::new(STARTING);

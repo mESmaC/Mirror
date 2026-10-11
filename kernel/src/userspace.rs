@@ -13,7 +13,7 @@ use crate::{
     ipc::{Ipc, IpcError, MESSAGE_SIZE},
     memory::{FrameAllocator, PAGE_SIZE},
     paging::{PageTables, PagingError, UserAddressSpace, UserPermissions},
-    ps2, serial, surface, timer, vm, windows,
+    ps2, serial, stacks, surface, timer, vm, windows,
 };
 use mirror_clock_protocol as clock_abi;
 use mirror_thread_protocol as thread_abi;
@@ -21,7 +21,6 @@ use mirror_vm_protocol as vm_abi;
 
 const STACK_BASE: u64 = 0x7fff_0000;
 const STACK_TOP: u64 = 0x8000_0000;
-const KERNEL_STACK_SIZE: usize = 64 * 1024;
 const MAX_WRITE: usize = 256;
 #[cfg(feature = "boot-smoke")]
 const CHECKS_PASSED: &[u8] = b"Mirror init: userspace checks passed\n";
@@ -53,10 +52,6 @@ const DESKTOP_CHECKS: &[u8] = b"Mirror desktop: checks passed\n";
 const AGENT_READY: &[u8] = b"Mirror agent: ready\n";
 #[cfg(feature = "test-trace")]
 const AGENT_CHECKS: &[u8] = b"Mirror agent: checks passed\n";
-
-#[repr(C, align(16))]
-struct KernelStack([u8; KERNEL_STACK_SIZE]);
-static mut KERNEL_STACK: KernelStack = KernelStack([0; KERNEL_STACK_SIZE]);
 
 // Only the BSP accesses this slot, with IF=0. It is populated immediately before
 // entry and cleared after the synchronous return; it never owns the context.
@@ -695,9 +690,10 @@ fn run_pair(
             .unwrap()
             .physical
     );
-    let stack_top = (&raw const KERNEL_STACK) as u64 + KERNEL_STACK_SIZE as u64;
+    let stack_top = stacks::bsp_rsp0_top();
     assert!(ACTIVE.load(Ordering::SeqCst).is_null());
-    // SAFETY: Dedicated static upper-half stack, IF=0, no active user process.
+    // SAFETY: The BSP's guarded RSP0 stack is mapped in the shared upper half
+    // of every root. IF=0 and no user process is active.
     unsafe { interrupts::set_kernel_stack(stack_top) };
     let mut cursor = 0;
     let mut last = None;
@@ -1254,8 +1250,8 @@ pub fn run_desktop(
         assert_eq!(processes[0].handles.len(), 5);
         assert_eq!(processes[1].handles.len(), 3);
         assert_eq!(processes[1].boot_handles[3..], [0, 0, 0]);
-        let stack_top = (&raw const KERNEL_STACK) as u64 + KERNEL_STACK_SIZE as u64;
-        // SAFETY: IF=0, no active user, and the dedicated static kernel stack
+        let stack_top = stacks::bsp_rsp0_top();
+        // SAFETY: IF=0, no active user, and the BSP's guarded RSP0 stack
         // remains mapped in the shared upper half of every process root.
         unsafe { interrupts::set_kernel_stack(stack_top) };
 
@@ -2031,8 +2027,9 @@ pub fn run_shell(
     let mut ipc = Ipc::new();
     let mut surface = surface::Session::desktop(display).expect("shell scanout");
     let mut input = input::Session::new(consumer);
-    let stack_top = (&raw const KERNEL_STACK) as u64 + KERNEL_STACK_SIZE as u64;
-    // SAFETY: IF=0, no active users; static stack stays mapped in every root.
+    let stack_top = stacks::bsp_rsp0_top();
+    // SAFETY: IF=0, no active users; the guarded RSP0 stack stays mapped in
+    // every root's shared upper half.
     unsafe { interrupts::set_kernel_stack(stack_top) };
     let mut cursor = 0;
     while !desktop.finished() {

@@ -171,7 +171,9 @@ const _: () = assert!(offset_of!(TrapFrame, ss) == 25 * 8);
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut TSS: TaskStateSegment = TaskStateSegment::EMPTY;
-static mut DOUBLE_FAULT_STACK: ExceptionStack = ExceptionStack([0; DOUBLE_FAULT_STACK_SIZE]);
+// The BSP's IST1-3 share this stack during early boot, until install_bsp_ists
+// moves them to their guarded stacks. Afterwards it stays idle.
+static mut EARLY_IST_STACK: ExceptionStack = ExceptionStack([0; DOUBLE_FAULT_STACK_SIZE]);
 static mut GDT: [u64; 7] = [0; 7];
 static mut IDT: [IdtEntry; 256] = [IdtEntry::MISSING; 256];
 
@@ -285,20 +287,20 @@ fn kernel_tls_clean() -> bool {
 }
 
 /// Install the boot CPU's GDT, TSS and exception/IRQ IDT once at CPL0.
-/// All descriptor storage and the double-fault stack must remain mapped.
+/// All descriptor storage and the early IST stack must remain mapped.
 /// Secondary CPUs load this shared IDT only after initialization is published.
 pub fn init() {
     arch::disable_interrupts();
     assert!(!is_initialized(), "IDT already loaded");
 
     let tss_address = addr_of!(TSS) as u64;
-    let stack_top = addr_of!(DOUBLE_FAULT_STACK) as u64 + DOUBLE_FAULT_STACK_SIZE as u64;
+    let stack_top = addr_of!(EARLY_IST_STACK) as u64 + DOUBLE_FAULT_STACK_SIZE as u64;
 
     // SAFETY: Only the boot CPU runs, IF is clear, and init is single-use. These
     // static objects have not been installed yet and no references alias writes.
     unsafe {
         addr_of_mut!(TSS).write(TaskStateSegment {
-            interrupt_stacks: [stack_top, 0, 0, 0, 0, 0, 0],
+            interrupt_stacks: [stack_top, stack_top, stack_top, 0, 0, 0, 0],
             ..TaskStateSegment::EMPTY
         });
         addr_of_mut!(GDT).write(gdt_entries(tss_address));
@@ -531,6 +533,39 @@ pub(crate) unsafe fn init_secondary(slot: usize, kernel_stack_top: u64) -> bool 
         && stack == DATA_SELECTOR
         && storage_valid
         && kernel_tls_clean()
+}
+
+/// Point the BSP's IST1-3 at their guarded stacks, replacing the early static
+/// stack, and verify each TSS field by reading it back.
+///
+/// # Safety
+/// Only the BSP calls this, once, with IF clear, after `init`. Each top is
+/// 16-byte aligned and immediately above its own mapped, writable,
+/// supervisor-only stack, which stays mapped in every address space.
+pub(crate) unsafe fn install_bsp_ists(tops: [u64; 3]) {
+    assert!(is_initialized(), "IDT not initialized");
+    assert!(!arch::interrupts_enabled(), "IST update requires IF=0");
+    for top in tops {
+        assert!(
+            top >= 0xffff_8000_0000_0000 && top.is_multiple_of(16),
+            "invalid IST stack"
+        );
+    }
+    // SAFETY: The caller supplies exclusive BSP access with IF clear. TSS is
+    // packed, so its IST fields need unaligned raw-pointer accesses, and no
+    // reference is formed. Hardware reads a field only to deliver an
+    // exception through a gate that names it, and the old stack stays mapped.
+    let fields = unsafe { addr_of_mut!(TSS.interrupt_stacks).cast::<u64>() };
+    for (index, top) in tops.into_iter().enumerate() {
+        // SAFETY: Index 0..3 stays inside the seven IST fields; see above.
+        unsafe { fields.add(index).write_unaligned(top) };
+    }
+    for (index, top) in tops.into_iter().enumerate() {
+        // SAFETY: The same in-bounds field. A volatile read of a byte array
+        // needs no alignment and makes this an actual load from the TSS.
+        let actual = unsafe { fields.add(index).cast::<[u8; 8]>().read_volatile() };
+        assert_eq!(u64::from_ne_bytes(actual), top, "BSP IST readback");
+    }
 }
 
 /// Set the dedicated kernel stack used by hardware on CPL3 -> CPL0 entry.

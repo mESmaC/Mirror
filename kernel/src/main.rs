@@ -41,7 +41,7 @@ mod vm;
 mod windows;
 mod xhci;
 
-use core::panic::PanicInfo;
+use core::{mem::ManuallyDrop, panic::PanicInfo};
 use limine::memory_map::EntryType;
 
 // Track linker-script edits as a compiler input without a host build script.
@@ -121,6 +121,59 @@ pub extern "C" fn _start() -> ! {
     // the heap range exclusively, and frame recycling is now available.
     unsafe { heap::init(&mut tables, &mut frames, boot.direct_map_offset) }
         .expect("could not initialize kernel heap");
+
+    // Leave Limine's stack for the guarded BSP stacks. They are mapped before
+    // share_with_secondaries seals kernel mappings and before any process root
+    // copies the upper half. Limine's stack stays reserved and idle.
+    // SAFETY: The BSP runs alone with IF=0 on the active owned root, with the
+    // sole allocator. Nothing has sealed kernel mappings or used the arena.
+    let bsp_stacks =
+        unsafe { stacks::map_bsp(&mut tables, &mut frames) }.expect("could not map the BSP stacks");
+    // SAFETY: Once, on the BSP with IF=0 after interrupts::init. Each IST top
+    // sits above its own guarded supervisor stack in the shared upper half.
+    unsafe { interrupts::install_bsp_ists(bsp_stacks.ist_tops) };
+    let early = ManuallyDrop::new(EarlyBoot {
+        boot,
+        usable_bytes,
+        tables,
+        frames,
+    });
+    // SAFETY: The scheduler stack is mapped, zeroed and guarded, and the
+    // owned root is active. The noreturn call follows the SysV alignment rule
+    // from the page-aligned top and never returns to Limine's stack, which
+    // stays mapped, so the continuation can move `early` out of this frame.
+    unsafe {
+        core::arch::asm!("mov rsp, rsi", "xor ebp, ebp", "call {entry}", "ud2",
+            entry = sym continue_boot, in("rdi") &raw const *early,
+            in("rsi") bsp_stacks.scheduler_top, options(noreturn));
+    }
+}
+
+/// Boot state that `_start` hands to `continue_boot` across the stack switch.
+struct EarlyBoot {
+    boot: boot::BootInfo,
+    usable_bytes: u64,
+    tables: paging::PageTables,
+    frames: memory::FrameAllocator<'static>,
+}
+
+/// The rest of BSP boot, on the guarded scheduler stack.
+///
+/// # Safety
+/// Only `_start` calls this, once, through its stack switch. `early` points to
+/// a live value on Limine's stack that `_start` never uses or drops again.
+unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
+    // SAFETY: The caller's contract makes this read the value's only move.
+    let EarlyBoot {
+        boot,
+        usable_bytes,
+        mut tables,
+        mut frames,
+    } = unsafe { early.read() };
+    assert!(
+        stacks::on_bsp_scheduler_stack(),
+        "BSP boot continued off its scheduler stack"
+    );
     let heap_stats = heap::stats();
     serial::println!(
         "MIRROR_HEAP_READY size={} free={}",

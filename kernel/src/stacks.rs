@@ -8,6 +8,17 @@
 //!
 //! Stacks are mapped only through the general kernel mapping path, so they must
 //! be created before `share_with_secondaries` seals kernel mappings.
+//!
+//! The stack arena starts with the BSP region: the scheduler stack, which
+//! replaces Limine's boot stack, the RSP0 trap stack and the IST1 (#DF), IST2
+//! (NMI) and IST3 (#MC) stacks. The AP slots (smp.rs) follow it from `AP_BASE`.
+//! The arena sits in the shared upper half, so every process root, which
+//! copies the upper PML4 entries, maps the BSP stacks too.
+
+use core::{
+    arch::asm,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use crate::{
     memory::{FrameAllocator, PAGE_SIZE},
@@ -18,6 +29,109 @@ use crate::{
 pub const MAX_PAGES: usize = 64;
 /// Guarded stacks live in the kernel half only.
 const KERNEL_HALF: u64 = 0xffff_8000_0000_0000;
+
+const ARENA: u64 = 0xffff_d100_0000_0000;
+const SCHEDULER_PAGES: usize = 64;
+const RSP0_PAGES: usize = 16;
+const IST_COUNT: usize = 3;
+const IST_PAGES: usize = 4;
+const SCHEDULER_BOTTOM: u64 = ARENA + PAGE_SIZE;
+const RSP0_BOTTOM: u64 = ARENA + span(SCHEDULER_PAGES) + PAGE_SIZE;
+const IST_BASE: u64 = ARENA + span(SCHEDULER_PAGES) + span(RSP0_PAGES);
+/// The first AP slot's guard below starts right after the BSP region.
+pub const AP_BASE: u64 = IST_BASE + IST_COUNT as u64 * span(IST_PAGES);
+/// The BSP region in map order: scheduler, RSP0, then IST1-3.
+const BSP_STACKS: [(u64, usize); 2 + IST_COUNT] = [
+    (SCHEDULER_BOTTOM, SCHEDULER_PAGES),
+    (RSP0_BOTTOM, RSP0_PAGES),
+    (ist_bottom(0), IST_PAGES),
+    (ist_bottom(1), IST_PAGES),
+    (ist_bottom(2), IST_PAGES),
+];
+
+const _: () = {
+    assert!(SCHEDULER_PAGES <= MAX_PAGES && RSP0_PAGES <= MAX_PAGES && IST_PAGES <= MAX_PAGES);
+    // Each BSP stack keeps its own guard on both sides: two unmapped pages
+    // between neighbours, and between IST3 and the first AP slot's stack.
+    let mut index = 1;
+    while index < BSP_STACKS.len() {
+        let (previous, pages) = BSP_STACKS[index - 1];
+        assert!(BSP_STACKS[index].0 == top(previous, pages) + 2 * PAGE_SIZE);
+        index += 1;
+    }
+    let (last, pages) = BSP_STACKS[BSP_STACKS.len() - 1];
+    assert!(AP_BASE == top(last, pages) + PAGE_SIZE);
+};
+
+static BSP_MAPPED: AtomicBool = AtomicBool::new(false);
+
+/// Address space one guarded stack of `pages` pages takes: its guard below,
+/// the stack and its guard above. The stack's bottom is one page into it.
+pub const fn span(pages: usize) -> u64 {
+    (pages as u64 + 2) * PAGE_SIZE
+}
+
+const fn top(bottom: u64, pages: usize) -> u64 {
+    bottom + pages as u64 * PAGE_SIZE
+}
+
+const fn ist_bottom(index: usize) -> u64 {
+    IST_BASE + index as u64 * span(IST_PAGES) + PAGE_SIZE
+}
+
+/// The tops of the BSP's guarded stacks that boot installs by hand. RSP0 is
+/// read through `bsp_rsp0_top` when userspace starts.
+pub struct BspStacks {
+    pub scheduler_top: u64,
+    pub ist_tops: [u64; IST_COUNT],
+}
+
+/// Map the BSP region: the 256 KiB scheduler stack, the 64 KiB RSP0 stack and
+/// three 16 KiB IST stacks, each guarded. If one fails, the stacks mapped
+/// before it are unmapped again and the error returns.
+///
+/// # Safety
+/// The `map_guarded` contract holds, and this runs once. The BSP region of
+/// the arena is unused: nothing else maps or accesses it.
+pub unsafe fn map_bsp(
+    tables: &mut PageTables,
+    frames: &mut FrameAllocator<'_>,
+) -> Result<BspStacks, &'static str> {
+    assert!(
+        !BSP_MAPPED.load(Ordering::Acquire),
+        "BSP stacks mapped twice"
+    );
+    for (index, &(bottom, pages)) in BSP_STACKS.iter().enumerate() {
+        // SAFETY: Inherited from the caller; each stack has its own range.
+        if let Err(reason) = unsafe { map_guarded(tables, frames, bottom, pages) } {
+            for &(bottom, pages) in &BSP_STACKS[..index] {
+                // SAFETY: Mapped by this loop; nothing has run on it yet.
+                unsafe { unmap_guarded(tables, frames, bottom, pages) };
+            }
+            return Err(reason);
+        }
+    }
+    BSP_MAPPED.store(true, Ordering::Release);
+    Ok(BspStacks {
+        scheduler_top: top(SCHEDULER_BOTTOM, SCHEDULER_PAGES),
+        ist_tops: core::array::from_fn(|index| top(ist_bottom(index), IST_PAGES)),
+    })
+}
+
+/// The top of the BSP's guarded RSP0 stack, for the TSS on user entry.
+pub fn bsp_rsp0_top() -> u64 {
+    assert!(BSP_MAPPED.load(Ordering::Acquire), "BSP stacks not mapped");
+    top(RSP0_BOTTOM, RSP0_PAGES)
+}
+
+/// Whether the current RSP lies in the BSP's guarded scheduler stack.
+pub fn on_bsp_scheduler_stack() -> bool {
+    let rsp: u64;
+    // SAFETY: Reads this CPU's stack pointer at CPL0 without side effects.
+    unsafe { asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)) };
+    BSP_MAPPED.load(Ordering::Acquire)
+        && (SCHEDULER_BOTTOM..top(SCHEDULER_BOTTOM, SCHEDULER_PAGES)).contains(&rsp)
+}
 
 /// Validate a guarded stack's placement and return its top. The guard below,
 /// the stack itself and the guard above must all lie in the kernel half.
