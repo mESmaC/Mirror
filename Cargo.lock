@@ -60,6 +60,10 @@ name = "mirror-desktop-protocol"
 version = "0.1.0"
 
 [[package]]
+name = "mirror-ext2-layout"
+version = "0.1.0"
+
+[[package]]
 name = "mirror-init"
 version = "0.1.0"
 dependencies = [

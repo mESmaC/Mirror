@@ -1,0 +1,29 @@
+# A host-only workspace: the root workspace builds for x86_64-unknown-none, so
+# it excludes this tool (spec 0015a). Build, test and lint it from the
+# repository root with --locked --target x86_64-pc-windows-msvc
+# --manifest-path tools/mirror-image/Cargo.toml.
+[workspace]
+resolver = "3"
+
+# The root workspace's lint table (0011-D5).
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[package]
+name = "mirror-image"
+version = "0.1.0"
+edition = "2024"
+# The pinned toolchain's major.minor, like the root Cargo.toml's; a toolchain
+# bump changes both (0011-D2, D3).
+rust-version = "1.99"
+publish = false
+
+[dependencies]
+fatfs = { version = "=0.3.6", default-features = false, features = ["std", "alloc"] }
+mirror-ext2-layout = { path = "../../crates/ext2-layout" }
+
+[lints]
+workspace = true

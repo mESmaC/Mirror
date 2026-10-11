@@ -80,6 +80,23 @@ try {
     }
 
     $espDirectory = Join-Path $repositoryRoot 'build/esp'
+    $imagePath = Join-Path $repositoryRoot 'build/mirror.img'
+    $vmdkPath = Join-Path $repositoryRoot 'build/mirror.vmdk'
+    # The disk image holds exactly the staged tree (spec 0015a), so restage it
+    # from empty. Drop the previous image first: if this build fails, no image
+    # of an older tree is left beside a partly restaged one.
+    foreach ($artifact in @($imagePath, $vmdkPath)) {
+        if (Test-Path -LiteralPath $artifact) { Remove-Item -LiteralPath $artifact -Force }
+    }
+    if (Test-Path -LiteralPath $espDirectory) {
+        # Refuse links, so the recursive removal never reaches outside the tree.
+        @(Get-Item -LiteralPath $espDirectory -Force) + @(Get-ChildItem -LiteralPath $espDirectory -Recurse -Force) | ForEach-Object {
+            if ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw "Refusing to clear $espDirectory because $($_.FullName) is a link."
+            }
+        }
+        Remove-Item -LiteralPath $espDirectory -Recurse -Force
+    }
     $efiDirectory = Join-Path $espDirectory 'EFI/BOOT'
     New-Item -ItemType Directory -Path $efiDirectory -Force | Out-Null
     Copy-Item -LiteralPath $bootFiles[0].FullName -Destination (Join-Path $efiDirectory 'BOOTX64.EFI') -Force
@@ -89,8 +106,39 @@ try {
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "target/x86_64-unknown-none/$profile/mirror-agent") -Destination (Join-Path $espDirectory 'agent.elf') -Force
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "target/x86_64-unknown-none/$profile/mirror-app") -Destination (Join-Path $espDirectory 'app.elf') -Force
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'boot/limine.conf') -Destination (Join-Path $espDirectory 'limine.conf') -Force
+    # The image redistributes Limine's binaries (BSD-2-Clause), so it carries
+    # the license files that sit beside BOOTX64.EFI in the verified archive.
+    $licenseDirectory = Join-Path $espDirectory 'LICENSES/limine'
+    New-Item -ItemType Directory -Path $licenseDirectory -Force | Out-Null
+    foreach ($licenseFile in @('LICENSE', '3RDPARTY.md')) {
+        $licenseSource = Join-Path $bootFiles[0].DirectoryName $licenseFile
+        if (-not (Test-Path -LiteralPath $licenseSource -PathType Leaf)) {
+            throw "The verified Limine archive lacks $licenseFile beside BOOTX64.EFI."
+        }
+        Copy-Item -LiteralPath $licenseSource -Destination (Join-Path $licenseDirectory $licenseFile) -Force
+    }
     $flavor = if ($Smoke) { 'smoke' } elseif ($Trace) { 'trace' } else { 'default' }
     Write-Host "Mirror $profile $flavor kernel and native programs staged in $espDirectory (agent-demo=$AgentDemo)"
+
+    # tools/mirror-image writes the GPT disk image and its VMDK descriptor from
+    # the staged tree, then reads the image back against the tree (spec 0015a).
+    # It is a host program in its own workspace, so this step needs the MSVC
+    # linker and Windows SDK (0015-D4).
+    & cargo build --locked --release --target x86_64-pc-windows-msvc --manifest-path (Join-Path $repositoryRoot 'tools/mirror-image/Cargo.toml')
+    if ($LASTEXITCODE -ne 0) { throw "mirror-image build failed with exit code $LASTEXITCODE." }
+    $imageTool = Join-Path $repositoryRoot 'tools/mirror-image/target/x86_64-pc-windows-msvc/release/mirror-image.exe'
+    if (-not (Test-Path -LiteralPath $imageTool -PathType Leaf)) {
+        throw "Cargo did not produce the expected image tool: $imageTool"
+    }
+    & $imageTool disk --esp $espDirectory --out $imagePath --vmdk $vmdkPath
+    if ($LASTEXITCODE -ne 0) { throw "mirror-image disk failed with exit code $LASTEXITCODE." }
+    & $imageTool verify --esp $espDirectory $imagePath
+    if ($LASTEXITCODE -ne 0) {
+        $verifyExitCode = $LASTEXITCODE
+        Remove-Item -LiteralPath $imagePath, $vmdkPath -Force
+        throw "mirror-image verify failed with exit code $verifyExitCode; the unverified image was removed."
+    }
+    Write-Host "Mirror $profile $flavor disk image written and verified: $imagePath, $vmdkPath"
 }
 finally {
     Pop-Location

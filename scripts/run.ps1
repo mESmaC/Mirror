@@ -256,15 +256,17 @@ if (-not $NoBuild) {
 }
 
 $buildDirectory = Join-Path $repositoryRoot 'build'
-$espDirectory = Join-Path $buildDirectory 'esp'
-foreach ($relativePath in @('EFI/BOOT/BOOTX64.EFI', 'kernel.elf', 'init.elf', 'desktop.elf', 'agent.elf', 'app.elf', 'limine.conf')) {
-    if (-not (Test-Path -LiteralPath (Join-Path $espDirectory $relativePath) -PathType Leaf)) {
-        throw "The boot tree is incomplete: $relativePath. Run scripts/build.ps1 first."
-    }
+# build.ps1 writes the 1 GiB disk image and verifies it against the staged tree
+# (spec 0015a). Every case attaches it read-only, so it never changes.
+$diskImage = Join-Path $buildDirectory 'mirror.img'
+if (-not (Test-Path -LiteralPath $diskImage -PathType Leaf) -or (Get-Item -LiteralPath $diskImage).Length -ne 1073741824) {
+    throw "The disk image is missing or incomplete: $diskImage. Run scripts/build.ps1 first."
 }
 
 # All fault cases use the same smoke binary, selected by its boot command line.
 # Always start from the repository config so -NoBuild cannot retain a stale mode.
+# Limine takes it from an SMBIOS OEM string, which overrides the image's own
+# limine.conf, so the image is never rewritten (0015-D7).
 $bootConfig = [System.IO.File]::ReadAllText((Join-Path $repositoryRoot 'boot/limine.conf'))
 $testMode = switch ($Fault) {
     'PageFault' { 'page-fault' }
@@ -309,7 +311,8 @@ if ($null -ne $testMode) { $kernelArguments += "mirror.test=$testMode" }
 if ($LegacyPic) { $kernelArguments += 'mirror.irq=pic' }
 if ($PitTimer) { $kernelArguments += 'mirror.timer=pit' }
 if ($kernelArguments.Count -gt 0) { $bootConfig += "`n    cmdline: $($kernelArguments -join ' ')`n" }
-[System.IO.File]::WriteAllText((Join-Path $espDirectory 'limine.conf'), $bootConfig)
+$smbiosConfig = Join-Path $buildDirectory 'limine-smbios.txt'
+[System.IO.File]::WriteAllText($smbiosConfig, "limine:config:$bootConfig")
 
 # Never write to the QEMU installation's firmware template. A fresh local copy
 # also prevents stale firmware boot entries from changing the smoke-test path.
@@ -334,8 +337,10 @@ $qemuArguments = @(
     '-no-reboot',
     '-drive', "if=pflash,unit=0,format=raw,readonly=on,file=$(ConvertTo-QemuOptionValue $codePath)",
     '-drive', "if=pflash,unit=1,format=raw,file=$(ConvertTo-QemuOptionValue $varsPath)",
-    '-drive', "if=none,id=mirror-esp,format=raw,readonly=on,file=fat:$(ConvertTo-QemuOptionValue $espDirectory)",
-    '-device', 'virtio-blk-pci,drive=mirror-esp,disable-legacy=on,bootindex=0'
+    # Only firmware reads the image; Mirror never binds this device (0015-D10).
+    '-drive', "if=none,id=mirror-disk,format=raw,readonly=on,file=$(ConvertTo-QemuOptionValue $diskImage)",
+    '-device', 'virtio-blk-pci,drive=mirror-disk,disable-legacy=on,bootindex=0',
+    '-smbios', "type=11,path=$(ConvertTo-QemuOptionValue $smbiosConfig)"
 )
 $deviceArguments = Get-MirrorDeviceArguments -Profile $DeviceProfile -RepositoryRoot $repositoryRoot -NoTestDisk:$NoTestDisk
 if ($deviceArguments.AhciFixture -ne $ahciFixture) {

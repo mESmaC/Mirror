@@ -26,12 +26,14 @@ $codePath = Get-MirrorFirmware -RequestedPath $FirmwareCode -QemuDirectory $qemu
 $varsTemplate = Get-MirrorFirmware -RequestedPath $FirmwareVars -QemuDirectory $qemuDirectory -Names @('edk2-i386-vars.fd', 'OVMF_VARS.fd', 'OVMF_VARS.4m.fd') -ParameterName 'FirmwareVars'
 $buildDirectory = Join-Path $repositoryRoot 'build'
 $espDirectory = Join-Path $buildDirectory 'esp'
-foreach ($relativePath in @('EFI/BOOT/BOOTX64.EFI', 'kernel.elf', 'init.elf', 'desktop.elf', 'agent.elf', 'app.elf', 'limine.conf')) {
-    if (-not (Test-Path -LiteralPath (Join-Path $espDirectory $relativePath) -PathType Leaf)) {
-        throw "The boot tree is incomplete: $relativePath. Run scripts/build.ps1 first."
-    }
+# Captures boot the image read-only with its own limine.conf and no SMBIOS
+# config (spec 0015a). build.ps1 writes the image only after restaging
+# build/esp and verifies it against that tree, so the staged limine.conf is
+# the one the image holds.
+$diskImage = Join-Path $buildDirectory 'mirror.img'
+if (-not (Test-Path -LiteralPath $diskImage -PathType Leaf) -or (Get-Item -LiteralPath $diskImage).Length -ne 1073741824) {
+    throw "The disk image is missing or incomplete: $diskImage. Run scripts/build.ps1 first."
 }
-Copy-Item -LiteralPath (Join-Path $repositoryRoot 'boot/limine.conf') -Destination (Join-Path $espDirectory 'limine.conf') -Force
 if ($Hygiene -and [System.IO.File]::ReadAllText((Join-Path $espDirectory 'limine.conf')) -match 'mirror\.perf=') {
     throw 'The hygiene probe boots without a mirror.perf= token, so the timing-marker exception (spec 0010-D4) stays off.'
 }
@@ -503,8 +505,8 @@ $qemuArguments = @(
     '-nic', 'none', '-no-reboot', '-no-shutdown',
     '-drive', "if=pflash,unit=0,format=raw,readonly=on,file=$(ConvertTo-QemuOptionValue $codePath)",
     '-drive', "if=pflash,unit=1,format=raw,file=$(ConvertTo-QemuOptionValue $varsPath)",
-    '-drive', "if=none,id=mirror-esp,format=raw,readonly=on,file=fat:$(ConvertTo-QemuOptionValue $espDirectory)",
-    '-device', 'virtio-blk-pci,drive=mirror-esp,disable-legacy=on,bootindex=0', '-serial', "file:$serialLog"
+    '-drive', "if=none,id=mirror-disk,format=raw,readonly=on,file=$(ConvertTo-QemuOptionValue $diskImage)",
+    '-device', 'virtio-blk-pci,drive=mirror-disk,disable-legacy=on,bootindex=0', '-serial', "file:$serialLog"
 )
 # Captures use the V1 device profile: the e1000 NIC and the AHCI SATA fixture.
 # The QEMU ATA model needs a writable backend, so the fixture is the fresh

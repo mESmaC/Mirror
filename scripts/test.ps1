@@ -64,16 +64,25 @@ try {
         Remove-Item -LiteralPath $logDirectory -Recurse -Force
     }
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+    # The root workspace excludes the host-only tools\ workspaces, so cargo fmt
+    # --all, clippy --workspace and cargo test -p never reach them (spec 0015a).
+    $imageToolManifest = Join-Path $repositoryRoot 'tools/mirror-image/Cargo.toml'
     & cargo fmt --all -- --check
     if ($LASTEXITCODE -ne 0) { throw 'Rust formatting check failed.' }
-    & cargo test --locked -p mirror-desktop-protocol -p mirror-window-protocol -p mirror-vm-protocol -p mirror-thread-protocol -p mirror-clock-protocol -p mirror-sync -p mirror-acpi -p mirror-ui-tokens --target x86_64-pc-windows-msvc
-    if ($LASTEXITCODE -ne 0) { throw 'Native protocol, synchronization, ACPI parser and UI token tests failed.' }
+    & cargo fmt --all --manifest-path $imageToolManifest -- --check
+    if ($LASTEXITCODE -ne 0) { throw 'mirror-image formatting check failed.' }
+    & cargo test --locked -p mirror-desktop-protocol -p mirror-window-protocol -p mirror-vm-protocol -p mirror-thread-protocol -p mirror-clock-protocol -p mirror-sync -p mirror-acpi -p mirror-ui-tokens -p mirror-ext2-layout --target x86_64-pc-windows-msvc
+    if ($LASTEXITCODE -ne 0) { throw 'Native protocol, synchronization, ACPI parser, UI token and ext2 layout tests failed.' }
+    & cargo test --locked --target x86_64-pc-windows-msvc --manifest-path $imageToolManifest
+    if ($LASTEXITCODE -ne 0) { throw 'mirror-image host tests failed.' }
     & cargo clippy --locked --workspace -- -D warnings
     if ($LASTEXITCODE -ne 0) { throw 'Normal kernel Clippy check failed.' }
     & cargo clippy --locked -p mirror-kernel --features test-trace -- -D warnings
     if ($LASTEXITCODE -ne 0) { throw 'Trace kernel Clippy check failed.' }
     & cargo clippy --locked --workspace --all-features -- -D warnings
     if ($LASTEXITCODE -ne 0) { throw 'Smoke kernel Clippy check failed.' }
+    & cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc --manifest-path $imageToolManifest -- -D warnings
+    if ($LASTEXITCODE -ne 0) { throw 'mirror-image Clippy check failed.' }
 
     foreach ($release in @($false, $true)) {
         $profile = if ($release) { 'release' } else { 'debug' }
@@ -83,6 +92,10 @@ try {
         $memoryMiB = 256
         $smpMemoryMiB = 256
         & (Join-Path $PSScriptRoot 'build.ps1') -Smoke -Release:$release -AgentDemo:$AgentDemo
+        # Every smoke case boots build/mirror.img read-only, so it must come out
+        # byte-identical (spec 0015a, acceptance test 4).
+        $diskImage = Join-Path $repositoryRoot 'build/mirror.img'
+        $diskImageHash = (Get-FileHash -LiteralPath $diskImage -Algorithm SHA256).Hash
         # Every case uses the V1 device profile, with the test fixture on AHCI
         # SATA, unless it names -DeviceProfile LegacyVirtio (spec 0014).
         # UserSimd remains a strict manual #XM probe: current QEMU TCG does not
@@ -170,6 +183,9 @@ try {
         Save-MirrorSmokeLogs "$profile-NoTestDisk"
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -NoKeyboard -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
         Save-MirrorSmokeLogs "$profile-NoKeyboard"
+        if ((Get-FileHash -LiteralPath $diskImage -Algorithm SHA256).Hash -ne $diskImageHash) {
+            throw "The $profile smoke cases changed build/mirror.img."
+        }
 
         # Captures drive a trace kernel: its console-text oracles are their
         # synchronization points (spec 0010).
