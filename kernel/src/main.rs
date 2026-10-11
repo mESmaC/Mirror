@@ -343,6 +343,9 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
     // user root has been released. Runtime leaf changes keep these tables pinned.
     unsafe { tables.prepare_shared_window(&mut frames) }.expect("shared kernel window");
     smp::init(&boot, topology.as_ref(), &mut tables, &mut frames);
+    // Every flavor reports each online CPU's stacks, then the BSP region.
+    smp::report_stacks();
+    stacks::report(&tables);
     kernel_vm::init(&tables, &mut frames, boot.direct_map_offset);
     #[cfg(feature = "boot-smoke")]
     kernel_vm::heap_window_self_test(&tables, &mut frames, boot.direct_map_offset);
@@ -455,6 +458,14 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
                 // SAFETY: Deliberate smoke-test #UD. The installed handler must
                 // report it and terminate the guest; no Rust execution resumes.
                 unsafe { core::arch::asm!("ud2", options(noreturn)) };
+            }
+            boot::SmokeMode::KernelStackOverflow => {
+                serial::println!("MIRROR_TEST_EXPECT_FATAL vector=8");
+                // SAFETY: Deliberate smoke-test #DF on the BSP. Userspace has
+                // finished, so no user context is active and the RSP0 stack is
+                // idle; the probe checks that IF is clear. The #DF handler on
+                // IST1 must report the fault and terminate the guest.
+                unsafe { stacks::overflow_rsp0() };
             }
         }
         // SAFETY: Deliberate #PF on an address just unmapped and invalidated by

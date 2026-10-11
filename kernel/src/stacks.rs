@@ -24,6 +24,7 @@ use core::{
 use crate::{
     memory::{FrameAllocator, PAGE_SIZE},
     paging::PageTables,
+    serial,
 };
 
 /// The largest stack this module maps: the BSP's 256 KiB scheduler stack.
@@ -118,6 +119,68 @@ pub unsafe fn map_bsp(
 pub fn bsp_rsp0_top() -> u64 {
     assert!(BSP_MAPPED.load(Ordering::Acquire), "BSP stacks not mapped");
     top(RSP0_BOTTOM, RSP0_PAGES)
+}
+
+/// The BSP's IST1 (#DF), IST2 (NMI) and IST3 (#MC) stacks as `bottom..top`
+/// ranges, in TSS order.
+pub fn bsp_ist_stacks() -> [core::ops::Range<u64>; IST_COUNT] {
+    assert!(BSP_MAPPED.load(Ordering::Acquire), "BSP stacks not mapped");
+    core::array::from_fn(|index| ist_bottom(index)..top(ist_bottom(index), IST_PAGES))
+}
+
+/// Check that every guard page of the BSP region is still unmapped, then
+/// report the region once in every build: the scheduler and RSP0 sizes in KiB,
+/// the IST count and the guard page below the RSP0 stack, which an RSP0
+/// overflow reaches first.
+pub fn report(tables: &PageTables) {
+    assert!(BSP_MAPPED.load(Ordering::Acquire), "BSP stacks not mapped");
+    for (bottom, pages) in BSP_STACKS {
+        check_guards(tables, bottom, top(bottom, pages)).expect("BSP stack guard");
+    }
+    let kib = |pages: usize| pages as u64 * PAGE_SIZE / 1024;
+    serial::println!(
+        "MIRROR_STACKS_READY scheduler={} rsp0={} ist={} rsp0_guard={:#x}",
+        kib(SCHEDULER_PAGES),
+        kib(RSP0_PAGES),
+        IST_COUNT,
+        RSP0_BOTTOM - PAGE_SIZE
+    );
+}
+
+/// Overflow the BSP's RSP0 stack on purpose (smoke mode
+/// `kernel-stack-overflow`). RSP starts 2 KiB below the stack's top and moves
+/// down one page per step, writing a word each time, until a write reaches the
+/// guard page below the stack. That write faults with RSP inside the guard
+/// page, so pushing the #PF frame faults again and the CPU raises #DF, which
+/// its gate delivers on IST1.
+///
+/// # Safety
+/// Only the BSP calls this, with IF clear and no user context active, so
+/// nothing else uses the RSP0 stack. The #DF handler must end the guest.
+#[cfg(feature = "boot-smoke")]
+pub unsafe fn overflow_rsp0() -> ! {
+    assert!(
+        !crate::arch::interrupts_enabled(),
+        "stack overflow probe requires IF=0"
+    );
+    let start = bsp_rsp0_top() - 2048;
+    // SAFETY: The caller's contract leaves the RSP0 stack idle and IF clear,
+    // so no interrupt shares the walk. Each write lands in the RSP0 stack
+    // until RSP enters the unmapped guard page below it, which `report`
+    // checked. Nothing returns: the resulting #DF runs on IST1 and its
+    // handler ends the guest.
+    unsafe {
+        asm!(
+            "mov rsp, {start}",
+            "2:",
+            "sub rsp, {page}",
+            "mov qword ptr [rsp], 0",
+            "jmp 2b",
+            start = in(reg) start,
+            page = const PAGE_SIZE,
+            options(noreturn),
+        )
+    }
 }
 
 /// Whether the current RSP lies in the BSP's guarded scheduler stack.

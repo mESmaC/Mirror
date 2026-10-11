@@ -21,7 +21,7 @@ param(
     [switch]$LegacyPic,
     [switch]$PitTimer,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
-    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation')][string]$Fault = 'None',
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -272,6 +272,7 @@ $bootConfig = [System.IO.File]::ReadAllText((Join-Path $repositoryRoot 'boot/lim
 $testMode = switch ($Fault) {
     'PageFault' { 'page-fault' }
     'InvalidOpcode' { 'invalid-opcode' }
+    'KernelStackOverflow' { 'kernel-stack-overflow' }
     'UserKernelRead' { 'user-kernel-read' }
     'UserCodeWrite' { 'user-code-write' }
     'UserNx' { 'user-nx' }
@@ -487,7 +488,7 @@ try {
     if (-not $expectedTlbTimeout -and $serial -match '(?im)^(?:MIRROR_PANIC|PANIC|\[panic\])') {
         throw "Mirror reported a panic. See $serialLog."
     }
-    $fatalKernelFault = $Fault -in @('PageFault', 'InvalidOpcode')
+    $fatalKernelFault = $Fault -in @('PageFault', 'InvalidOpcode', 'KernelStackOverflow')
     $expectedExitCode = if ($fatalKernelFault -or $expectedTlbTimeout) { 35 } else { 33 }
     if ($qemuExitCode -ne $expectedExitCode) {
         $qemuError = [System.IO.File]::ReadAllText($stderrLog)
@@ -544,6 +545,9 @@ try {
     Assert-MirrorTimer -Serial $serial -Smoke $true -UseLegacyPic ([bool]$LegacyPic) -ForcePit ([bool]$PitTimer) -FaultMode $Fault
     Assert-MirrorClock -Serial $serial -Smoke $true -WithoutHpet ([bool]$NoHpet) -FaultMode $Fault
     Assert-MirrorSmpMarkers -Serial $serial -RequestedCpus $CpuCount -UseLegacyPic ([bool]$LegacyPic) -FaultMode $Fault
+    # Every online CPU reports its guarded stacks; -LegacyPic keeps the APs
+    # offline, so only the BSP reports (spec 0016a).
+    $rsp0Guard = Assert-MirrorStacks -Serial $serial -OnlineCpus $(if ($LegacyPic) { 1 } else { $CpuCount }) -Smoke $true
     Assert-MirrorHeapGrowth -Serial $serial -RequestedCpus $CpuCount -Smoke $true -UseLegacyPic ([bool]$LegacyPic)
     Assert-MirrorDriverCatalog -Serial $serial -Smoke $true -LegacyDisk ($DeviceProfile -eq 'LegacyVirtio' -and -not $NoTestDisk) -XhciAttached ([bool]$Xhci)
     if ($CrowdedPci) {
@@ -844,16 +848,31 @@ try {
         }
     }
     elseif ($fatalKernelFault) {
-        $vector = if ($Fault -eq 'PageFault') { 14 } else { 6 }
-        $diagnostic = "(?m)^MIRROR_EXCEPTION vector=$vector error=0x0 rip=0x[0-9a-f]+ cr2="
-        if ($Fault -eq 'PageFault') { $diagnostic += '0xffffc00000000000(?:\s|$)' }
-        else { $diagnostic += '0x[0-9a-f]+(?:\s|$)' }
-        if ($serial -notmatch $diagnostic -or $serial -notmatch "(?m)^MIRROR_TEST_EXPECT_FATAL vector=$vector(?:\s|$)") {
+        $vector = switch ($Fault) { 'PageFault' { 14 } 'InvalidOpcode' { 6 } 'KernelStackOverflow' { 8 } }
+        # Exactly one announced fault and one diagnostic, both for this scenario.
+        $expected = [regex]::Matches($serial, ('(?m)^MIRROR_TEST_EXPECT_FATAL vector={0}\r?$' -f $vector))
+        $exception = [regex]::Matches($serial, ('(?m)^MIRROR_EXCEPTION vector={0} error=0x0 rip=0x[0-9a-f]+ cr2=(0x[0-9a-f]+)\r?$' -f $vector))
+        if ($expected.Count -ne 1 -or $exception.Count -ne 1 -or
+            [regex]::Matches($serial, '(?m)^MIRROR_TEST_EXPECT_FATAL(?:\s|$)').Count -ne 1 -or
+            [regex]::Matches($serial, '(?m)^MIRROR_EXCEPTION(?:\s|$)').Count -ne 1 -or
+            $exception[0].Index -le $expected[0].Index) {
             throw "Mirror did not report the intended $Fault diagnostic. See $serialLog."
+        }
+        $cr2 = [Convert]::ToUInt64($exception[0].Groups[1].Value.Substring(2), 16)
+        if ($Fault -eq 'PageFault' -and $cr2 -ne [Convert]::ToUInt64('ffffc00000000000', 16)) {
+            throw "The page-fault test must fault on its unmapped test address. See $serialLog."
+        }
+        # The overflowing write, and the #PF frame push that turns it into a
+        # double fault on IST1, both land in the guard page below RSP0.
+        if ($Fault -eq 'KernelStackOverflow' -and ($cr2 -lt $rsp0Guard -or $cr2 -ge $rsp0Guard + 4096)) {
+            throw "The RSP0 overflow must fault inside the guard page at $('0x{0:x}' -f $rsp0Guard). See $serialLog."
         }
         if ($serial -match '(?m)^MIRROR_BOOT_OK(?:\s|$)') {
             throw "Fatal-fault test incorrectly reached normal boot completion. See $serialLog."
         }
+    }
+    if (-not $fatalKernelFault -and $serial -match '(?m)^MIRROR_TEST_EXPECT_FATAL(?:\s|$)') {
+        throw "Mirror announced a fatal-fault test that $Fault does not run. See $serialLog."
     }
     foreach ($marker in $markers) {
         if ($serial -notmatch "(?m)^$marker(?:\s|$)") {

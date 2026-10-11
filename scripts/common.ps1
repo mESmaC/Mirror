@@ -385,6 +385,58 @@ function Assert-MirrorTraceMarker {
     }
 }
 
+function Assert-MirrorStacks {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [Parameter(Mandatory = $true)][int]$OnlineCpus,
+        [Parameter(Mandatory = $true)][bool]$Smoke
+    )
+
+    # Spec 0016a. After SMP startup every flavor prints one MIRROR_CPU_STACKS
+    # line per online CPU in slot order, the BSP first, and then one
+    # MIRROR_STACKS_READY line. Each CPU's TSS points IST1-3 at its own guarded
+    # stacks, and its CR4.MCE equals its CPUID MCE bit. QEMU's qemu64 and max
+    # models both report MCE, so the bit must be set. Only smoke kernels run
+    # the NMI and #MC IST probe. Returns the guard page below the BSP's RSP0
+    # stack.
+    $records = [regex]::Matches($Serial, '(?m)^MIRROR_CPU_STACKS cpu=(\d+) ist=3 mce=([01]) cpuid_mce=([01])\r?$')
+    if ($records.Count -ne $OnlineCpus -or [regex]::Matches($Serial, '(?m)^MIRROR_CPU_STACKS(?:\s|$)').Count -ne $OnlineCpus) {
+        throw "Mirror must report guarded stacks with three IST stacks for exactly $OnlineCpus online CPU(s)."
+    }
+    $startup = [regex]::Matches($Serial, '(?m)^MIRROR_SMP_(?:READY|SKIPPED)(?:\s|$)')
+    if ($startup.Count -ne 1 -or $records[0].Index -le $startup[0].Index) {
+        throw 'The per-CPU stack reports must follow SMP startup.'
+    }
+    for ($cpu = 0; $cpu -lt $OnlineCpus; $cpu++) {
+        $record = $records[$cpu]
+        if ([int]$record.Groups[1].Value -ne $cpu) {
+            throw 'The per-CPU stack reports must list cpu=0..N-1 in order.'
+        }
+        if ($record.Groups[3].Value -ne '1' -or $record.Groups[2].Value -ne $record.Groups[3].Value) {
+            throw "CPU $cpu must report CPUID MCE support and set CR4.MCE to match it."
+        }
+    }
+    $ready = [regex]::Matches($Serial, '(?m)^MIRROR_STACKS_READY scheduler=256 rsp0=64 ist=3 rsp0_guard=(0x[0-9a-f]+)\r?$')
+    if ($ready.Count -ne 1 -or [regex]::Matches($Serial, '(?m)^MIRROR_STACKS_READY(?:\s|$)').Count -ne 1 -or
+        $ready[0].Index -le $records[$OnlineCpus - 1].Index) {
+        throw 'Mirror must report the BSP stack region once, after the per-CPU stack reports.'
+    }
+    $guard = [Convert]::ToUInt64($ready[0].Groups[1].Value.Substring(2), 16)
+    if ($guard -lt [Convert]::ToUInt64('ffff800000000000', 16) -or ($guard % 4096) -ne 0) {
+        throw 'The RSP0 guard page must be a page-aligned kernel-half address.'
+    }
+    $istProbes = [regex]::Matches($Serial, '(?m)^MIRROR_IST_OK(?:\s|$)').Count
+    if ($Smoke) {
+        if ($istProbes -ne 1 -or [regex]::Matches($Serial, '(?m)^MIRROR_IST_OK nmi=2 mc=3\r?$').Count -ne 1) {
+            throw 'A smoke kernel must run NMI on IST2 and #MC on IST3 exactly once.'
+        }
+    }
+    elseif ($istProbes -ne 0) {
+        throw 'Only smoke kernels run the NMI and #MC IST probe.'
+    }
+    return $guard
+}
+
 function Assert-MirrorClock {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,

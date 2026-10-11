@@ -57,8 +57,9 @@ struct Slot {
     actual_stack: AtomicU64,
     actual_root: AtomicU64,
     // CR4 as the AP saw it once its descriptors, FPU controls and root were
-    // installed, for the BSP's per-CPU report.
+    // installed, and its own CPUID MCE bit, for the BSP's per-CPU report.
     actual_cr4: AtomicU64,
+    cpuid_mce: AtomicBool,
     command: AtomicU64,
     operation: AtomicU32,
     argument: AtomicU64,
@@ -82,6 +83,7 @@ impl Slot {
             actual_stack: AtomicU64::new(0),
             actual_root: AtomicU64::new(0),
             actual_cr4: AtomicU64::new(0),
+            cpuid_mce: AtomicBool::new(false),
             command: AtomicU64::new(0),
             operation: AtomicU32::new(0),
             argument: AtomicU64::new(0),
@@ -288,6 +290,49 @@ pub fn init(
     rendezvous("boot", 8);
 }
 
+/// After startup, report every online CPU's stacks, the BSP first, as
+/// `MIRROR_CPU_STACKS`: how many of its TSS IST1-3 fields point at the tops of
+/// its own guarded IST stacks, and its CR4.MCE and CPUID MCE bits. The BSP
+/// reads its own state; an AP's comes from its slot and its TSS.
+pub fn report_stacks() {
+    assert!(!arch::interrupts_enabled() && !is_secondary());
+    let report = |cpu: usize, expected: [u64; stacks::IST_COUNT], cr4: u64, cpuid_mce: bool| {
+        // SAFETY: The BSP reads its own TSS. An AP's slot was observed online
+        // with Acquire ordering below, after its init_secondary succeeded,
+        // and an AP never writes its TSS again.
+        let installed = unsafe { interrupts::installed_ists(cpu) };
+        let ist = installed
+            .iter()
+            .zip(expected)
+            .filter(|&(&actual, top)| actual == top)
+            .count();
+        serial::println!(
+            "MIRROR_CPU_STACKS cpu={} ist={} mce={} cpuid_mce={}",
+            cpu,
+            ist,
+            u8::from(cr4 & interrupts::CR4_MCE != 0),
+            u8::from(cpuid_mce)
+        );
+    };
+    let cr4: u64;
+    // SAFETY: CPU-local register inspection at CPL0, no mutation.
+    unsafe { asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
+    let bsp_tops = stacks::bsp_ist_stacks().map(|stack| stack.end);
+    report(0, bsp_tops, cr4, interrupts::cpuid_mce());
+    // COUNT stays 0 when SMP was skipped, so only the BSP reports.
+    let count = COUNT.load(Ordering::Relaxed);
+    for (index, slot) in SLOTS.iter().enumerate().take(count).skip(1) {
+        if slot.state.load(Ordering::Acquire) == ONLINE {
+            report(
+                index,
+                ist_tops(index),
+                slot.actual_cr4.load(Ordering::Relaxed),
+                slot.cpuid_mce.load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
 fn prepare(
     boot: &BootInfo,
     topology: Option<&Topology>,
@@ -467,6 +512,8 @@ extern "C" fn secondary_main(index: usize) -> ! {
     slot.actual_stack.store(stack, Ordering::Relaxed);
     slot.actual_root.store(root, Ordering::Relaxed);
     slot.actual_cr4.store(cr4, Ordering::Relaxed);
+    slot.cpuid_mce
+        .store(interrupts::cpuid_mce(), Ordering::Relaxed);
     // Cancellation is terminal: a late AP may never resurrect an offline slot.
     if slot
         .state

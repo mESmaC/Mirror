@@ -43,7 +43,7 @@ const DOUBLE_FAULT_IST: u8 = 1;
 const NMI_IST: u8 = 2;
 const MACHINE_CHECK_IST: u8 = 3;
 const EARLY_IST_STACK_SIZE: usize = 16 * 1024;
-const CR4_MCE: u64 = 1 << 6;
+pub(crate) const CR4_MCE: u64 = 1 << 6;
 const MAX_CPUS: usize = 64;
 const IPI_VECTOR: usize = 240;
 const LOCAL_TIMER_VECTOR: usize = 241;
@@ -208,6 +208,14 @@ static EXPECTED_PAGE_FAULT: AtomicU64 = AtomicU64::new(0);
 static PAGE_FAULT_ARMED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "boot-smoke")]
 static APIC_SPURIOUS_COUNT: AtomicUsize = AtomicUsize::new(0);
+// The IST probe arms one vector, 2 or 18, and its handler records which BSP
+// IST stack, 1-3, held its frame (0 for none).
+#[cfg(feature = "boot-smoke")]
+const NO_IST_PROBE: u64 = u64::MAX;
+#[cfg(feature = "boot-smoke")]
+static IST_PROBE_VECTOR: AtomicU64 = AtomicU64::new(NO_IST_PROBE);
+#[cfg(feature = "boot-smoke")]
+static IST_PROBE_STACK: AtomicU64 = AtomicU64::new(0);
 
 unsafe extern "C" {
     static mirror_exception_entries: [u64; 48];
@@ -380,6 +388,11 @@ fn gdt_entries(tss_address: u64) -> [u64; 7] {
     ]
 }
 
+/// Whether CPUID 1 EDX[7] reports machine-check exception support on this CPU.
+pub(crate) fn cpuid_mce() -> bool {
+    core::arch::x86_64::__cpuid(1).edx & (1 << 7) != 0
+}
+
 /// Set CR4.MCE (bit 6) when CPUID 1 EDX[7] reports machine-check support, so
 /// a machine check reaches the #MC gate instead of shutting the CPU down. CR4
 /// is read back: returns whether its MCE bit equals the CPUID bit and every
@@ -389,7 +402,7 @@ fn gdt_entries(tss_address: u64) -> [u64; 7] {
 /// The caller runs at CPL0 with IF clear and has loaded the shared IDT on this
 /// CPU, so a machine check from here on is delivered through vector 18.
 unsafe fn enable_machine_check() -> bool {
-    let supported = core::arch::x86_64::__cpuid(1).edx & (1 << 7) != 0;
+    let supported = cpuid_mce();
     let before: u64;
     // SAFETY: CPL0 per the caller; reading CR4 changes no processor state.
     unsafe { asm!("mov {}, cr4", out(reg) before, options(nomem, nostack, preserves_flags)) };
@@ -619,6 +632,37 @@ pub(crate) unsafe fn install_bsp_ists(tops: [u64; IST_COUNT]) {
         let actual = unsafe { fields.add(index).cast::<[u8; 8]>().read_volatile() };
         assert_eq!(u64::from_ne_bytes(actual), top, "BSP IST readback");
     }
+}
+
+/// Read back a CPU's TSS IST1-3 fields: `cpu` 0 is the BSP, and 1..64 are
+/// the secondary slots.
+///
+/// # Safety
+/// Nothing writes that TSS during the call. For the BSP, the caller is the
+/// BSP. For a secondary, `init_secondary` succeeded on it and the caller has
+/// observed, with Acquire ordering, a publication the secondary made after
+/// that, such as its online state.
+pub(crate) unsafe fn installed_ists(cpu: usize) -> [u64; IST_COUNT] {
+    let tss = if cpu == 0 {
+        addr_of!(TSS)
+    } else {
+        assert!(cpu < MAX_CPUS, "invalid CPU slot");
+        assert!(
+            SECONDARY_CLAIMED[cpu - 1].load(Ordering::Acquire),
+            "secondary descriptors not installed"
+        );
+        // SAFETY: The index is in bounds and no reference to the array is
+        // formed.
+        unsafe {
+            addr_of!(SECONDARY_TSS)
+                .cast::<TaskStateSegment>()
+                .add(cpu - 1)
+        }
+    };
+    // SAFETY: The TSS is permanently mapped, and the caller guarantees that no
+    // write races this read. The packed fields need an unaligned raw read.
+    let fields = unsafe { addr_of!((*tss).interrupt_stacks).read_unaligned() };
+    core::array::from_fn(|index| fields[index])
 }
 
 /// Set the dedicated kernel stack used by hardware on CPL3 -> CPL0 entry.
@@ -854,9 +898,62 @@ pub fn self_test() {
     assert_kernel_tls_clean();
     serial::println!("MIRROR_EXCEPTIONS_OK");
     serial::println!("MIRROR_TLS_KERNEL_OK selectors=1 bases=1 clean=1");
+    ist_self_test();
     if crate::apic::is_enabled() {
         spurious_self_test();
     }
+}
+
+/// Raise NMI and #MC in software at CPL0, each against an armed expectation.
+/// Each handler must find its frame inside its own guarded BSP IST stack, IST2
+/// for NMI and IST3 for #MC, and return. The marker reports the IST stack each
+/// handler observed.
+#[cfg(feature = "boot-smoke")]
+fn ist_self_test() {
+    assert!(!arch::interrupts_enabled());
+    let mut observed = [0; 2];
+    for (index, vector) in [2_u64, 18].into_iter().enumerate() {
+        IST_PROBE_STACK.store(0, Ordering::SeqCst);
+        assert_eq!(
+            IST_PROBE_VECTOR.swap(vector, Ordering::SeqCst),
+            NO_IST_PROBE
+        );
+        // SAFETY: Both gates are DPL0 interrupt gates installed by init, and
+        // install_bsp_ists pointed IST2 and IST3 at mapped guarded stacks.
+        // The armed handler returns through IRETQ, which restores every
+        // register and RFLAGS; IF stays clear. An unexpected outcome is fatal.
+        unsafe {
+            if vector == 2 {
+                asm!("int 2");
+            } else {
+                asm!("int 18");
+            }
+        }
+        assert_eq!(
+            IST_PROBE_VECTOR.load(Ordering::SeqCst),
+            NO_IST_PROBE,
+            "IST probe was not delivered"
+        );
+        observed[index] = IST_PROBE_STACK.load(Ordering::SeqCst);
+    }
+    assert_eq!(
+        observed,
+        [u64::from(NMI_IST), u64::from(MACHINE_CHECK_IST)],
+        "IST probe ran on the wrong stack"
+    );
+    assert_kernel_tls_clean();
+    serial::println!("MIRROR_IST_OK nmi={} mc={}", observed[0], observed[1]);
+}
+
+/// The BSP IST stack, numbered 1-3, that holds the whole frame, or 0.
+#[cfg(feature = "boot-smoke")]
+fn ist_holding(frame: &TrapFrame) -> u64 {
+    let start = frame as *const TrapFrame as u64;
+    let end = start + size_of::<TrapFrame>() as u64;
+    crate::stacks::bsp_ist_stacks()
+        .iter()
+        .position(|stack| stack.start <= start && end <= stack.end)
+        .map_or(0, |index| index as u64 + 1)
 }
 
 /// The spurious gate uses the shared entry/return path, but consumes neither
@@ -1008,6 +1105,26 @@ fn dispatch(frame: &mut TrapFrame) {
         } else if frame.vector == 3 && BREAKPOINT_ARMED.swap(false, Ordering::SeqCst) {
             BREAKPOINT_COUNT.fetch_add(1, Ordering::SeqCst);
             return;
+        } else if IST_PROBE_VECTOR
+            .compare_exchange(
+                frame.vector,
+                NO_IST_PROBE,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            let stack = ist_holding(frame);
+            IST_PROBE_STACK.store(stack, Ordering::SeqCst);
+            let expected = if frame.vector == 2 {
+                NMI_IST
+            } else {
+                MACHINE_CHECK_IST
+            };
+            if frame.cs == u64::from(CODE_SELECTOR) && stack == u64::from(expected) {
+                return;
+            }
+            serial::println!("IST probe frame did not match its expected IST stack");
         }
     }
 
