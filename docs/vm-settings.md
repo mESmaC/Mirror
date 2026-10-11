@@ -10,9 +10,19 @@ VMware is the only VM target before physical hardware (ledger G3a). QEMU runs th
 
 To boot a newer build, power the VM off and run `package.ps1` again. The descriptor is byte-identical across rebuilds, so the VM needs no change (0015-D9).
 
+## Creating the VM
+
+Create the VM the way Workstation does, then set the keys under Settings. Use the New Virtual Machine wizard with "Other 64-bit" as the guest, or from a shell:
+
+```
+vmcli VM Create -n <name> -d <dir> -c other-64
+```
+
+Either one writes Workstation's defaults, which the checks depend on: `pciBridge0` plus `pciBridge4` to `pciBridge7`, each a `pcieRootPort` with 8 functions (32 root ports, so 42 PCI functions with the disk and NIC), `vmci0.present = "TRUE"`, `mks.enable3d = "TRUE"` and `hpet0.present = "TRUE"`. A hand-written `.vmx` without the extra root ports gives a smaller PCI layout and hides the 32-function inventory cap that spec 0013 removes. `vmcli` writes no `firmware` key, which means BIOS, so the `firmware` key below is required.
+
 ## Reference
 
-Confirmed by spec 0015a's check 9 on 2026-10-11, on the install below, with exactly the settings on this page. Changing a value means rerunning that check.
+Confirmed by spec 0015a's check 9 on 2026-10-11, on the install below, in a VM created as above with exactly the settings on this page. Changing a value means rerunning that check.
 
 | Field | Value |
 | --- | --- |
