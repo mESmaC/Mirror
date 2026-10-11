@@ -35,12 +35,12 @@ A mouse fault or a full mouse ring never changes keyboard state: held modifiers,
 **Lost record** (`kernel/src/input.rs:12, 31, 97`): words are `[1, 3, mask, 0, 0, 0, 0, 0]` with mask 1 (keyboard), 2 (pointer) or 3 (initial session record only).
 
 **Consumers**
-- Kernel console (`kernel/src/main.rs:531-537`): a keyboard loss calls only `console.input_lost()` (console.rs:191-195); a pointer loss calls only `pointer.input_lost()` (pointer.rs:64-67). The marker becomes `MIRROR_CONSOLE_INPUT_LOST device=keyboard|pointer`, which `capture.ps1:198` and `:269` still match. It carries no user content and stays in every build flavor, as 0010 lists it (S7b).
+- Kernel console (`kernel/src/main.rs:531-537`): a keyboard loss calls only `console.input_lost()` (console.rs:191-195); a pointer loss calls only `pointer.input_lost()` (pointer.rs:64-67). The marker becomes `MIRROR_CONSOLE_INPUT_LOST device=keyboard|pointer`, which `capture.ps1:200` and `:271` still match. It carries no user content and stays in every build flavor, as 0010 lists it (S7b).
 - Desktop decoder (`userspace/desktop/src/main.rs:128-131`): returns `Event::Lost { keyboard, pointer }` and rejects mask 0 or any bit above bit 1. main.rs:179 expects the initial mask 3.
 - Shell (`userspace/desktop/src/shell.rs:432-443`): a pointer loss resets capture, buttons and click arming, then sends Reset to each app. A keyboard loss sends apps nothing, because app Reset and Focus clear only pointer and focus state (`userspace/app/src/main.rs:211-220`). Behaviour change: the per-window `pending` reset (shell.rs:436-439) is removed, so a loss no longer drops events already queued for apps.
 - Scratchpad UI (`userspace/desktop/src/ui.rs:185-191`): only a keyboard loss clears the draft and sets the notice. A pointer loss resets buttons and click arming.
 
-**Files touched:** `kernel/src/{ps2,keyboard,mouse,input,main}.rs`, `userspace/desktop/src/{main,shell,ui}.rs`, `readme.md:332` (the global loss barrier becomes per-device loss and coalescing) and `readme.md:507` ("loss records clear every payload field" becomes the device mask).
+**Files touched:** `kernel/src/{ps2,keyboard,mouse,input,main}.rs`, `userspace/desktop/src/{main,shell,ui}.rs`, `readme.md:334` (the global loss barrier becomes per-device loss and coalescing) and `readme.md:509` ("loss records clear every payload field" becomes the device mask).
 
 ## Acceptance tests
 Boot-smoke self-tests; the existing markers must still print.
@@ -64,5 +64,5 @@ Manual check on VMware Workstation. The VM boots 0015a's disk image with the set
 No crates. QEMU (`.tools/qemu`, GPL-2.0) is already used. The manual check needs VMware Workstation (proprietary, no cost), installed: Workstation Pro 26.0.1 (26H1u1) build 25688693 (2026-10-10).
 
 ## Open questions
-1. Resolved 2026-10-09: absolute pointing is spec 0017c (ledger S1d), the VMware vmmouse protocol in M0, so the pointer is not grabbed. QEMU q35 enables `vmport` (and its vmmouse) by default, and `run.ps1:324` turns it off only for `-NoKeyboard`, so 0017c tests the protocol in QEMU.
+1. Resolved 2026-10-09: absolute pointing is spec 0017c (ledger S1d), the VMware vmmouse protocol in M0, so the pointer is not grabbed. QEMU q35 enables `vmport` (and its vmmouse) by default, and `run.ps1:327` turns it off only for `-NoKeyboard`, so 0017c tests the protocol in QEMU.
 2. Follow-up suggestion: move the keyboard and mouse decoders into a `no_std` crate with host cargo tests. This spec keeps boot-smoke tests only.

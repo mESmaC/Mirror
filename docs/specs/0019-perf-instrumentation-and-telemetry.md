@@ -102,7 +102,7 @@ After the `after_userspace` heap growth (`main.rs:313-319`) and before the first
 
 ### Files
 
-- **`crates/perf-protocol`** (`mirror-perf-protocol`, D11): `#![no_std]` and `#![forbid(unsafe_code)]` (0011-D6), `[lints] workspace = true` (0011-D5), no dependencies. It holds the token parser, family and identifier names, a formatter for each line into a fixed buffer, min/p50/p95/max over a slice, and a line parser for tests and host tools. It joins the root `members` (`Cargo.toml:2`) and the host-test command (`test.ps1:69`).
+- **`crates/perf-protocol`** (`mirror-perf-protocol`, D11): `#![no_std]` and `#![forbid(unsafe_code)]` (0011-D6), `[lints] workspace = true` (0011-D5), no dependencies. It holds the token parser, family and identifier names, a formatter for each line into a fixed buffer, min/p50/p95/max over a slice, and a line parser for tests and host tools. It joins the root `members` (`Cargo.toml:2`) and the host-test command (`test.ps1:74`).
 - **`kernel/src/perf.rs`**: config, milestone hooks, input ring, sampler, flip and benchmarks. Hooks: `main.rs` (milestone, benchmark and flip sites), `clock.rs:71` (the TSC/HPET pair), `ahci.rs` (SPD and BDF getters), `framebuffer.rs` (a full-screen fill), `ps2.rs`, `keyboard.rs` and `mouse.rs` (start stamps), `userspace.rs` (present, input syscall, idle point, sampler), `boot.rs` (smoke filter, non-panicking command-line read).
 - **Scripts (D12):**
   - A `-Perf` capture boots the SMBIOS config instead of the image's embedded one. `run.ps1` checks `-Perf` against D4's grammar; under `-Smoke`, an invalid list expects `MIRROR_PERF_OFF`, the `unknown smoke-test command line` panic and exit 35.
@@ -111,7 +111,7 @@ After the `after_userspace` heap growth (`main.rs:313-319`) and before the first
 
 ## Acceptance tests
 
-1. **Host tests.** `test.ps1:69` adds `-p mirror-perf-protocol`.
+1. **Host tests.** `test.ps1:74` adds `-p mirror-perf-protocol`.
    - Grammar: accepts `boot`, `1`, `1,flip`, `telemetry,boot` and `agent`, and ignores other tokens (`mirror.test=page-fault`, `mirror.irq=pic`). Rejects `mirror.perf=`, `1,`, `,1`, `BOOT`, `1,1`, `2`, two perf tokens, a 65-byte token and a non-ASCII byte.
    - Lines: every family round-trips through format and parse, every value fits the vocabulary, and INPUT and MEM lines hold only decimals and `none`.
    - Statistics on known vectors: odd and even lengths, a single sample, all values equal.

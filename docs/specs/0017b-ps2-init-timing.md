@@ -42,14 +42,14 @@ Decisions in 0017a that also govern this spec:
 - `mirror.test=ps2-bat-timeout` (`Ps2BatTimeout`): during the mouse BAT wait only, mouse-source bytes are read and dropped.
 - `mirror.test=ps2-stale-scancode` (`Ps2StaleScancode`): the first keyboard-source read after 0xAE returns an injected 0x1c before any real controller data, and the kernel prints `MIRROR_PS2_INJECTED stale=1`.
 
-**Files touched:** `kernel/src/{ps2,timer,boot,main}.rs`, `scripts/run.ps1`, `scripts/test.ps1`, `readme.md:328` (init waits are bounded by elapsed time).
+**Files touched:** `kernel/src/{ps2,timer,boot,main}.rs`, `scripts/run.ps1`, `scripts/test.ps1`, `readme.md:330` (init waits are bounded by elapsed time).
 
 ## Acceptance tests
 1. `timer::policy_self_test` (boot-smoke, MIRROR_TIMER_POLICY_OK): `pit_elapsed` cases with no wrap, one wrap, equal samples, and the divisor boundary (previous 1, current PIT_DIVISOR gives 1).
 
 QEMU integration (`scripts/run.ps1`, `scripts/test.ps1`):
 2. Every smoke boot that has an i8042, except the `Ps2BatTimeout` cases, asserts `MIRROR_PS2_INIT ... selftest=0` with elapsed_ms < 250 and no `MIRROR_PS2_TIMEOUT`. The `-NoKeyboard` case still ends in both SKIPPED markers and prints no timeout.
-3. `-Fault Ps2BatTimeout`, run once by default (clock=hpet) and once with `-NoHpet` (clock=pit). Expected: MIRROR_KEYBOARD_READY, `MIRROR_MOUSE_SKIPPED reason=OutputTimeout`, and `MIRROR_PS2_TIMEOUT wait=bat` with 4000 <= elapsed_ms <= 4500. run.ps1:623-625 expects MOUSE_SKIPPED instead of MOUSE_READY only for this fault.
+3. `-Fault Ps2BatTimeout`, run once by default (clock=hpet) and once with `-NoHpet` (clock=pit). Expected: MIRROR_KEYBOARD_READY, `MIRROR_MOUSE_SKIPPED reason=OutputTimeout`, and `MIRROR_PS2_TIMEOUT wait=bat` with 4000 <= elapsed_ms <= 4500. run.ps1:628-630 expects MOUSE_SKIPPED instead of MOUSE_READY only for this fault.
 4. `-Fault Ps2StaleScancode`: MIRROR_KEYBOARD_READY, MIRROR_MOUSE_READY and `MIRROR_PS2_INJECTED stale=1`. The implementer lands the fault before the reorder and records that it then gives `MIRROR_KEYBOARD_SKIPPED reason=Configuration`.
 5. `scripts/test.ps1` runs cases 3 (both clocks) and 4 in each profile, which adds 3 smoke boots per profile. Before merge (ledger P8), the full `scripts/test.ps1` passes.
 
@@ -60,4 +60,4 @@ Manual check on VMware Workstation. The VM boots 0015a's disk image with the ref
 No crates. QEMU (`.tools/qemu`, GPL-2.0) is already used. The manual check needs VMware Workstation (proprietary, no cost), installed: Workstation Pro 26.0.1 (26H1u1) build 25688693 (2026-10-10).
 
 ## Open questions
-1. External fact, checked by test 6: whether VMware passes the F0 00 readback. If it fails, D9's rejected alternative (the translated Set 1 fallback) becomes required. That changes a confirmed decision, so it goes back to Cameron first (README rule 5), and the Set 1 work then joins this spec. Static evidence (VMware 26.0.1, 2026-10-10): VMware answers the get-scancode-set query only while `keyboard.queryScancodeSet` is TRUE (default TRUE); `docs/vm-settings.md` must not set it FALSE. VMware's internal key codes are Set 1, so Set 2 output with translation off is a less-exercised path (inference). Test 6 reads the readback result from the existing markers (`set=2`, or `reason=WrongScanSet`).
+1. External fact, checked by test 6: whether VMware passes the F0 00 readback. If it fails, D9's rejected alternative (the translated Set 1 fallback) becomes required. That changes a confirmed decision, so it goes back to Cameron first (README rule 5), and the Set 1 work then joins this spec. Static evidence (VMware 26.0.1, 2026-10-10): VMware answers the get-scancode-set query only while `keyboard.queryScancodeSet` is TRUE (default TRUE); `docs/vm-settings.md` must not set it FALSE. VMware's internal key codes are Set 1, so Set 2 output with translation off is a less-exercised path (inference). Test 6 reads the readback result from the existing markers (`set=2`, or `reason=WrongScanSet`). Observed 2026-10-11, before this spec, in 0015a's check 9 with `keyboard.queryScancodeSet` unset: every one of 8 VMware boots logged `MIRROR_KEYBOARD_SKIPPED reason=WrongScanSet`, which `prepare_keyboard` returns only when the F0 00 readback is not 2 (kernel/src/ps2.rs:332). The byte VMware returned is not logged. So with today's init sequence the readback fails, and D9's rejected alternative comes back to Cameron when this spec comes up; test 6 still records the byte.

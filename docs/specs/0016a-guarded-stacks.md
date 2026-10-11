@@ -55,8 +55,8 @@ Line references are at HEAD 4614249; earlier M0 specs shift some of them. Work o
    - A new fatal mode, `kernel-stack-overflow`, in `SmokeMode` (boot.rs:152-223), handled next to the existing ones (main.rs:393-401). It prints `MIRROR_TEST_EXPECT_FATAL vector=8`, sets RSP to the RSP0 stack top minus 2 KiB, then repeats `sub rsp, 4096` and `mov qword ptr [rsp], 0`. The write that reaches the guard page faults with RSP inside that page, so pushing the #PF frame faults again and the CPU raises #DF on IST1.
 
    Scripts and docs:
-   - run.ps1 gets `-Fault KernelStackOverflow` and adds it to its fatal set (run.ps1:475) with vector 8 and `error=0x0`, which its fatal-diagnostic regex (run.ps1:795-801) already expects. It checks that cr2 lies in the page at `rsp0_guard`. On every smoke boot it checks the `MIRROR_CPU_STACKS` lines, `MIRROR_STACKS_READY` and `MIRROR_IST_OK`.
-   - test.ps1 adds KernelStackOverflow to the main battery (test.ps1:90).
+   - run.ps1 gets `-Fault KernelStackOverflow` and adds it to its fatal set (run.ps1:480) with vector 8 and `error=0x0`, which its fatal-diagnostic regex (run.ps1:800-806) already expects. It checks that cr2 lies in the page at `rsp0_guard`. On every smoke boot it checks the `MIRROR_CPU_STACKS` lines, `MIRROR_STACKS_READY` and `MIRROR_IST_OK`.
+   - test.ps1 adds KernelStackOverflow to the main battery (test.ps1:103).
    - readme.md line 7 says every CPU has guarded stacks.
 
 ## Acceptance tests
