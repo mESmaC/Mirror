@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "boot-smoke")]
 use core::sync::atomic::{AtomicU64, AtomicUsize};
 
-use crate::{arch, fpu, serial, timer};
+use crate::{arch, fpu, serial, stacks::IST_COUNT, timer};
 
 global_asm!(
     include_str!("interrupts.S"),
@@ -40,7 +40,7 @@ const USER_CODE_SELECTOR: u16 = 0x33;
 // restore IOPL, NT, VM, VIF, VIP, or reserved bits from a saved user context.
 const USER_RFLAGS_MASK: u64 = 0x25_0dd5;
 const DOUBLE_FAULT_IST: u8 = 1;
-const DOUBLE_FAULT_STACK_SIZE: usize = 16 * 1024;
+const EARLY_IST_STACK_SIZE: usize = 16 * 1024;
 const MAX_CPUS: usize = 64;
 const IPI_VECTOR: usize = 240;
 const LOCAL_TIMER_VECTOR: usize = 241;
@@ -78,7 +78,7 @@ impl TaskStateSegment {
 }
 
 #[repr(C, align(16))]
-struct ExceptionStack([u8; DOUBLE_FAULT_STACK_SIZE]);
+struct ExceptionStack([u8; EARLY_IST_STACK_SIZE]);
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -173,7 +173,7 @@ static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut TSS: TaskStateSegment = TaskStateSegment::EMPTY;
 // The BSP's IST1-3 share this stack during early boot, until install_bsp_ists
 // moves them to their guarded stacks. Afterwards it stays idle.
-static mut EARLY_IST_STACK: ExceptionStack = ExceptionStack([0; DOUBLE_FAULT_STACK_SIZE]);
+static mut EARLY_IST_STACK: ExceptionStack = ExceptionStack([0; EARLY_IST_STACK_SIZE]);
 static mut GDT: [u64; 7] = [0; 7];
 static mut IDT: [IdtEntry; 256] = [IdtEntry::MISSING; 256];
 
@@ -185,8 +185,6 @@ static SECONDARY_CLAIMED: [AtomicBool; MAX_CPUS - 1] =
 static mut SECONDARY_TSS: [TaskStateSegment; MAX_CPUS - 1] =
     [const { TaskStateSegment::EMPTY }; MAX_CPUS - 1];
 static mut SECONDARY_GDT: [[u64; 7]; MAX_CPUS - 1] = [[0; 7]; MAX_CPUS - 1];
-static mut SECONDARY_DOUBLE_FAULT_STACKS: [ExceptionStack; MAX_CPUS - 1] =
-    [const { ExceptionStack([0; DOUBLE_FAULT_STACK_SIZE]) }; MAX_CPUS - 1];
 
 static USER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -294,7 +292,7 @@ pub fn init() {
     assert!(!is_initialized(), "IDT already loaded");
 
     let tss_address = addr_of!(TSS) as u64;
-    let stack_top = addr_of!(EARLY_IST_STACK) as u64 + DOUBLE_FAULT_STACK_SIZE as u64;
+    let stack_top = addr_of!(EARLY_IST_STACK) as u64 + EARLY_IST_STACK_SIZE as u64;
 
     // SAFETY: Only the boot CPU runs, IF is clear, and init is single-use. These
     // static objects have not been installed yet and no references alias writes.
@@ -411,26 +409,36 @@ unsafe fn load_descriptors(gdtr: &DescriptorPointer, idtr: &DescriptorPointer) {
     }
 }
 
-/// Install and verify a secondary CPU's private GDT, TSS and double-fault IST.
+/// Install and verify a secondary CPU's private GDT, TSS, RSP0 and IST1-3.
 /// Failures are returned without logging or entering the BSP panic path.
 ///
 /// # Safety
 /// The caller runs at CPL0 on the identified secondary with IF clear, exactly
 /// once for a slot in 1..64. The BSP has completed init. `kernel_stack_top` is
-/// immediately above this CPU's future private supervisor-writable stack. This
-/// routine only stores that address in RSP0; it may run on Limine's reserved AP
-/// bootstrap stack before the private stack is mapped and entered. The current
-/// stack and all descriptor storage must remain mapped throughout this call.
-/// Before setting IF or entering CPL3, map and switch to the permanent private
-/// stack. The bootstrap stack remains reserved until its last use has ended.
+/// immediately above this CPU's future private supervisor-writable stack, and
+/// `ist_tops` are immediately above its own private IST1 (#DF), IST2 (NMI) and
+/// IST3 (#MC) stacks. This routine only stores those addresses in the TSS; it
+/// may run on Limine's reserved AP bootstrap stack and root, before the private
+/// stacks are mapped, and an exception through an IST gate in that window
+/// triple-faults the CPU. The current stack and all descriptor storage must
+/// remain mapped throughout this call. Before setting IF or entering CPL3,
+/// activate a root that maps the private stacks and switch to the kernel stack.
+/// The bootstrap stack remains reserved until its last use has ended.
 /// The secondary must not enter userspace or call BSP-only interrupt routines.
-pub(crate) unsafe fn init_secondary(slot: usize, kernel_stack_top: u64) -> bool {
+pub(crate) unsafe fn init_secondary(
+    slot: usize,
+    kernel_stack_top: u64,
+    ist_tops: [u64; IST_COUNT],
+) -> bool {
     if !(1..MAX_CPUS).contains(&slot)
         || !INITIALIZED.load(Ordering::Acquire)
         || arch::interrupts_enabled()
         || kernel_stack_top == 0
         || !kernel_stack_top.is_multiple_of(16)
         || ((1_u64 << 47)..0xffff_8000_0000_0000).contains(&kernel_stack_top)
+        || ist_tops
+            .iter()
+            .any(|&top| top < 0xffff_8000_0000_0000 || !top.is_multiple_of(16))
     {
         return false;
     }
@@ -442,26 +450,26 @@ pub(crate) unsafe fn init_secondary(slot: usize, kernel_stack_top: u64) -> bool 
     // SAFETY: The checked slot's atomic claim grants exclusive access to these
     // distinct objects, including while other CPUs load their own descriptors.
     // No whole-array reference is formed. All arrays have permanent mappings.
-    let (tss, gdt, double_fault_top) = unsafe {
+    let (tss, gdt) = unsafe {
         (
             addr_of_mut!(SECONDARY_TSS)
                 .cast::<TaskStateSegment>()
                 .add(index),
             addr_of_mut!(SECONDARY_GDT).cast::<[u64; 7]>().add(index),
-            addr_of!(SECONDARY_DOUBLE_FAULT_STACKS)
-                .cast::<ExceptionStack>()
-                .add(index) as u64
-                + DOUBLE_FAULT_STACK_SIZE as u64,
         )
     };
     let expected_gdt = gdt_entries(tss as u64);
+    // IST1-3 hold the caller's tops; IST4-7 stay unused.
+    let mut expected_ists = [0; 7];
+    expected_ists[..IST_COUNT].copy_from_slice(&ist_tops);
     // SAFETY: This CPU exclusively owns these uninstalled descriptor objects.
-    // The caller supplies a valid private kernel stack; the IST is a distinct
-    // statically allocated supervisor stack, never the BSP's emergency stack.
+    // The caller supplies this CPU's private kernel and IST stacks, distinct
+    // from every other CPU's; hardware reads these fields only on CPL3 entry
+    // or on delivery through an IST gate.
     unsafe {
         tss.write(TaskStateSegment {
             privilege_stacks: [kernel_stack_top, 0, 0],
-            interrupt_stacks: [double_fault_top, 0, 0, 0, 0, 0, 0],
+            interrupt_stacks: expected_ists,
             ..TaskStateSegment::EMPTY
         });
         gdt.write(expected_gdt);
@@ -517,10 +525,7 @@ pub(crate) unsafe fn init_secondary(slot: usize, kernel_stack_top: u64) -> bool 
                 .cast::<u64>()
                 .read_unaligned()
                 == kernel_stack_top
-            && addr_of!((*tss).interrupt_stacks)
-                .cast::<u64>()
-                .read_unaligned()
-                == double_fault_top
+            && addr_of!((*tss).interrupt_stacks).read_unaligned() == expected_ists
     };
     actual_gdt.limit == gdtr.limit
         && actual_gdt.base == gdtr.base
@@ -542,7 +547,7 @@ pub(crate) unsafe fn init_secondary(slot: usize, kernel_stack_top: u64) -> bool 
 /// Only the BSP calls this, once, with IF clear, after `init`. Each top is
 /// 16-byte aligned and immediately above its own mapped, writable,
 /// supervisor-only stack, which stays mapped in every address space.
-pub(crate) unsafe fn install_bsp_ists(tops: [u64; 3]) {
+pub(crate) unsafe fn install_bsp_ists(tops: [u64; IST_COUNT]) {
     assert!(is_initialized(), "IDT not initialized");
     assert!(!arch::interrupts_enabled(), "IST update requires IF=0");
     for top in tops {

@@ -26,8 +26,12 @@ use mirror_acpi::Topology;
 
 const MAX_CPUS: usize = 64;
 const STACK_PAGES: usize = 16;
-// AP slots follow the BSP region of the stack arena (stacks.rs).
-const STACK_STRIDE: u64 = stacks::span(STACK_PAGES);
+// AP slots follow the BSP region of the stack arena (stacks.rs). Each holds the
+// kernel stack, then IST1 (#DF), IST2 (NMI) and IST3 (#MC), every one with its
+// own guard page below and above.
+const SLOT_STACKS: usize = 1 + stacks::IST_COUNT;
+const STACK_STRIDE: u64 =
+    stacks::span(STACK_PAGES) + stacks::IST_COUNT as u64 * stacks::span(stacks::IST_PAGES);
 const IPI_VECTOR: u8 = 240;
 const WAIT_TICKS: u64 = 500;
 const ABSENT: u32 = 0;
@@ -183,11 +187,31 @@ fn validate_identities(
     Ok(())
 }
 
+fn slot_base(slot: usize) -> u64 {
+    stacks::AP_BASE + (slot - 1) as u64 * STACK_STRIDE
+}
 fn stack_bottom(slot: usize) -> u64 {
-    stacks::AP_BASE + (slot - 1) as u64 * STACK_STRIDE + PAGE_SIZE
+    slot_base(slot) + PAGE_SIZE
 }
 fn stack_top(slot: usize) -> u64 {
     stack_bottom(slot) + STACK_PAGES as u64 * PAGE_SIZE
+}
+fn ist_bottom(slot: usize, ist: usize) -> u64 {
+    slot_base(slot)
+        + stacks::span(STACK_PAGES)
+        + ist as u64 * stacks::span(stacks::IST_PAGES)
+        + PAGE_SIZE
+}
+/// The tops of a slot's IST1-3 stacks, in TSS order.
+fn ist_tops(slot: usize) -> [u64; stacks::IST_COUNT] {
+    core::array::from_fn(|ist| ist_bottom(slot, ist) + stacks::IST_PAGES as u64 * PAGE_SIZE)
+}
+/// A slot's stacks in map order: the kernel stack, then IST1-3.
+fn slot_stacks(slot: usize) -> [(u64, usize); SLOT_STACKS] {
+    core::array::from_fn(|index| match index {
+        0 => (stack_bottom(slot), STACK_PAGES),
+        ist => (ist_bottom(slot, ist - 1), stacks::IST_PAGES),
+    })
 }
 
 /// Only BSP boot calls this, after all mutating kernel paging self-tests and
@@ -345,19 +369,16 @@ fn allocate_stacks(
         // SAFETY: The BSP runs with IF=0 on the active root and owns the
         // allocator. No AP was released and the root is not yet published, so
         // kernel mappings are unsealed. Only this slot uses its arena range.
-        match unsafe { stacks::map_guarded(tables, frames, stack_bottom(slot), STACK_PAGES) } {
-            Ok(top) => assert_eq!(top, stack_top(slot), "AP stack layout"),
-            Err(reason) => {
-                // map_guarded already rolled back its own pages.
-                for mapped in 1..slot {
-                    // SAFETY: Same BSP ownership. This slot's stack was mapped
-                    // above and no AP was released to run on it.
-                    unsafe {
-                        stacks::unmap_guarded(tables, frames, stack_bottom(mapped), STACK_PAGES)
-                    };
-                }
-                return Err(reason);
+        // Each of its stacks owns a separate span of the slot, guards
+        // included, so no two share a page; the self-test checks the layout.
+        if let Err(reason) = unsafe { stacks::map_set(tables, frames, &slot_stacks(slot)) } {
+            // map_set already rolled back this slot's stacks.
+            for mapped in 1..slot {
+                // SAFETY: Same BSP ownership. This slot's stacks were mapped
+                // above and no AP was released to run on them.
+                unsafe { stacks::unmap_set(tables, frames, &slot_stacks(mapped)) };
             }
+            return Err(reason);
         }
     }
     Ok(())
@@ -383,9 +404,14 @@ unsafe extern "C" fn secondary_entry(cpu: &Cpu) -> ! {
         arch::halt();
     }
     let top = slot.stack_top.load(Ordering::Relaxed);
-    // SAFETY: Unique validated AP slot; Limine's reserved stack and the kernel
-    // image/IST are mapped now and in the sealed root. No CPL3 entry is allowed.
-    if !unsafe { interrupts::init_secondary(index, top) } {
+    // SAFETY: Unique validated AP slot. Limine's reserved stack and the kernel
+    // image, with this CPU's descriptors and the shared IDT, are mapped now and
+    // in the sealed root. The RSP0 and IST1-3 tops sit above this slot's
+    // guarded stacks, which the BSP mapped before publication, but only in the
+    // sealed root: until activate_secondary below, a #DF finds its IST
+    // unmapped and triple-faults this CPU instead of being recorded. LINT1
+    // stays masked until apic::init_secondary. No CPL3 entry is allowed.
+    if !unsafe { interrupts::init_secondary(index, top, ist_tops(index)) } {
         fail(index, 2);
     }
     if fpu::init_secondary().is_err() {
@@ -1192,16 +1218,30 @@ fn self_test() {
         ),
         Err("cpu_identity_mismatch")
     );
+    // Slot 1's lower guard is the first page after the BSP region, whose IST3
+    // top lies one guard page below AP_BASE.
+    assert_eq!(stack_bottom(1) - PAGE_SIZE, stacks::AP_BASE);
+    let mut previous_top = stacks::AP_BASE - PAGE_SIZE;
     for index in 1..MAX_CPUS {
+        let set = slot_stacks(index);
+        assert_eq!(set[0], (stack_bottom(index), STACK_PAGES));
         assert_eq!(stack_top(index) - stack_bottom(index), 64 * 1024);
-        assert!(stack_bottom(index).is_multiple_of(PAGE_SIZE));
-        if index > 1 {
-            assert_eq!(stack_bottom(index) - stack_top(index - 1), 2 * PAGE_SIZE);
-        } else {
-            // Slot 1's lower guard is the first page after the BSP region.
-            assert_eq!(stack_bottom(index) - PAGE_SIZE, stacks::AP_BASE);
+        for (ist, top) in ist_tops(index).into_iter().enumerate() {
+            let (bottom, pages) = set[ist + 1];
+            assert_eq!(bottom + pages as u64 * PAGE_SIZE, top);
+            assert_eq!(top - bottom, 16 * 1024);
         }
+        // Every stack keeps its own guard below and above, so each neighbour,
+        // across slot boundaries too, sits exactly two unmapped pages away.
+        for (bottom, pages) in set {
+            assert!(bottom.is_multiple_of(PAGE_SIZE));
+            assert_eq!(bottom - previous_top, 2 * PAGE_SIZE);
+            previous_top = bottom + pages as u64 * PAGE_SIZE;
+        }
+        assert_eq!(previous_top + PAGE_SIZE, slot_base(index) + STACK_STRIDE);
     }
+    // The last slot's upper guard ends below the shared window.
+    assert!(previous_top + PAGE_SIZE <= paging::SHARED_BASE);
     let state = AtomicU32::new(STARTING);
     assert!(
         state

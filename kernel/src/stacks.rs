@@ -11,8 +11,9 @@
 //!
 //! The stack arena starts with the BSP region: the scheduler stack, which
 //! replaces Limine's boot stack, the RSP0 trap stack and the IST1 (#DF), IST2
-//! (NMI) and IST3 (#MC) stacks. The AP slots (smp.rs) follow it from `AP_BASE`.
-//! The arena sits in the shared upper half, so every process root, which
+//! (NMI) and IST3 (#MC) stacks. The AP slots (smp.rs) follow it from `AP_BASE`,
+//! each with the AP's kernel stack, which is also its RSP0, and its own IST1-3
+//! stacks. The arena sits in the shared upper half, so every process root, which
 //! copies the upper PML4 entries, maps the BSP stacks too.
 
 use core::{
@@ -33,8 +34,10 @@ const KERNEL_HALF: u64 = 0xffff_8000_0000_0000;
 const ARENA: u64 = 0xffff_d100_0000_0000;
 const SCHEDULER_PAGES: usize = 64;
 const RSP0_PAGES: usize = 16;
-const IST_COUNT: usize = 3;
-const IST_PAGES: usize = 4;
+/// Every CPU has guarded IST1 (#DF), IST2 (NMI) and IST3 (#MC) stacks of
+/// 16 KiB each: the BSP in its region, an AP in its slot.
+pub const IST_COUNT: usize = 3;
+pub const IST_PAGES: usize = 4;
 const SCHEDULER_BOTTOM: u64 = ARENA + PAGE_SIZE;
 const RSP0_BOTTOM: u64 = ARENA + span(SCHEDULER_PAGES) + PAGE_SIZE;
 const IST_BASE: u64 = ARENA + span(SCHEDULER_PAGES) + span(RSP0_PAGES);
@@ -101,16 +104,9 @@ pub unsafe fn map_bsp(
         !BSP_MAPPED.load(Ordering::Acquire),
         "BSP stacks mapped twice"
     );
-    for (index, &(bottom, pages)) in BSP_STACKS.iter().enumerate() {
-        // SAFETY: Inherited from the caller; each stack has its own range.
-        if let Err(reason) = unsafe { map_guarded(tables, frames, bottom, pages) } {
-            for &(bottom, pages) in &BSP_STACKS[..index] {
-                // SAFETY: Mapped by this loop; nothing has run on it yet.
-                unsafe { unmap_guarded(tables, frames, bottom, pages) };
-            }
-            return Err(reason);
-        }
-    }
+    // SAFETY: Inherited from the caller. The const asserts above keep each
+    // stack's range, guards included, apart from every other.
+    unsafe { map_set(tables, frames, &BSP_STACKS) }?;
     BSP_MAPPED.store(true, Ordering::Release);
     Ok(BspStacks {
         scheduler_top: top(SCHEDULER_BOTTOM, SCHEDULER_PAGES),
@@ -210,6 +206,46 @@ pub unsafe fn map_guarded(
             unsafe { unmap_pages(tables, frames, bottom, mapped) };
             Err(reason)
         }
+    }
+}
+
+/// Map each `(bottom, pages)` stack of `set` through `map_guarded`, in order.
+/// If one fails, the stacks mapped before it are unmapped again and the error
+/// returns, so a failed call leaves no stack of the set mapped.
+///
+/// # Safety
+/// The `map_guarded` contract holds for every stack of `set`, and no two of
+/// them share a page, guards included.
+pub unsafe fn map_set(
+    tables: &mut PageTables,
+    frames: &mut FrameAllocator<'_>,
+    set: &[(u64, usize)],
+) -> Result<(), &'static str> {
+    for (index, &(bottom, pages)) in set.iter().enumerate() {
+        // SAFETY: Inherited from the caller for this stack's own range.
+        if let Err(reason) = unsafe { map_guarded(tables, frames, bottom, pages) } {
+            // map_guarded already rolled back its own pages.
+            // SAFETY: Each earlier stack was mapped by this loop, and its top
+            // was never handed out, so nothing has run on it.
+            unsafe { unmap_set(tables, frames, &set[..index]) };
+            return Err(reason);
+        }
+    }
+    Ok(())
+}
+
+/// Unmap every stack of a set that `map_set` mapped and release its frames.
+///
+/// # Safety
+/// The `unmap_guarded` contract holds for every stack of `set`.
+pub unsafe fn unmap_set(
+    tables: &mut PageTables,
+    frames: &mut FrameAllocator<'_>,
+    set: &[(u64, usize)],
+) {
+    for &(bottom, pages) in set {
+        // SAFETY: Inherited from the caller for this stack.
+        unsafe { unmap_guarded(tables, frames, bottom, pages) };
     }
 }
 
