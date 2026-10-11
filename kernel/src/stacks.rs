@@ -297,6 +297,36 @@ pub unsafe fn map_set(
     Ok(())
 }
 
+/// Map the set `set(index)` for each index of `indices`, in order, through
+/// `map_set`. If one fails, the sets mapped before it are unmapped again and
+/// the error returns, so a failed call leaves no stack of any set mapped.
+///
+/// # Safety
+/// The `map_set` contract holds for every set, and no two sets share a page,
+/// guards included. `set` returns the same set each time it is called with
+/// the same index.
+pub unsafe fn map_sets<const N: usize>(
+    tables: &mut PageTables,
+    frames: &mut FrameAllocator<'_>,
+    indices: core::ops::Range<usize>,
+    set: impl Fn(usize) -> [(u64, usize); N],
+) -> Result<(), &'static str> {
+    for index in indices.clone() {
+        // SAFETY: Inherited from the caller for this set.
+        if let Err(reason) = unsafe { map_set(tables, frames, &set(index)) } {
+            // map_set already rolled back this set's stacks.
+            for mapped in indices.start..index {
+                // SAFETY: This loop mapped each earlier set, which `set`
+                // returns unchanged, and no stack top was handed out, so
+                // nothing has run on them.
+                unsafe { unmap_set(tables, frames, &set(mapped)) };
+            }
+            return Err(reason);
+        }
+    }
+    Ok(())
+}
+
 /// Unmap every stack of a set that `map_set` mapped and release its frames.
 ///
 /// # Safety
@@ -351,10 +381,10 @@ unsafe fn unmap_pages(
     }
 }
 
-/// Exercise placement checks, zeroing, guard rejection and rollback on scratch
-/// pages beside `paging::TEST_ADDRESS`, whose page table the paging self-test
-/// already created, so frame counts compare exactly. Every page is unmapped
-/// again on return.
+/// Exercise placement checks, zeroing, guard rejection and rollback, of one
+/// stack and of stack sets, on scratch pages beside `paging::TEST_ADDRESS`,
+/// whose page table the paging self-test already created, so frame counts
+/// compare exactly. Every page is unmapped again on return.
 ///
 /// # Safety
 /// The `map_guarded` contract holds, the paging self-test has run, and no
@@ -438,5 +468,25 @@ pub unsafe fn self_test(tables: &mut PageTables, frames: &mut FrameAllocator<'_>
     assert_eq!((allocated(frames), tables.owned_table_count()), before);
     for page in 0..PAGES as u64 {
         assert_eq!(tables.translate(BOTTOM + page * PAGE_SIZE), Ok(None));
+    }
+    // Set rollback: set 0 maps both its stacks. Set 1 maps its first stack,
+    // then its second fails layout validation before mapping anything, so
+    // map_set unmaps set 1's first stack and map_sets unmaps all of set 0.
+    // Every guard of these stacks lies in the scratch pages, and no two
+    // stacks share a page.
+    let sets = |index: usize| match index {
+        0 => [(BOTTOM - 7 * PAGE_SIZE, 1), (BOTTOM - 4 * PAGE_SIZE, 1)],
+        _ => [(BOTTOM, PAGES), (TOP + 2 * PAGE_SIZE, 0)],
+    };
+    // SAFETY: Every stack and guard of both sets lies in the unused scratch
+    // pages, `sets` is a pure function of the index, and the failing stack is
+    // rejected before it maps anything.
+    let result = unsafe { map_sets(tables, frames, 0..2, sets) };
+    assert_eq!(result, Err("stack_layout_invalid"));
+    assert_eq!((allocated(frames), tables.owned_table_count()), before);
+    for (bottom, pages) in (0..2).flat_map(sets) {
+        for page in 0..pages as u64 {
+            assert_eq!(tables.translate(bottom + page * PAGE_SIZE), Ok(None));
+        }
     }
 }

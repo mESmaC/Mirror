@@ -411,7 +411,9 @@ unsafe fn enable_machine_check() -> bool {
         // SAFETY: CPL0 with IF clear per the caller. CPUID reports MCE, so
         // bit 6 is defined and setting it cannot fault; every other bit keeps
         // the value just read. The IDT is loaded, so a machine check from now
-        // on reaches its handler instead of shutting the CPU down.
+        // on is delivered through its gate instead of shutting the CPU down.
+        // On an AP whose IST3 is not yet mapped, that delivery raises the #PF
+        // that init_secondary describes.
         unsafe { asm!("mov cr4, {}", in(reg) expected, options(nostack, preserves_flags)) };
     }
     let after: u64;
@@ -475,8 +477,13 @@ unsafe fn load_descriptors(gdtr: &DescriptorPointer, idtr: &DescriptorPointer) {
 /// `ist_tops` are immediately above its own private IST1 (#DF), IST2 (NMI) and
 /// IST3 (#MC) stacks. This routine only stores those addresses in the TSS; it
 /// may run on Limine's reserved AP bootstrap stack and root, before the private
-/// stacks are mapped, and an exception through an IST gate in that window
-/// triple-faults the CPU. The current stack and all descriptor storage must
+/// stacks are mapped. From its IDT load until the caller activates a root that
+/// maps them, pushing a frame onto an IST stack faults. Only a #DF then
+/// triple-faults the CPU, because #DF plus the #PF from its IST1 push shuts it
+/// down. NMI and #MC are benign, so the #PF from an IST2 or IST3 push is
+/// delivered serially through the #PF gate, which has no IST, on the current
+/// stack, and the secondary fault path records it as vector 14 with CR2 inside
+/// that IST stack. The current stack and all descriptor storage must
 /// remain mapped throughout this call. Before setting IF or entering CPL3,
 /// activate a root that maps the private stacks and switch to the kernel stack.
 /// The bootstrap stack remains reserved until its last use has ended.
@@ -543,7 +550,10 @@ pub(crate) unsafe fn init_secondary(
     unsafe { load_descriptors(&gdtr, &idtr) };
     // SAFETY: This AP runs at CPL0 with IF clear and has just loaded the
     // shared IDT. Until the caller activates the root that maps IST3, a
-    // machine check triple-faults, as it would with CR4.MCE clear.
+    // machine check's push onto IST3 raises #PF. #MC is benign, so that #PF is
+    // delivered serially on the current stack and the secondary fault path
+    // records it as vector 14, rather than the CPU shutting down as it would
+    // with CR4.MCE clear.
     let machine_check = unsafe { enable_machine_check() };
 
     let mut actual_gdt = DescriptorPointer { limit: 0, base: 0 };

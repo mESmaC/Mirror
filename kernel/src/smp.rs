@@ -414,23 +414,14 @@ fn allocate_stacks(
     tables: &mut PageTables,
     frames: &mut FrameAllocator<'_>,
 ) -> Result<(), &'static str> {
-    for slot in 1..count {
-        // SAFETY: The BSP runs with IF=0 on the active root and owns the
-        // allocator. No AP was released and the root is not yet published, so
-        // kernel mappings are unsealed. Only this slot uses its arena range.
-        // Each of its stacks owns a separate span of the slot, guards
-        // included, so no two share a page; the self-test checks the layout.
-        if let Err(reason) = unsafe { stacks::map_set(tables, frames, &slot_stacks(slot)) } {
-            // map_set already rolled back this slot's stacks.
-            for mapped in 1..slot {
-                // SAFETY: Same BSP ownership. This slot's stacks were mapped
-                // above and no AP was released to run on them.
-                unsafe { stacks::unmap_set(tables, frames, &slot_stacks(mapped)) };
-            }
-            return Err(reason);
-        }
-    }
-    Ok(())
+    // SAFETY: The BSP runs with IF=0 on the active root and owns the
+    // allocator. No AP was released and the root is not yet published, so
+    // kernel mappings are unsealed. Only its slot uses each slot's arena
+    // range, and slot_stacks is a pure function of the slot. Each stack owns a
+    // separate span of its slot, guards included, so no two stacks of any
+    // slots share a page; the self-test checks the layout. On failure map_sets
+    // unmaps every slot it mapped before any AP could run on it.
+    unsafe { stacks::map_sets(tables, frames, 1..count, slot_stacks) }
 }
 
 unsafe extern "C" fn secondary_entry(cpu: &Cpu) -> ! {
@@ -457,9 +448,14 @@ unsafe extern "C" fn secondary_entry(cpu: &Cpu) -> ! {
     // image, with this CPU's descriptors and the shared IDT, are mapped now and
     // in the sealed root. The RSP0 and IST1-3 tops sit above this slot's
     // guarded stacks, which the BSP mapped before publication, but only in the
-    // sealed root: until activate_secondary below, a #DF, NMI or #MC finds its
-    // IST unmapped and triple-faults this CPU instead of being recorded. LINT1
-    // stays masked until apic::init_secondary. No CPL3 entry is allowed.
+    // sealed root. So from init_secondary's IDT load until activate_secondary
+    // below, pushing a frame onto an IST stack faults. Only a #DF then
+    // triple-faults this CPU: its IST1 push raises #PF, and #DF plus #PF shuts
+    // the CPU down. NMI and #MC are benign, so the #PF from an IST2 or IST3
+    // push is delivered serially through the #PF gate, which has no IST, on
+    // Limine's stack, and secondary_fault records this slot FAILED with vector
+    // 14 and cr2 inside that IST stack. LINT1 stays masked until
+    // apic::init_secondary. No CPL3 entry is allowed.
     if !unsafe { interrupts::init_secondary(index, top, ist_tops(index)) } {
         fail(index, 2);
     }
