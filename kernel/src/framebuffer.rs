@@ -9,6 +9,7 @@
 
 use core::{marker::PhantomData, ptr::NonNull};
 use limine::framebuffer::{Framebuffer, MemoryModel};
+use mirror_ui_tokens::{CURSOR, CURSOR_HEIGHT, CURSOR_WIDTH, DEFAULT, Rgb};
 
 const MAX_DIMENSION: u64 = 8192;
 const MAX_BYTE_LEN: u64 = 128 * 1024 * 1024;
@@ -194,39 +195,22 @@ impl Color {
     const fn rgb(red: u8, green: u8, blue: u8) -> Self {
         Self { red, green, blue }
     }
+
+    /// A solid theme token; its padding X byte is dropped.
+    const fn token(color: Rgb) -> Self {
+        let [red, green, blue, _] = color.rgbx();
+        Self::rgb(red, green, blue)
+    }
 }
 
-const BACKGROUND: Color = Color::rgb(9, 14, 21);
-const PANEL: Color = Color::rgb(17, 25, 36);
-const BORDER: Color = Color::rgb(38, 52, 67);
-const TEXT: Color = Color::rgb(230, 239, 245);
-const MUTED: Color = Color::rgb(141, 161, 177);
-const ACCENT: Color = Color::rgb(89, 221, 202);
-
-const CURSOR_WIDTH: usize = 12;
-const CURSOR_HEIGHT: usize = 18;
-// Original arrow with an opaque dark outline and light interior; dots leave
-// the scene untouched. Its hot spot is the top-left pixel.
-const CURSOR: [&[u8; CURSOR_WIDTH]; CURSOR_HEIGHT] = [
-    b"X...........",
-    b"XX..........",
-    b"XOX.........",
-    b"XOOX........",
-    b"XOOOX.......",
-    b"XOOOOX......",
-    b"XOOOOOX.....",
-    b"XOOOOOOX....",
-    b"XOOOOOOOX...",
-    b"XOOOOOOOOX..",
-    b"XOOOOOOOOOX.",
-    b"XOOOOOXXXXXX",
-    b"XOOXOOX.....",
-    b"XOX.XOOX....",
-    b"XX..XOOX....",
-    b"X....XOOX...",
-    b".....XOOX...",
-    b"......XX....",
-];
+// The boot screen and console draw from the shared theme (spec 0029-D5), so
+// the base around a centered desktop matches the shell's own backdrop.
+const BACKGROUND: Color = Color::token(DEFAULT.base);
+const PANEL: Color = Color::token(DEFAULT.surface);
+const BORDER: Color = Color::token(DEFAULT.border_strong);
+const TEXT: Color = Color::token(DEFAULT.text_primary);
+const MUTED: Color = Color::token(DEFAULT.text_secondary);
+const ACCENT: Color = Color::token(DEFAULT.accent);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Clip {
@@ -425,8 +409,9 @@ impl<'a> Driver<'a> {
         self.clip = previous;
     }
 
-    /// Draw an opaque arrow over the current scene. Positions outside the
-    /// framebuffer are ignored; arrows at its right/bottom edges are clipped.
+    /// Draw the shared pointer sprite (0029-D12) over the current scene.
+    /// Positions outside the framebuffer are ignored; a pointer at its
+    /// right/bottom edges is clipped.
     pub fn draw_cursor(&mut self, x: usize, y: usize) {
         if x >= self.layout.info.width || y >= self.layout.info.height {
             return;
@@ -1287,6 +1272,11 @@ pub fn self_test() {
     fn rejected(description: Description, error: FramebufferError) {
         assert!(matches!(Layout::validate(0x1000, description), Err(actual) if actual == error));
     }
+    // Expected BGR32 bytes of a theme color, spelled out independently of
+    // `Layout::encode` so the oracles follow the tokens (spec 0029-D5).
+    fn bgrx(color: Color) -> [u8; 4] {
+        [color.blue, color.green, color.red, 0]
+    }
 
     let rgb24 = Description {
         width: 3,
@@ -1414,8 +1404,8 @@ pub fn self_test() {
     for row in 0..18 {
         assert_eq!(&canvas[8 + row * 80 + 76..8 + row * 80 + 80], &[0xa5; 4]);
     }
-    assert_eq!(&canvas[1356..1360], &[245, 239, 230, 0]);
-    assert_eq!(&canvas[1440..1444], &[245, 239, 230, 0]);
+    assert_eq!(&canvas[1356..1360], &bgrx(TEXT));
+    assert_eq!(&canvas[1440..1444], &bgrx(TEXT));
     assert!(canvas[8..1448].iter().any(|&byte| byte != 0xa5));
     assert_eq!(clipped_span(i64::MIN, u64::MAX, 19), (0, 19));
     assert_eq!(clipped_span(19, u64::MAX, 19), (19, 19));
@@ -1511,7 +1501,7 @@ pub fn self_test() {
     // 14 text columns reserve two prompt cells and one caret cell, leaving
     // eleven visible bytes; the cursor after 96 input bytes scrolls to x=82.
     let caret = 8 + 80 * 388 + 82 * 4;
-    assert_eq!(&console_canvas[caret..caret + 4], &[202, 221, 89, 0]);
+    assert_eq!(&console_canvas[caret..caret + 4], &bgrx(ACCENT));
     {
         let mut driver = surface(&mut console_canvas[8..38_808], console_description)
             .expect("partial console update");
@@ -1539,11 +1529,11 @@ pub fn self_test() {
         &console_canvas[history_marker..history_marker + 4],
         &[6, 5, 4, 0]
     );
-    assert_eq!(&console_canvas[caret..caret + 4], &[36, 25, 17, 0]);
+    assert_eq!(&console_canvas[caret..caret + 4], &bgrx(PANEL));
     let cleared_caret = 8 + 80 * 388 + 16 * 4;
     assert_eq!(
         &console_canvas[cleared_caret..cleared_caret + 4],
-        &[202, 221, 89, 0]
+        &bgrx(ACCENT)
     );
     console.dispatch(crate::console::Operation::Clear);
     {
@@ -1557,7 +1547,7 @@ pub fn self_test() {
     );
     assert_eq!(
         &console_canvas[history_marker..history_marker + 4],
-        &[36, 25, 17, 0]
+        &bgrx(PANEL)
     );
     console.input_lost();
     {
@@ -1567,10 +1557,10 @@ pub fn self_test() {
         driver.fill_rect(0, 0, 18, 7, PANEL);
         driver.text(0, 0, "Mm!", 1, TEXT);
     }
-    assert_eq!(&console_canvas[8..12], &[245, 239, 230, 0]);
+    assert_eq!(&console_canvas[8..12], &bgrx(TEXT));
     // Uppercase M has top-row ink; lowercase m has two empty leading rows.
-    assert_eq!(&console_canvas[8 + 6 * 4..8 + 7 * 4], &[36, 25, 17, 0]);
-    assert_eq!(&console_canvas[8 + 14 * 4..8 + 15 * 4], &[245, 239, 230, 0]);
+    assert_eq!(&console_canvas[8 + 6 * 4..8 + 7 * 4], &bgrx(PANEL));
+    assert_eq!(&console_canvas[8 + 14 * 4..8 + 15 * 4], &bgrx(TEXT));
     assert!(
         console_canvas[..8]
             .iter()

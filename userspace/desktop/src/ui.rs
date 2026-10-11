@@ -3,9 +3,14 @@
 use crate::render::{self, Rect, Renderer};
 use crate::{Event, require};
 use mirror_desktop_protocol::{Change, Editor, Operation, Request, Response, Snapshot};
+use mirror_ui_tokens::Role;
 
 const CAPACITY: usize = mirror_desktop_protocol::CAPACITY;
-const CELL: usize = 12;
+/// The Scratchpad's draft, applied note and button labels predate the type
+/// roles and keep scale 2 (0029-D10: existing text keeps its scale). CELL is
+/// their advance, which the caret hit test uses.
+const LARGE: usize = 2;
+const CELL: usize = 6 * LARGE;
 pub const EDIT: u8 = 1;
 pub const OUTPUT: u8 = 2;
 pub const POINTER: u8 = 4;
@@ -64,6 +69,9 @@ pub struct Ui {
     editor: Editor,
     input_focused: bool,
     agent_focused: bool,
+    /// Focus last moved by Tab, not by a press: Apply and Run agent then show
+    /// the focus ring, as CSS `:focus-visible` does for buttons (0029-D7).
+    keyboard_focus: bool,
     agent_status: AgentStatus,
     notice: bool,
     pointer_x: usize,
@@ -82,6 +90,7 @@ impl Ui {
             editor: Editor::new(),
             input_focused: true,
             agent_focused: false,
+            keyboard_focus: false,
             agent_status: AgentStatus::Ready,
             notice: false,
             pointer_x: width / 2,
@@ -188,6 +197,7 @@ impl Ui {
                     return EXIT;
                 }
                 if kind == 4 && flags & 2 == 0 {
+                    self.keyboard_focus = true;
                     if self.input_focused {
                         self.input_focused = false;
                     } else if self.agent_focused {
@@ -270,14 +280,17 @@ impl Ui {
                         change |= self.dispatch_human(Operation::SetCaret(caret));
                         self.input_focused = true;
                         self.agent_focused = false;
+                        self.keyboard_focus = false;
                         change |= EDIT | AGENT;
                     } else if self.layout.button.contains(self.pointer_x, self.pointer_y) {
                         self.input_focused = false;
                         self.agent_focused = false;
+                        self.keyboard_focus = false;
                         change |= EDIT | AGENT | self.submit();
                     } else if self.layout.agent.contains(self.pointer_x, self.pointer_y) {
                         self.input_focused = false;
                         self.agent_focused = true;
+                        self.keyboard_focus = false;
                         change |= EDIT | AGENT | self.run_agent();
                     }
                 }
@@ -287,43 +300,67 @@ impl Ui {
     }
 
     pub fn paint_initial(&self, renderer: &mut Renderer) {
-        renderer.fill(Rect::new(0, 0, self.width, self.height), render::DESKTOP);
-        renderer.fill(Rect::new(0, 0, self.width, 48), render::TOPBAR);
-        renderer.fill(Rect::new(0, 47, self.width, 1), render::BORDER);
-        renderer.text(28, 17, b"MIRROR", 2, render::TEXT);
-        renderer.text(self.width - 104, 21, b"DESKTOP", 1, render::ACCENT);
-        // Keep the footer below the panel shadow, including the smallest layout.
-        renderer.fill(Rect::new(28, self.height - 38, 4, 20), render::ACCENT_DARK);
+        renderer.fill(Rect::new(0, 0, self.width, self.height), render::BASE);
+        renderer.fill(Rect::new(0, 0, self.width, 48), render::SURFACE);
+        renderer.fill(Rect::new(0, 47, self.width, 1), render::BORDER_SUBTLE);
+        renderer.text(
+            28,
+            17,
+            b"MIRROR",
+            Role::Title3.scale(),
+            render::TEXT_PRIMARY,
+        );
+        renderer.text(
+            self.width - 104,
+            21,
+            b"DESKTOP",
+            Role::Overline.scale(),
+            render::ACCENT,
+        );
+        // Keep the footer below the panel, including the smallest layout.
+        renderer.fill(
+            Rect::new(28, self.height - 38, 4, 20),
+            render::ACCENT_SUBTLE,
+        );
         renderer.text(
             44,
             self.height - 32,
             b"Press Esc to return to the console.",
-            1,
-            render::MUTED,
+            Role::Caption.scale(),
+            render::TEXT_SECONDARY,
         );
+        // Elevation is border-only (0029-D4): the offset shadow block is gone.
         let window = self.layout.window;
-        renderer.fill(
-            Rect::new(window.x + 8, window.y + 8, window.width, window.height),
-            render::SHADOW,
-        );
-        renderer.fill(window, render::PANEL);
-        renderer.border(window, render::BORDER);
+        renderer.fill(window, render::SURFACE);
+        renderer.border(window, render::BORDER_STRONG);
         renderer.fill(
             Rect::new(window.x + 1, window.y + 1, window.width - 2, 63),
-            render::RAISED,
+            render::OVERLAY,
         );
-        renderer.text(window.x + 28, window.y + 23, b"Scratchpad", 3, render::TEXT);
+        renderer.text(
+            window.x + 28,
+            window.y + 23,
+            b"Scratchpad",
+            Role::Display.scale(),
+            render::TEXT_PRIMARY,
+        );
         renderer.fill(
             Rect::new(window.x + window.width - 24, window.y + 28, 6, 6),
             render::ACCENT,
         );
-        renderer.text(window.x + 28, window.y + 83, b"YOUR NOTE", 1, render::MUTED);
+        renderer.text(
+            window.x + 28,
+            window.y + 83,
+            b"YOUR NOTE",
+            Role::Overline.scale(),
+            render::TEXT_SECONDARY,
+        );
         renderer.text(
             window.x + 28,
             window.y + 178,
             b"APPLIED NOTE",
-            1,
-            render::MUTED,
+            Role::Overline.scale(),
+            render::TEXT_SECONDARY,
         );
         self.paint_edit(renderer);
         self.paint_output(renderer);
@@ -351,31 +388,34 @@ impl Ui {
 
     fn paint_edit(&self, renderer: &mut Renderer) {
         let field = self.layout.field;
-        renderer.fill(field, render::FIELD);
+        renderer.fill(field, render::SURFACE);
+        // A focused field keeps its accent border and also shows the ring
+        // whenever focused, as `:focus-visible` does for inputs (0029-D7).
         renderer.border(
             field,
             if self.input_focused {
                 render::ACCENT
             } else {
-                render::BORDER
+                render::BORDER_STRONG
             },
         );
+        renderer.focus_ring(field, self.input_focused, render::SURFACE);
         let start = self.input_start();
         let end = self.editor.draft().len().min(start + self.layout.visible);
         renderer.text(
             self.layout.text_x,
             self.layout.text_y,
             &self.editor.draft()[start..end],
-            2,
-            render::TEXT,
+            LARGE,
+            render::TEXT_PRIMARY,
         );
         if self.editor.draft().is_empty() && !self.input_focused {
             renderer.text(
                 self.layout.text_x,
                 self.layout.text_y,
                 b"Write a note",
-                2,
-                render::MUTED,
+                LARGE,
+                render::TEXT_SECONDARY,
             );
         }
         if self.input_focused {
@@ -389,23 +429,28 @@ impl Ui {
                 render::ACCENT,
             );
         }
+        // Apply is a primary button. Its focus shows as the ring after Tab,
+        // never as a border color alone, and not after a press (0029-D7).
         let button = self.layout.button;
-        renderer.fill(button, render::BUTTON);
-        renderer.border(
+        renderer.fill(button, render::ACCENT);
+        renderer.focus_ring(
             button,
-            if !self.input_focused && !self.agent_focused {
-                render::TEXT
-            } else {
-                render::BUTTON
-            },
+            self.keyboard_focus && !self.input_focused && !self.agent_focused,
+            render::SURFACE,
         );
-        renderer.text(button.x + 30, button.y + 15, b"Apply", 2, render::DESKTOP);
+        renderer.text(
+            button.x + 30,
+            button.y + 15,
+            b"Apply",
+            LARGE,
+            render::ON_ACCENT,
+        );
     }
 
     fn paint_output(&self, renderer: &mut Renderer) {
         let output = self.layout.output;
-        renderer.fill(output, render::TOPBAR);
-        renderer.border(output, render::BORDER);
+        renderer.fill(output, render::SURFACE);
+        renderer.border(output, render::BORDER_STRONG);
         let padding_y = if output.height < 38 { 3 } else { 12 };
         let columns = (output.width - 24) / CELL;
         let rows = output.height.saturating_sub(padding_y * 2) / 18;
@@ -419,11 +464,11 @@ impl Ui {
                 output.x + 12,
                 output.y + padding_y + row * 18,
                 line,
-                2,
+                LARGE,
                 if self.snapshot().has_applied {
-                    render::TEXT
+                    render::TEXT_PRIMARY
                 } else {
-                    render::MUTED
+                    render::TEXT_SECONDARY
                 },
             );
         }
@@ -438,7 +483,7 @@ impl Ui {
                 window.width - 56,
                 12,
             ),
-            render::PANEL,
+            render::SURFACE,
         );
         let (notice, color) = if self.notice {
             (
@@ -448,14 +493,14 @@ impl Ui {
         } else {
             (
                 &b"Session only. Run agent replaces your note. Tab changes focus."[..],
-                render::MUTED,
+                render::TEXT_SECONDARY,
             )
         };
         renderer.text(
             window.x + 28,
             window.y + window.height - 26,
             &notice[..notice.len().min((window.width - 56) / 6)],
-            1,
+            Role::Caption.scale(),
             color,
         );
     }
@@ -477,28 +522,27 @@ impl Ui {
         renderer.fill(
             button,
             if disabled {
-                render::RAISED
+                render::OVERLAY
             } else {
-                render::BUTTON
+                render::ACCENT
             },
         );
-        renderer.border(
+        renderer.border(button, render::BORDER_STRONG);
+        // Run agent sits on the desktop backdrop, so a cleared ring is base.
+        renderer.focus_ring(
             button,
-            if self.agent_focused {
-                render::TEXT
-            } else {
-                render::BORDER
-            },
+            self.keyboard_focus && self.agent_focused,
+            render::BASE,
         );
         renderer.text(
             button.x + (button.width - label.len() * CELL) / 2,
             button.y + 8,
             label,
-            2,
+            LARGE,
             if disabled {
-                render::MUTED
+                render::TEXT_SECONDARY
             } else {
-                render::DESKTOP
+                render::ON_ACCENT
             },
         );
     }

@@ -6,6 +6,7 @@ use crate::{
     Event as HardwareEvent, SYS_INPUT_POLL, SYS_SLEEP, SYS_TICKS, boot_handle, exit, next_input,
     require, surface_dimensions, syscall, write,
 };
+use mirror_ui_tokens::{DEFAULT, Role};
 use mirror_window_protocol::{self as protocol, AppInfo, Event, TileRequest};
 
 const OUTER_WIDTH: usize = protocol::WIDTH + 2;
@@ -13,6 +14,15 @@ const OUTER_HEIGHT: usize = protocol::HEIGHT + 30;
 const TASKBAR_HEIGHT: usize = 48;
 const PENDING_EVENTS: usize = 16;
 const LOG_CAPACITY: usize = 32;
+// Type roles on the 5x7 font (0029-D10); every existing string keeps its
+// scale and position. The other strings name their roles where drawn.
+const WORDMARK: Role = Role::Title3;
+const STOPPED_TITLE: Role = Role::Title2;
+// App pixels the smoke oracles wait for (0029-D6). Notes and Counter draw the
+// same tokens, so slots, not colors, identify windows.
+const FOCUSED_BORDER: [u8; 4] = DEFAULT.accent.rgbx();
+const UNFOCUSED_BORDER: [u8; 4] = DEFAULT.border_strong.rgbx();
+const INK: [u8; 4] = DEFAULT.text_primary.rgbx();
 
 #[derive(Clone, Copy)]
 struct Pending {
@@ -82,8 +92,10 @@ impl Window {
     fn outer(self) -> Rect {
         Rect::new(self.x, self.y, OUTER_WIDTH, OUTER_HEIGHT)
     }
+    /// A window draws nothing outside its outer rectangle: the offset shadow
+    /// block is gone (0029-D4), so its damage no longer reaches 8 px beyond.
     fn damage(self) -> Rect {
-        Rect::new(self.x, self.y, OUTER_WIDTH + 8, OUTER_HEIGHT + 8)
+        self.outer()
     }
     fn content(self) -> Rect {
         Rect::new(self.x + 1, self.y + 29, protocol::WIDTH, protocol::HEIGHT)
@@ -93,6 +105,35 @@ impl Window {
     }
     fn minimize_button(self) -> Rect {
         Rect::new(self.x + 266, self.y + 5, 22, 18)
+    }
+    /// Shown only while the app is stopped (0029-D8). The spec places it at
+    /// content-local (23, 100), below "Relaunch it, or close this window.";
+    /// in today's chrome the content starts at y + 29.
+    fn relaunch_button(self) -> Rect {
+        Rect::new(self.x + 24, self.y + 129, 96, 28)
+    }
+    fn stopped(self) -> bool {
+        self.state != protocol::RUNNING
+    }
+}
+
+/// Why the last launch was refused. While one is set, a toast says so above
+/// the windows (0029-D8); the next launch or close clears it.
+#[derive(Clone, Copy)]
+enum Refusal {
+    /// Both window slots are in use.
+    NoSlot,
+    /// `SYS_APP_LAUNCH` failed.
+    LaunchFailed,
+}
+
+impl Refusal {
+    /// The `refused launch` capture fence (trace builds only, 0010-D4).
+    fn code(self) -> u64 {
+        match self {
+            Self::NoSlot => 1,
+            Self::LaunchFailed => 2,
+        }
     }
 }
 
@@ -127,7 +168,7 @@ struct Shell {
     logs: [Option<Log>; LOG_CAPACITY],
     log_length: usize,
     pointer_changed: bool,
-    launch_failed: bool,
+    launch_failed: Option<Refusal>,
 }
 
 impl Shell {
@@ -150,7 +191,7 @@ impl Shell {
             logs: [None; LOG_CAPACITY],
             log_length: 0,
             pointer_changed: false,
-            launch_failed: false,
+            launch_failed: None,
         }
     }
 
@@ -221,6 +262,24 @@ impl Shell {
         let width = ((self.width - 252) / protocol::MAX_APPS).min(156);
         Rect::new(236 + slot * (width + 8), self.height - 40, width, 32)
     }
+    /// The refused-launch toast, top right below the top bar (0029-D8). It
+    /// depends on no window geometry and fits the 480-pixel minimum width.
+    fn toast(&self) -> Rect {
+        Rect::new(self.width - 326, 44, 310, 52)
+    }
+
+    fn refuse_launch(&mut self, refusal: Refusal) {
+        self.launch_failed = Some(refusal);
+        // The launchers no longer change on a refusal; only the toast does.
+        self.invalidate(self.toast());
+        self.log(b"refused launch", &[refusal.code()]);
+    }
+
+    fn clear_launch_failure(&mut self) {
+        if self.launch_failed.take().is_some() {
+            self.invalidate(self.toast());
+        }
+    }
 
     fn enqueue(&mut self, slot: usize, event: Event) {
         let focused = self.focused == Some(slot);
@@ -265,14 +324,12 @@ impl Shell {
 
     fn launch(&mut self, kind: u64) -> Option<usize> {
         let Some(slot) = self.windows.iter().position(Option::is_none) else {
-            self.launch_failed = true;
-            self.invalidate(self.taskbar());
+            self.refuse_launch(Refusal::NoSlot);
             return None;
         };
         let handle = syscall(protocol::SYS_APP_LAUNCH, self.supervisor, kind, 0);
         if handle <= 0 {
-            self.launch_failed = true;
-            self.invalidate(self.taskbar());
+            self.refuse_launch(Refusal::LaunchFailed);
             return None;
         }
         let info = app_info(handle as u64).unwrap_or_else(|| exit(141));
@@ -292,7 +349,7 @@ impl Shell {
             ready: false,
             pending: Pending::new(),
         });
-        self.launch_failed = false;
+        self.clear_launch_failure();
         self.log(b"launch", &[slot as u64, info.pid, kind]);
         self.focus(Some(slot));
         Some(slot)
@@ -311,10 +368,20 @@ impl Shell {
         }
         self.windows[slot] = None;
         self.capture = Capture::None;
-        self.launch_failed = false;
+        self.clear_launch_failure();
         self.invalidate(window.damage());
         self.log(b"close", &[slot as u64, window.pid]);
         self.focus(self.top_visible());
+    }
+
+    /// The Relaunch button of a stopped window (0029-D8): close it, then
+    /// launch the same kind, which takes the slot just freed.
+    fn relaunch(&mut self, slot: usize) {
+        let Some(window) = self.windows[slot] else {
+            return;
+        };
+        self.close(slot);
+        self.launch(window.kind);
     }
 
     fn minimize(&mut self, slot: usize) {
@@ -471,6 +538,13 @@ impl Shell {
                         }
                     }
                 }
+                // The toast sits above the windows: pointer events inside it
+                // reach no window (0029-D8).
+                if self.launch_failed.is_some()
+                    && self.toast().contains(self.pointer_x, self.pointer_y)
+                {
+                    return false;
+                }
                 if let Some(slot) = self.hit(self.pointer_x, self.pointer_y) {
                     let window = self.windows[slot].unwrap();
                     if pressed {
@@ -491,6 +565,12 @@ impl Shell {
                                 x: self.pointer_x - window.x,
                                 y: self.pointer_y - window.y,
                             };
+                        } else if window.stopped()
+                            && window
+                                .relaunch_button()
+                                .contains(self.pointer_x, self.pointer_y)
+                        {
+                            self.relaunch(slot);
                         } else {
                             self.capture = Capture::Client(slot);
                             // This press followed an observed hardware release.
@@ -573,31 +653,40 @@ impl Shell {
     }
 
     fn paint(&self, renderer: &mut Renderer) {
-        renderer.fill(Rect::new(0, 0, self.width, self.height), render::DESKTOP);
-        renderer.fill(
-            Rect::new(self.width / 2, 40, self.width / 2, self.height - 88),
-            render::TOPBAR,
+        // Color only for meaning (0029-D4): the decorative right-half panel,
+        // the accent rule under the headline and the window shadows are gone.
+        renderer.fill(Rect::new(0, 0, self.width, self.height), render::BASE);
+        renderer.fill(Rect::new(0, 0, self.width, 36), render::SURFACE);
+        renderer.fill(Rect::new(0, 35, self.width, 1), render::BORDER_SUBTLE);
+        renderer.text(20, 10, b"MIRROR", WORDMARK.scale(), render::TEXT_PRIMARY);
+        renderer.text(
+            120,
+            14,
+            b"Native desktop",
+            Role::Caption.scale(),
+            render::TEXT_SECONDARY,
         );
-        renderer.fill(Rect::new(0, 0, self.width, 36), render::TOPBAR);
-        renderer.fill(Rect::new(0, 35, self.width, 1), render::BORDER);
-        renderer.text(20, 10, b"MIRROR", 2, render::TEXT);
-        renderer.text(120, 14, b"Native desktop", 1, render::MUTED);
         renderer.text(
             self.width - 146,
             14,
             b"Esc returns to console",
-            1,
-            render::MUTED,
+            Role::Caption.scale(),
+            render::TEXT_SECONDARY,
         );
-        renderer.text(48, 84, b"Your workspace", 3, render::TEXT);
+        renderer.text(
+            48,
+            84,
+            b"Your workspace",
+            Role::Display.scale(),
+            render::TEXT_PRIMARY,
+        );
         renderer.text(
             48,
             118,
             b"Open an app below to get started.",
-            1,
-            render::MUTED,
+            Role::Body.scale(),
+            render::TEXT_SECONDARY,
         );
-        renderer.fill(Rect::new(48, 146, 52, 3), render::ACCENT);
         for &slot in &self.order {
             let Some(window) = self.windows[slot] else {
                 continue;
@@ -605,26 +694,27 @@ impl Shell {
             if window.minimized {
                 continue;
             }
+            // Today's chrome geometry and colors, mapped onto the tokens; the
+            // design's 38 px titlebar and caption buttons are 0029-D9's.
+            let focused = self.focused == Some(slot);
             let outer = window.outer();
-            renderer.fill(
-                Rect::new(window.x + 8, window.y + 8, OUTER_WIDTH, OUTER_HEIGHT),
-                render::SHADOW,
-            );
-            renderer.fill(outer, render::PANEL);
+            renderer.fill(outer, render::SURFACE);
+            // 0029-D9's frame colors land before its geometry: the focused
+            // frame must read stronger than the unfocused one.
             renderer.border(
                 outer,
-                if self.focused == Some(slot) {
-                    render::ACCENT_DARK
+                if focused {
+                    render::BORDER_STRONG
                 } else {
-                    render::BORDER
+                    render::BORDER_SUBTLE
                 },
             );
             renderer.fill(
                 Rect::new(window.x + 1, window.y + 1, OUTER_WIDTH - 2, 28),
-                if self.focused == Some(slot) {
-                    render::RAISED
+                if focused {
+                    render::OVERLAY
                 } else {
-                    render::PANEL
+                    render::SURFACE
                 },
             );
             renderer.fill(
@@ -635,100 +725,164 @@ impl Shell {
                 window.x + 26,
                 window.y + 11,
                 title(window.kind),
-                1,
-                render::TEXT,
+                Role::Label.scale(),
+                render::TEXT_PRIMARY,
             );
             renderer.text(
                 window.x + 190,
                 window.y + 11,
-                if window.state == protocol::RUNNING {
-                    b"APP"
-                } else {
-                    b"STOPPED"
-                },
-                1,
-                render::MUTED,
+                if window.stopped() { b"STOPPED" } else { b"APP" },
+                Role::Overline.scale(),
+                render::TEXT_SECONDARY,
             );
-            renderer.fill(window.minimize_button(), render::TOPBAR);
+            renderer.fill(window.minimize_button(), render::SURFACE);
             renderer.fill(
                 Rect::new(window.x + 272, window.y + 17, 10, 2),
-                render::MUTED,
+                render::TEXT_SECONDARY,
             );
-            renderer.fill(window.close_button(), render::TOPBAR);
-            renderer.text(window.x + 301, window.y + 10, b"x", 1, render::MUTED);
-            renderer.fill(window.content(), render::FIELD);
-            if window.state != protocol::RUNNING {
+            renderer.fill(window.close_button(), render::SURFACE);
+            renderer.text(
+                window.x + 301,
+                window.y + 10,
+                b"x",
+                Role::Label.scale(),
+                render::TEXT_SECONDARY,
+            );
+            renderer.fill(window.content(), render::SURFACE);
+            if window.stopped() {
+                // Errors are icon and text, and offer recovery (0029-D8).
+                renderer.text(
+                    window.x + 8,
+                    window.y + 74,
+                    b"!",
+                    STOPPED_TITLE.scale(),
+                    render::DANGER,
+                );
                 renderer.text(
                     window.x + 24,
                     window.y + 74,
                     b"Application stopped",
-                    2,
-                    render::WARNING,
+                    STOPPED_TITLE.scale(),
+                    render::DANGER,
                 );
                 renderer.text(
                     window.x + 24,
                     window.y + 105,
-                    b"Close this window to launch it again.",
-                    1,
-                    render::MUTED,
+                    b"Relaunch it, or close this window.",
+                    Role::Body.scale(),
+                    render::TEXT_SECONDARY,
+                );
+                let button = window.relaunch_button();
+                renderer.fill(button, render::ACCENT);
+                renderer.text(
+                    button.x + 24,
+                    button.y + 10,
+                    b"Relaunch",
+                    Role::Label.scale(),
+                    render::ON_ACCENT,
                 );
             } else if !window.ready {
                 renderer.text(
                     window.x + 24,
                     window.y + 80,
                     b"Opening application...",
-                    1,
-                    render::MUTED,
+                    Role::Body.scale(),
+                    render::TEXT_SECONDARY,
                 );
             }
         }
-        renderer.fill(self.taskbar(), render::PANEL);
+        renderer.fill(self.taskbar(), render::SURFACE);
         renderer.fill(
             Rect::new(0, self.height - TASKBAR_HEIGHT, self.width, 1),
-            render::BORDER,
+            render::BORDER_SUBTLE,
         );
         for kind in [protocol::NOTES, protocol::COUNTER] {
             let button = self.launcher(kind);
-            renderer.fill(button, render::RAISED);
-            renderer.border(
-                button,
-                if self.launch_failed {
-                    render::WARNING
-                } else {
-                    render::BORDER
-                },
+            renderer.fill(button, render::OVERLAY);
+            renderer.border(button, render::BORDER_STRONG);
+            renderer.text(
+                button.x + 12,
+                button.y + 12,
+                title(kind),
+                Role::Label.scale(),
+                render::TEXT_PRIMARY,
             );
-            renderer.text(button.x + 12, button.y + 12, title(kind), 1, render::TEXT);
         }
         for slot in 0..protocol::MAX_APPS {
             let Some(window) = self.windows[slot] else {
                 continue;
             };
             let button = self.task_button(slot);
+            let active = self.focused == Some(slot) && !window.minimized;
             renderer.fill(
                 button,
-                if self.focused == Some(slot) && !window.minimized {
-                    render::ACCENT_DARK
+                if active {
+                    render::ACCENT_SUBTLE
                 } else {
-                    render::TOPBAR
+                    render::OVERLAY
                 },
             );
             renderer.text(
                 button.x + 10,
                 button.y + 12,
                 title(window.kind),
-                1,
-                render::TEXT,
+                Role::Label.scale(),
+                if active {
+                    render::ACCENT_SUBTLE_TEXT
+                } else {
+                    render::TEXT_PRIMARY
+                },
             );
             renderer.fill(
                 Rect::new(button.x + 8, button.y + 28, button.width - 16, 2),
                 if window.minimized {
-                    render::MUTED
+                    render::TEXT_TERTIARY
                 } else {
                     render::ACCENT
                 },
             );
         }
+        if let Some(refusal) = self.launch_failed {
+            self.paint_toast(renderer, refusal);
+        }
+    }
+
+    /// The refused-launch toast (0029-D8), painted after the windows: an
+    /// elevated card with a border-strong frame (no shadow here, and
+    /// border-subtle is 1.21:1 on elevated), a 3 px bar and `!` in warning or
+    /// danger, a text-primary title and a text-secondary body.
+    fn paint_toast(&self, renderer: &mut Renderer, refusal: Refusal) {
+        let toast = self.toast();
+        let (color, heading, body) = match refusal {
+            Refusal::NoSlot => (
+                render::WARNING,
+                &b"Two windows are open"[..],
+                &b"Close one to open another."[..],
+            ),
+            Refusal::LaunchFailed => (
+                render::DANGER,
+                &b"The app could not start"[..],
+                &b"Click its launcher to try again."[..],
+            ),
+        };
+        renderer.fill(toast, render::ELEVATED);
+        renderer.border(toast, render::BORDER_STRONG);
+        renderer.fill(Rect::new(toast.x, toast.y, 3, toast.height), color);
+        renderer.text(toast.x + 15, toast.y + 15, b"!", Role::Label.scale(), color);
+        renderer.text(
+            toast.x + 27,
+            toast.y + 15,
+            heading,
+            Role::Label.scale(),
+            render::TEXT_PRIMARY,
+        );
+        renderer.text(
+            toast.x + 27,
+            toast.y + 31,
+            body,
+            Role::Caption.scale(),
+            render::TEXT_SECONDARY,
+        );
     }
 
     fn render(&mut self, renderer: &mut Renderer, surface: u64) -> bool {
@@ -743,11 +897,12 @@ impl Shell {
         let empty = WindowView {
             slot: 0,
             outer: Rect::new(0, 0, 0, 0),
-            shadow: Rect::new(0, 0, 0, 0),
             content: Rect::new(0, 0, 0, 0),
             ready: false,
         };
-        let mut views = [empty; protocol::MAX_APPS];
+        // One view per window, then the toast: last and never ready, so its
+        // palette pixels stay over any app content beneath it.
+        let mut views = [empty; protocol::MAX_APPS + 1];
         let mut count = 0;
         for &slot in &self.order {
             if let Some(window) = self.windows[slot]
@@ -756,12 +911,18 @@ impl Shell {
                 views[count] = WindowView {
                     slot,
                     outer: window.outer(),
-                    shadow: Rect::new(window.x + 8, window.y + 8, OUTER_WIDTH, OUTER_HEIGHT),
                     content: window.content(),
                     ready: window.ready,
                 };
                 count += 1;
             }
+        }
+        if self.launch_failed.is_some() {
+            views[count] = WindowView {
+                outer: self.toast(),
+                ..empty
+            };
+            count += 1;
         }
         renderer.flush_windows(surface, &views[..count])
     }
@@ -896,10 +1057,10 @@ fn smoke_test(console: u64, supervisor: u64) -> ! {
     let first = shell.launch(protocol::NOTES).unwrap_or_else(|| exit(150));
     // Observe the focused frame before requesting its inverse, so a still-
     // queued focus change cannot be mistaken for a completed state transition.
-    wait_pixel(&mut shell, first, 12, 60, [46, 118, 101, 0]);
+    wait_pixel(&mut shell, first, 12, 60, FOCUSED_BORDER);
     let second = shell.launch(protocol::NOTES).unwrap_or_else(|| exit(151));
-    wait_pixel(&mut shell, first, 12, 60, [100, 116, 124, 0]);
-    wait_pixel(&mut shell, second, 12, 60, [46, 118, 101, 0]);
+    wait_pixel(&mut shell, first, 12, 60, UNFOCUSED_BORDER);
+    wait_pixel(&mut shell, second, 12, 60, FOCUSED_BORDER);
     let first_before = app_info(shell.windows[first].unwrap().handle).unwrap();
     let second_before = app_info(shell.windows[second].unwrap().handle).unwrap();
     require(first_before.pid != second_before.pid, 152);
@@ -909,7 +1070,7 @@ fn smoke_test(console: u64, supervisor: u64) -> ! {
         ascii: b'a',
     });
     // Lowercase 'a' has ink at this pixel; the empty document does not.
-    wait_pixel(&mut shell, second, 17, 74, [34, 48, 57, 0]);
+    wait_pixel(&mut shell, second, 17, 74, INK);
     require(
         app_info(shell.windows[second].unwrap().handle)
             .unwrap()
@@ -934,24 +1095,21 @@ fn smoke_test(console: u64, supervisor: u64) -> ! {
             && shell.windows[first].unwrap().pid != old_pid,
         156,
     );
-    wait_pixel(&mut shell, second, 12, 60, [100, 116, 124, 0]);
-    wait_pixel(&mut shell, first, 12, 60, [110, 180, 245, 0]);
+    wait_pixel(&mut shell, second, 12, 60, UNFOCUSED_BORDER);
+    wait_pixel(&mut shell, first, 12, 60, FOCUSED_BORDER);
     shell.enqueue(first, Event::TestFault);
     let start = syscall(SYS_TICKS, 0, 0, 0);
-    loop {
+    let stopped = loop {
         shell.flush_events();
-        if app_info(shell.windows[first].unwrap().handle)
-            .unwrap()
-            .state
-            == protocol::FAULTED
-        {
-            break;
+        let info = app_info(shell.windows[first].unwrap().handle).unwrap();
+        if info.state == protocol::FAULTED {
+            break info;
         }
         require(syscall(SYS_TICKS, 0, 0, 0) - start < 500, 157);
         syscall(SYS_SLEEP, 1, 0, 0);
-    }
+    };
     shell.focus(Some(second));
-    wait_pixel(&mut shell, second, 12, 60, [46, 118, 101, 0]);
+    wait_pixel(&mut shell, second, 12, 60, FOCUSED_BORDER);
     let before = app_info(shell.windows[second].unwrap().handle)
         .unwrap()
         .revision;
@@ -960,7 +1118,7 @@ fn smoke_test(console: u64, supervisor: u64) -> ! {
         kind: 1,
         ascii: b'b',
     });
-    wait_pixel(&mut shell, second, 23, 74, [34, 48, 57, 0]);
+    wait_pixel(&mut shell, second, 23, 74, INK);
     require(
         app_info(shell.windows[second].unwrap().handle)
             .unwrap()
@@ -972,16 +1130,46 @@ fn smoke_test(console: u64, supervisor: u64) -> ! {
         frame_hash(shell.windows[second].unwrap().handle).is_some(),
         158,
     );
+    // Smoke has no renderer, so record the polled stop as refresh() does; the
+    // Relaunch button exists only for a stopped window (0029-D8). Then press
+    // it at its center through the same Mouse arm as a real click.
+    let mut window = shell.windows[first].unwrap();
+    let (stopped_handle, stopped_pid) = (window.handle, window.pid);
+    window.state = stopped.state;
+    window.pending = Pending::new();
+    window.ready = false;
+    shell.windows[first] = Some(window);
+    let button = window.relaunch_button();
+    shell.pointer_x = button.x + button.width / 2;
+    shell.pointer_y = button.y + button.height / 2;
+    for buttons in [0, 1] {
+        shell.process(HardwareEvent::Mouse {
+            dx: 0,
+            dy: 0,
+            buttons,
+        });
+    }
+    let relaunched = shell.windows[first].unwrap_or_else(|| exit(171));
+    require(
+        relaunched.handle != stopped_handle
+            && relaunched.pid != stopped_pid
+            && relaunched.kind == protocol::COUNTER
+            && relaunched.state == protocol::RUNNING
+            && app_info(stopped_handle).is_none()
+            && app_info(relaunched.handle).is_some_and(|info| info.state == protocol::RUNNING),
+        172,
+    );
+    wait_pixel(&mut shell, first, 12, 60, FOCUSED_BORDER);
     shell.close(first);
     let busy = shell.launch(protocol::COUNTER).unwrap_or_else(|| exit(159));
-    wait_pixel(&mut shell, second, 12, 60, [100, 116, 124, 0]);
-    wait_pixel(&mut shell, busy, 12, 60, [110, 180, 245, 0]);
+    wait_pixel(&mut shell, second, 12, 60, UNFOCUSED_BORDER);
+    wait_pixel(&mut shell, busy, 12, 60, FOCUSED_BORDER);
     shell.enqueue(busy, Event::TestBusy);
     // This color is published only by the gated diagnostic handler immediately
     // before its CPU-bound loop. A timer/focus frame cannot satisfy this fence.
     wait_pixel(&mut shell, busy, 0, 0, [255, 128, 0, 0]);
     shell.focus(Some(second));
-    wait_pixel(&mut shell, second, 12, 60, [46, 118, 101, 0]);
+    wait_pixel(&mut shell, second, 12, 60, FOCUSED_BORDER);
     let before = app_info(shell.windows[second].unwrap().handle)
         .unwrap()
         .revision;
@@ -990,7 +1178,7 @@ fn smoke_test(console: u64, supervisor: u64) -> ! {
         kind: 1,
         ascii: b'c',
     });
-    wait_pixel(&mut shell, second, 29, 74, [34, 48, 57, 0]);
+    wait_pixel(&mut shell, second, 29, 74, INK);
     require(
         app_info(shell.windows[second].unwrap().handle)
             .unwrap()

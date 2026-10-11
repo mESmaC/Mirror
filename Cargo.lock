@@ -38,6 +38,7 @@ dependencies = [
 name = "mirror-app"
 version = "0.1.0"
 dependencies = [
+ "mirror-ui-tokens",
  "mirror-window-protocol",
 ]
 
@@ -50,6 +51,7 @@ name = "mirror-desktop"
 version = "0.1.0"
 dependencies = [
  "mirror-desktop-protocol",
+ "mirror-ui-tokens",
  "mirror-window-protocol",
 ]
 
@@ -76,6 +78,7 @@ dependencies = [
  "mirror-acpi",
  "mirror-clock-protocol",
  "mirror-thread-protocol",
+ "mirror-ui-tokens",
  "mirror-vm-protocol",
  "mirror-window-protocol",
 ]
@@ -89,6 +92,10 @@ dependencies = [
 
 [[package]]
 name = "mirror-thread-protocol"
+version = "0.1.0"
+
+[[package]]
+name = "mirror-ui-tokens"
 version = "0.1.0"
 
 [[package]]

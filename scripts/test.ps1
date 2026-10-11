@@ -66,8 +66,8 @@ try {
     New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
     & cargo fmt --all -- --check
     if ($LASTEXITCODE -ne 0) { throw 'Rust formatting check failed.' }
-    & cargo test --locked -p mirror-desktop-protocol -p mirror-window-protocol -p mirror-vm-protocol -p mirror-thread-protocol -p mirror-clock-protocol -p mirror-sync -p mirror-acpi --target x86_64-pc-windows-msvc
-    if ($LASTEXITCODE -ne 0) { throw 'Native protocol, synchronization, and ACPI parser tests failed.' }
+    & cargo test --locked -p mirror-desktop-protocol -p mirror-window-protocol -p mirror-vm-protocol -p mirror-thread-protocol -p mirror-clock-protocol -p mirror-sync -p mirror-acpi -p mirror-ui-tokens --target x86_64-pc-windows-msvc
+    if ($LASTEXITCODE -ne 0) { throw 'Native protocol, synchronization, ACPI parser and UI token tests failed.' }
     & cargo clippy --locked --workspace -- -D warnings
     if ($LASTEXITCODE -ne 0) { throw 'Normal kernel Clippy check failed.' }
     & cargo clippy --locked -p mirror-kernel --features test-trace -- -D warnings
@@ -183,7 +183,7 @@ try {
             Copy-Item -LiteralPath (Join-Path $repositoryRoot "build/$artifact") -Destination (Join-Path $logDirectory "$profile-$artifact") -Force
         }
         $applicationArtifacts = if ($AgentDemo) { @('desktop-agent.png') } else {
-            @('desktop-windows.png', 'desktop-moved.png', 'desktop-minimized.png', 'desktop-reopened.png', 'desktop-counter.png')
+            @('desktop-windows.png', 'desktop-moved.png', 'desktop-minimized.png', 'desktop-reopened.png', 'desktop-launch-refused.png', 'desktop-counter.png')
         }
         foreach ($artifact in $applicationArtifacts) {
             Copy-Item -LiteralPath (Join-Path $repositoryRoot "build/$artifact") -Destination (Join-Path $logDirectory "$profile-$artifact") -Force

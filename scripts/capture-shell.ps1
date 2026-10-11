@@ -229,6 +229,17 @@ function Invoke-MirrorShellCapture {
     Sync-MirrorShellFrame $Process $pointer
     Save-MirrorScreenshot $Process (Join-Path $buildDirectory 'desktop-reopened.png')
 
+    # Both slots are in use, so the Counter launcher is refused (spec 0029-D8):
+    # the shell shows its warning toast and starts no application. The close
+    # below clears the toast.
+    $offset = (Read-MirrorSerial).Length
+    Invoke-MirrorShellClick $Process $pointer 164 ($height - 24)
+    Wait-MirrorShellMessage $Process 'refused launch 1' $offset
+    if ((Read-MirrorSerial).Substring($offset) -match '(?m)^(?:user: Mirror shell: launch |MIRROR_APP_STARTED(?:\s|$))') {
+        throw 'A refused launch started an application.'
+    }
+    Save-MirrorScreenshot $Process (Join-Path $buildDirectory 'desktop-launch-refused.png')
+
     # Focus the exposed portion of the first title before using its close button:
     # the reopened sibling otherwise covers that button at the overlap.
     Invoke-MirrorShellClick $Process $pointer 320 200
@@ -255,5 +266,5 @@ function Invoke-MirrorShellCapture {
     if ((Read-MirrorSerial) -match '(?m)^MIRROR_AGENT_READY(?:\s|$)') {
         throw 'Default desktop unexpectedly launched an agent.'
     }
-    Write-Host 'Shell capture passed: independent apps, focus, drag, minimize/restore, close/relaunch, Counter, and session cleanup.'
+    Write-Host 'Shell capture passed: independent apps, focus, drag, minimize/restore, close/relaunch, refused launch, Counter, and session cleanup.'
 }

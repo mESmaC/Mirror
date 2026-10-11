@@ -213,8 +213,9 @@ fn smoke(console: u64, surface: u64, input: u64, service: &mut service::Service)
     service.check_idle_authority(&mut state);
     require(state.submitted() == b"Hello from Mirror agent", 64);
     write(console, b"Mirror desktop: agent operations passed\n");
+    let [red, green, blue, unused] = mirror_ui_tokens::DEFAULT.accent.rgbx();
     let packet = [
-        0u8, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 73, 215, 199, 0,
+        0u8, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, red, green, blue, unused,
     ];
     require(
         syscall(SYS_SURFACE_PRESENT, surface, packet.as_ptr() as u64, 20) == 20,
