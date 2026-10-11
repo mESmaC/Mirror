@@ -18,6 +18,7 @@ param(
     [switch]$NoKeyboard,
     [switch]$NoHpet,
     [switch]$ExtendedCpu,
+    [switch]$BaselineCpu,
     [switch]$LegacyPic,
     [switch]$PitTimer,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
@@ -247,10 +248,17 @@ if ($Fault -eq 'TimerCalibration' -and ($LegacyPic -or $PitTimer)) {
 if ($Fault -eq 'ClockActivation' -and $NoHpet) {
     throw 'Clock activation fault injection requires HPET hardware.'
 }
-# Only QEMU's max model (-ExtendedCpu) reports SMEP, SMAP and UMIP. Without
-# them the kernel probes panic and SGDT succeeds (spec 0016b).
-if ($Fault -in @('KernelSmep', 'KernelSmap', 'UserUmip') -and -not $ExtendedCpu) {
-    throw "-Fault $Fault requires -ExtendedCpu, whose CPU model reports SMEP, SMAP and UMIP."
+# The default CPU model reports SMEP and SMAP, -ExtendedCpu's max model also
+# reports UMIP, and -BaselineCpu's plain qemu64 reports none of them (0016-D6).
+# Without them the kernel probes panic and SGDT succeeds (spec 0016b).
+if ($ExtendedCpu -and $BaselineCpu) {
+    throw '-ExtendedCpu and -BaselineCpu select different CPU models; pass at most one.'
+}
+if ($Fault -in @('KernelSmep', 'KernelSmap') -and $BaselineCpu) {
+    throw "-Fault $Fault requires SMEP and SMAP, which -BaselineCpu's CPU model does not report."
+}
+if ($Fault -eq 'UserUmip' -and -not $ExtendedCpu) {
+    throw '-Fault UserUmip requires -ExtendedCpu, the only CPU model that reports UMIP.'
 }
 $qemu = Get-MirrorQemu -RequestedPath $QemuPath -RepositoryRoot $repositoryRoot
 $qemuDirectory = Split-Path -Parent $qemu
@@ -333,7 +341,10 @@ $serialLog = Join-Path $buildDirectory 'serial.log'
 $stdoutLog = Join-Path $buildDirectory 'qemu.stdout.log'
 $stderrLog = Join-Path $buildDirectory 'qemu.stderr.log'
 
-$cpuModel = if ($ExtendedCpu) { 'max' } else { 'qemu64' }
+# The default smoke CPU adds SMEP and SMAP to qemu64, so every case runs with
+# them on (0016-D6). -BaselineCpu keeps the plain model for one Normal boot per
+# build profile, and -ExtendedCpu selects max.
+$cpuModel = if ($ExtendedCpu) { 'max' } elseif ($BaselineCpu) { 'qemu64' } else { 'qemu64,+smep,+smap' }
 $machine = 'q35,accel=tcg'
 if ($NoKeyboard) { $machine += ',i8042=off,vmport=off' }
 if ($NoHpet) { $machine += ',hpet=off' }
@@ -558,9 +569,11 @@ try {
     # offline, so only the BSP reports (spec 0016a).
     $rsp0Guard = Assert-MirrorStacks -Serial $serial -OnlineCpus $(if ($LegacyPic) { 1 } else { $CpuCount }) -Smoke $true
     # Every online CPU also reports its protections, and the BSP its
-    # speculative-execution exposure (spec 0016b). QEMU's max model reports
-    # SMEP and SMAP; qemu64 reports neither.
-    Assert-MirrorHardening -Serial $serial -OnlineCpus $(if ($LegacyPic) { 1 } else { $CpuCount }) -SmepSmap ([bool]$ExtendedCpu)
+    # speculative-execution exposure (spec 0016b). The default model and max
+    # report SMEP and SMAP, and only max reports UMIP; -BaselineCpu's plain
+    # qemu64 reports none of them (0016-D6).
+    $smapActive = -not $BaselineCpu
+    Assert-MirrorHardening -Serial $serial -OnlineCpus $(if ($LegacyPic) { 1 } else { $CpuCount }) -SmepSmap $smapActive -Umip ([bool]$ExtendedCpu)
     Assert-MirrorCpuVulnerability -Serial $serial
     # While SMAP is active, every smoke kernel entry runs with AC clear, and the
     # register probe in each of init's four process runs enters with user AC
@@ -568,7 +581,7 @@ try {
     # marker is absent.
     $entryAc = [regex]::Matches($serial, '(?m)^MIRROR_ENTRY_AC_OK user_ac=([1-9][0-9]*)\r?$')
     $entryAcLines = [regex]::Matches($serial, '(?m)^MIRROR_ENTRY_AC_OK(?:\s|$)').Count
-    if ($ExtendedCpu) {
+    if ($smapActive) {
         $userspaceRuns = [regex]::Matches($serial, '(?m)^MIRROR_USERSPACE_OK(?:\s|$)')
         if ($entryAc.Count -ne 1 -or $entryAcLines -ne 1 -or [uint64]$entryAc[0].Groups[1].Value -lt 4 -or
             $userspaceRuns.Count -ne 4 -or $entryAc[0].Index -le $userspaceRuns[3].Index) {
@@ -927,7 +940,7 @@ try {
             throw "Mirror smoke test did not report $marker. See $serialLog."
         }
     }
-    Write-Host "Mirror boot smoke test passed (fault=$Fault, profile=$DeviceProfile, xhci=$Xhci, usb=$usbFixture, usb-full-speed=$XhciFullSpeed, no-display=$NoDisplayDevice, extended-cpu=$ExtendedCpu, cpus=$CpuCount, legacy-pic=$LegacyPic, pit-timer=$PitTimer, no-hpet=$NoHpet, QEMU exit $expectedExitCode). Serial log: $serialLog"
+    Write-Host "Mirror boot smoke test passed (fault=$Fault, profile=$DeviceProfile, xhci=$Xhci, usb=$usbFixture, usb-full-speed=$XhciFullSpeed, no-display=$NoDisplayDevice, extended-cpu=$ExtendedCpu, baseline-cpu=$BaselineCpu, cpus=$CpuCount, legacy-pic=$LegacyPic, pit-timer=$PitTimer, no-hpet=$NoHpet, QEMU exit $expectedExitCode). Serial log: $serialLog"
     # Keep firmware's terminal control sequences in the raw log, not tool output.
     Write-Output (($serial -split '\r?\n' | Where-Object { $_ -match '^(MIRROR_|Memory map:|Direct map offset:|Page tables:)' }) -join [Environment]::NewLine)
 }

@@ -75,8 +75,9 @@ function Assert-MirrorCaptureSmp {
     Assert-MirrorUsbMarkers -Serial $Serial -Attached $false -Smoke $false
     # Trace and default kernels report every CPU's guarded stacks too (spec 0016a).
     $null = Assert-MirrorStacks -Serial $Serial -OnlineCpus $RequestedCpus -Smoke $false
-    # And every CPU's protections (spec 0016b); qemu64 reports neither SMEP nor SMAP.
-    Assert-MirrorHardening -Serial $Serial -OnlineCpus $RequestedCpus -SmepSmap $false
+    # And every CPU's protections (spec 0016b). The capture CPU,
+    # qemu64,+smep,+smap, reports SMEP and SMAP but not UMIP (0016-D6).
+    Assert-MirrorHardening -Serial $Serial -OnlineCpus $RequestedCpus -SmepSmap $true -Umip $false
     # And the BSP's speculative-execution exposure (spec 0016b).
     Assert-MirrorCpuVulnerability -Serial $Serial
     if ($Serial -match '(?m)^MIRROR_(?:SMP_SKIPPED|SMP_CPU_FAILED|SMP_GUARD_OK|SMP_UNMAP_OK|SMP_TLB_TIMEOUT_ARMED|SHARED_TIMEOUT_\w+|SHARED_VM_SKIPPED|SHARED_OFFLINE_OK)(?:\s|$)') {
@@ -505,8 +506,10 @@ function Complete-MirrorCapture {
     }
 }
 
+# Captures use run.ps1's default smoke CPU, so the shell, apps and console run
+# with SMEP and SMAP on (0016-D6).
 $qemuArguments = @(
-    '-machine', 'q35,accel=tcg', '-cpu', 'qemu64', '-m', '256', '-smp', "$CpuCount",
+    '-machine', 'q35,accel=tcg', '-cpu', 'qemu64,+smep,+smap', '-m', '256', '-smp', "$CpuCount",
     '-display', 'none', '-vga', 'std', '-monitor', 'none', '-qmp', 'stdio',
     '-nic', 'none', '-no-reboot', '-no-shutdown',
     '-drive', "if=pflash,unit=0,format=raw,readonly=on,file=$(ConvertTo-QemuOptionValue $codePath)",

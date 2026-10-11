@@ -441,7 +441,8 @@ function Assert-MirrorHardening {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,
         [Parameter(Mandatory = $true)][int]$OnlineCpus,
-        [Parameter(Mandatory = $true)][bool]$SmepSmap
+        [Parameter(Mandatory = $true)][bool]$SmepSmap,
+        [Parameter(Mandatory = $true)][bool]$Umip
     )
 
     # Spec 0016b. After SMP startup every flavor prints one MIRROR_CPU_HARDENING
@@ -449,8 +450,9 @@ function Assert-MirrorHardening {
     # smep, smap and umip must equal CR4 bits 20, 21 and 11, recomputed here
     # from cr4. Each CPU sets SMEP, SMAP and UMIP exactly where its CPUID
     # reports them. An AP whose CPUID set differs from the BSP's fails startup,
-    # so every line reports the same set. QEMU's max model reports SMEP and
-    # SMAP and qemu64 reports neither, as $SmepSmap says.
+    # so every line reports the same set. The CPU model fixes that set, as
+    # $SmepSmap and $Umip say: the default qemu64,+smep,+smap reports SMEP and
+    # SMAP, max reports all three, and plain qemu64 reports none (0016-D6).
     $records = [regex]::Matches($Serial, '(?m)^MIRROR_CPU_HARDENING cpu=(\d+) cr4=(0x[0-9a-f]+) smep=([01]) smap=([01]) umip=([01]) sce=0 cpuid_smep=([01]) cpuid_smap=([01]) cpuid_umip=([01])\r?$')
     if ($records.Count -ne $OnlineCpus -or [regex]::Matches($Serial, '(?m)^MIRROR_CPU_HARDENING(?:\s|$)').Count -ne $OnlineCpus) {
         throw "Mirror must report CPU protections with EFER.SCE clear for exactly $OnlineCpus online CPU(s)."
@@ -460,6 +462,7 @@ function Assert-MirrorHardening {
         throw 'The per-CPU protection reports must follow SMP startup.'
     }
     $expected = if ($SmepSmap) { '1' } else { '0' }
+    $expectedUmip = if ($Umip) { '1' } else { '0' }
     for ($cpu = 0; $cpu -lt $OnlineCpus; $cpu++) {
         $record = $records[$cpu]
         if ([int]$record.Groups[1].Value -ne $cpu) {
@@ -481,8 +484,9 @@ function Assert-MirrorHardening {
                 throw "CPU $cpu reported CPUID protections that differ from the BSP's."
             }
         }
-        if ($record.Groups[6].Value -ne $expected -or $record.Groups[7].Value -ne $expected) {
-            throw "CPU $cpu must report cpuid_smep=$expected cpuid_smap=$expected on this CPU model."
+        if ($record.Groups[6].Value -ne $expected -or $record.Groups[7].Value -ne $expected -or
+            $record.Groups[8].Value -ne $expectedUmip) {
+            throw "CPU $cpu must report cpuid_smep=$expected cpuid_smap=$expected cpuid_umip=$expectedUmip on this CPU model."
         }
     }
 }

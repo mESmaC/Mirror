@@ -100,10 +100,13 @@ try {
         $diskImage = Join-Path $repositoryRoot 'build/mirror.img'
         $diskImageHash = (Get-FileHash -LiteralPath $diskImage -Algorithm SHA256).Hash
         # Every case uses the V1 device profile, with the test fixture on AHCI
-        # SATA, unless it names -DeviceProfile LegacyVirtio (spec 0014).
+        # SATA, unless it names -DeviceProfile LegacyVirtio (spec 0014). It also
+        # uses the qemu64,+smep,+smap CPU unless it names -ExtendedCpu (max) or
+        # -BaselineCpu (plain qemu64), so every case but the baseline one runs
+        # with SMEP and SMAP on (0016-D6).
         # UserSimd remains a strict manual #XM probe: current QEMU TCG does not
         # deliver that unmasked SSE arithmetic exception (QEMU issue 215).
-        foreach ($fault in @('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall')) {
+        foreach ($fault in @('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall')) {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Release:$release -AgentDemo:$AgentDemo -Fault $fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
             Save-MirrorSmokeLogs "$profile-$fault"
         }
@@ -145,12 +148,16 @@ try {
         }
         # Expose AVX and FSGSBASE through CPUID as well as exercising the
         # conservative CPU model. The kernel must keep both features disabled.
-        # This model also reports SMEP, SMAP and UMIP, which the kernel enables
-        # and its supervisor-access and SGDT probes test (spec 0016b).
-        foreach ($fault in @('None', 'UserAvx', 'UserFsgsbase', 'KernelSmep', 'KernelSmap', 'UserUmip')) {
+        # Only this model reports UMIP, which the kernel enables and the SGDT
+        # probe tests (spec 0016b).
+        foreach ($fault in @('None', 'UserAvx', 'UserFsgsbase', 'UserUmip')) {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -ExtendedCpu -Release:$release -AgentDemo:$AgentDemo -Fault $fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
             Save-MirrorSmokeLogs "$profile-ExtendedCpu-$fault"
         }
+        # One Normal boot keeps plain qemu64, which reports neither SMEP nor
+        # SMAP, to show that such a CPU still boots and passes (0016-D6).
+        & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -BaselineCpu -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+        Save-MirrorSmokeLogs "$profile-BaselineCpu"
         # Bring all configured CPUs online with private stacks/descriptors and
         # verify IPI rendezvous before and after the BSP's userspace workloads.
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
