@@ -18,7 +18,7 @@ Font names such as Inter and JetBrains Mono appear only in CSS font stacks, so t
 
 ## Where each part lands
 
-- The solid color tokens, spacing, focus ring, written error states, window-chrome geometry and the type scale mapped onto today's 5x7 font go onto today's renderer through side spec 0029, with the dark theme as the default.
+- The solid color tokens, spacing, focus ring, written error states and the type scale mapped onto today's 5x7 font went onto today's renderer through side spec 0029, with the dark theme as the default. 0029-D9's window-chrome geometry was withdrawn and moves to the window manager in Phase 4 of `docs/specs/roadmap-replan.md`, whose compositor and renderer replace today's renderer.
 - Alpha, soft shadows, glass, motion and z-order layers belong to the userspace compositor, 0027a.
 - Fonts, text layout and the icon rasterizer belong to 0086.
 - The keyboard model and shortcuts belong to 0084, and roles and semantics to 0044 (element trees, A19).
