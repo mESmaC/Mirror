@@ -1041,6 +1041,10 @@ extern "C" fn mirror_exception_dispatch(frame: &mut TrapFrame) {
 }
 
 fn dispatch(frame: &mut TrapFrame) {
+    // Every BSP entry first proves that the entry stub cleared AC while SMAP
+    // is active, and counts entries from CPL3 with AC set (spec 0016b).
+    #[cfg(feature = "boot-smoke")]
+    crate::hardening::check_entry_ac(frame.cs, frame.rflags);
     if frame.vector == IPI_VECTOR as u64 {
         crate::smp::handle_ipi();
         return;

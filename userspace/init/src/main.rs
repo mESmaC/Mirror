@@ -956,8 +956,9 @@ fn check_syscall_registers(pid: i64) {
     // pushes. Declare every other general-purpose register as an output so broken
     // restoration can be detected without compiler assumptions hiding the
     // problem. RBX/RBP are reserved by LLVM; save, test, and restore them inside
-    // the assembly instead. Capture DF after rescheduling and clear it before any
-    // Rust code resumes.
+    // the assembly instead. Enter with DF and AC set (POPFQ may set AC at CPL3;
+    // every stack access in the window is aligned), capture both after
+    // rescheduling, and clear both before any Rust code resumes.
     unsafe {
         asm!(
             "push rbx",
@@ -967,10 +968,16 @@ fn check_syscall_registers(pid: i64) {
             "xor rbx, 0x88",
             "mov rbp, r8",
             "xor rbp, 0xbb",
+            "pushfq",
+            "bts qword ptr [rsp], 18",
+            "popfq",
             "std",
             "int 0x80",
             "pushfq",
-            "cld",
+            "pushfq",
+            "btr qword ptr [rsp], 18",
+            "btr qword ptr [rsp], 10",
+            "popfq",
             "test rax, rax",
             "jnz 2f",
             "xor rbx, 0x88",
@@ -980,6 +987,8 @@ fn check_syscall_registers(pid: i64) {
             "cmp rbp, r8",
             "jne 2f",
             "test qword ptr [rsp], 0x400",
+            "jz 2f",
+            "test qword ptr [rsp], 0x40000",
             "jz 2f",
             "lea rax, [rsp + 16]",
             "cmp rax, [rsp + 8]",
@@ -1097,7 +1106,7 @@ fn check_preempted_arithmetic(pid: i64) {
 extern "C" fn init_main(launch: u64) -> ! {
     let probe = launch & 0xff;
     let role = launch >> 8;
-    require(role <= 1 && probe <= 20 && (role == 0 || probe == 0), 33);
+    require(role <= 1 && probe <= 22 && (role == 0 || probe == 0), 33);
     fpu::check_initial();
     tls::check_initial();
     let code_segment: u16;
@@ -1312,6 +1321,17 @@ extern "C" fn init_main(launch: u64) -> ! {
         // ends the process.
         17 => unsafe { tls::mirror_probe_fsgsbase_fault() },
         18..=20 => threads::scenario(probe),
+        // SAFETY: SYSCALL deliberately raises #UD while the kernel keeps
+        // EFER.SCE clear. The kernel ends the process at the fault. SYSCALL
+        // would write RCX and R11, so both are declared clobbered.
+        21 => unsafe { asm!("syscall", out("rcx") _, out("r11") _, options(nostack)) },
+        // SAFETY: SGDT at CPL3 deliberately raises #GP(0) while the kernel sets
+        // CR4.UMIP, and the kernel ends the process at the fault. Without UMIP
+        // it stores the 10-byte descriptor-table register in this local.
+        22 => unsafe {
+            let mut table = [0_u8; 10];
+            asm!("sgdt [{}]", in(reg) table.as_mut_ptr(), options(nostack));
+        },
         _ => exit(30),
     }
     // Reaching here means a protection probe unexpectedly succeeded.

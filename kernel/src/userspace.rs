@@ -2393,6 +2393,8 @@ fn validate_process(process: &Process<'_>, scenario: u64) {
                     serial::println!("MIRROR_THREAD_FAULT_OK");
                     (6, 0, address)
                 }
+                21 => (6, 0, address), // SYSCALL raises #UD while EFER.SCE is clear.
+                22 => (13, 0, address), // UMIP: SGDT at CPL3 raises #GP(0).
                 _ => panic!("unexpected probe {probe}"),
             };
             assert_eq!((vector, error, address), expected, "wrong user fault");

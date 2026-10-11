@@ -375,6 +375,9 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
             scenario,
             display.as_mut(),
         );
+        // Init's register probe entered with AC set; while SMAP is active,
+        // every entry must have run with AC clear (spec 0016b).
+        hardening::report_entry_ac();
     }
     smp::rendezvous("after_userspace", 4);
     grow_kernel_heap(
@@ -472,6 +475,27 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
                 // idle; the probe checks that IF is clear. The #DF handler on
                 // IST1 must report the fault and terminate the guest.
                 unsafe { stacks::overflow_rsp0() };
+            }
+            mode @ (boot::SmokeMode::KernelSmep | boot::SmokeMode::KernelSmap) => {
+                serial::println!("MIRROR_TEST_EXPECT_FATAL vector=14");
+                let probe = if matches!(mode, boot::SmokeMode::KernelSmep) {
+                    hardening::UserAccessProbe::Execute
+                } else {
+                    hardening::UserAccessProbe::Read
+                };
+                // SAFETY: Deliberate smoke-test #PF on the BSP. Userspace and
+                // the desktop have finished, so no user context is active; the
+                // kernel root is active, `frames` is its unique allocator, and
+                // the probe checks that IF is clear. The #PF handler must
+                // report the fault and terminate the guest.
+                unsafe {
+                    hardening::user_access_probe(
+                        probe,
+                        &tables,
+                        &mut frames,
+                        boot.direct_map_offset,
+                    )
+                };
             }
         }
         // SAFETY: Deliberate #PF on an address just unmapped and invalidated by

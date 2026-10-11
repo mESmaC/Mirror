@@ -12,6 +12,10 @@
 //! The BSP also reports its Meltdown and MDS exposure from the CPU vendor and
 //! IA32_ARCH_CAPABILITIES, and the kernel applies no mitigation (0016-D5).
 //!
+//! Smoke kernels also check that every BSP entry runs with AC clear while SMAP
+//! is active, and their `kernel-smep` and `kernel-smap` modes prove that a
+//! supervisor fetch from, or read of, a user page faults.
+//!
 //! CR4 and EFER: Intel SDM vol. 3A, sections 2.5 and 2.2.1; SMEP and SMAP:
 //! section 4.6; CPUID leaf 7: vol. 2A, CPUID.
 //! https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
@@ -23,9 +27,16 @@ use core::arch::{
     asm,
     x86_64::{__cpuid, __cpuid_count},
 };
+#[cfg(feature = "boot-smoke")]
+use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::{arch, interrupts, serial};
+#[cfg(feature = "boot-smoke")]
+use crate::{
+    memory::{FrameAllocator, PAGE_SIZE},
+    paging::{PageTables, UserAddressSpace, UserPermissions},
+};
 
 const CR4_UMIP: u64 = 1 << 11;
 const CR4_SMEP: u64 = 1 << 20;
@@ -41,6 +52,13 @@ const CPUID_1_ECX_HYPERVISOR: u32 = 1 << 31;
 const IA32_ARCH_CAPABILITIES: u32 = 0x10a;
 const ARCH_CAPABILITIES_RDCL_NO: u64 = 1 << 0;
 const ARCH_CAPABILITIES_MDS_NO: u64 = 1 << 5;
+/// The user pages that the `kernel-smep` probe calls into and the
+/// `kernel-smap` probe reads, each in its own fresh address space. run.ps1
+/// checks CR2 against them.
+#[cfg(feature = "boot-smoke")]
+const SMEP_PROBE_ADDRESS: u64 = 0x5e00_0000;
+#[cfg(feature = "boot-smoke")]
+const SMAP_PROBE_ADDRESS: u64 = 0x5a00_0000;
 
 /// Set in `BSP_CONTROLS` once the BSP has configured itself; bits 0-2 then
 /// hold its `Controls`.
@@ -54,6 +72,11 @@ static BSP_CONTROLS: AtomicU8 = AtomicU8::new(0);
 /// support differs from the BSP's fails startup (0016-D1). No code is patched.
 #[unsafe(no_mangle)]
 static MIRROR_SMAP_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// BSP entries from CPL3 whose saved RFLAGS had AC set, counted while SMAP is
+/// active.
+#[cfg(feature = "boot-smoke")]
+static USER_AC_ENTRIES: AtomicUsize = AtomicUsize::new(0);
 
 /// The protections one CPU's CPUID reports.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -303,6 +326,124 @@ pub(crate) fn report_vulnerabilities() {
         meltdown.name(),
         mds.name()
     );
+}
+
+/// Called by `interrupts::dispatch` on every BSP entry in smoke kernels, with
+/// the saved CS and RFLAGS. While SMAP is active, the entry stub must have
+/// cleared AC, or the kernel could touch user pages; IRET restores the saved
+/// AC. Counts the entries from CPL3 whose saved AC was set.
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn check_entry_ac(cs: u64, rflags: u64) {
+    if !MIRROR_SMAP_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    assert!(
+        !alignment_check_set(),
+        "kernel entry kept RFLAGS.AC set with SMAP active"
+    );
+    if cs & 3 == 3 && rflags & RFLAGS_AC != 0 {
+        USER_AC_ENTRIES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// After init's battery, while SMAP is active, report `MIRROR_ENTRY_AC_OK`
+/// with the number of entries from CPL3 whose saved AC was set. Init's
+/// register probe enters with AC set, so at least one must have arrived.
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn report_entry_ac() {
+    if MIRROR_SMAP_ACTIVE.load(Ordering::Relaxed) {
+        let entries = USER_AC_ENTRIES.load(Ordering::Relaxed);
+        assert!(entries > 0, "no user entry arrived with RFLAGS.AC set");
+        serial::println!("MIRROR_ENTRY_AC_OK user_ac={}", entries);
+    }
+}
+
+/// A supervisor access to a user page that SMEP or SMAP must stop.
+#[cfg(feature = "boot-smoke")]
+#[derive(Clone, Copy)]
+pub(crate) enum UserAccessProbe {
+    /// Call into a read-execute user page holding RET (`kernel-smep`).
+    Execute,
+    /// Read a read-write user page (`kernel-smap`).
+    Read,
+}
+
+/// Map one user page in a fresh `UserAddressSpace`, activate that space, and
+/// access the page from CPL0. SMEP or SMAP must turn the access into a #PF,
+/// whose handler reports it and ends the guest. A probe that returns panics.
+///
+/// # Safety
+/// Only the BSP calls this, with IF clear, no user context active, the kernel
+/// root active and `frames` its unique allocator, with recycling enabled.
+/// Nothing runs afterwards: the guest ends at the fault, so the probe space
+/// and its frames are never reclaimed.
+#[cfg(feature = "boot-smoke")]
+pub(crate) unsafe fn user_access_probe(
+    probe: UserAccessProbe,
+    kernel: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    direct_map: u64,
+) -> ! {
+    assert!(
+        !arch::interrupts_enabled(),
+        "user access probe requires IF=0"
+    );
+    let (address, permissions, fill, protection) = match probe {
+        UserAccessProbe::Execute => (
+            SMEP_PROBE_ADDRESS,
+            UserPermissions::READ_EXECUTE,
+            0xc3,
+            CR4_SMEP,
+        ),
+        UserAccessProbe::Read => (
+            SMAP_PROBE_ADDRESS,
+            UserPermissions::READ_WRITE,
+            0x5a,
+            CR4_SMAP,
+        ),
+    };
+    assert_ne!(
+        read_cr4() & protection,
+        0,
+        "user access probe requires its CR4 protection"
+    );
+    let physical = frames.allocate().expect("user access probe page");
+    let page = direct_map
+        .checked_add(physical)
+        .expect("user access probe direct map") as *mut u8;
+    // SAFETY: A fresh, exclusively owned frame, which the direct map covers in
+    // full and writable. RET (0xc3) fills the executable page.
+    unsafe { page.write_bytes(fill, PAGE_SIZE as usize) };
+    // SAFETY: The caller runs this on the BSP with IF clear, the kernel root
+    // active and its unique allocator. Kernel code, stacks and data lie in the
+    // shared upper half, which the new root borrows.
+    let mut space =
+        unsafe { UserAddressSpace::new(kernel, frames) }.expect("user access probe space");
+    // SAFETY: Transfers the fresh, initialized frame, whose only other alias is
+    // the dormant direct map, into the inactive space.
+    unsafe { space.map_page(address, physical, permissions, frames) }
+        .expect("user access probe mapping");
+    // SAFETY: BSP with IF clear. Code, the current and interrupt stacks and all
+    // kernel data lie in the shared upper half, and the space stays live until
+    // the guest ends at the fault.
+    unsafe { space.activate() }.expect("user access probe activation");
+    match probe {
+        // SAFETY: Deliberate supervisor fetch from a user page, which SMEP
+        // turns into #PF; its handler reports it and ends the guest. Without
+        // SMEP the page's RET returns at once, and every register CALL may
+        // touch is declared clobbered.
+        UserAccessProbe::Execute => unsafe {
+            asm!("call {}", in(reg) address, clobber_abi("C"));
+        },
+        // SAFETY: Deliberate supervisor read of a user page with AC clear,
+        // which SMAP turns into #PF; its handler reports it and ends the guest.
+        // Without SMAP it only reads the mapped page.
+        UserAccessProbe::Read => unsafe {
+            asm!("mov {0}, qword ptr [{0}]", inout(reg) address => _,
+                options(nostack, readonly, preserves_flags));
+        },
+    }
+    panic!("user access probe returned");
 }
 
 fn alignment_check_set() -> bool {

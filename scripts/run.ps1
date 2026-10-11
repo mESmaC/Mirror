@@ -21,7 +21,7 @@ param(
     [switch]$LegacyPic,
     [switch]$PitTimer,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
-    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation')][string]$Fault = 'None',
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -247,6 +247,11 @@ if ($Fault -eq 'TimerCalibration' -and ($LegacyPic -or $PitTimer)) {
 if ($Fault -eq 'ClockActivation' -and $NoHpet) {
     throw 'Clock activation fault injection requires HPET hardware.'
 }
+# Only QEMU's max model (-ExtendedCpu) reports SMEP, SMAP and UMIP. Without
+# them the kernel probes panic and SGDT succeeds (spec 0016b).
+if ($Fault -in @('KernelSmep', 'KernelSmap', 'UserUmip') -and -not $ExtendedCpu) {
+    throw "-Fault $Fault requires -ExtendedCpu, whose CPU model reports SMEP, SMAP and UMIP."
+}
 $qemu = Get-MirrorQemu -RequestedPath $QemuPath -RepositoryRoot $repositoryRoot
 $qemuDirectory = Split-Path -Parent $qemu
 $codePath = Get-MirrorFirmware -RequestedPath $FirmwareCode -QemuDirectory $qemuDirectory -Names @('edk2-x86_64-code.fd', 'OVMF_CODE.fd', 'OVMF_CODE.4m.fd') -ParameterName 'FirmwareCode'
@@ -273,6 +278,8 @@ $testMode = switch ($Fault) {
     'PageFault' { 'page-fault' }
     'InvalidOpcode' { 'invalid-opcode' }
     'KernelStackOverflow' { 'kernel-stack-overflow' }
+    'KernelSmep' { 'kernel-smep' }
+    'KernelSmap' { 'kernel-smap' }
     'UserKernelRead' { 'user-kernel-read' }
     'UserCodeWrite' { 'user-code-write' }
     'UserNx' { 'user-nx' }
@@ -302,6 +309,8 @@ $testMode = switch ($Fault) {
     'ThreadLastExit' { 'thread-last-exit' }
     'ThreadProcessExit' { 'thread-process-exit' }
     'ThreadFault' { 'thread-fault' }
+    'UserSyscall' { 'user-syscall' }
+    'UserUmip' { 'user-umip' }
     'SmpUnmap' { 'smp-unmap' }
     'SmpTlbTimeout' { 'smp-tlb-timeout' }
     'TimerCalibration' { 'timer-calibration' }
@@ -488,7 +497,7 @@ try {
     if (-not $expectedTlbTimeout -and $serial -match '(?im)^(?:MIRROR_PANIC|PANIC|\[panic\])') {
         throw "Mirror reported a panic. See $serialLog."
     }
-    $fatalKernelFault = $Fault -in @('PageFault', 'InvalidOpcode', 'KernelStackOverflow')
+    $fatalKernelFault = $Fault -in @('PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap')
     $expectedExitCode = if ($fatalKernelFault -or $expectedTlbTimeout) { 35 } else { 33 }
     if ($qemuExitCode -ne $expectedExitCode) {
         $qemuError = [System.IO.File]::ReadAllText($stderrLog)
@@ -553,6 +562,22 @@ try {
     # SMEP and SMAP; qemu64 reports neither.
     Assert-MirrorHardening -Serial $serial -OnlineCpus $(if ($LegacyPic) { 1 } else { $CpuCount }) -SmepSmap ([bool]$ExtendedCpu)
     Assert-MirrorCpuVulnerability -Serial $serial
+    # While SMAP is active, every smoke kernel entry runs with AC clear, and the
+    # register probe in each of init's four process runs enters with user AC
+    # set, so at least four entries are counted (spec 0016b). Without SMAP the
+    # marker is absent.
+    $entryAc = [regex]::Matches($serial, '(?m)^MIRROR_ENTRY_AC_OK user_ac=([1-9][0-9]*)\r?$')
+    $entryAcLines = [regex]::Matches($serial, '(?m)^MIRROR_ENTRY_AC_OK(?:\s|$)').Count
+    if ($ExtendedCpu) {
+        $userspaceRuns = [regex]::Matches($serial, '(?m)^MIRROR_USERSPACE_OK(?:\s|$)')
+        if ($entryAc.Count -ne 1 -or $entryAcLines -ne 1 -or [uint64]$entryAc[0].Groups[1].Value -lt 4 -or
+            $userspaceRuns.Count -ne 4 -or $entryAc[0].Index -le $userspaceRuns[3].Index) {
+            throw 'With SMAP active, Mirror must report once, after the four init process runs, that at least four entries from CPL3 with AC set ran the kernel with AC clear.'
+        }
+    }
+    elseif ($entryAcLines -ne 0) {
+        throw 'Mirror reported the SMAP entry check on a CPU without SMAP.'
+    }
     Assert-MirrorHeapGrowth -Serial $serial -RequestedCpus $CpuCount -Smoke $true -UseLegacyPic ([bool]$LegacyPic)
     Assert-MirrorDriverCatalog -Serial $serial -Smoke $true -LegacyDisk ($DeviceProfile -eq 'LegacyVirtio' -and -not $NoTestDisk) -XhciAttached ([bool]$Xhci)
     if ($CrowdedPci) {
@@ -759,6 +784,8 @@ try {
         'ThreadLastExit' { 18 }
         'ThreadProcessExit' { 19 }
         'ThreadFault' { 20 }
+        'UserSyscall' { 21 }
+        'UserUmip' { 22 }
         default { 0 }
     }
     if ($serial -notmatch "(?m)^MIRROR_USERSPACE_OK scenario=$scenario(?:\s|$)") {
@@ -802,6 +829,8 @@ try {
             'UserAvx' { 6 }
             'UserFsgsbase' { 6 }
             'ThreadFault' { 6 }
+            'UserSyscall' { 6 }
+            'UserUmip' { 13 }
             default { 14 }
         }
         if ($serial -notmatch "(?m)^MIRROR_USER_FAULT_CONTAINED vector=$userVector(?:\s|$)") {
@@ -813,7 +842,7 @@ try {
                 throw "Mirror did not report the precise anonymous-memory protection fault for $Fault. See $serialLog."
             }
         }
-        elseif ($Fault -in @('UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadFault')) {
+        elseif ($Fault -in @('UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadFault', 'UserSyscall', 'UserUmip')) {
             if ($serial -notmatch "(?m)^MIRROR_USER_FAULT_CONTAINED vector=$userVector error=0x0(?:\s|`$)") {
                 throw "Mirror did not report the precise processor-state exception for $Fault. See $serialLog."
             }
@@ -853,19 +882,33 @@ try {
         }
     }
     elseif ($fatalKernelFault) {
-        $vector = switch ($Fault) { 'PageFault' { 14 } 'InvalidOpcode' { 6 } 'KernelStackOverflow' { 8 } }
+        $vector = switch ($Fault) { 'PageFault' { 14 } 'InvalidOpcode' { 6 } 'KernelStackOverflow' { 8 } 'KernelSmep' { 14 } 'KernelSmap' { 14 } }
+        # A supervisor fetch from a present user page sets P and I/D, and a
+        # supervisor read of one sets P only (spec 0016b). Every other fatal
+        # fault reports error 0.
+        $errorCode = switch ($Fault) { 'KernelSmep' { '0x11' } 'KernelSmap' { '0x1' } default { '0x0' } }
         # Exactly one announced fault and one diagnostic, both for this scenario.
         $expected = [regex]::Matches($serial, ('(?m)^MIRROR_TEST_EXPECT_FATAL vector={0}\r?$' -f $vector))
-        $exception = [regex]::Matches($serial, ('(?m)^MIRROR_EXCEPTION vector={0} error=0x0 rip=0x[0-9a-f]+ cr2=(0x[0-9a-f]+)\r?$' -f $vector))
+        $exception = [regex]::Matches($serial, ('(?m)^MIRROR_EXCEPTION vector={0} error={1} rip=(0x[0-9a-f]+) cr2=(0x[0-9a-f]+)\r?$' -f $vector, $errorCode))
         if ($expected.Count -ne 1 -or $exception.Count -ne 1 -or
             [regex]::Matches($serial, '(?m)^MIRROR_TEST_EXPECT_FATAL(?:\s|$)').Count -ne 1 -or
             [regex]::Matches($serial, '(?m)^MIRROR_EXCEPTION(?:\s|$)').Count -ne 1 -or
             $exception[0].Index -le $expected[0].Index) {
             throw "Mirror did not report the intended $Fault diagnostic. See $serialLog."
         }
-        $cr2 = [Convert]::ToUInt64($exception[0].Groups[1].Value.Substring(2), 16)
+        $rip = [Convert]::ToUInt64($exception[0].Groups[1].Value.Substring(2), 16)
+        $cr2 = [Convert]::ToUInt64($exception[0].Groups[2].Value.Substring(2), 16)
         if ($Fault -eq 'PageFault' -and $cr2 -ne [Convert]::ToUInt64('ffffc00000000000', 16)) {
             throw "The page-fault test must fault on its unmapped test address. See $serialLog."
+        }
+        # The SMEP probe faults fetching the first byte of its user page, and
+        # the SMAP probe faults in kernel code reading its user page. Both
+        # addresses are fixed in kernel/src/hardening.rs.
+        if ($Fault -eq 'KernelSmep' -and ($cr2 -ne 0x5e000000 -or $rip -ne $cr2)) {
+            throw "The SMEP probe must fault fetching its user page at 0x5e000000. See $serialLog."
+        }
+        if ($Fault -eq 'KernelSmap' -and ($cr2 -ne 0x5a000000 -or $rip -lt [Convert]::ToUInt64('ffff800000000000', 16))) {
+            throw "The SMAP probe must fault in kernel code reading its user page at 0x5a000000. See $serialLog."
         }
         # The overflowing write, and the #PF frame push that turns it into a
         # double fault on IST1, both land in the guard page below RSP0.

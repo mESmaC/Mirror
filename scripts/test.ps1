@@ -33,11 +33,11 @@ function Assert-MirrorKernelImage {
         # speculative-execution exposure; only smoke kernels probe the NMI and
         # #MC IST stacks (specs 0016a, 0016b).
         $required = @('MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN')
-        $forbidden = @('MIRROR_IST_OK', 'MIRROR_TRACE_ON', 'MIRROR_CONSOLE_COMMAND operation=', 'MIRROR_POINTER_UPDATED', 'MIRROR_POINTER_CLICK', 'MIRROR_SHELL_FRAME', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'Mirror shell: ready', 'MIRROR_USERSPACE_OK', 'Mirror init: VM checks passed', 'fixture data mismatch', 'unexpected budget exhaustion')
+        $forbidden = @('MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_TRACE_ON', 'MIRROR_CONSOLE_COMMAND operation=', 'MIRROR_POINTER_UPDATED', 'MIRROR_POINTER_CLICK', 'MIRROR_SHELL_FRAME', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'Mirror shell: ready', 'MIRROR_USERSPACE_OK', 'Mirror init: VM checks passed', 'fixture data mismatch', 'unexpected budget exhaustion')
     }
     else {
         $required = @('MIRROR_TRACE_ON', 'MIRROR_SHELL_FRAME', 'MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN')
-        $forbidden = @('MIRROR_USERSPACE_OK', 'fixture data mismatch', 'MIRROR_IST_OK')
+        $forbidden = @('MIRROR_USERSPACE_OK', 'fixture data mismatch', 'MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK')
     }
     foreach ($text in $required) {
         if ($image.IndexOf($text, [StringComparison]::Ordinal) -lt 0) {
@@ -103,7 +103,7 @@ try {
         # SATA, unless it names -DeviceProfile LegacyVirtio (spec 0014).
         # UserSimd remains a strict manual #XM probe: current QEMU TCG does not
         # deliver that unmasked SSE arithmetic exception (QEMU issue 215).
-        foreach ($fault in @('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault')) {
+        foreach ($fault in @('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall')) {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Release:$release -AgentDemo:$AgentDemo -Fault $fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
             Save-MirrorSmokeLogs "$profile-$fault"
         }
@@ -145,7 +145,9 @@ try {
         }
         # Expose AVX and FSGSBASE through CPUID as well as exercising the
         # conservative CPU model. The kernel must keep both features disabled.
-        foreach ($fault in @('None', 'UserAvx', 'UserFsgsbase')) {
+        # This model also reports SMEP, SMAP and UMIP, which the kernel enables
+        # and its supervisor-access and SGDT probes test (spec 0016b).
+        foreach ($fault in @('None', 'UserAvx', 'UserFsgsbase', 'KernelSmep', 'KernelSmap', 'UserUmip')) {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -ExtendedCpu -Release:$release -AgentDemo:$AgentDemo -Fault $fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
             Save-MirrorSmokeLogs "$profile-ExtendedCpu-$fault"
         }
