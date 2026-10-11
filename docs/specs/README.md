@@ -7,7 +7,7 @@ Small, self-contained specs. Each one covers one bounded piece of work that a si
 
 ## Spec map (v1)
 
-M0's specs are drafted in this folder (see each file's Status). M1-M9 specs are planned, not yet drafted. Each one is sized for one agent and cites the ledger IDs it implements.
+M0's specs are drafted in this folder (see each file's Status). M1-M9 specs are planned, not yet drafted, except side spec 0029, which is drafted. Each one is sized for one agent and cites the ledger IDs it implements.
 
 **M0: Hygiene, VM boot images, absolute pointing, baselines**
 - 0010 Boot hygiene: test battery and fixture asserts behind `boot-smoke`, user-content logging and test oracles behind `test-trace`, opt-in perf exception (S7, S7a, S7b)
@@ -25,7 +25,7 @@ M0's specs are drafted in this folder (see each file's Status). M1-M9 specs are 
 - 0018 Performance baseline harness: the four gates, measured on Linux and Windows VMs in the host's ULM monitor mode (G7, G7a, O3)
 - 0019 Mirror perf instrumentation and telemetry: kernel side of 0018-D9 and device/link telemetry (S7b, C3)
 
-M0 execution order (confirmed): commit `docs/specs`, then 0012 first. Then 0011, 0014, 0010, 0015a, 0015b, 0013, 0016a, 0016b, 0017a and 0017b, then 0017c, then 0019, one at a time, each updating the AGENTS.md lines it changes in the same commit (P9). 0018's baseline track runs in parallel; its Mirror rows follow 0015a, 0013 (without 0013-D9 a VMware boot falls back to one CPU on the legacy PIC), 0017c and 0019.
+M0 execution order (confirmed): commit `docs/specs`, then 0012 first. Then 0011, 0014, 0010, 0015a, 0015b, 0013, 0016a, 0016b, 0017a and 0017b, then 0017c, then 0019, one at a time, each updating the AGENTS.md lines it changes in the same commit (P9). 0018's baseline track runs in parallel; its Mirror rows follow 0015a, 0013 (without 0013-D9 a VMware boot falls back to one CPU on the legacy PIC), 0017c and 0019. Side spec 0029 (confirmed 2026-10-10) runs after 0010 and before 0015a; its D9 lands with 0017c.
 
 **M1: ABI reset, kernel objects, compositor protocol, userspace target**
 - 0020 `mirror-sys`: one syscall and error table (S8); UTF-8 strings (S11); reserves realtime-clock and random-bytes calls (S14, S15)
@@ -37,6 +37,7 @@ M0 execution order (confirmed): commit `docs/specs`, then 0012 first. Then 0011,
 - 0026 `mirror-rt`: entry, allocator, handles, threads, panic output (S8)
 - 0027a Compositor protocol: shared-memory surfaces, any display size and live resize, clipboard object, versioned input envelope with seat and provenance (S6d, S6f, S1c, S11, A20; coordinate with Kimi)
 - 0028 Userspace target: hard-float, SSE2 baseline, AVX2 by runtime dispatch, build-std on the pinned compiler (S12, S8)
+- 0029 UI tokens on the current renderer: Kimi's design tokens on today's shell, apps and boot screen (P2a, G12; side spec, before 0027a)
 
 **M2: Processes, services, system log, crypto and entropy**
 - 0027b App launch out of the kernel, completing S6d (S6d, S6f; after 0030 and 0031)

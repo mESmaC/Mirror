@@ -139,6 +139,7 @@ Source interviews: the 2026-10-09 spec interview, then the 2026-10-09 gap interv
 | S18 | Memory policy. A fixed reserve for the kernel, compositor, shell and system services that nothing else can consume. The engine and indexer run in S4's background class, get pressure notifications and shrink their caches (expert cache, KV) first. Out-of-memory victim order: background work, then agent tasks, then normal apps; never the compositor, shell or system services. Grants can carry per-agent memory limits. Extends 0054. | confirmed |
 | S19 | Network. DHCPv4 with a static override, IPv6 with SLAAC, DNS servers from DHCP. The daily VM uses NAT. Spec 0074, before 0073: an HTTP/1.1 client and server (the server for the Agent API listener), SSE and JSON, crates per S3. | confirmed |
 | S20 | Files in and out. In-guest fetch and put commands over HTTPS (0081, using 0074), plus VMware shared folders (HGFS over the guest RPC channel, spec 0087). Outbound transfer by agents is a grantable, audited capability (0075). | confirmed |
+| S21 | UI theme: dark is the default and the only theme drawn until the theme preference (0068) and the Settings app (0088) ship Light. The theme values come from Kimi's design tokens (P2a), through spec 0029 until 0027a. (Cameron, 2026-10-10.) | confirmed |
 
 ## Process (P)
 
@@ -146,6 +147,7 @@ Source interviews: the 2026-10-09 spec interview, then the 2026-10-09 gap interv
 | --- | --- | --- |
 | P1 | Specs live in `docs/specs/` as small numbered files following the template in README.md. Nothing is built from unconfirmed decisions. | confirmed |
 | P2 | Cameron dispatches agents. Claude proposes non-blocking side tasks on request. Kimi stays on UI. Kimi's UI work is design, mostly outside Rust, and blocks nothing: Cameron passes its details on when it is ready, and specs marked "with Kimi" proceed without waiting for it. (Amended 2026-10-10.) | confirmed |
+| P2a | Kimi's design files in `docs/design/` are design references, not contracts. A spec that builds UI cites the sections it uses and confirms the specific values it adopts in its own decision table; where a page and a confirmed decision disagree, the decision wins and the page is revised. (Cameron, 2026-10-10, when merging Kimi's `design/design-system` branch.) | confirmed |
 | P3 | CI is deferred. Work is mostly one agent at a time. | confirmed |
 | P4 | The license is deferred while the repo is private. Every adopted dependency's license is recorded. | confirmed |
 | P5a | Pin the Rust toolchain to 1.99.0 and bump it deliberately. (Amended 2026-10-10: 1.96.0 became 1.99.0, the stable compiler already on the development machine. With `rust-version = "1.99"` the only new clippy finding is at `kernel/src/usb.rs:538`, which 0011 fixes.) | confirmed |
@@ -178,7 +180,7 @@ v1 order. The harness follows the process model (A15), and harness code is writt
 
 State after the 2026-10-09 gap interview, its write-up and its addendum, the 2026-10-10 pin change (P5a: 1.99.0), and the 2026-10-10 VMware addendum (Workstation Pro 26.0.1 checked and powered on).
 
-**Next in the M0 order:** 0015a. Done and waiting for Cameron to merge, in order, all fast-forward: `claude/0011-toolchain-and-lints` (0011), then `claude/0014-device-profiles` (0014), then `claude/0010-boot-hygiene` (0010). Each is stacked on the one before, and both full suites passed on each on Rust 1.99.0 (2026-10-10). 0012 is done (e6c5ec7).
+**Next:** spec 0029 (UI tokens on the current renderer, confirmed 2026-10-10), all but D9, right after Cameron merges the 0010 stack; then the M0 order continues with 0015a. 0029-D9 lands together with 0017c. Waiting for Cameron to merge: `claude/0010-boot-hygiene`, which carries 0011, 0014 and 0010 (one merge; main has moved, so it is a normal merge, checked conflict-free). 0012 is done (e6c5ec7).
 
 **Confirmed, but not yet written into the spec text:** none. Confirmed decisions that name a spec not yet drafted (for example 0027a, 0033 or 0067) live in this ledger and the README.md spec map until that spec is written.
 
@@ -202,7 +204,7 @@ State after the 2026-10-09 gap interview, its write-up and its addendum, the 202
    - Absolute VNC pointer events not reaching vmmouse (0017c check 8, 0018 open question 9). Recommended fallback: 0018-D12's corner homing.
    - `monitor_control.restrict_backdoor` after 0017c check 7: item 2.
 
-Kimi's UI branch is not on the remote yet. It blocks nothing (P2), and AGENTS.md keeps the placeholder "name supplied by Cameron" until Cameron passes the details on.
+Kimi's UI branch is `design/design-system`, kept in Kimi's own clone. Its five design pages were merged into `docs/design/` on 2026-10-10 as references (P2a). `docs/design/README.md` lists the review notes Kimi should address; none blocks anything (P2).
 
 **Spec-map placements Claude inferred** (for Cameron's awareness, not blocking): S2b's boot-time ext2 checker in 0064; the per-CPU SYSCALL entry rework in 0050.
 
