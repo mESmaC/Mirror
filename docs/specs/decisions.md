@@ -180,11 +180,9 @@ v1 order. The harness follows the process model (A15), and harness code is writt
 
 State after the 2026-10-09 gap interview, its write-up and its addendum, the 2026-10-10 pin change (P5a: 1.99.0), and the 2026-10-10 VMware addendum (Workstation Pro 26.0.1 checked and powered on).
 
-**Next in the M0 order:** 0011. 0012 is done (e6c5ec7, 2026-10-10). Its first step, the `kernel/src/usb.rs:538` as_chunks fix, waits on branch `claude/0011-usb-as-chunks` (23bdcba) for Cameron to merge; the full suite passed there on Rust 1.99.0. Build the rest of 0011 on top of it.
+**Next:** spec 0029 (UI tokens on the current renderer, confirmed 2026-10-10), all but D9, right after Cameron merges the 0010 stack; then the M0 order continues with 0015a. 0029-D9 lands together with 0017c. Waiting for Cameron to merge: `claude/0010-boot-hygiene`, which carries 0011, 0014 and 0010 (one merge; main has moved, so it is a normal merge, checked conflict-free). 0012 is done (e6c5ec7).
 
 **Confirmed, but not yet written into the spec text:** none. Confirmed decisions that name a spec not yet drafted (for example 0027a, 0033 or 0067) live in this ledger and the README.md spec map until that spec is written.
-
-**Awaiting Cameron now:** spec 0029 (UI tokens on the current renderer, a side spec drafted 2026-10-10). Its D3-D11 are proposed, and its place in the execution order is undecided. The window-chrome geometry (D9) has to land with or after 0017c and before 0018's Mirror rows; the rest can land once 0010 is merged.
 
 **Decided when their spec comes up** (Cameron, 2026-10-10; none blocks the current M0 work):
 1. Spec 0019 (all proposed; D3-D12 unchanged by the gap interview):

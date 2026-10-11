@@ -25,7 +25,7 @@ M0's specs are drafted in this folder (see each file's Status). M1-M9 specs are 
 - 0018 Performance baseline harness: the four gates, measured on Linux and Windows VMs in the host's ULM monitor mode (G7, G7a, O3)
 - 0019 Mirror perf instrumentation and telemetry: kernel side of 0018-D9 and device/link telemetry (S7b, C3)
 
-M0 execution order (confirmed): commit `docs/specs`, then 0012 first. Then 0011, 0014, 0010, 0015a, 0015b, 0013, 0016a, 0016b, 0017a and 0017b, then 0017c, then 0019, one at a time, each updating the AGENTS.md lines it changes in the same commit (P9). 0018's baseline track runs in parallel; its Mirror rows follow 0015a, 0013 (without 0013-D9 a VMware boot falls back to one CPU on the legacy PIC), 0017c and 0019.
+M0 execution order (confirmed): commit `docs/specs`, then 0012 first. Then 0011, 0014, 0010, 0015a, 0015b, 0013, 0016a, 0016b, 0017a and 0017b, then 0017c, then 0019, one at a time, each updating the AGENTS.md lines it changes in the same commit (P9). 0018's baseline track runs in parallel; its Mirror rows follow 0015a, 0013 (without 0013-D9 a VMware boot falls back to one CPU on the legacy PIC), 0017c and 0019. Side spec 0029 (confirmed 2026-10-10) runs after 0010 and before 0015a; its D9 lands with 0017c.
 
 **M1: ABI reset, kernel objects, compositor protocol, userspace target**
 - 0020 `mirror-sys`: one syscall and error table (S8); UTF-8 strings (S11); reserves realtime-clock and random-bytes calls (S14, S15)
