@@ -40,7 +40,10 @@ const USER_CODE_SELECTOR: u16 = 0x33;
 // restore IOPL, NT, VM, VIF, VIP, or reserved bits from a saved user context.
 const USER_RFLAGS_MASK: u64 = 0x25_0dd5;
 const DOUBLE_FAULT_IST: u8 = 1;
+const NMI_IST: u8 = 2;
+const MACHINE_CHECK_IST: u8 = 3;
 const EARLY_IST_STACK_SIZE: usize = 16 * 1024;
+const CR4_MCE: u64 = 1 << 6;
 const MAX_CPUS: usize = 64;
 const IPI_VECTOR: usize = 240;
 const LOCAL_TIMER_VECTOR: usize = 241;
@@ -284,8 +287,10 @@ fn kernel_tls_clean() -> bool {
     fs_selector == 0 && gs_selector == 0 && (fs_low | fs_high | gs_low | gs_high) == 0
 }
 
-/// Install the boot CPU's GDT, TSS and exception/IRQ IDT once at CPL0.
-/// All descriptor storage and the early IST stack must remain mapped.
+/// Install the boot CPU's GDT, TSS and exception/IRQ IDT once at CPL0, then
+/// set CR4.MCE when CPUID reports machine-check support, panicking if CR4 does
+/// not read back as expected. All descriptor storage and the early IST stack
+/// must remain mapped.
 /// Secondary CPUs load this shared IDT only after initialization is published.
 pub fn init() {
     arch::disable_interrupts();
@@ -305,7 +310,13 @@ pub fn init() {
         let handlers = addr_of!(mirror_exception_entries).cast::<u64>();
         let entries = addr_of_mut!(IDT).cast::<IdtEntry>();
         for vector in 0..48 {
-            let ist = if vector == 8 { DOUBLE_FAULT_IST } else { 0 };
+            // NMI, #DF and #MC never run on the stack they interrupted.
+            let ist = match vector {
+                2 => NMI_IST,
+                8 => DOUBLE_FAULT_IST,
+                18 => MACHINE_CHECK_IST,
+                _ => 0,
+            };
             entries
                 .add(vector)
                 .write(IdtEntry::interrupt(handlers.add(vector).read(), ist));
@@ -343,6 +354,10 @@ pub fn init() {
     // SAFETY: The BSP exclusively initialized these permanently mapped tables
     // with IF clear, and no secondary may load the IDT until publication below.
     unsafe { load_descriptors(&gdtr, &idtr) };
+    // SAFETY: The BSP runs at CPL0 with IF clear and has just loaded the IDT,
+    // whose #MC gate uses IST3 on the mapped early IST stack.
+    let machine_check = unsafe { enable_machine_check() };
+    assert!(machine_check, "CR4.MCE does not match CPUID");
     INITIALIZED.store(true, Ordering::Release);
     serial::println!("MIRROR_IDT_READY exceptions=32 double_fault_ist=1 irqs=16");
 }
@@ -363,6 +378,33 @@ fn gdt_entries(tss_address: u64) -> [u64; 7] {
         0x00cf_f300_0000_ffff, // DPL3 accessed, writable data.
         0x00af_fb00_0000_ffff, // DPL3 accessed, 64-bit code.
     ]
+}
+
+/// Set CR4.MCE (bit 6) when CPUID 1 EDX[7] reports machine-check support, so
+/// a machine check reaches the #MC gate instead of shutting the CPU down. CR4
+/// is read back: returns whether its MCE bit equals the CPUID bit and every
+/// other bit kept its value. Reports only; the caller decides how to fail.
+///
+/// # Safety
+/// The caller runs at CPL0 with IF clear and has loaded the shared IDT on this
+/// CPU, so a machine check from here on is delivered through vector 18.
+unsafe fn enable_machine_check() -> bool {
+    let supported = core::arch::x86_64::__cpuid(1).edx & (1 << 7) != 0;
+    let before: u64;
+    // SAFETY: CPL0 per the caller; reading CR4 changes no processor state.
+    unsafe { asm!("mov {}, cr4", out(reg) before, options(nomem, nostack, preserves_flags)) };
+    let expected = if supported { before | CR4_MCE } else { before };
+    if expected != before {
+        // SAFETY: CPL0 with IF clear per the caller. CPUID reports MCE, so
+        // bit 6 is defined and setting it cannot fault; every other bit keeps
+        // the value just read. The IDT is loaded, so a machine check from now
+        // on reaches its handler instead of shutting the CPU down.
+        unsafe { asm!("mov cr4, {}", in(reg) expected, options(nostack, preserves_flags)) };
+    }
+    let after: u64;
+    // SAFETY: As for the first read.
+    unsafe { asm!("mov {}, cr4", out(reg) after, options(nomem, nostack, preserves_flags)) };
+    after == expected && (after & CR4_MCE != 0) == supported
 }
 
 /// The caller owns this CPU's writable GDT/TSS with IF clear, and both tables
@@ -409,7 +451,8 @@ unsafe fn load_descriptors(gdtr: &DescriptorPointer, idtr: &DescriptorPointer) {
     }
 }
 
-/// Install and verify a secondary CPU's private GDT, TSS, RSP0 and IST1-3.
+/// Install and verify a secondary CPU's private GDT, TSS, RSP0 and IST1-3,
+/// then set CR4.MCE when CPUID reports it and verify CR4 by readback.
 /// Failures are returned without logging or entering the BSP panic path.
 ///
 /// # Safety
@@ -485,6 +528,10 @@ pub(crate) unsafe fn init_secondary(
     // SAFETY: The private GDT/TSS are initialized and writable, the shared IDT
     // was acquired after BSP publication, and IF remains clear on this CPU.
     unsafe { load_descriptors(&gdtr, &idtr) };
+    // SAFETY: This AP runs at CPL0 with IF clear and has just loaded the
+    // shared IDT. Until the caller activates the root that maps IST3, a
+    // machine check triple-faults, as it would with CR4.MCE clear.
+    let machine_check = unsafe { enable_machine_check() };
 
     let mut actual_gdt = DescriptorPointer { limit: 0, base: 0 };
     let mut actual_idt = DescriptorPointer { limit: 0, base: 0 };
@@ -537,6 +584,7 @@ pub(crate) unsafe fn init_secondary(
         && extra == DATA_SELECTOR
         && stack == DATA_SELECTOR
         && storage_valid
+        && machine_check
         && kernel_tls_clean()
 }
 

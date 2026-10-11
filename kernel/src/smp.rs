@@ -56,6 +56,9 @@ struct Slot {
     stack_top: AtomicU64,
     actual_stack: AtomicU64,
     actual_root: AtomicU64,
+    // CR4 as the AP saw it once its descriptors, FPU controls and root were
+    // installed, for the BSP's per-CPU report.
+    actual_cr4: AtomicU64,
     command: AtomicU64,
     operation: AtomicU32,
     argument: AtomicU64,
@@ -78,6 +81,7 @@ impl Slot {
             stack_top: AtomicU64::new(0),
             actual_stack: AtomicU64::new(0),
             actual_root: AtomicU64::new(0),
+            actual_cr4: AtomicU64::new(0),
             command: AtomicU64::new(0),
             operation: AtomicU32::new(0),
             argument: AtomicU64::new(0),
@@ -408,8 +412,8 @@ unsafe extern "C" fn secondary_entry(cpu: &Cpu) -> ! {
     // image, with this CPU's descriptors and the shared IDT, are mapped now and
     // in the sealed root. The RSP0 and IST1-3 tops sit above this slot's
     // guarded stacks, which the BSP mapped before publication, but only in the
-    // sealed root: until activate_secondary below, a #DF finds its IST
-    // unmapped and triple-faults this CPU instead of being recorded. LINT1
+    // sealed root: until activate_secondary below, a #DF, NMI or #MC finds its
+    // IST unmapped and triple-faults this CPU instead of being recorded. LINT1
     // stays masked until apic::init_secondary. No CPL3 entry is allowed.
     if !unsafe { interrupts::init_secondary(index, top, ist_tops(index)) } {
         fail(index, 2);
@@ -439,10 +443,12 @@ extern "C" fn secondary_main(index: usize) -> ! {
     let slot = &SLOTS[index];
     let stack: u64;
     let root: u64;
+    let cr4: u64;
     // SAFETY: CPU-local register inspection at CPL0, no mutation.
     unsafe {
         asm!("mov {}, rsp", out(reg) stack, options(nomem, nostack, preserves_flags));
         asm!("mov {}, cr3", out(reg) root, options(nomem, nostack, preserves_flags));
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
     }
     if !(stack_bottom(index)..stack_top(index)).contains(&stack)
         || root != ROOT.load(Ordering::Relaxed)
@@ -460,6 +466,7 @@ extern "C" fn secondary_main(index: usize) -> ! {
     }
     slot.actual_stack.store(stack, Ordering::Relaxed);
     slot.actual_root.store(root, Ordering::Relaxed);
+    slot.actual_cr4.store(cr4, Ordering::Relaxed);
     // Cancellation is terminal: a late AP may never resurrect an offline slot.
     if slot
         .state
