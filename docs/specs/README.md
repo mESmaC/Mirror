@@ -7,7 +7,7 @@ Small, self-contained specs. Each one covers one bounded piece of work that a si
 
 ## Spec map (v1)
 
-M0's specs are drafted in this folder (see each file's Status). M1-M9 specs are planned, not yet drafted. Each one is sized for one agent and cites the ledger IDs it implements.
+M0's specs are drafted in this folder (see each file's Status). M1-M9 specs are planned, not yet drafted, except side spec 0029, which is drafted. Each one is sized for one agent and cites the ledger IDs it implements.
 
 **M0: Hygiene, VM boot images, absolute pointing, baselines**
 - 0010 Boot hygiene: test battery and fixture asserts behind `boot-smoke`, user-content logging and test oracles behind `test-trace`, opt-in perf exception (S7, S7a, S7b)
@@ -37,6 +37,7 @@ M0 execution order (confirmed): commit `docs/specs`, then 0012 first. Then 0011,
 - 0026 `mirror-rt`: entry, allocator, handles, threads, panic output (S8)
 - 0027a Compositor protocol: shared-memory surfaces, any display size and live resize, clipboard object, versioned input envelope with seat and provenance (S6d, S6f, S1c, S11, A20; coordinate with Kimi)
 - 0028 Userspace target: hard-float, SSE2 baseline, AVX2 by runtime dispatch, build-std on the pinned compiler (S12, S8)
+- 0029 UI tokens on the current renderer: Kimi's design tokens on today's shell, apps and boot screen (P2a, G12; side spec, before 0027a)
 
 **M2: Processes, services, system log, crypto and entropy**
 - 0027b App launch out of the kernel, completing S6d (S6d, S6f; after 0030 and 0031)

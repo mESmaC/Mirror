@@ -139,6 +139,7 @@ Source interviews: the 2026-10-09 spec interview, then the 2026-10-09 gap interv
 | S18 | Memory policy. A fixed reserve for the kernel, compositor, shell and system services that nothing else can consume. The engine and indexer run in S4's background class, get pressure notifications and shrink their caches (expert cache, KV) first. Out-of-memory victim order: background work, then agent tasks, then normal apps; never the compositor, shell or system services. Grants can carry per-agent memory limits. Extends 0054. | confirmed |
 | S19 | Network. DHCPv4 with a static override, IPv6 with SLAAC, DNS servers from DHCP. The daily VM uses NAT. Spec 0074, before 0073: an HTTP/1.1 client and server (the server for the Agent API listener), SSE and JSON, crates per S3. | confirmed |
 | S20 | Files in and out. In-guest fetch and put commands over HTTPS (0081, using 0074), plus VMware shared folders (HGFS over the guest RPC channel, spec 0087). Outbound transfer by agents is a grantable, audited capability (0075). | confirmed |
+| S21 | UI theme: dark is the default and the only theme drawn until the theme preference (0068) and the Settings app (0088) ship Light. The theme values come from Kimi's design tokens (P2a), through spec 0029 until 0027a. (Cameron, 2026-10-10.) | confirmed |
 
 ## Process (P)
 
@@ -182,6 +183,8 @@ State after the 2026-10-09 gap interview, its write-up and its addendum, the 202
 **Next in the M0 order:** 0011. 0012 is done (e6c5ec7, 2026-10-10). Its first step, the `kernel/src/usb.rs:538` as_chunks fix, waits on branch `claude/0011-usb-as-chunks` (23bdcba) for Cameron to merge; the full suite passed there on Rust 1.99.0. Build the rest of 0011 on top of it.
 
 **Confirmed, but not yet written into the spec text:** none. Confirmed decisions that name a spec not yet drafted (for example 0027a, 0033 or 0067) live in this ledger and the README.md spec map until that spec is written.
+
+**Awaiting Cameron now:** spec 0029 (UI tokens on the current renderer, a side spec drafted 2026-10-10). Its D3-D11 are proposed, and its place in the execution order is undecided. The window-chrome geometry (D9) has to land with or after 0017c and before 0018's Mirror rows; the rest can land once 0010 is merged.
 
 **Decided when their spec comes up** (Cameron, 2026-10-10; none blocks the current M0 work):
 1. Spec 0019 (all proposed; D3-D12 unchanged by the gap interview):
