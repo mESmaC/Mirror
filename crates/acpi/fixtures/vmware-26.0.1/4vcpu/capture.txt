@@ -1,0 +1,28 @@
+Spec 0013-D8 fixture: raw MADT (APIC.bin, 122 bytes) and HPET (HPET.bin, 56 bytes)
+from the reference VMware VM at 4 vCPUs, captured 2026-10-11.
+
+Host
+  VMware Workstation Pro 26.0.1 (26H1u1), build 25688693
+
+.vmx inputs
+  numvcpus = 4
+  cpuid.coresPerSocket = unset
+  vcpu.hotadd = unset
+  virtualHW.version = 22
+  guestOS = other-64
+
+vmware.log firmware lines
+  The EFI ROM is EFI2.7 64-bit.
+  Guest: EFI ROM version: VMW201.00V.25600138.B64.2607151225 (64-bit RELEASE)
+
+Linux apic=debug IOAPIC lines (dmesg)
+  [    0.698451] IO APIC #4......
+  [    0.698452] .... register #00: 00000000
+  [    0.698452] .......    : physical APIC id: 00
+
+Capture method
+  VM created by Workstation's own create path, `vmcli VM Create -c other-64`,
+  then given the keys in docs/vm-settings.md. Guest: Alpine Linux 3.24.2 live
+  ISO (Linux 6.18.52-0-virt) booted with apic=debug. The tables are the files
+  /sys/firmware/acpi/tables/APIC and /sys/firmware/acpi/tables/HPET, copied
+  unmodified; both checksums are valid.

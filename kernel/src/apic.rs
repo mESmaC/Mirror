@@ -239,8 +239,17 @@ fn prepare(
             inputs: 0,
         };
         chip.inputs = ioapic_inputs(chip.read(1))?;
-        if (chip.read(0) >> 24) as u8 != entry.id {
-            return Err("ioapic_id_mismatch");
+        // The MADT address and GSI base identify the controller, and the
+        // register is never rewritten (0013-D9). Redirection entries address
+        // the BSP's local APIC, so the IOAPIC's own ID plays no part in
+        // delivery; a disagreement is only reported.
+        if let Some(hardware) = ioapic_id_mismatch(entry.id, chip.read(0)) {
+            serial::println!(
+                "MIRROR_APIC_IOAPIC_ID index={} firmware={} hardware={}",
+                index,
+                entry.id,
+                hardware
+            );
         }
         validate_gsi_range(chip.gsi_base, chip.inputs, &io[..index])?;
         io[index] = chip;
@@ -279,6 +288,15 @@ fn prepare(
     })
 }
 
+/// Returns the IOAPIC ID register's bits 31:24 when they differ from the
+/// MADT's ID for that controller, and `None` when they agree. VMware's
+/// firmware writes the MADT ID as the first unused CPU slot while the register
+/// resets to 0 (0013-D9).
+fn ioapic_id_mismatch(firmware: u8, id_register: u32) -> Option<u8> {
+    let hardware = (id_register >> 24) as u8;
+    (hardware != firmware).then_some(hardware)
+}
+
 fn ioapic_inputs(version: u32) -> Result<u32, &'static str> {
     let maximum = (version >> 16) & 0xff;
     // IOREGSEL is 8 bits; the last redirection pair must fit 0xfe/0xff.
@@ -304,15 +322,22 @@ fn validate_gsi_range(base: u32, inputs: u32, previous: &[IoApic]) -> Result<(),
 
 fn lint_configuration(uid: u32, nmis: &[LocalNmi]) -> [u32; 2] {
     let mut lint = [MASKED | 254; 2];
-    for nmi in nmis {
-        // The parser validates LINT0/1 and rejects overlapping descriptions.
-        // UID identifies the CPU independently of either MADT record encoding.
-        if nmi.processor_uid.is_none() || nmi.processor_uid == Some(uid) {
-            lint[nmi.lint as usize] = (4 << 8)
-                | electrical(
-                    nmi.polarity.unwrap_or(Polarity::ActiveHigh),
-                    nmi.trigger.unwrap_or(Trigger::Edge),
-                );
+    // The parser validates LINT0/1 and keeps at most one record per LINT for
+    // the wildcard and for each UID (0013-D3). Apply wildcards first, then
+    // UID-specific records, so that a specific record overrides a wildcard on
+    // the same LINT whatever their table order. UID identifies the CPU
+    // independently of either MADT record encoding.
+    for specific in [false, true] {
+        for nmi in nmis {
+            if nmi.processor_uid.is_some() == specific
+                && (nmi.processor_uid.is_none() || nmi.processor_uid == Some(uid))
+            {
+                lint[nmi.lint as usize] = (4 << 8)
+                    | electrical(
+                        nmi.polarity.unwrap_or(Polarity::ActiveHigh),
+                        nmi.trigger.unwrap_or(Trigger::Edge),
+                    );
+            }
         }
     }
     lint
@@ -910,7 +935,35 @@ pub fn self_test() {
             lint_configuration(43, &[nmi, global]),
             [MASKED | 254, 0x400]
         );
+        // 0013-D3: on one LINT the specific record overrides the wildcard for
+        // its own CPU only, and table order never changes the result.
+        let specific = LocalNmi { x2apic, ..nmi };
+        let wildcard = LocalNmi { lint: 0, ..global };
+        for uid in [42, 43] {
+            assert_eq!(
+                lint_configuration(uid, &[specific, wildcard]),
+                lint_configuration(uid, &[wildcard, specific])
+            );
+        }
+        assert_eq!(
+            lint_configuration(42, &[wildcard, specific]),
+            [0xa400, MASKED | 254]
+        );
+        assert_eq!(
+            lint_configuration(43, &[specific, wildcard]),
+            [0x400, MASKED | 254]
+        );
     }
+
+    // 0013-D9, with no MMIO. VMware's 128-slot MADT gives its IOAPIC ID 0x80
+    // while the register reads 0: reported, not rejected. QEMU agrees at 0, and
+    // register bits 23:0 are reserved.
+    assert_eq!(ioapic_id_mismatch(0x80, 0), Some(0));
+    assert_eq!(ioapic_id_mismatch(1, 0), Some(0));
+    assert_eq!(ioapic_id_mismatch(0, 0x0100_0000), Some(1));
+    assert_eq!(ioapic_id_mismatch(0, 0), None);
+    assert_eq!(ioapic_id_mismatch(0x80, 0x8000_0000), None);
+    assert_eq!(ioapic_id_mismatch(5, 0x05ff_ffff), None);
 
     let mut banks = 0;
     assert!(isr_clear(|offset| {

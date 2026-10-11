@@ -18,10 +18,14 @@ pub const HPET_TABLE_SIZE: usize = 56;
 pub const MAX_RSDP_SIZE: usize = 4096;
 pub const MAX_TABLE_SIZE: usize = 256 * 1024;
 pub const MAX_ROOT_ENTRIES: usize = 256;
+/// The most usable CPU records retained. Enabled records take priority over
+/// online-capable ones, and the rest are omitted and counted (0013-D4).
 pub const MAX_CPUS: usize = 64;
 pub const MAX_IO_APICS: usize = 8;
 pub const MAX_OVERRIDES: usize = 16;
-pub const MAX_LOCAL_NMIS: usize = 64;
+/// One record per LINT for each retained CPU plus one wildcard per LINT, the
+/// most that remains once unmatched and redundant records are dropped.
+pub const MAX_LOCAL_NMIS: usize = 2 * MAX_CPUS + 2;
 pub const MAX_NMI_SOURCES: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,10 +155,12 @@ impl<'a> Sdt<'a> {
 }
 
 /// Firmware's description of one HPET block, without any live MMIO access.
-/// The driver must validate the address against platform memory ownership and
-/// compare the reported block ID with hardware before using the counter.
+/// The table supplies only the register address, which the driver must still
+/// validate against platform memory ownership. The hardware GCAP_ID register,
+/// not this table, is authoritative for the block's identity and capabilities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hpet {
+    /// Firmware's copy of GCAP_ID[31:0], stored without validation.
     pub event_timer_block_id: u32,
     pub address: u64,
     pub number: u8,
@@ -176,20 +182,16 @@ impl Hpet {
         }
         let bytes = table.bytes;
         require(bytes, HPET_TABLE_SIZE)?;
+        // The block ID is not validated here: the driver checks REV_ID and
+        // bit 14 in the hardware register, which wins over this copy.
         let event_timer_block_id = u32_at(bytes, 36);
-        if event_timer_block_id & (1 << 14) != 0 {
-            return Err(Error::Reserved);
-        }
-        if event_timer_block_id & 0xff == 0 {
-            return Err(Error::Revision);
-        }
-        // This GAS addresses a register block, so width and offset are zero
-        // (ACPI 6.6 section 5.2.3.2). HPET 1.0a also reserves GAS byte3; retain
-        // its legacy zero access-size encoding. System I/O is unsupported.
+        // Only the GAS space ID and address are used. Firmware commonly
+        // encodes a register width of 64 although ACPI 6.6 section 5.2.3.2
+        // gives a register block zero width and offset, so the width, offset
+        // and access size bytes are ignored. System I/O is unsupported.
         if bytes[40] != 0 {
             return Err(Error::Address);
         }
-        reserved(&bytes[41..44])?;
         let address = u64_at(bytes, 44);
         if address == 0 || !address.is_multiple_of(8) || address.checked_add(1024).is_none() {
             return Err(Error::Address);
@@ -211,6 +213,8 @@ impl Hpet {
     }
 }
 
+/// A validated RSDT or XSDT. Its entries are firmware addresses that the
+/// caller reads one at a time, so one bad entry costs only that table.
 #[derive(Clone, Copy, Debug)]
 pub struct Root<'a> {
     entries: &'a [u8],
@@ -218,6 +222,8 @@ pub struct Root<'a> {
 }
 
 impl<'a> Root<'a> {
+    /// Validates the table, its entry width and the entry cap. Null and
+    /// repeated entries are not errors: `addresses` skips them.
     pub fn parse(bytes: &'a [u8], kind: RootKind) -> Result<Self, Error> {
         let table = Sdt::parse(bytes)?;
         let (signature, width) = match kind {
@@ -231,29 +237,31 @@ impl<'a> Root<'a> {
         if !entries.len().is_multiple_of(width) {
             return Err(Error::Length);
         }
+        // The cap counts every entry, null and repeated ones included, and
+        // bounds the quadratic repeat check in `addresses`.
         if entries.len() / width > MAX_ROOT_ENTRIES {
             return Err(Error::Capacity);
         }
-        let root = Self { entries, width };
-        for (index, address) in root.addresses().enumerate() {
-            if address == 0 {
-                return Err(Error::Address);
-            }
-            if root.addresses().take(index).any(|prior| prior == address) {
-                return Err(Error::Duplicate);
-            }
-        }
-        Ok(root)
+        Ok(Self { entries, width })
     }
 
-    pub fn addresses(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
-        self.entries.chunks_exact(self.width).map(|entry| {
-            if self.width == 4 {
-                u32_at(entry, 0) as u64
-            } else {
-                u64_at(entry, 0)
-            }
+    /// Table addresses in root order. A null entry is skipped, and an address
+    /// that appears more than once is yielded only at its first position.
+    pub fn addresses(&self) -> impl Iterator<Item = u64> + '_ {
+        (0..self.entries.len() / self.width).filter_map(move |index| {
+            let address = self.entry(index);
+            let repeated = (0..index).any(|prior| self.entry(prior) == address);
+            (address != 0 && !repeated).then_some(address)
         })
+    }
+
+    fn entry(&self, index: usize) -> u64 {
+        let offset = index * self.width;
+        if self.width == 4 {
+            u32_at(self.entries, offset) as u64
+        } else {
+            u64_at(self.entries, offset)
+        }
     }
 }
 
@@ -321,6 +329,22 @@ pub struct NmiSource {
     pub trigger: Option<Trigger>,
 }
 
+/// MADT records that were valid but dropped rather than rejecting the table
+/// (0013-D3, D4). Each count is bounded by the records in one table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MadtDiagnostics {
+    /// Usable CPU records beyond MAX_CPUS.
+    pub omitted_cpus: u32,
+    /// Local NMI records that repeat an earlier record's LINT, target and
+    /// resolved mode.
+    pub merged_nmis: u32,
+    /// Local NMI records that repeat an earlier record's LINT and target with
+    /// a different resolved mode. The earlier record is kept.
+    pub conflicting_nmis: u32,
+    /// UID-specific local NMI records whose UID matches no retained CPU.
+    pub unmatched_nmis: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct Topology {
     pub lapic_address: u64,
@@ -335,9 +359,18 @@ pub struct Topology {
     local_nmi_count: usize,
     nmi_sources: [NmiSource; MAX_NMI_SOURCES],
     nmi_source_count: usize,
+    diagnostics: MadtDiagnostics,
 }
 
 impl Topology {
+    /// Parses the MADT in three bounded walks over its records. The first
+    /// frames every record and validates and counts the usable CPU records,
+    /// the second retains CPUs by 0013-D4's priority, and the third counts
+    /// the omitted CPUs and handles every other record. Local NMI records are
+    /// therefore matched against the retained CPUs wherever they appear in
+    /// the table. Surplus CPU records and redundant or unmatched local NMI
+    /// records are dropped and counted in `diagnostics`; every other
+    /// duplicate or surplus record still rejects the table.
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
         let table = Sdt::parse(bytes)?;
         if table.signature() != *b"APIC" {
@@ -362,21 +395,35 @@ impl Topology {
             local_nmi_count: 0,
             nmi_sources: [NmiSource::default(); MAX_NMI_SOURCES],
             nmi_source_count: 0,
+            diagnostics: MadtDiagnostics::default(),
         };
-        let mut remaining = &bytes[44..];
-        let mut address_override = false;
-        while !remaining.is_empty() {
-            require(remaining, 2)?;
-            let length = remaining[1] as usize;
-            if length < 2 {
-                return Err(Error::RecordLength);
+        let records = &bytes[44..];
+        let mut enabled = 0;
+        for record in Records(records) {
+            if let Some(cpu) = cpu_record(record?)? {
+                enabled += usize::from(cpu.enabled);
             }
-            require(remaining, length)?;
-            let record = &remaining[..length];
+        }
+        let mut selection = CpuSelection::new(enabled);
+        for record in Records(records) {
+            if let Some(cpu) = cpu_record(record?)?
+                && selection.retains(&cpu)
+            {
+                result.add_cpu(cpu)?;
+            }
+        }
+        // Replays the second walk's selection to find the omitted records.
+        let mut selection = CpuSelection::new(enabled);
+        let mut address_override = false;
+        for record in Records(records) {
+            let record = record?;
             match record[0] {
-                0 => {
-                    record_length(record, 8)?;
-                    result.add_cpu(record[2] as u32, record[3] as u32, u32_at(record, 4), false)?;
+                0 | 9 => {
+                    if let Some(cpu) = cpu_record(record)?
+                        && !selection.retains(&cpu)
+                    {
+                        result.omit_cpu(&cpu)?;
+                    }
                 }
                 1 => {
                     record_length(record, 12)?;
@@ -460,16 +507,6 @@ impl Topology {
                     address_override = true;
                     result.lapic_address = u64_at(record, 4);
                 }
-                9 => {
-                    record_length(record, 16)?;
-                    reserved(&record[2..4])?;
-                    result.add_cpu(
-                        u32_at(record, 12),
-                        u32_at(record, 4),
-                        u32_at(record, 8),
-                        true,
-                    )?;
-                }
                 10 => {
                     record_length(record, 12)?;
                     reserved(&record[9..12])?;
@@ -488,7 +525,6 @@ impl Topology {
                 6..=8 => return Err(Error::UnsupportedInterruptModel),
                 _ => {}
             }
-            remaining = &remaining[length..];
         }
         page_address(result.lapic_address)?;
         if result
@@ -528,6 +564,10 @@ impl Topology {
         &self.nmi_sources[..self.nmi_source_count]
     }
 
+    pub fn diagnostics(&self) -> MadtDiagnostics {
+        self.diagnostics
+    }
+
     /// Resolve ISA polarity/trigger defaults and reject an identity input
     /// repurposed by another IRQ override or an NMI source. IOAPIC GSI coverage
     /// requires hardware register discovery and is checked by the caller.
@@ -559,51 +599,180 @@ impl Topology {
         Ok(route)
     }
 
-    fn add_cpu(&mut self, uid: u32, apic_id: u32, flags: u32, x2apic: bool) -> Result<(), Error> {
-        // ACPI requires an unusable record (neither availability bit set) to
-        // be ignored, including identity fields that firmware may leave stale.
-        if flags & 3 == 0 {
-            return Ok(());
-        }
-        if flags & !3 != 0 || flags & 3 == 3 {
-            return Err(Error::Reserved);
-        }
-        if apic_id == u32::MAX || (!x2apic && apic_id == 0xff) {
-            return Err(Error::Address);
-        }
+    /// Retains a usable CPU. `CpuSelection` admits at most MAX_CPUS, so the
+    /// push cannot fail on capacity.
+    fn add_cpu(&mut self, cpu: Cpu) -> Result<(), Error> {
+        self.check_cpu_identity(&cpu)?;
+        push(&mut self.cpus, &mut self.cpu_count, cpu)
+    }
+
+    /// Counts a usable CPU that did not fit. Its identity is still checked
+    /// against every retained CPU, so a record cannot claim the UID or APIC
+    /// ID of a CPU that Mirror starts. Two omitted records are not compared
+    /// with each other, which would need a quadratic walk of the table, and
+    /// neither is used.
+    fn omit_cpu(&mut self, cpu: &Cpu) -> Result<(), Error> {
+        self.check_cpu_identity(cpu)?;
+        self.diagnostics.omitted_cpus += 1;
+        Ok(())
+    }
+
+    fn check_cpu_identity(&self, cpu: &Cpu) -> Result<(), Error> {
         if self
             .cpus()
             .iter()
-            .any(|cpu| cpu.uid == uid || cpu.apic_id == apic_id)
+            .any(|prior| prior.uid == cpu.uid || prior.apic_id == cpu.apic_id)
         {
-            return Err(Error::Duplicate);
+            Err(Error::Duplicate)
+        } else {
+            Ok(())
         }
-        push(
-            &mut self.cpus,
-            &mut self.cpu_count,
-            Cpu {
-                uid,
-                apic_id,
-                enabled: flags & 1 != 0,
-                online_capable: flags & 2 != 0,
-                x2apic,
-            },
-        )
     }
 
+    /// Records one local NMI connection (0013-D3, D4). A UID-specific record
+    /// whose UID matches no retained CPU is dropped. A record that repeats an
+    /// earlier record's LINT and target, meaning the same UID in either
+    /// record encoding or the wildcard in either, is dropped and the earlier
+    /// record wins. A UID-specific record and a wildcard are distinct
+    /// targets, so both are kept, and the APIC driver applies the specific
+    /// one to its CPU. Stored records keep firmware's raw flags.
     fn add_local_nmi(&mut self, entry: LocalNmi) -> Result<(), Error> {
         if entry.lint > 1 {
             return Err(Error::Reserved);
         }
-        if self.local_nmis().iter().any(|prior| {
-            prior.lint == entry.lint
-                && (prior.processor_uid.is_none()
-                    || entry.processor_uid.is_none()
-                    || prior.processor_uid == entry.processor_uid)
-        }) {
-            return Err(Error::Duplicate);
+        if let Some(uid) = entry.processor_uid
+            && !self.cpus().iter().any(|cpu| cpu.uid == uid)
+        {
+            self.diagnostics.unmatched_nmis += 1;
+            return Ok(());
         }
-        push(&mut self.local_nmis, &mut self.local_nmi_count, entry)
+        let same_mode = self
+            .local_nmis()
+            .iter()
+            .find(|prior| prior.lint == entry.lint && prior.processor_uid == entry.processor_uid)
+            .map(|prior| prior.resolved_mode() == entry.resolved_mode());
+        match same_mode {
+            Some(true) => self.diagnostics.merged_nmis += 1,
+            Some(false) => self.diagnostics.conflicting_nmis += 1,
+            // The retained CPUs have distinct UIDs, so at most one record per
+            // LINT for each of them plus one wildcard per LINT reaches here,
+            // and MAX_LOCAL_NMIS holds them all.
+            None => push(&mut self.local_nmis, &mut self.local_nmi_count, entry)?,
+        }
+        Ok(())
+    }
+}
+
+impl LocalNmi {
+    /// The electrical mode with "conforms to bus" resolved to active-high and
+    /// edge-triggered, as the APIC driver programs it.
+    fn resolved_mode(&self) -> (Polarity, Trigger) {
+        (
+            self.polarity.unwrap_or(Polarity::ActiveHigh),
+            self.trigger.unwrap_or(Trigger::Edge),
+        )
+    }
+}
+
+/// Walks the MADT's interrupt controller structures. Each item is one record,
+/// bounded by its declared length; a framing error ends the walk.
+struct Records<'a>(&'a [u8]);
+
+impl<'a> Iterator for Records<'a> {
+    type Item = Result<&'a [u8], Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.0.is_empty() {
+            return None;
+        }
+        let length = match self.0.get(1) {
+            None => Err(Error::Truncated),
+            Some(&length) if length < 2 => Err(Error::RecordLength),
+            Some(&length) if self.0.len() < length as usize => Err(Error::Truncated),
+            Some(&length) => Ok(length as usize),
+        };
+        Some(match length {
+            Ok(length) => {
+                let (record, remaining) = self.0.split_at(length);
+                self.0 = remaining;
+                Ok(record)
+            }
+            Err(error) => {
+                self.0 = &[];
+                Err(error)
+            }
+        })
+    }
+}
+
+/// Decodes a processor local APIC (type 0) or x2APIC (type 9) record. Other
+/// types give `None`, and so does a record with neither availability bit set:
+/// ACPI requires such a record to be ignored, including identity fields that
+/// firmware may leave stale.
+fn cpu_record(record: &[u8]) -> Result<Option<Cpu>, Error> {
+    let (uid, apic_id, flags, x2apic) = match record[0] {
+        0 => {
+            record_length(record, 8)?;
+            (record[2] as u32, record[3] as u32, u32_at(record, 4), false)
+        }
+        9 => {
+            record_length(record, 16)?;
+            reserved(&record[2..4])?;
+            (
+                u32_at(record, 12),
+                u32_at(record, 4),
+                u32_at(record, 8),
+                true,
+            )
+        }
+        _ => return Ok(None),
+    };
+    if flags & 3 == 0 {
+        return Ok(None);
+    }
+    if flags & !3 != 0 || flags & 3 == 3 {
+        return Err(Error::Reserved);
+    }
+    if apic_id == u32::MAX || (!x2apic && apic_id == 0xff) {
+        return Err(Error::Address);
+    }
+    Ok(Some(Cpu {
+        uid,
+        apic_id,
+        enabled: flags & 1 != 0,
+        online_capable: flags & 2 != 0,
+        x2apic,
+    }))
+}
+
+/// 0013-D4's CPU retention. Enabled records take priority over
+/// online-capable ones, and within each kind the earliest records in the
+/// table are kept, so the retained CPUs stay in table order.
+struct CpuSelection {
+    enabled: usize,
+    online_capable: usize,
+}
+
+impl CpuSelection {
+    fn new(enabled: usize) -> Self {
+        let enabled = enabled.min(MAX_CPUS);
+        Self {
+            enabled,
+            online_capable: MAX_CPUS - enabled,
+        }
+    }
+
+    /// Takes the usable CPU records in table order, one call each, and says
+    /// whether each one is retained.
+    fn retains(&mut self, cpu: &Cpu) -> bool {
+        let remaining = if cpu.enabled {
+            &mut self.enabled
+        } else {
+            &mut self.online_capable
+        };
+        let retained = *remaining > 0;
+        *remaining = remaining.saturating_sub(1);
+        retained
     }
 }
 

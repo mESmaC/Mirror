@@ -256,7 +256,7 @@ pub(crate) fn test_inventory() -> pci::Inventory {
         display_devices: 0,
         virtio_gpu_devices: 0,
         config_reads: 0,
-        devices: [None; 32],
+        devices: [None; pci::MAX_RETAINED],
         retained: 5,
         omitted: 3,
     };

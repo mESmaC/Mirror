@@ -124,7 +124,7 @@ fn hpet_bounds_declared_length_and_checksum() {
 }
 
 #[test]
-fn hpet_rejects_signature_revision_and_reserved_block_id() {
+fn hpet_rejects_signature_and_revision() {
     let mut bytes = hpet();
     bytes[..4].copy_from_slice(b"APIC");
     repair_checksum(&mut bytes, 9);
@@ -135,31 +135,64 @@ fn hpet_rejects_signature_revision_and_reserved_block_id() {
         repair_checksum(&mut bytes, 9);
         assert_eq!(Hpet::parse(&bytes), Err(Error::Revision));
     }
-    let mut bytes = hpet();
-    bytes[36] = 0;
-    repair_checksum(&mut bytes, 9);
-    assert_eq!(Hpet::parse(&bytes), Err(Error::Revision));
-    let mut bytes = hpet();
-    bytes[37] |= 1 << 6;
-    repair_checksum(&mut bytes, 9);
-    assert_eq!(Hpet::parse(&bytes), Err(Error::Reserved));
 }
 
 #[test]
-fn hpet_rejects_unsupported_gas_and_invalid_addresses() {
+fn hpet_ignores_gas_shape_and_stores_any_block_id() {
+    // 0013-D5: the table supplies only the register address. Firmware's GAS
+    // width, offset and access size are ignored, and the driver checks the
+    // hardware block ID's REV_ID and bit 14 instead of the table's copy.
+    let base = Hpet::parse(&hpet()).unwrap();
+    let mut variants = Vec::new();
+    variants.extend([32, 64].map(|width| [(41, width)]));
+    variants.extend((1..=4).map(|access| [(43, access)]));
+    variants.extend([1, 4, 63, 0xff].map(|offset| [(42, offset)]));
+    variants.push([(41, 0xff)]);
+    for variant in variants {
+        let mut bytes = hpet();
+        for (offset, value) in variant {
+            bytes[offset] = value;
+        }
+        repair_checksum(&mut bytes, 9);
+        assert_eq!(Hpet::parse(&bytes), Ok(base), "{variant:?}");
+    }
+    // A typical firmware encoding: 64 bits wide, QWORD access.
+    let mut bytes = hpet();
+    bytes[41] = 64;
+    bytes[43] = 4;
+    repair_checksum(&mut bytes, 9);
+    assert_eq!(Hpet::parse(&bytes), Ok(base));
+    for block_id in [
+        0x8086_a200, // REV_ID 0
+        0x8086_e201, // bit 14 set
+        0x8086_e200,
+        0,
+        u32::MAX,
+    ] {
+        let mut bytes = hpet();
+        bytes[36..40].copy_from_slice(&block_id.to_le_bytes());
+        repair_checksum(&mut bytes, 9);
+        assert_eq!(
+            Hpet::parse(&bytes),
+            Ok(Hpet {
+                event_timer_block_id: block_id,
+                ..base
+            })
+        );
+    }
+}
+
+#[test]
+fn hpet_rejects_unsupported_spaces_and_invalid_addresses() {
     for space in [1, 2, 0x7f, 0xff] {
         let mut bytes = hpet();
         bytes[40] = space;
         repair_checksum(&mut bytes, 9);
         assert_eq!(Hpet::parse(&bytes), Err(Error::Address));
-    }
-    for offset in 41..44 {
-        for value in [1, 4, 32, 64, 0xff] {
-            let mut bytes = hpet();
-            bytes[offset] = value;
-            repair_checksum(&mut bytes, 9);
-            assert_eq!(Hpet::parse(&bytes), Err(Error::Reserved));
-        }
+        // Other GAS fields do not change the verdict on the space.
+        bytes[41] = 64;
+        repair_checksum(&mut bytes, 9);
+        assert_eq!(Hpet::parse(&bytes), Err(Error::Address));
     }
     for address in [
         0,
@@ -355,7 +388,7 @@ fn sdt_header_mapping_and_checksum_are_separate() {
 }
 
 #[test]
-fn roots_validate_width_duplicates_null_and_capacity() {
+fn roots_validate_width_and_capacity() {
     let rsdt = sdt(b"RSDT", &[0x34, 0x12, 0, 0, 0x78, 0x56, 0, 0]);
     assert_eq!(
         Root::parse(&rsdt, RootKind::Rsdt)
@@ -376,28 +409,70 @@ fn roots_validate_width_duplicates_null_and_capacity() {
         Root::parse(&xsdt, RootKind::Rsdt).unwrap_err(),
         Error::Signature
     );
+    // The cap counts every entry, including null and repeated ones.
     for (body, expected) in [
         (vec![1; 7], Error::Length),
-        (vec![0; 8], Error::Address),
-        (vec![1; 16], Error::Duplicate),
         (vec![1; (MAX_ROOT_ENTRIES + 1) * 8], Error::Capacity),
+        (vec![0; (MAX_ROOT_ENTRIES + 1) * 8], Error::Capacity),
     ] {
         assert_eq!(
             Root::parse(&sdt(b"XSDT", &body), RootKind::Xsdt).unwrap_err(),
             expected
         );
     }
+    assert_eq!(
+        Root::parse(
+            &sdt(b"RSDT", &[0; (MAX_ROOT_ENTRIES + 1) * 4]),
+            RootKind::Rsdt
+        )
+        .unwrap_err(),
+        Error::Capacity
+    );
     let mut body = Vec::new();
     for address in 1..=MAX_ROOT_ENTRIES as u64 {
         body.extend_from_slice(&address.to_le_bytes());
     }
-    assert_eq!(
+    assert!(
         Root::parse(&sdt(b"XSDT", &body), RootKind::Xsdt)
             .unwrap()
             .addresses()
-            .len(),
-        MAX_ROOT_ENTRIES
+            .eq(1..=MAX_ROOT_ENTRIES as u64)
     );
+}
+
+#[test]
+fn roots_skip_null_entries_and_visit_repeated_addresses_once() {
+    // 0013-D6: neither costs the other tables.
+    let xsdt = |entries: &[u64]| {
+        let body: Vec<u8> = entries
+            .iter()
+            .flat_map(|entry| entry.to_le_bytes())
+            .collect();
+        let bytes = sdt(b"XSDT", &body);
+        Root::parse(&bytes, RootKind::Xsdt)
+            .unwrap()
+            .addresses()
+            .collect::<Vec<_>>()
+    };
+    assert!(xsdt(&[]).is_empty());
+    assert!(xsdt(&[0]).is_empty());
+    assert_eq!(xsdt(&[1, 1]), [1]);
+    assert_eq!(
+        xsdt(&[0x1000, 0, 0x2000, 0x1000, 0, 0x1_0000_3000, 0x2000]),
+        [0x1000, 0x2000, 0x1_0000_3000]
+    );
+    // An RSDT reads 32-bit entries with the same rules.
+    let rsdt = sdt(b"RSDT", &[0, 0, 0, 0, 0x34, 0x12, 0, 0, 0x34, 0x12, 0, 0]);
+    assert_eq!(
+        Root::parse(&rsdt, RootKind::Rsdt)
+            .unwrap()
+            .addresses()
+            .collect::<Vec<_>>(),
+        [0x1234]
+    );
+    // A full table of one repeated address, or of null entries, stays bounded.
+    assert_eq!(xsdt(&[7; MAX_ROOT_ENTRIES]), [7]);
+    assert!(xsdt(&[0; MAX_ROOT_ENTRIES]).is_empty());
 }
 
 #[test]
@@ -436,6 +511,7 @@ fn topology_discovers_enabled_and_online_capable_cpus() {
     );
     assert_eq!(topology.local_nmis()[0].processor_uid, None);
     assert_eq!(topology.local_nmis()[0].polarity, None);
+    assert_eq!(topology.diagnostics(), MadtDiagnostics::default());
 }
 
 #[test]
@@ -508,8 +584,16 @@ fn interrupt_flags_preserve_conformance_and_reject_reserved_encodings() {
     for flags in [0x100, 0x1000, 0x8000] {
         topology_error(&iso(5, 5, flags), Error::Reserved);
     }
-    let records = [local_nmi(4, 1, 0xd), x2nmi(700, 0, 3), nmi(40, 0)].concat();
+    let records = [
+        cpu(4, 4, 1),
+        x2cpu(700, 300, 1),
+        local_nmi(4, 1, 0xd),
+        x2nmi(700, 0, 3),
+        nmi(40, 0),
+    ]
+    .concat();
     let topology = Topology::parse(&madt(&records)).unwrap();
+    assert_eq!(topology.local_nmis().len(), 2);
     assert_eq!(
         topology.local_nmis()[0].polarity,
         Some(Polarity::ActiveHigh)
@@ -538,30 +622,336 @@ fn duplicate_irq_overrides_and_nmi_conflicts_are_rejected() {
     assert!(topology.isa_irq(2).is_ok());
 }
 
-#[test]
-fn local_nmi_wildcards_and_duplicate_connections_are_checked() {
-    for records in [
-        [local_nmi(4, 1, 0), local_nmi(4, 1, 5)],
-        [local_nmi(0xff, 1, 0), local_nmi(4, 1, 0)],
-        [local_nmi(4, 1, 0), x2nmi(u32::MAX, 1, 0)],
-        [x2nmi(4, 1, 0), local_nmi(4, 1, 0)],
-    ] {
-        topology_error(&records.concat(), Error::Duplicate);
+fn diagnostics(merged: u32, conflicting: u32, unmatched: u32) -> MadtDiagnostics {
+    MadtDiagnostics {
+        omitted_cpus: 0,
+        merged_nmis: merged,
+        conflicting_nmis: conflicting,
+        unmatched_nmis: unmatched,
     }
+}
+
+#[test]
+fn redundant_local_nmis_merge_and_wildcards_coexist_with_specific_records() {
+    // 0013-D3: both wildcard encodings on one LINT describe one connection.
+    let records = [local_nmi(0xff, 1, 0), x2nmi(u32::MAX, 1, 5)].concat();
+    let topology = Topology::parse(&madt(&records)).unwrap();
+    assert_eq!(
+        topology.local_nmis(),
+        [LocalNmi {
+            processor_uid: None,
+            x2apic: false,
+            lint: 1,
+            polarity: None,
+            trigger: None,
+        }]
+    );
+    assert_eq!(topology.diagnostics(), diagnostics(1, 0, 0));
+    // One UID in either encoding is one target; a UID and the wildcard are
+    // two, and both are kept for the APIC driver to order.
+    for (records, count, merged) in [
+        ([local_nmi(4, 1, 0), local_nmi(4, 1, 5)], 1, 1),
+        ([local_nmi(0xff, 1, 0), local_nmi(4, 1, 0)], 2, 0),
+        ([local_nmi(4, 1, 0), x2nmi(u32::MAX, 1, 0)], 2, 0),
+        ([x2nmi(4, 1, 0), local_nmi(4, 1, 0)], 1, 1),
+    ] {
+        let records = [cpu(4, 0, 1), records.concat()].concat();
+        let topology = Topology::parse(&madt(&records)).unwrap();
+        assert_eq!(topology.local_nmis().len(), count);
+        assert_eq!(topology.diagnostics(), diagnostics(merged, 0, 0));
+    }
+    // The first record wins with its own encoding and raw flags.
+    let records = [cpu(4, 0, 1), x2nmi(4, 1, 0), local_nmi(4, 1, 5)].concat();
+    let topology = Topology::parse(&madt(&records)).unwrap();
+    assert_eq!(
+        topology.local_nmis(),
+        [LocalNmi {
+            processor_uid: Some(4),
+            x2apic: true,
+            lint: 1,
+            polarity: None,
+            trigger: None,
+        }]
+    );
+    // Different LINTs are different connections.
+    let records = [local_nmi(0xff, 0, 0), x2nmi(u32::MAX, 1, 0)].concat();
+    let topology = Topology::parse(&madt(&records)).unwrap();
+    assert_eq!(topology.local_nmis().len(), 2);
+    assert_eq!(topology.diagnostics(), MadtDiagnostics::default());
+    let records = [cpu(4, 0, 1), local_nmi(4, 0, 5), x2nmi(4, 1, 5)].concat();
+    assert_eq!(
+        Topology::parse(&madt(&records)).unwrap().local_nmis().len(),
+        2
+    );
     let topology = Topology::parse(&madt(&x2nmi(u32::MAX, 1, 0))).unwrap();
     assert_eq!(topology.local_nmis()[0].processor_uid, None);
     assert!(topology.local_nmis()[0].x2apic);
-    assert!(
-        Topology::parse(&madt(
-            &[local_nmi(0xff, 0, 0), x2nmi(u32::MAX, 1, 0)].concat()
-        ))
-        .is_ok()
-    );
+    // Malformed records are rejected even when they would be dropped.
     topology_error(&local_nmi(0, 2, 0), Error::Reserved);
     topology_error(&x2nmi(0, 2, 0), Error::Reserved);
+    topology_error(&local_nmi(9, 1, 0x10), Error::Reserved);
+    topology_error(
+        &[local_nmi(0xff, 1, 0), local_nmi(0xff, 1, 2)].concat(),
+        Error::Reserved,
+    );
     let mut record = x2nmi(0, 1, 0);
     record[11] = 1;
     topology_error(&record, Error::Reserved);
+}
+
+#[test]
+fn conflicting_local_nmis_keep_the_first_record() {
+    let records = [local_nmi(0xff, 1, 0xd), x2nmi(u32::MAX, 1, 5)].concat();
+    let topology = Topology::parse(&madt(&records)).unwrap();
+    assert_eq!(
+        topology.local_nmis(),
+        [LocalNmi {
+            processor_uid: None,
+            x2apic: false,
+            lint: 1,
+            polarity: Some(Polarity::ActiveHigh),
+            trigger: Some(Trigger::Level),
+        }]
+    );
+    assert_eq!(topology.diagnostics(), diagnostics(0, 1, 0));
+    // Modes are compared with "conforms" resolved to active-high and edge.
+    for (first, second, merged, conflicting) in [
+        (0, 5, 1, 0),
+        (5, 0, 1, 0),
+        (0, 1, 1, 0),
+        (0, 4, 1, 0),
+        (0, 3, 0, 1),
+        (0, 0xc, 0, 1),
+        (0xf, 0xf, 1, 0),
+        (0xf, 0xd, 0, 1),
+    ] {
+        let records = [cpu(4, 0, 1), local_nmi(4, 1, first), x2nmi(4, 1, second)].concat();
+        let topology = Topology::parse(&madt(&records)).unwrap();
+        assert_eq!(topology.local_nmis().len(), 1);
+        assert_eq!(
+            topology.local_nmis()[0],
+            LocalNmi {
+                processor_uid: Some(4),
+                x2apic: false,
+                lint: 1,
+                polarity: interrupt_flags(first).unwrap().0,
+                trigger: interrupt_flags(first).unwrap().1,
+            }
+        );
+        assert_eq!(
+            topology.diagnostics(),
+            diagnostics(merged, conflicting, 0),
+            "{first:x} {second:x}"
+        );
+    }
+    // Three records on one connection: the later two are each counted.
+    let records = [
+        local_nmi(0xff, 0, 5),
+        x2nmi(u32::MAX, 0, 5),
+        local_nmi(0xff, 0, 0xf),
+    ]
+    .concat();
+    let topology = Topology::parse(&madt(&records)).unwrap();
+    assert_eq!(topology.local_nmis().len(), 1);
+    assert_eq!(topology.diagnostics(), diagnostics(1, 1, 0));
+}
+
+#[test]
+fn local_nmis_for_absent_cpus_are_dropped_wherever_they_appear() {
+    // 0013-D4: a UID-specific record applies only to a retained CPU, in
+    // either record encoding, and NMI records may precede the CPU records.
+    let records = [
+        local_nmi(4, 1, 5),
+        x2nmi(700, 1, 5),
+        local_nmi(5, 1, 5),
+        x2nmi(701, 0, 5),
+        cpu(4, 0, 1),
+        x2cpu(700, 300, 2),
+        cpu(5, 5, 0), // unusable, so its UID is not a target
+    ]
+    .concat();
+    let topology = Topology::parse(&madt(&records)).unwrap();
+    let uids: Vec<_> = topology
+        .local_nmis()
+        .iter()
+        .map(|nmi| nmi.processor_uid)
+        .collect();
+    assert_eq!(uids, [Some(4), Some(700)]);
+    assert_eq!(topology.diagnostics(), diagnostics(0, 0, 2));
+    // UIDs are one namespace across the two encodings.
+    let records = [x2cpu(4, 300, 1), local_nmi(4, 1, 5)].concat();
+    let topology = Topology::parse(&madt(&records)).unwrap();
+    assert_eq!(topology.local_nmis()[0].processor_uid, Some(4));
+    assert_eq!(topology.diagnostics(), MadtDiagnostics::default());
+    // With no CPU records, only wildcards remain.
+    let records = [local_nmi(0, 1, 5), local_nmi(0xff, 1, 5), x2nmi(0, 0, 5)].concat();
+    let topology = Topology::parse(&madt(&records)).unwrap();
+    assert_eq!(topology.local_nmis().len(), 1);
+    assert_eq!(topology.local_nmis()[0].processor_uid, None);
+    assert_eq!(topology.diagnostics(), diagnostics(0, 0, 2));
+}
+
+#[test]
+fn vmware_style_per_slot_records_keep_the_present_cpus() {
+    // 128 CPU slots, 4 present: every type-0 record, then one LINT1 NMI
+    // record (flags 5) per slot.
+    let slots = |absent_flags: u32| {
+        let mut records = Vec::new();
+        for slot in 0..128u8 {
+            records.extend(cpu(slot, slot, if slot < 4 { 1 } else { absent_flags }));
+        }
+        for slot in 0..128u8 {
+            records.extend(local_nmi(slot, 1, 5));
+        }
+        records
+    };
+    let topology = Topology::parse(&madt(&slots(0))).unwrap();
+    assert_eq!(topology.cpus().len(), 4);
+    assert!(topology.cpus().iter().all(|cpu| cpu.enabled));
+    assert!(
+        topology
+            .local_nmis()
+            .iter()
+            .map(|nmi| nmi.processor_uid)
+            .eq((0..4).map(Some))
+    );
+    assert_eq!(topology.diagnostics(), diagnostics(0, 0, 124));
+
+    // Not VMware's layout: its revision-3 MADT never sets online-capable.
+    let topology = Topology::parse(&madt(&slots(2))).unwrap();
+    assert_eq!(topology.cpus().len(), MAX_CPUS);
+    assert!(
+        topology
+            .cpus()
+            .iter()
+            .map(|cpu| cpu.uid)
+            .eq(0..MAX_CPUS as u32)
+    );
+    assert_eq!(topology.cpus().iter().filter(|cpu| cpu.enabled).count(), 4);
+    assert_eq!(topology.local_nmis().len(), 64);
+    assert_eq!(
+        topology.diagnostics(),
+        MadtDiagnostics {
+            omitted_cpus: 64,
+            ..diagnostics(0, 0, 64)
+        }
+    );
+
+    // Interleaved, in the record order of VMware's MADT builder, in a
+    // revision-3 MADT with PCAT_COMPAT set.
+    let mut records = Vec::new();
+    for slot in 0..128u8 {
+        records.extend(cpu(slot, 2 * slot, if slot < 4 { 1 } else { 0 }));
+        records.extend(local_nmi(slot, 1, 5));
+    }
+    records.extend(io_apic(0x80, 0xfec0_0000, 0));
+    records.extend(iso(0, 2, 5));
+    records.extend(iso(9, 9, 0xf));
+    records.extend(iso(10, 10, 0xf));
+    let mut bytes = madt(&records);
+    bytes[8] = 3;
+    repair_checksum(&mut bytes, 9);
+    let topology = Topology::parse(&bytes).unwrap();
+    assert!(topology.legacy_pic);
+    assert_eq!(topology.cpus().len(), 4);
+    assert_eq!(topology.local_nmis().len(), 4);
+    assert_eq!(topology.diagnostics(), diagnostics(0, 0, 124));
+    assert_eq!(topology.overrides().len(), 3);
+    assert_eq!(
+        topology.io_apics(),
+        [IoApic {
+            id: 0x80,
+            address: 0xfec0_0000,
+            gsi_base: 0
+        }]
+    );
+}
+
+#[test]
+fn surplus_cpu_records_are_omitted_with_enabled_records_first() {
+    let mut records = Vec::new();
+    for index in 0..=MAX_CPUS as u8 {
+        records.extend(cpu(index, index, 1));
+    }
+    let topology = Topology::parse(&madt(&records)).unwrap();
+    assert!(
+        topology
+            .cpus()
+            .iter()
+            .map(|cpu| cpu.uid)
+            .eq(0..MAX_CPUS as u32)
+    );
+    assert_eq!(topology.diagnostics().omitted_cpus, 1);
+
+    // Enabled records win wherever they are, and each kind keeps table order.
+    let mut records = Vec::new();
+    for index in 0..60u8 {
+        records.extend(cpu(index, index, 2));
+    }
+    for index in 60..70u8 {
+        records.extend(cpu(index, index, 1));
+    }
+    let topology = Topology::parse(&madt(&records)).unwrap();
+    assert!(
+        topology
+            .cpus()
+            .iter()
+            .map(|cpu| cpu.uid)
+            .eq((0..54).chain(60..70))
+    );
+    assert_eq!(topology.cpus().iter().filter(|cpu| cpu.enabled).count(), 10);
+    assert_eq!(
+        topology.diagnostics(),
+        MadtDiagnostics {
+            omitted_cpus: 6,
+            ..MadtDiagnostics::default()
+        }
+    );
+
+    // x2APIC records share the capacity, and unusable records never count.
+    let mut records = Vec::new();
+    for index in 0..40u32 {
+        records.extend(x2cpu(1000 + index, 1000 + index, 2));
+        records.extend(cpu(index as u8, index as u8, 0));
+        records.extend(cpu(100 + index as u8, 100 + index as u8, 1));
+    }
+    let topology = Topology::parse(&madt(&records)).unwrap();
+    assert_eq!(topology.cpus().len(), MAX_CPUS);
+    assert_eq!(topology.cpus().iter().filter(|cpu| cpu.enabled).count(), 40);
+    assert_eq!(topology.cpus().iter().filter(|cpu| cpu.x2apic).count(), 24);
+    assert_eq!(topology.diagnostics().omitted_cpus, 16);
+    // A local NMI for an omitted CPU is unmatched.
+    records.extend(x2nmi(1039, 1, 5));
+    records.extend(x2nmi(1000, 1, 5));
+    let topology = Topology::parse(&madt(&records)).unwrap();
+    assert_eq!(topology.local_nmis()[0].processor_uid, Some(1000));
+    assert_eq!(topology.diagnostics().unmatched_nmis, 1);
+}
+
+#[test]
+fn omitted_cpu_records_cannot_reuse_a_retained_identity() {
+    let retained = |count: u8| {
+        let mut records = Vec::new();
+        for index in 1..=count {
+            records.extend(cpu(index, index, 1));
+        }
+        records
+    };
+    // After, and before, the retained CPU it collides with.
+    for extra in [cpu(1, 100, 1), cpu(100, 1, 1)] {
+        topology_error(&[retained(64), extra].concat(), Error::Duplicate);
+    }
+    for extra in [cpu(1, 100, 2), x2cpu(1, 1000, 2), x2cpu(1000, 64, 2)] {
+        topology_error(&[extra, retained(64)].concat(), Error::Duplicate);
+    }
+    let distinct = [cpu(100, 100, 2), retained(64)].concat();
+    assert_eq!(
+        Topology::parse(&madt(&distinct))
+            .unwrap()
+            .diagnostics()
+            .omitted_cpus,
+        1
+    );
 }
 
 #[test]
@@ -657,17 +1047,14 @@ fn madt_record_lengths_and_unknown_records_are_bounded() {
 }
 
 #[test]
-fn all_topology_capacity_limits_fail_without_partial_results() {
+fn controller_capacity_limits_fail_and_local_nmis_always_fit() {
     let mut cpus = Vec::new();
     for index in 0..MAX_CPUS {
         cpus.extend(cpu(index as u8, index as u8, 1));
     }
-    assert_eq!(
-        Topology::parse(&madt(&cpus)).unwrap().cpus().len(),
-        MAX_CPUS
-    );
-    cpus.extend(cpu(MAX_CPUS as u8, MAX_CPUS as u8, 1));
-    topology_error(&cpus, Error::Capacity);
+    let topology = Topology::parse(&madt(&cpus)).unwrap();
+    assert_eq!(topology.cpus().len(), MAX_CPUS);
+    assert_eq!(topology.diagnostics(), MadtDiagnostics::default());
 
     let mut ios = Vec::new();
     for index in 0..MAX_IO_APICS {
@@ -684,16 +1071,31 @@ fn all_topology_capacity_limits_fail_without_partial_results() {
     ios.extend(io_apic(100, 0xfe00_0000, 1000));
     topology_error(&ios, Error::Capacity);
 
-    let mut locals = Vec::new();
-    for index in 0..MAX_LOCAL_NMIS {
-        locals.extend(x2nmi(index as u32, 1, 0));
+    // Local NMIs never overflow (0013-D4): the most that survive are one per
+    // LINT for each retained CPU and one wildcard per LINT. Every further
+    // record repeats a connection or targets an absent CPU.
+    let mut locals = cpus.clone();
+    for lint in 0..2 {
+        locals.extend(local_nmi(0xff, lint, 0));
+        for index in 0..MAX_CPUS {
+            locals.extend(x2nmi(index as u32, lint, 0));
+        }
     }
+    let topology = Topology::parse(&madt(&locals)).unwrap();
+    assert_eq!(topology.local_nmis().len(), MAX_LOCAL_NMIS);
+    assert_eq!(topology.diagnostics(), MadtDiagnostics::default());
+    for lint in 0..2 {
+        locals.extend(x2nmi(u32::MAX, lint, 0));
+        for index in 0..=MAX_CPUS {
+            locals.extend(local_nmi(index as u8, lint, 5));
+        }
+    }
+    let topology = Topology::parse(&madt(&locals)).unwrap();
+    assert_eq!(topology.local_nmis().len(), MAX_LOCAL_NMIS);
     assert_eq!(
-        Topology::parse(&madt(&locals)).unwrap().local_nmis().len(),
-        MAX_LOCAL_NMIS
+        topology.diagnostics(),
+        diagnostics(2 * MAX_CPUS as u32 + 2, 0, 2)
     );
-    locals.extend(x2nmi(MAX_LOCAL_NMIS as u32, 1, 0));
-    topology_error(&locals, Error::Capacity);
 
     let mut nmis = Vec::new();
     for index in 0..MAX_NMI_SOURCES {
@@ -721,6 +1123,99 @@ fn all_topology_capacity_limits_fail_without_partial_results() {
     );
 }
 
+/// Tables captured from the reference VMware Workstation VM (0013-D8). Each
+/// directory's capture.txt records the VM inputs and the capture method.
+const VMWARE_CAPTURES: [(usize, &[u8], &[u8]); 2] = [
+    (
+        1,
+        include_bytes!("../fixtures/vmware-26.0.1/1vcpu/APIC.bin"),
+        include_bytes!("../fixtures/vmware-26.0.1/1vcpu/HPET.bin"),
+    ),
+    (
+        4,
+        include_bytes!("../fixtures/vmware-26.0.1/4vcpu/APIC.bin"),
+        include_bytes!("../fixtures/vmware-26.0.1/4vcpu/HPET.bin"),
+    ),
+];
+
+#[test]
+fn vmware_workstation_captured_tables_parse() {
+    for (vcpus, madt, hpet) in VMWARE_CAPTURES {
+        let header = Sdt::parse(madt).unwrap().header();
+        assert_eq!((header.signature, header.revision), (*b"APIC", 3));
+        let topology = Topology::parse(madt).unwrap();
+        assert_eq!(topology.lapic_address, 0xfee0_0000);
+        assert!(topology.legacy_pic);
+        // One slot per vCPU: a type-0 record and a LINT1 NMI record each.
+        assert_eq!(topology.cpus().len(), vcpus);
+        for (cpu, slot) in topology.cpus().iter().zip(0..) {
+            assert_eq!(
+                *cpu,
+                Cpu {
+                    uid: slot,
+                    apic_id: slot,
+                    enabled: true,
+                    online_capable: false,
+                    x2apic: false
+                }
+            );
+        }
+        assert_eq!(topology.local_nmis().len(), vcpus);
+        for (nmi, slot) in topology.local_nmis().iter().zip(0..) {
+            assert_eq!(
+                *nmi,
+                LocalNmi {
+                    processor_uid: Some(slot),
+                    x2apic: false,
+                    lint: 1,
+                    polarity: Some(Polarity::ActiveHigh),
+                    trigger: Some(Trigger::Edge),
+                }
+            );
+        }
+        // The IOAPIC's MADT ID is the first unused CPU slot, here the vCPU
+        // count. Its ID register reads 0 (capture.txt), which is 0013-D9's
+        // mismatch.
+        assert_eq!(
+            topology.io_apics(),
+            [IoApic {
+                id: vcpus as u8,
+                address: 0xfec0_0000,
+                gsi_base: 0
+            }]
+        );
+        assert_eq!(
+            topology.overrides(),
+            [InterruptOverride {
+                source: 0,
+                gsi: 2,
+                polarity: Polarity::ActiveHigh,
+                trigger: Trigger::Edge
+            }]
+        );
+        assert!(topology.nmi_sources().is_empty());
+        assert_eq!(topology.isa_irq(0).unwrap().gsi, 2);
+        assert_eq!(topology.diagnostics(), MadtDiagnostics::default());
+
+        let header = Sdt::parse(hpet).unwrap().header();
+        assert_eq!(
+            (header.signature, header.length),
+            (*b"HPET", HPET_TABLE_SIZE)
+        );
+        assert_eq!(
+            Hpet::parse(hpet),
+            Ok(Hpet {
+                event_timer_block_id: 0x8086_af01,
+                address: 0xfed0_0000,
+                number: 0,
+                minimum_tick: 14318,
+                page_protection: 1,
+                oem_attributes: 0,
+            })
+        );
+    }
+}
+
 #[test]
 fn checksummed_arbitrary_madt_payloads_do_not_panic() {
     let mut seed = 0x14bc_9862u32;
@@ -733,5 +1228,75 @@ fn checksummed_arbitrary_madt_payloads_do_not_panic() {
             *byte = seed as u8;
         }
         let _ = Topology::parse(&madt(&records));
+    }
+}
+
+#[test]
+fn random_cpu_and_local_nmi_mixes_account_for_every_record() {
+    let mut seed = 0x2718_2818u32;
+    let mut next = |bound: u32| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed % bound
+    };
+    const FLAGS: [u16; 8] = [0, 1, 3, 4, 5, 0xc, 0xd, 0xf];
+    for _ in 0..400 {
+        let mut records = Vec::new();
+        let (mut enabled, mut capable, mut nmis) = (0, 0, 0);
+        for identity in 0..next(160) {
+            let flags = next(3);
+            enabled += usize::from(flags == 1);
+            capable += usize::from(flags == 2);
+            if next(2) == 0 {
+                records.extend(cpu(identity as u8, identity as u8, flags));
+            } else {
+                records.extend(x2cpu(identity, 0x1000 + identity, flags));
+            }
+            for _ in 0..next(3) {
+                let uid = match next(4) {
+                    0 => None,
+                    _ => Some(next(200)),
+                };
+                let (lint, flags) = (next(2) as u8, FLAGS[next(8) as usize]);
+                nmis += 1;
+                records.extend(match (uid, next(2)) {
+                    (None, 0) => local_nmi(0xff, lint, flags),
+                    (None, _) => x2nmi(u32::MAX, lint, flags),
+                    (Some(uid), 0) if uid < 0xff => local_nmi(uid as u8, lint, flags),
+                    (Some(uid), _) => x2nmi(uid, lint, flags),
+                });
+            }
+        }
+        let topology = Topology::parse(&madt(&records)).unwrap();
+        let diagnostics = topology.diagnostics();
+        let retained_enabled = enabled.min(MAX_CPUS);
+        assert_eq!(
+            topology.cpus().iter().filter(|cpu| cpu.enabled).count(),
+            retained_enabled
+        );
+        assert_eq!(
+            topology.cpus().len(),
+            retained_enabled + capable.min(MAX_CPUS - retained_enabled)
+        );
+        assert_eq!(
+            topology.cpus().len() + diagnostics.omitted_cpus as usize,
+            enabled + capable
+        );
+        assert_eq!(
+            topology.local_nmis().len()
+                + (diagnostics.merged_nmis
+                    + diagnostics.conflicting_nmis
+                    + diagnostics.unmatched_nmis) as usize,
+            nmis
+        );
+        for (index, nmi) in topology.local_nmis().iter().enumerate() {
+            if let Some(uid) = nmi.processor_uid {
+                assert!(topology.cpus().iter().any(|cpu| cpu.uid == uid));
+            }
+            assert!(!topology.local_nmis()[..index].iter().any(|prior| {
+                prior.lint == nmi.lint && prior.processor_uid == nmi.processor_uid
+            }));
+        }
     }
 }

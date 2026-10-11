@@ -65,7 +65,8 @@ function Assert-MirrorDriverCatalog {
     $matched = [uint64]$catalog[0].Groups[2].Value
     $unsupported = [uint64]$catalog[0].Groups[3].Value
     $omitted = [uint64]$catalog[0].Groups[4].Value
-    if ($retained -eq 0 -or $retained -gt 32 -or $matched -gt $retained -or $unsupported -ne $retained - $matched -or
+    # The kernel retains at most 256 functions (0013-D7) and only counts the rest.
+    if ($retained -eq 0 -or $retained -gt 256 -or $matched -gt $retained -or $unsupported -ne $retained - $matched -or
         $retained -ne [uint64]$pci[0].Groups[6].Value -or $omitted -ne [uint64]$pci[0].Groups[7].Value -or
         $retained + $omitted -ne [uint64]$pci[0].Groups[1].Value -or $catalog[0].Index -le $pci[0].Index) {
         throw 'Driver catalog counts must preserve the complete bounded PCI inventory.'

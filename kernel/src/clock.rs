@@ -125,11 +125,20 @@ fn prepare(
     *mapped = true;
     // SAFETY: The temporary UC page is live and the capability register is RO.
     let capability = unsafe { read(CAPABILITIES) };
-    let timers = identify(capability, descriptor.event_timer_block_id)?;
+    let timers = identify(capability)?;
     // From the first write onward any inability to stop the device is fatal.
     // We must never expose inherited or partially configured comparator IRQs.
     quiesce(timers).expect("quiesce HPET before clock setup");
-    let (period, _) = capabilities(capability, descriptor.event_timer_block_id)?;
+    let (period, _) = capabilities(capability)?;
+    // The hardware register is authoritative; the table's copy of its block
+    // ID is only compared and reported (0013-D5).
+    if let Some(hardware) = block_id_mismatch(descriptor.event_timer_block_id, capability) {
+        serial::println!(
+            "MIRROR_CLOCK_ID_MISMATCH firmware={:#x} hardware={:#x}",
+            descriptor.event_timer_block_id,
+            hardware
+        );
+    }
     #[cfg(feature = "boot-smoke")]
     {
         let rollover = counter_rollover_self_test();
@@ -159,15 +168,25 @@ fn prepare(
     result.map(|()| (period, timers))
 }
 
-fn identify(value: u64, firmware_id: u32) -> Result<u32, &'static str> {
-    if value as u32 != firmware_id || value & 0xff == 0 || value & (1 << 14) != 0 {
+/// Validates the hardware GCAP_ID's identity fields, which take precedence
+/// over the ACPI table's copy (0013-D5): a nonzero REV_ID and a clear
+/// reserved bit 14. Returns the comparator count.
+fn identify(value: u64) -> Result<u32, &'static str> {
+    if value & 0xff == 0 || value & (1 << 14) != 0 {
         return Err("hpet_identity");
     }
     Ok(((value >> 8) as u32 & 31) + 1)
 }
 
-fn capabilities(value: u64, firmware_id: u32) -> Result<(u32, u32), &'static str> {
-    let timers = identify(value, firmware_id)?;
+/// Returns the hardware GCAP_ID[31:0] when it differs from the block ID that
+/// the ACPI table reports, and `None` when they agree.
+fn block_id_mismatch(firmware: u32, capability: u64) -> Option<u32> {
+    let hardware = capability as u32;
+    (hardware != firmware).then_some(hardware)
+}
+
+fn capabilities(value: u64) -> Result<(u32, u32), &'static str> {
+    let timers = identify(value)?;
     if value & COUNTER_64 == 0 {
         return Err("hpet_counter_width");
     }
@@ -340,23 +359,27 @@ unsafe fn write(offset: u64, value: u64) {
 fn policy_self_test() {
     let id = 0x8086_a201;
     let valid = u64::from(10_000_000_u32) << 32 | u64::from(id);
-    assert_eq!(capabilities(valid, id), Ok((10_000_000, 3)));
-    assert_eq!(capabilities(valid, id ^ 1), Err("hpet_identity"));
+    assert_eq!(capabilities(valid), Ok((10_000_000, 3)));
+    assert_eq!(block_id_mismatch(id, valid), None);
+    // 0013-D5: a table block ID that differs from the hardware no longer
+    // rejects the clock. It is reported with the hardware value.
+    assert_eq!(block_id_mismatch(id ^ 1, valid), Some(id));
+    assert_eq!(block_id_mismatch(0, valid), Some(id));
+    // The hardware register itself still needs a REV_ID and a clear bit 14.
+    assert_eq!(capabilities(valid & !0xff), Err("hpet_identity"));
+    assert_eq!(capabilities(valid | 1 << 14), Err("hpet_identity"));
+    assert_eq!(capabilities(valid & !COUNTER_64), Err("hpet_counter_width"));
+    assert_eq!(capabilities(u64::from(id)), Err("hpet_period"));
     assert_eq!(
-        capabilities(valid & !COUNTER_64, id & !(COUNTER_64 as u32)),
-        Err("hpet_counter_width")
-    );
-    assert_eq!(capabilities(u64::from(id), id), Err("hpet_period"));
-    assert_eq!(
-        capabilities(u64::from(MIN_PERIOD_FS - 1) << 32 | u64::from(id), id),
+        capabilities(u64::from(MIN_PERIOD_FS - 1) << 32 | u64::from(id)),
         Err("hpet_period")
     );
     assert_eq!(
-        capabilities(u64::from(MIN_PERIOD_FS) << 32 | u64::from(id), id),
+        capabilities(u64::from(MIN_PERIOD_FS) << 32 | u64::from(id)),
         Ok((MIN_PERIOD_FS, 3))
     );
     assert_eq!(
-        capabilities((u64::from(MAX_PERIOD_FS) + 1) << 32 | u64::from(id), id),
+        capabilities((u64::from(MAX_PERIOD_FS) + 1) << 32 | u64::from(id)),
         Err("hpet_period")
     );
     assert_eq!(nanoseconds(0, MAX_PERIOD_FS), 0);

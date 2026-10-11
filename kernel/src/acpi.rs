@@ -108,14 +108,26 @@ impl Reader<'_, '_> {
         let root = Root::parse(&root_bytes, rsdp.root_kind).map_err(Error::Table)?;
         let mut topology = None;
         let mut hpet = None;
-        for address in root.addresses() {
-            // Identify known optional tables before validating their length or
-            // copying their body: one malformed descriptor must not discard a
-            // different valid subsystem. Unreadable signatures and malformed
-            // unknown-table headers retain the root discovery's fail-closed
-            // behavior because the table's identity cannot be established.
+        let mut skipped_tables = 0_u32;
+        // Root entries are handled one at a time (0013-D6). `addresses` skips
+        // null and repeated entries. Identify each table by its signature
+        // before validating its length or copying its body, so a malformed
+        // descriptor costs only that table. An unreadable signature skips its
+        // entry with a diagnostic whose index is the entry's position among
+        // those `addresses` yields. Tables other than APIC and HPET are not
+        // read past their signature. Only the RSDP and root table abort.
+        for (index, address) in root.addresses().enumerate() {
             let mut signature = [0; 4];
-            self.read(address, &mut signature)?;
+            if let Err(error) = self.read(address, &mut signature) {
+                serial::println!(
+                    "MIRROR_ACPI_TABLE_SKIPPED index={} address={:#x} reason={}",
+                    index,
+                    address,
+                    error
+                );
+                skipped_tables += 1;
+                continue;
+            }
             match &signature {
                 b"APIC" => {
                     let candidate = self
@@ -129,24 +141,28 @@ impl Reader<'_, '_> {
                         .and_then(|bytes| Hpet::parse(&bytes).map_err(Error::Table));
                     unique_table(&mut hpet, candidate, Error::DuplicateHpet);
                 }
-                _ => {
-                    let mut header = [0; SDT_HEADER_SIZE];
-                    self.read(address, &mut header)?;
-                    Header::parse(&header).map_err(Error::Table)?;
-                }
+                _ => {}
             }
         }
         let topology = match topology.unwrap_or(Err(Error::MissingMadt)) {
             Ok(topology) => {
+                // The trailing counters report what discovery tolerated
+                // instead of rejecting (0013-D3, D4, D6).
+                let diagnostics = topology.diagnostics();
                 serial::println!(
-                    "MIRROR_ACPI_READY revision={} root={:?} cpus={} enabled={} ioapics={} overrides={} lapic={:#x}",
+                    "MIRROR_ACPI_READY revision={} root={:?} cpus={} enabled={} ioapics={} overrides={} lapic={:#x} omitted_cpus={} nmi_merged={} nmi_conflicts={} nmi_unmatched={} skipped_tables={}",
                     rsdp.revision,
                     rsdp.root_kind,
                     topology.cpus().len(),
                     topology.cpus().iter().filter(|cpu| cpu.enabled).count(),
                     topology.io_apics().len(),
                     topology.overrides().len(),
-                    topology.lapic_address
+                    topology.lapic_address,
+                    diagnostics.omitted_cpus,
+                    diagnostics.merged_nmis,
+                    diagnostics.conflicting_nmis,
+                    diagnostics.unmatched_nmis,
+                    skipped_tables
                 );
                 for cpu in topology.cpus() {
                     serial::println!(

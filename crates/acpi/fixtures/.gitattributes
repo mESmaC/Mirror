@@ -1,0 +1,2 @@
+# Raw ACPI tables are compared byte for byte; never convert line endings.
+*.bin binary

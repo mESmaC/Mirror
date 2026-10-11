@@ -450,23 +450,16 @@ impl Driver {
             }
             if pending & 1 == 0 {
                 fence(Ordering::SeqCst);
-                let status = self.port_read(port, IS);
-                if status & (PORT_ERRORS & !(1 << 30)) != 0 {
-                    return Err(AhciError::InvalidTransfer);
-                }
-                if status & (1 << 30) != 0 || self.port_read(port, TFD) & TASK_ERROR != 0 {
-                    return Err(AhciError::IoError);
-                }
-                if self.port_read(port, TFD) & TASK_BUSY != 0 {
-                    return Err(AhciError::InvalidTransfer);
-                }
-                // SAFETY: CI cleared after this command, and coherent DMA has
-                // been acquired before reading its bounded command-header count.
-                let transferred = unsafe { dma.as_ptr().add(4).cast::<u32>().read_volatile() };
-                if transferred != SECTOR_SIZE as u32 {
-                    return Err(AhciError::InvalidTransfer);
-                }
-                return Ok(());
+                return completion(
+                    |register| self.port_read(port, register),
+                    POLL_LIMIT,
+                    || {
+                        // SAFETY: CI cleared after this command, and coherent
+                        // DMA has been acquired before reading its bounded
+                        // command-header count.
+                        unsafe { dma.as_ptr().add(4).cast::<u32>().read_volatile() }
+                    },
+                );
             }
             if deadline(start, poll, REQUEST_NS) {
                 break;
@@ -572,17 +565,13 @@ impl Driver {
         timeout: u64,
         error: AhciError,
     ) -> Result<(), AhciError> {
-        let start = clock::snapshot().map(|time| time.monotonic_ns);
-        for poll in 0..POLL_LIMIT {
-            if self.port_read(port, register) & mask == 0 {
-                return Ok(());
-            }
-            if deadline(start, poll, timeout) {
-                break;
-            }
-            core::hint::spin_loop();
-        }
-        Err(error)
+        poll_clear(
+            || self.port_read(port, register),
+            mask,
+            timeout,
+            POLL_LIMIT,
+            error,
+        )
     }
 
     /// Stop every engine and revoke DMA pointers before reclaiming memory. PCI
@@ -649,6 +638,60 @@ impl Driver {
         assert!(port < 32 && self.implemented & (1_u32 << port) != 0 && register < PORT_STRIDE);
         self.write(PORT_START + u64::from(port) * PORT_STRIDE + register, value);
     }
+}
+
+/// Polls `read` until no bit of `mask` is set, for at most `limit` reads and,
+/// with a clock, at most `timeout` nanoseconds.
+fn poll_clear(
+    mut read: impl FnMut() -> u32,
+    mask: u32,
+    timeout: u64,
+    limit: usize,
+    error: AhciError,
+) -> Result<(), AhciError> {
+    let start = clock::snapshot().map(|time| time.monotonic_ns);
+    for poll in 0..limit {
+        if read() & mask == 0 {
+            return Ok(());
+        }
+        if deadline(start, poll, timeout) {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    Err(error)
+}
+
+/// Judges a command whose CI bit has cleared, reading the selected port's
+/// registers through `read` and the command header's PRD byte count through
+/// `transferred`. ATA status bits are valid only once BSY clears, and VMware's
+/// controller clears CI while TFD still shows BSY for a short time, so this
+/// first waits, bounded by REQUEST_NS and `limit` reads, for BSY and DRQ to
+/// clear (0013-D10). A TFD still busy at the bound is an invalid transfer. The
+/// error checks then read IS and TFD after that wait.
+fn completion(
+    mut read: impl FnMut(u64) -> u32,
+    limit: usize,
+    transferred: impl FnOnce() -> u32,
+) -> Result<(), AhciError> {
+    poll_clear(
+        || read(TFD),
+        TASK_BUSY,
+        REQUEST_NS,
+        limit,
+        AhciError::InvalidTransfer,
+    )?;
+    let status = read(IS);
+    if status & (PORT_ERRORS & !(1 << 30)) != 0 {
+        return Err(AhciError::InvalidTransfer);
+    }
+    if status & (1 << 30) != 0 || read(TFD) & TASK_ERROR != 0 {
+        return Err(AhciError::IoError);
+    }
+    if transferred() != SECTOR_SIZE as u32 {
+        return Err(AhciError::InvalidTransfer);
+    }
+    Ok(())
 }
 
 fn deadline(start: Option<u64>, poll: usize, timeout: u64) -> bool {
@@ -802,5 +845,92 @@ pub fn self_test() {
         validate_page(0xfee0_0000, &[&ram]),
         Err(AhciError::MemoryOverlap)
     ));
+    completion_self_test();
     crate::serial::println!("MIRROR_AHCI_TESTS_OK");
+}
+
+/// 0013-D10 with a scripted register sequence instead of a controller. QEMU's
+/// AHCI model never shows the busy window that VMware's does.
+#[cfg(feature = "boot-smoke")]
+fn completion_self_test() {
+    const READY: u32 = 0x50; // DRDY and DSC.
+    const VMWARE_BUSY: u32 = 0xc0; // BSY and DRDY, as observed after CI cleared.
+    // Returns the result and the number of TFD reads. The last TFD value
+    // repeats once the script runs out.
+    fn scripted(
+        tfd: &[u32],
+        status: u32,
+        limit: usize,
+        transferred: u32,
+    ) -> (Result<(), AhciError>, usize) {
+        let mut reads = 0;
+        let result = completion(
+            |register| match register {
+                TFD => {
+                    let value = tfd[reads.min(tfd.len() - 1)];
+                    reads += 1;
+                    value
+                }
+                IS => status,
+                _ => panic!("unexpected AHCI completion register"),
+            },
+            limit,
+            || transferred,
+        );
+        (result, reads)
+    }
+
+    let sector = SECTOR_SIZE as u32;
+    // Already idle: one wait read, then the error check reads TFD again.
+    assert!(matches!(scripted(&[READY], 0, 8, sector), (Ok(()), 2)));
+    // VMware: BSY for the first reads after CI cleared, then clear.
+    let busy = [VMWARE_BUSY, VMWARE_BUSY, VMWARE_BUSY, READY];
+    assert!(matches!(scripted(&busy, 0, 8, sector), (Ok(()), 5)));
+    // DRQ is waited for too.
+    assert!(matches!(
+        scripted(&[0x58, READY], 0, 8, sector),
+        (Ok(()), 3)
+    ));
+    // ERR read while BSY is not judged: the error check reads TFD after the
+    // wait, and a real error still fails once BSY clears.
+    assert!(matches!(
+        scripted(&[VMWARE_BUSY | 1, READY], 0, 8, sector),
+        (Ok(()), 3)
+    ));
+    assert!(matches!(
+        scripted(&[VMWARE_BUSY, READY | 1], 0, 8, sector),
+        (Err(AhciError::IoError), 3)
+    ));
+    assert!(matches!(
+        scripted(&[VMWARE_BUSY, READY | 0x20], 0, 8, sector),
+        (Err(AhciError::IoError), 3)
+    ));
+    // Still busy at the bound: no error check, an invalid transfer.
+    assert!(matches!(
+        scripted(&[VMWARE_BUSY], 0, 4, sector),
+        (Err(AhciError::InvalidTransfer), 4)
+    ));
+    assert!(matches!(
+        scripted(&[0x08], 0, 4, sector),
+        (Err(AhciError::InvalidTransfer), 4)
+    ));
+    // Port status is judged after the wait as before: TFES is a device error
+    // and the other error bits fail the transfer.
+    assert!(matches!(
+        scripted(&busy, 1 << 30, 8, sector),
+        (Err(AhciError::IoError), 4)
+    ));
+    for bit in [24, 26, 27, 28, 29] {
+        assert!(matches!(
+            scripted(&busy, 1 << bit, 8, sector),
+            (Err(AhciError::InvalidTransfer), 4)
+        ));
+    }
+    // A PRD byte count other than one sector still fails.
+    for count in [0, sector - 1, sector + 1] {
+        assert!(matches!(
+            scripted(&busy, 0, 8, count),
+            (Err(AhciError::InvalidTransfer), 5)
+        ));
+    }
 }

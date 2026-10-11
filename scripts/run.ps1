@@ -9,6 +9,7 @@ param(
     [switch]$NoDisplayDevice,
     [switch]$NoTestDisk,
     [ValidateSet('V1', 'LegacyVirtio')][string]$DeviceProfile = 'V1',
+    [switch]$CrowdedPci,
     [switch]$Xhci,
     [switch]$XhciKeyboard,
     [switch]$XhciMouse,
@@ -347,6 +348,15 @@ if ($deviceArguments.AhciFixture -ne $ahciFixture) {
     throw "Device profile $DeviceProfile disagrees with the runner about the AHCI fixture."
 }
 $qemuArguments += $deviceArguments.NicArguments
+if ($CrowdedPci) {
+    # 32 PCIe root ports at 00:15.0-00:18.7, where VMware puts its own, push
+    # the profile's later bus-0 functions past the first 32 (spec 0013, test
+    # 11). io-reserve=0 keeps OVMF from exhausting the 64 KiB I/O space.
+    for ($port = 0; $port -lt 32; $port++) {
+        $address = '0x{0:x}.0x{1:x}' -f (0x15 + [int][math]::Floor($port / 8)), ($port % 8)
+        $qemuArguments += @('-device', "pcie-root-port,bus=pcie.0,addr=$address,multifunction=on,chassis=$($port + 1),id=mirror-rp$($port + 1),io-reserve=0")
+    }
+}
 if ($Xhci) { $qemuArguments += @('-device', 'qemu-xhci,id=mirror-xhci') }
 # Pin the USB descriptor version and physical port assignment. Both HID models
 # expose one configuration/interface; their interface protocols distinguish them.
@@ -503,6 +513,17 @@ try {
     if ($serial -notmatch "(?m)^MIRROR_ACPI_READY [^\r\n]* cpus=$CpuCount enabled=$CpuCount(?:\s|$)") {
         throw "ACPI discovery must report exactly $CpuCount enabled processors."
     }
+    # Discovery drops surplus MADT records and skips unreadable root entries
+    # with counters and markers instead of rejecting (spec 0013). QEMU's
+    # firmware triggers none of them, and its IOAPIC ID register matches the
+    # MADT, so every counter is 0 and neither marker appears.
+    if ([regex]::Matches($serial, '(?m)^MIRROR_ACPI_READY(?:\s|$)').Count -ne 1 -or
+        [regex]::Matches($serial, '(?m)^MIRROR_ACPI_READY [^\r\n]* omitted_cpus=0 nmi_merged=0 nmi_conflicts=0 nmi_unmatched=0 skipped_tables=0\r?$').Count -ne 1) {
+        throw 'ACPI discovery must report once that it dropped no MADT record and skipped no root-table entry.'
+    }
+    if ($serial -match '(?m)^MIRROR_(?:ACPI_TABLE_SKIPPED|APIC_IOAPIC_ID)(?:\s|$)') {
+        throw "QEMU's firmware unexpectedly produced a skipped root-table entry or an IOAPIC ID mismatch."
+    }
     if ($LegacyPic) {
         $markers += 'MIRROR_APIC_SKIPPED reason=boot_policy'
         if ($serial -match '(?m)^MIRROR_APIC_(?:READY|SPURIOUS_OK)(?:\s|$)') {
@@ -525,6 +546,31 @@ try {
     Assert-MirrorSmpMarkers -Serial $serial -RequestedCpus $CpuCount -UseLegacyPic ([bool]$LegacyPic) -FaultMode $Fault
     Assert-MirrorHeapGrowth -Serial $serial -RequestedCpus $CpuCount -Smoke $true -UseLegacyPic ([bool]$LegacyPic)
     Assert-MirrorDriverCatalog -Serial $serial -Smoke $true -LegacyDisk ($DeviceProfile -eq 'LegacyVirtio' -and -not $NoTestDisk) -XhciAttached ([bool]$Xhci)
+    if ($CrowdedPci) {
+        # Spec 0013, test 11. Below slot 0x15, bus 0 holds q35's host bridge,
+        # the boot disk and the NIC, plus VGA, xHCI and the legacy VirtIO disk
+        # when attached, which QEMU gives the lowest free slots. The 32 root
+        # ports follow, and q35's LPC, AHCI and SMBus functions at 00:1f.0-3
+        # come last: AHCI is past the first 32 functions, and all are retained.
+        $lowFunctions = 3 + [int](-not $NoDisplayDevice) + [int][bool]$Xhci + [int]($DeviceProfile -eq 'LegacyVirtio')
+        $functions = $lowFunctions + 32 + 3
+        if ([regex]::Matches($serial, ('(?m)^MIRROR_PCI_READY functions={0} bridges=32 [^\r\n]* retained={0} omitted=0 reads=[0-9]+\r?$' -f $functions)).Count -ne 1) {
+            throw "The crowded PCI case must retain all $functions functions, 32 of them bridges."
+        }
+        $records = [regex]::Matches($serial, '(?m)^MIRROR_DRIVER_DEVICE [^\r\n]*')
+        if ($records.Count -ne $functions) {
+            throw "The crowded PCI case must list all $functions functions in the driver catalog."
+        }
+        for ($port = 0; $port -lt 32; $port++) {
+            $expected = 'MIRROR_DRIVER_DEVICE bdf=00:{0:x2}.{1} id=1b36:000c class=06:04:00 driver=none match=none' -f (0x15 + [int][math]::Floor($port / 8)), ($port % 8)
+            if ($records[$lowFunctions + $port].Value -cne $expected) {
+                throw "The crowded PCI case must list root port $port at its 00:15.0-00:18.7 address after the low bus-0 functions."
+            }
+        }
+        if ($records[$functions - 2].Value -notmatch '^MIRROR_DRIVER_DEVICE bdf=00:1f\.2 [^\r\n]* driver=ahci-sata match=class$') {
+            throw "The crowded PCI case must retain the AHCI controller at 00:1f.2 as function $($functions - 1) of $functions."
+        }
+    }
     Assert-MirrorAhciMarkers -Serial $serial -Attached $ahciFixture -Smoke $true -FaultMode $Fault
     Assert-MirrorXhciMarkers -Serial $serial -Attached ([bool]$Xhci) -UsbDevice $usbFixture -WithoutHpet ([bool]$NoHpet) -Smoke $true -FaultMode $Fault
     Assert-MirrorUsbMarkers -Serial $serial -Attached ([bool]$Xhci) -UsbDevice $usbFixture -FullSpeed ([bool]$XhciFullSpeed) -WithoutHpet ([bool]$NoHpet) -Smoke $true -FaultMode $Fault

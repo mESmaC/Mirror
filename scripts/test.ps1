@@ -118,6 +118,10 @@ try {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Release:$release -AgentDemo:$AgentDemo -Fault $fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
             Save-MirrorSmokeLogs "$profile-$fault"
         }
+        # 32 PCIe root ports at VMware's slots, 00:15.0-00:18.7, push the AHCI
+        # controller past the first 32 PCI functions (spec 0013, test 11).
+        & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -CrowdedPci -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+        Save-MirrorSmokeLogs "$profile-CrowdedPci"
         # Verify controller ring wrapping and bounded USB2 enumeration through
         # endpoint zero. Include addressed-slot failure cleanup and refusal of
         # multiple devices or missing reset timing; HID report input is separate.

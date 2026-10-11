@@ -30,7 +30,10 @@ const FUNCTION_COUNT: u8 = 8;
 const MAX_FUNCTIONS: u32 = BUS_COUNT as u32 * SLOT_COUNT as u32 * FUNCTION_COUNT as u32;
 // ID, class/revision, header, and (only for type-1 bridges) bus-number DWORD.
 const MAX_CONFIG_READS: u32 = MAX_FUNCTIONS * 4;
-const MAX_RETAINED: usize = 32;
+/// Functions kept in the inventory, in BDF order. Binding, the serial listing
+/// and the console `devices` pages cover all of them; later functions are only
+/// counted (0013-D7). The array stays allocation-free, at about 4 KiB.
+pub(crate) const MAX_RETAINED: usize = 256;
 const VIRTIO_VENDOR: u16 = 0x1af4;
 const COMMAND_IO: u16 = 1;
 const COMMAND_MEMORY: u16 = 1 << 1;
@@ -105,7 +108,8 @@ pub(crate) struct Inventory {
     pub display_devices: u32,
     pub virtio_gpu_devices: u32,
     pub config_reads: u32,
-    /// First 32 functions in BDF order; diagnostics have the same bound.
+    /// First MAX_RETAINED (256) functions in BDF order; diagnostics have the
+    /// same bound.
     pub devices: [Option<Device>; MAX_RETAINED],
     pub retained: usize,
     pub omitted: u32,
@@ -565,9 +569,10 @@ pub(crate) struct LegacyBlock {
 
 impl LegacyBlock {
     /// Claim a firmware-assigned 1af4:1001, type-0 function. Only the retained
-    /// inventory (at most 32 devices) is considered. An absent fixture is None;
-    /// the first candidate with invalid configuration returns an error instead
-    /// of quietly selecting a different disk. No configuration is written.
+    /// inventory (at most MAX_RETAINED, 256, devices) is considered. An absent
+    /// fixture is None; the first candidate with invalid configuration returns
+    /// an error instead of quietly selecting a different disk. No configuration
+    /// is written.
     pub(crate) fn discover(inventory: &Inventory) -> Result<Option<Self>, LegacyError> {
         let Some(device) = inventory.devices.iter().flatten().find(|device| {
             device.vendor == VIRTIO_VENDOR && device.device == 0x1001 && device.header & 0x7f == 0
@@ -812,8 +817,9 @@ fn scan(read: impl FnMut(u32) -> u32) -> Inventory {
 
 /// Discover firmware-visible segment-0 functions on the BSP. This module is
 /// the sole CF8/CFC owner; SMP will require a shared configuration lock. There
-/// are at most 65,536 function addresses, 262,144 configuration reads, and 33
-/// diagnostic lines. No device configuration register is written.
+/// are at most 65,536 function addresses, 262,144 configuration reads, and 257
+/// diagnostic lines: one per retained function and the summary. No device
+/// configuration register is written.
 pub(crate) fn probe() -> Inventory {
     let initial_if = arch::interrupts_enabled();
     let inventory = scan(read_configuration_address);
@@ -968,13 +974,73 @@ pub(crate) fn self_test() {
     });
     assert_eq!(crowded.functions, 8192);
     assert_eq!(crowded.virtio_block_devices, 8192);
-    assert_eq!(crowded.retained, MAX_RETAINED);
-    assert_eq!(crowded.omitted, 8192 - MAX_RETAINED as u32);
+    assert_eq!(MAX_RETAINED, 256);
+    assert_eq!(crowded.retained, 256);
+    assert_eq!(crowded.omitted, 7936);
     assert_eq!(crowded.config_reads, 8192 * 3);
+    assert!(crowded.devices.iter().all(Option::is_some));
+    retention_self_test();
     legacy_self_test();
     ahci_self_test();
     xhci_self_test();
     serial::println!("MIRROR_PCI_TESTS_OK");
+}
+
+/// 0013-D7: a controller past the old 32-function cap stays visible. Bus 0
+/// holds five eight-function slots, 40 functions in all: 39 PCIe root ports,
+/// like the 32 that VMware puts ahead of its storage, then an AHCI controller.
+#[cfg(feature = "boot-smoke")]
+fn retention_self_test() {
+    let inventory = scan(|address| {
+        let bus = (address >> 16) & 0xff;
+        let slot = (address >> 11) & 0x1f;
+        let function = (address >> 8) & 7;
+        let ahci = (slot, function) == (4, 7);
+        match (bus, slot, address & 0xfc) {
+            (0, 0..=4, 0) if ahci => 0x07e0_15ad,
+            (0, 0..=4, 0) => 0x07a0_15ad,
+            (0, 0..=4, 8) if ahci => 0x0106_0100,
+            (0, 0..=4, 8) => 0x0604_0001,
+            (0, 0..=4, 0x0c) if ahci => 0,
+            (0, 0..=4, 0x0c) if function == 0 => 0x0081_0000,
+            (0, 0..=4, 0x0c) => 0x0001_0000,
+            (0, 0..=4, 0x18) => {
+                let secondary = slot * 8 + function + 1;
+                (secondary << 16) | (secondary << 8)
+            }
+            (_, _, 0) => 0xffff_ffff,
+            _ => panic!("unexpected retention-test register read"),
+        }
+    });
+    assert_eq!(inventory.functions, 40);
+    assert_eq!(inventory.bridges, 39);
+    assert_eq!(inventory.retained, 40);
+    assert_eq!(inventory.omitted, 0);
+    // 8192 function-0 identity reads, 35 for the other functions, two detail
+    // reads per function and one bus-number read per bridge.
+    assert_eq!(inventory.config_reads, 8192 + 35 + 40 * 2 + 39);
+    // The same search that AhciController::discover runs.
+    let ahci = inventory
+        .devices
+        .iter()
+        .flatten()
+        .find(|device| device.is_ahci())
+        .expect("AHCI past the first 32 functions");
+    assert_eq!(
+        ahci.bdf,
+        Bdf {
+            bus: 0,
+            slot: 4,
+            function: 7
+        }
+    );
+    assert_eq!(
+        inventory.devices[..40]
+            .iter()
+            .flatten()
+            .position(|device| device.is_ahci()),
+        Some(39)
+    );
 }
 
 #[cfg(feature = "boot-smoke")]
