@@ -1,7 +1,7 @@
 # 0015b: Live ISO
 
-Status: confirmed (2026-10-09)
-Depends on: 0015a (`tools/mirror-image`, its `build.ps1` step, `package.ps1` and `docs/vm-settings.md`) and 0014 (the `LegacyVirtio` profile). It lands right after 0015a in the M0 order.
+Status: confirmed (2026-10-09); moved to Phase 11 by the roadmap re-plan (Cameron, 2026-10-11, the first part of RD1). It is re-drafted and re-confirmed before Phase 11, because 0062 retires the LegacyVirtio profile its `-Iso` case uses. What the re-draft covers (running `-Iso` under V1, and which system assets the live ISO carries) is proposed in RD1 and RD14 of `roadmap-replan.md` and decided with the re-draft. Not built until then.
+Depends on: 0015a (`tools/mirror-image`, its `build.ps1` step, `package.ps1` and `docs/vm-settings.md`) and 0014 (the `LegacyVirtio` profile). It lands in Phase 11 (it was right after 0015a in the M0 order).
 Ledger: S5, S5a, S2a, G3a (related: S1b, S7a, P3)
 
 ## Goal
@@ -88,4 +88,4 @@ As in 0015a, firmware must start Limine from the El Torito image, and Limine mus
 ## Open questions
 
 1. Follow-up spec, after M5: once the system needs a root filesystem, the live ISO needs one too, for example an ext2 image loaded into a RAM disk as a Limine module. This spec does not decide how. README.md lists it under the unscheduled follow-ups.
-2. Follow-up for 0062: when it retires `LegacyVirtio` (0014-D5), it must rehome the `-Iso` case. Under `V1`, the smoke assert at `kernel/src/main.rs:206-209` must then accept a boot with no VirtIO block device.
+2. 0062 (Phase 6) retires `LegacyVirtio` (0014-D5) before this spec lands in Phase 11, so there is no `-Iso` case for it to rehome. The re-draft chooses the `-Iso` case's profile; under `V1`, the smoke assert at `kernel/src/main.rs:206-209` must accept a boot with no VirtIO block device.

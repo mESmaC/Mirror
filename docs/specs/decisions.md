@@ -44,7 +44,7 @@ Source interviews: the 2026-10-09 spec interview, then the 2026-10-09 gap interv
 | A8 | Audit log: immutable. Neither humans nor agents can edit it; both can view it. The user sets its TTL and expiry is the only way entries leave. TTL changes are themselves logged. Optional retention copies go to local or cloud storage. (Clarified 2026-10-09 by A8a: a TTL change applies only to new entries, a full log refuses agent actions, and cloud retention copies come after v1.) | confirmed |
 | A8a | Audit semantics (clarifies A8). A TTL change applies only to entries written after it. When the log is full, agent actions are refused until space frees and the human is notified; human actions are never blocked. Entries hold digests and references, with secrets redacted at write time. "Immutable" means runtime prevention plus tamper evidence: a SHA-256 hash chain anchored in the immutable core, so offline edits are detected, not prevented. Retention copies go to local storage in v1, cloud after v1. The TTL counts against a persisted monotonic counter (S15). | confirmed |
 | A9 | Immutable core: compiled into the kernel and protected against runtime tampering in v1. It holds audit integrity, the capability core and its ceilings, human override, and input provenance (contents may change). No signing path runs code in it, and the user experience cannot reach it. It does not limit root's normal authority. (Amended 2026-10-09: the core also holds the trusted approval path, see A9a.) | confirmed |
-| A9a | The trusted approval path is part of the immutable core: a compositor-owned prompt that apps and agents cannot draw or imitate (UAC secure-desktop style), answerable only from the human seat. It exists from M3 (0049); the 0083 panel hosts it from M7. | confirmed |
+| A9a | The trusted approval path is part of the immutable core: a compositor-owned prompt that apps and agents cannot draw or imitate (UAC secure-desktop style), answerable only from the human seat. 0049 builds the prompt and the 0083 panel hosts it, both in Phase 10. Whether the compositor reserves its layer earlier, in 0027a and NEW 0027c (Phase 4), is RD2 in `roadmap-replan.md`, proposed and decided before Phase 1. (Amended 2026-10-11 by the roadmap re-plan, RS1: it said the prompt exists from M3 and the panel hosts it from M7.) | confirmed |
 | A10 | Experiment builds: a compile-time profile leaves out the immutable core and makes its rules runtime-configurable. A persistent marker appears on screen and in every audit entry. | confirmed |
 | A11 | v1 principals: one owner, who is root (a full capability bundle, below the immutable core), plus agent principals. More human accounts come later. | confirmed |
 | A11a | v1 has an owner login screen like other OSes, with optional auto-login. The 0018 baselines keep auto-login. | confirmed |
@@ -52,7 +52,7 @@ Source interviews: the 2026-10-09 spec interview, then the 2026-10-09 gap interv
 | A13 | The Agent API uses a Mirror-native protocol, with an MCP adapter for interop. | confirmed |
 | A13a | External agents. The Agent API listens only on the VM's host-facing interface (host-only or NAT-forwarded, not the LAN by default). An agent enrolls with a pairing code shown on Mirror's screen and approved through the trusted prompt (A9a), and gets its own principal and a revocable token. The default preset is read-only. TLS uses a Mirror-generated identity. The MCP adapter exposes Mirror as an MCP server. (Amended 2026-10-10: VMware NAT port forwards accept connections from the LAN, so a NAT forward stays off the LAN only with a host firewall rule. The adapter, host-only (VMnet1) or a NAT forward plus a host firewall rule, is open and decided with 0076; see Pending.) | confirmed |
 | A14 | The human talks to and supervises the agent through an assistant panel that opens and closes at will. | confirmed |
-| A15 | The harness is built early, right after the kernel object and process model. The audit log stays in memory until the filesystem exists. | confirmed |
+| A15 | The harness product layer (0041-0043, 0045-0049, 0083, 0076 and 0073) follows once Mirror is a usable OS, in Phase 10; the filesystem exists by then, so its audit log (0043) is persisted from the start. Which harness kernel primitives still land early is RD2 in `roadmap-replan.md`, proposed and decided before Phase 1. (Amended 2026-10-11 by the roadmap re-plan, RS1: it said the harness is built early, right after the kernel object and process model, with the audit log in memory until the filesystem exists.) | confirmed |
 | A16 | Credentials use a standard keyring plus broker. | confirmed |
 | A16a | The broker makes provider calls itself, so agent processes never see raw keys or tokens. They hold only a capability to request completions. | confirmed |
 | A16b | The keyring is encrypted at rest with a key derived from the owner password (Argon2id) and unlocked at login. With auto-login it asks for the password on first use. | confirmed |
@@ -117,7 +117,7 @@ Source interviews: the 2026-10-09 spec interview, then the 2026-10-09 gap interv
 | S4 | The general scheduler becomes work-conserving and gets basic priority classes (interactive above normal above background) in v1, replacing the hard 32%-of-one-core cap. This is ordinary OS scheduling, not the inference-aware pillar; it protects the input-latency gate while a local model runs. | confirmed |
 | S5 | Two boot artifacts: a disk image (GPT: FAT32 boot partition plus ext2 root) for development, and a bootable ISO. Both run in VMware, and the disk image is also used for QEMU tests. They replace the host-directory-only boot. (Amended 2026-10-09: VirtualBox dropped.) | confirmed |
 | S5a | The v1 ISO boots Mirror live. An installer that writes a disk from inside Mirror needs FAT32 writes (S2a), so it comes after v1. | confirmed |
-| S6 | ABI reset, done before more code depends on the current ABI. | confirmed |
+| S6 | ABI reset, done before more code depends on the current ABI. (Amended 2026-10-11 by the roadmap re-plan, RS1: the reset, 0020-0025, follows Phase 1's kernel core, which adds no syscall and changes only the thread-protocol and vm-protocol limits.) | confirmed |
 | S6a | Fast SYSCALL entry with 6 register arguments and a per-process personality selector (native, later Linux and Windows tables). INT 0x80 stays as a legacy shim. | confirmed |
 | S6b | Kernel object model: reference-counted objects with rights, handle transfer over channels, channel creation on demand, and waiting on many objects at once. It replaces the fixed 8 handles and 2 channels. | confirmed |
 | S6c | Shared memory objects that can be mapped between processes (surfaces, large buffers, model weights), replacing copy-everything syscalls. | confirmed |
@@ -141,6 +141,7 @@ Source interviews: the 2026-10-09 spec interview, then the 2026-10-09 gap interv
 | S19 | Network. DHCPv4 with a static override, IPv6 with SLAAC, DNS servers from DHCP. The daily VM uses NAT. Spec 0074, before 0073: an HTTP/1.1 client and server (the server for the Agent API listener), SSE and JSON, crates per S3. | confirmed |
 | S20 | Files in and out. In-guest fetch and put commands over HTTPS (0081, using 0074), plus VMware shared folders (HGFS over the guest RPC channel, spec 0087). Outbound transfer by agents is a grantable, audited capability (0075). | confirmed |
 | S21 | UI theme: dark is the default and the only theme drawn until the theme preference (0068) and the Settings app (0088) ship Light. The theme values come from Kimi's design tokens (P2a), through spec 0029 until 0027a. (Cameron, 2026-10-10.) | confirmed |
+| S22 | Audio. v1 plays sound: an HD Audio output driver, a mixer and a volume control (a NEW spec in Phase 9, after 0060b), tested on VMware's HD Audio and QEMU's `intel-hda` with a WAV audiodev; the volume control in Kimi's top bar and quick settings comes with it. (Cameron, 2026-10-11, roadmap re-plan RS4, under G12.) Audio input is not decided; the re-plan proposes it for after v1 (section 7, RD18, before Phase 8). | confirmed |
 
 ## Process (P)
 
@@ -160,28 +161,30 @@ Source interviews: the 2026-10-09 spec interview, then the 2026-10-09 gap interv
 | P9 | Permanent rule: every spec or change that alters something AGENTS.md describes updates those AGENTS.md lines in the same commit. | confirmed |
 | P8 | Each commit runs the targeted test cases for what it touches. The full `scripts/test.ps1` (and `-AgentDemo` when agent-demo code is touched) runs when a spec is complete, before its branch is merged. | confirmed |
 
-## Milestones (M)
+## Phases
 
-v1 order. The harness follows the process model (A15), and harness code is written SMP-safe from the start.
+v1 order (Cameron, 2026-10-11: roadmap re-plan RS1 and RS2, adopted as proposed in `roadmap-replan.md`). Phases 0-11 replace milestones M0-M9: Mirror becomes a modern OS first, and the harness product layer follows once it is usable (A15). Storage and network come before Kimi's shell. Harness code is still written SMP-safe from the start. Each phase ends in checks that can be run in VMware; README.md's spec map lists the specs in each phase. NEW specs and splits are confirmed and numbered when their phase comes up (RD24). Specs and ledger rows written before 2026-10-11 (for example A1a, S1d, S6f and S12-S17) cite M0-M9; the Replaces column maps each milestone to its phases.
 
-| ID | Milestone | Status |
+| Phase | Goal | Replaces |
 | --- | --- | --- |
-| M0 | Hygiene, VM boot images, absolute pointing, performance baselines | confirmed (renamed 2026-10-09) |
-| M1 | ABI reset: `mirror-sys`/`mirror-rt`, kernel objects, compositor protocol, userspace target | confirmed (renamed 2026-10-09) |
-| M2 | Processes, services and namespaces, system log, crypto and entropy | confirmed (renamed 2026-10-09) |
-| M3 | Agent harness core: principals and login, grants, audit, operations, Agent API, tasks, approvals | confirmed (renamed 2026-10-09) |
-| M4 | SMP userspace, scheduler, AVX2, large memory, ACPI power, wall clock | confirmed (renamed 2026-10-09) |
-| M5 | Storage: runtime drivers, mirrored pool, ext2 then ext3, settings store, VM layout and updates, SVGA II display | confirmed (renamed 2026-10-09) |
-| M6 | Network: e1000, TCP/IP with DHCP, DNS, TLS, HTTP, remote agent access, MCP adapter | confirmed (renamed 2026-10-09) |
-| M7 | Typed shell, native tools, text stack, apps, guest services, `std` port, assistant panel | confirmed (renamed 2026-10-09) |
-| M8 | AI: keyring broker, providers, evaluation, model store, inference engine, built-in assistant | confirmed (renamed 2026-10-09) |
-| M9 | Performance gates pass, completing v1 | confirmed |
+| 0 | Mirror boots well in VMware: disk image, firmware and PCI tolerance, hardening, PS/2, absolute pointing, reboot | the rest of M0, except 0015b (Phase 11), 0019 (Phases 1 and 6) and 0018's Mirror rows (Phase 4) |
+| 1 | Kernel core, built once: process and thread table, per-CPU data, kernel heap and frame allocator v2, userspace on all CPUs, scheduler v2, AVX2 state, TSC time | parts of M4 |
+| 2 | ABI, kernel objects and timers | M1's ABI and objects, M4's wall clock |
+| 3 | Userspace platform: runtime, userspace target, ELF loader v2, process model, boot bundle, services, system log | M1's runtime and target, M2 |
+| 4 | A modern desktop at the VM window's size: compositor, input v2 core, renderer, frame clock, core text and icons, toolkit core, window manager, SVGA II with live resize, host clipboard | parts of M1, M2 (0027b, 0039), M3 (0044a), M5 and M7 |
+| 5 | Power: ACPI namespace, orderly shutdown and reboot, VMware power and resume | M4's power |
+| 6 | Files that survive reboot: runtime driver model, block layer, mirrored pool, ext2 then ext3, VFS, settings, time zones | M5 |
+| 7 | Network: crypto, entropy, e1000, TCP/IP, DNS, TLS, HTTP | M6 and M2's crypto |
+| 8 | Kimi's desktop shell: widgets, scaling, notifications, app registry, open/save chooser, chrome, login, first-run setup | new |
+| 9 | Apps and tools: `std`, typed shell, native tools, terminal, editor, file manager, settings, audio, screenshots, shared folders | M7 |
+| 10 | Harness product layer: principals' presets and grants, audit, Agent API, override, seats, tasks, approvals, assistant panel, remote access, MCP | M3, parts of M6 and M7 |
+| 11 | AI and v1 acceptance | M8, M9, M0's 0015b, and the rest of M4's 0054 and 0055 |
 
 ## Pending (resume here)
 
-State after the 2026-10-09 gap interview, its write-up and its addendum, the 2026-10-10 pin change (P5a: 1.99.0), and the 2026-10-10 VMware addendum (Workstation Pro 26.0.1 checked and powered on).
+State after the 2026-10-09 gap interview, its write-up and its addendum, the 2026-10-10 pin change (P5a: 1.99.0), the 2026-10-10 VMware addendum (Workstation Pro 26.0.1 checked and powered on), and the 2026-10-11 roadmap re-plan (RS1-RS4 and the first part of RD1 confirmed).
 
-**Next:** a roadmap re-plan. On 2026-10-10 Cameron questioned UI work on today's renderer and asked to get Mirror to a modern OS first; a gap audit of the code against a modern OS and Kimi's design is running, and its proposed reordering of M0-M7 goes to Cameron for confirmation. Until Cameron confirms a new order, the confirmed order stands and continues with 0015a. 0029 part 1 is done on `claude/0029-ui-tokens` (2654a75, plus its spec update), waiting for Cameron's merge; whether 0029-D9 still lands with 0017c is part of the re-plan. 0011, 0014 and 0010 are merged into local `main` (a8a2581, not yet pushed). 0012 is done (e6c5ec7).
+**Next:** 0015a (disk image), then 0013, in Phase 0 (Cameron, 2026-10-11). The roadmap re-plan is adopted: RS1 (phases 0-11 replace M0-M9), RS2 (storage and network before Kimi's shell), RS3 (0029-D9's geometry withdrawn; 0029 is complete) and RS4 (audio in v1, S22) are confirmed, and 0015b moves to Phase 11, to be re-drafted and re-confirmed before then (RD1, first part). The re-plan's other decisions (RS5, RS6, the rest of RD1, RD2-RD25, and each NEW spec and split in `roadmap-replan.md`) stay proposed and are decided when due, as its Due column says. Waiting for Cameron to merge: `claude/0029-ui-tokens`, which fast-forwards `main` and carries 0029 and these docs. The re-plan docs ride on that branch instead of going straight to `main` (an exception to P7a): local `main` holds unpushed merges, and the docs edit files the branch also changes, so one fast-forward brings both. 0011, 0014 and 0010 are merged into local `main` (a8a2581, not yet pushed). 0012 is done (e6c5ec7).
 
 **Confirmed, but not yet written into the spec text:** none. Confirmed decisions that name a spec not yet drafted (for example 0027a, 0033 or 0067) live in this ledger and the README.md spec map until that spec is written.
 

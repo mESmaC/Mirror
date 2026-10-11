@@ -1,7 +1,7 @@
 # 0000: North star
 
-Status: confirmed (2026-10-09)
-Ledger: G1, G2, G3, G3a, G4, G5, G6, G7, G8, G8a, G8b, G8c, G8d, G9, G10, G11, G12; A1, A1a, A2, A3, A3a, A3b, A4, A5, A5a, A6, A7, A8, A8a, A9, A9a, A10, A11, A11a, A12, A13, A13a, A14, A15, A16, A16a, A16b, A17, A17a, A18, A19, A20, A21; I1, I2, I3, I4, I4a, I4b, I4c, I4d, I5, I6, I7, I8, I8a, I9, I10, I10a, I11, I11a, I11b, I11c, I12, I13, I14, I15; S1, S1a, S1c, S1d, S2, S2b, S4, S11, S15, S16, S19, S20; C1, C2, C3, C4; M0, M1, M2, M3, M4, M5, M6, M7, M8, M9
+Status: confirmed (2026-10-09; amended 2026-10-11: audio output with volume control, S22)
+Ledger: G1, G2, G3, G3a, G4, G5, G6, G7, G8, G8a, G8b, G8c, G8d, G9, G10, G11, G12; A1, A1a, A2, A3, A3a, A3b, A4, A5, A5a, A6, A7, A8, A8a, A9, A9a, A10, A11, A11a, A12, A13, A13a, A14, A15, A16, A16a, A16b, A17, A17a, A18, A19, A20, A21; I1, I2, I3, I4, I4a, I4b, I4c, I4d, I5, I6, I7, I8, I8a, I9, I10, I10a, I11, I11a, I11b, I11c, I12, I13, I14, I15; S1, S1a, S1c, S1d, S2, S2b, S4, S11, S15, S16, S19, S20, S22; C1, C2, C3, C4; Phases 0-11 (which replaced M0-M9 on 2026-10-11)
 
 ## What Mirror is
 
@@ -33,7 +33,7 @@ v1 is done when Cameron uses Mirror daily inside VMware (QEMU for automated test
 - persistent files (ext2, then ext3), including a mirrored (RAID-1-like) pool across two or more virtual disks
 - network and internet access
 - Mirror's typed, agent-native shell and native command-line tools
-- modern desktop basics: any display resolution (1920x1080 and larger) with live resize, absolute pointing, clipboard shared with the host, shared folders, owner login, wall-clock time, clean shutdown and reboot, a full Unicode text stack, and the G10 app set (text editor, file manager, settings, system and task monitor, terminal, assistant panel)
+- modern desktop basics: any display resolution (1920x1080 and larger) with live resize, absolute pointing, clipboard shared with the host, shared folders, owner login, wall-clock time, clean shutdown and reboot, audio output with volume control (S22), a full Unicode text stack, and the G10 app set (text editor, file manager, settings, system and task monitor, terminal, assistant panel)
 - the agent harness: principals, read-only and full-access presets, grants, human override, input provenance, the immutable audit log, and the Agent API with an MCP adapter
 - the built-in assistant (an Agent API client) with an open/close panel, using cloud providers (OpenAI, Anthropic, OpenAI-compatible) or Mirror's own CPU inference engine (Qwen3 MoE, sharded models, TurboQuant KV cache, CLM context objects with Suffix Cache Reuse)
 - an OS semantic index and agent memory, built on TurboQuant vector compression and an embedding model
