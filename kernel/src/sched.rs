@@ -45,10 +45,12 @@ use core::{
 };
 
 use super::{
-    ACTIVE, ACTIVE_INPUT, ACTIVE_IPC, ACTIVE_SURFACE, ACTIVE_WINDOWS, CpuPolicy, Outcome, Process,
-    ShellRuntime, State, Thread, complete_wait, deadline_reached, release_handles, resume_process,
-    thread_abi, vm_abi,
+    ACTIVE, ACTIVE_INPUT, ACTIVE_IPC, ACTIVE_SURFACE, ACTIVE_WINDOWS, CpuPolicy, MemoryClass,
+    Outcome, Process, ShellRuntime, State, Thread, complete_wait, deadline_reached,
+    release_handles, resume_process, thread_abi, vm_abi,
 };
+#[cfg(feature = "boot-smoke")]
+use crate::elf;
 use crate::{
     arch, heap, input, interrupts,
     ipc::{self, Ipc},
@@ -675,9 +677,187 @@ pub(super) unsafe fn discard(slot: usize) -> Process {
     unsafe { remove_process(slot) }
 }
 
+/// The slot whose entry is `process`, by pointer identity (0054-D5's skip
+/// rule). No table entry is borrowed, so the caller's own reference stays
+/// unique.
+pub(super) fn slot_of(process: &Process) -> usize {
+    let pointer = core::ptr::from_ref(process);
+    process_slots()
+        .find(|&slot| core::ptr::eq(PROCESSES.entry(slot).cast_const(), pointer))
+        .expect("live process not in the table")
+}
+
 /// Occupied process slots, in slot order.
 pub(super) fn process_slots() -> impl Iterator<Item = usize> {
     (0..PROCESS_SLOTS).filter(|&slot| PROCESSES.is_occupied(slot))
+}
+
+/// 0054-D5's kill rank: background first, then agent, then normal and test;
+/// the protected class is never a candidate.
+fn kill_rank(class: MemoryClass) -> Option<u8> {
+    match class {
+        MemoryClass::Background => Some(0),
+        MemoryClass::Agent => Some(1),
+        MemoryClass::Normal | MemoryClass::Test => Some(2),
+        MemoryClass::Protected => None,
+    }
+}
+
+/// Select the next OOM victim (0054-D5): for a non-protected requester, only
+/// strictly lower kill classes; for a protected or kernel requester, every
+/// non-protected class. The lowest kill class first; within a class, the
+/// largest footprint — owned pages plus owned tables plus the 0059-D3 charge,
+/// each counted once — then the newest PID. Only live processes are
+/// candidates. The requester's slot is never borrowed here: its caller holds
+/// that reference.
+pub(super) fn select_victim(requester: Option<(usize, MemoryClass)>) -> Option<usize> {
+    let requester_rank = requester.and_then(|(_, class)| kill_rank(class));
+    let skip = requester.map(|(slot, _)| slot);
+    let mut best: Option<(usize, u8, u64, u64)> = None;
+    for slot in process_slots() {
+        if Some(slot) == skip {
+            continue;
+        }
+        // SAFETY: the scheduler holds no other reference to this entry.
+        let process = unsafe { process(slot) };
+        if process.finished() {
+            continue;
+        }
+        let Some(rank) = kill_rank(process.memory_class) else {
+            continue;
+        };
+        if let Some(requester_rank) = requester_rank
+            && rank >= requester_rank
+        {
+            continue;
+        }
+        let footprint = process.space.owned_page_count() as u64
+            + process.space.owned_table_count() as u64
+            + process.surface_frames;
+        let better = match best {
+            None => true,
+            Some((_, best_rank, best_footprint, best_pid)) => {
+                rank < best_rank
+                    || (rank == best_rank && footprint > best_footprint)
+                    || (rank == best_rank && footprint == best_footprint && process.pid > best_pid)
+            }
+        };
+        if better {
+            best = Some((slot, rank, footprint, process.pid));
+        }
+    }
+    best.map(|(slot, _, _, _)| slot)
+}
+
+/// 0054-D5's selection self-test (boot-smoke): drive victim selection over
+/// synthetic class/charge entries for the class order, the footprint and PID
+/// tie-breaks, and the protected exclusion. Identical images make the base
+/// footprints equal, so the charge assignments decide them.
+#[cfg(feature = "boot-smoke")]
+pub(super) fn selection_self_test(
+    kernel: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    bytes: &[u8],
+    image: &elf::Image,
+    direct_map: u64,
+) {
+    let before = frames.stats().unwrap().allocated_frames;
+    const CLASSES: [MemoryClass; 5] = [
+        MemoryClass::Background,
+        MemoryClass::Background,
+        MemoryClass::Agent,
+        MemoryClass::Normal,
+        MemoryClass::Protected,
+    ];
+    let charges = [0u64, 4, 9, 99, 1000];
+    let mut slots = [0usize; 5];
+    for (index, (class, charge)) in CLASSES.into_iter().zip(charges).enumerate() {
+        slots[index] = super::load_process(
+            kernel,
+            frames,
+            bytes,
+            image,
+            direct_map,
+            0,
+            MemoryClass::Test,
+        )
+        .expect("selection test process");
+        // SAFETY: the fresh entry has never run and nothing else references it.
+        let process = unsafe { process(slots[index]) };
+        process.memory_class = class;
+        process.surface_frames = charge;
+    }
+    // A normal requester takes the lowest eligible class, and within it the
+    // largest footprint: the second background entry's 4 beats the first's 0.
+    assert_eq!(
+        select_victim(Some((slots[3], MemoryClass::Normal))),
+        Some(slots[1])
+    );
+    // The PID tie-break: equal footprints take the newer entry.
+    // SAFETY: as above; nothing else references the entry.
+    unsafe { process(slots[0]) }.surface_frames = 4;
+    assert_eq!(
+        select_victim(Some((slots[3], MemoryClass::Normal))),
+        Some(slots[1])
+    );
+    // The footprint rule: an older but larger entry wins.
+    // SAFETY: as above.
+    unsafe { process(slots[0]) }.surface_frames = 5;
+    assert_eq!(
+        select_victim(Some((slots[3], MemoryClass::Normal))),
+        Some(slots[0])
+    );
+    // A background requester has no lower class, and no requester is its own
+    // victim.
+    assert_eq!(
+        select_victim(Some((slots[0], MemoryClass::Background))),
+        None
+    );
+    assert_eq!(
+        select_victim(Some((slots[1], MemoryClass::Background))),
+        None
+    );
+    // A protected or kernel requester draws from every non-protected class,
+    // still in S18's order: background first, and within it the larger
+    // footprint (5 beats 4).
+    assert_eq!(
+        select_victim(Some((slots[4], MemoryClass::Protected))),
+        Some(slots[0])
+    );
+    assert_eq!(select_victim(None), Some(slots[0]));
+    // The protected entry is never a candidate, whatever its footprint.
+    assert_ne!(select_victim(None), Some(slots[4]));
+    // Finished entries are excluded: with both backgrounds done, the agent
+    // dies before normal; with everything done, no candidate remains.
+    // SAFETY: the entry has never run and nothing else references it.
+    unsafe { process(slots[0]) }.finish(Outcome::Exit(0));
+    // SAFETY: as above.
+    unsafe { process(slots[1]) }.finish(Outcome::Exit(0));
+    assert_eq!(select_victim(None), Some(slots[2]));
+    // SAFETY: as above.
+    unsafe { process(slots[2]) }.finish(Outcome::Exit(0));
+    assert_eq!(select_victim(None), Some(slots[3]));
+    // SAFETY: as above.
+    unsafe { process(slots[3]) }.finish(Outcome::Exit(0));
+    assert_eq!(select_victim(None), None);
+    for slot in slots {
+        // SAFETY: the process never ran, and nothing references it.
+        let process = unsafe { process(slot) };
+        if process.finished() {
+            process.release_threads();
+        }
+        // SAFETY: it never ran, finished or not, and nothing references it.
+        let mut process = unsafe { discard(slot) };
+        // SAFETY: its root has never been active, and nothing references its
+        // tree.
+        unsafe { process.space.destroy(frames) }.expect("selection teardown");
+    }
+    assert_drained();
+    assert_eq!(
+        frames.stats().unwrap().allocated_frames,
+        before,
+        "selection test frame leak"
+    );
 }
 
 /// Append a ready thread to the run queue.

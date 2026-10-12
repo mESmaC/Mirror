@@ -91,6 +91,10 @@ enum Outcome {
     BudgetExhausted,
     SessionEnded,
     Terminated,
+    /// Killed as an OOM victim (0054-D5); the address space was destroyed at
+    /// kill time, so the zombie keeps only this outcome and reap skips the
+    /// destroy. The shell reads it as FAULTED with detail 0.
+    OutOfMemory,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,6 +231,17 @@ impl MemoryClass {
     /// 0054-D4: only the protected class may draw the reserve floor.
     fn may_draw_reserve(self) -> bool {
         matches!(self, MemoryClass::Protected)
+    }
+
+    /// The marker name (0054-D5's MIRROR_OOM_KILL).
+    fn name(self) -> &'static str {
+        match self {
+            MemoryClass::Protected => "protected",
+            MemoryClass::Normal => "normal",
+            MemoryClass::Agent => "agent",
+            MemoryClass::Background => "background",
+            MemoryClass::Test => "test",
+        }
     }
 }
 
@@ -418,6 +433,12 @@ struct Process {
     /// carries its apps' surfaces). Maintained in every flavor so 0054a can
     /// consume the counters; boot-smoke only: the zero-at-reap check.
     surface_frames: u64,
+    /// The process's memory class (0054-D2), set at creation; 0054-D5's victim
+    /// choice reads it, and the Vm carries its limits.
+    memory_class: MemoryClass,
+    /// The address space was already destroyed (0054-D5's OOM kill), so reap
+    /// skips the destroy.
+    space_destroyed: bool,
     #[cfg(feature = "boot-smoke")]
     ipc_checks: bool,
     ipc_sent: usize,
@@ -591,6 +612,7 @@ pub fn run_init(
     test_load_rollback(kernel, frames, bytes, &image, direct_map);
     vm::self_test(kernel, frames, direct_map);
     table_bounds_self_test(kernel, frames, bytes, &image, direct_map);
+    sched::selection_self_test(kernel, frames, bytes, &image, direct_map);
     run_pair(
         kernel,
         frames,
@@ -990,6 +1012,8 @@ fn load_process(
         boot_handles: [0; 6],
         handles_closed: false,
         surface_frames: 0,
+        memory_class: class,
+        space_destroyed: false,
         #[cfg(feature = "boot-smoke")]
         ipc_checks: false,
         ipc_sent: 0,
@@ -1187,9 +1211,12 @@ fn run_pair(
     let mut zombies = unsafe { [sched::reap(first), sched::reap(second)] };
     sched::assert_drained();
     for zombie in &mut zombies {
-        // SAFETY: All contexts are finished, ACTIVE is clear, the kernel root
-        // is active, and no handler retains a reference into either user tree.
-        unsafe { zombie.space.destroy(frames) }.expect("release user address space");
+        // 0054-D5: an OOM victim's space was destroyed at kill time.
+        if !zombie.space_destroyed {
+            // SAFETY: All contexts are finished, ACTIVE is clear, the kernel
+            // root is active, and no handler retains a reference into the tree.
+            unsafe { zombie.space.destroy(frames) }.expect("release user address space");
+        }
         #[cfg(feature = "boot-smoke")]
         zombie.check_charges_zero();
     }
@@ -1472,7 +1499,7 @@ fn resume_process(
     // Session pointers remain exclusively borrowed until deferred copy/syscall
     // work completes. No user context or interrupt handler is active here.
     if let State::Memory(request) = process.thread().state {
-        complete_memory(process, frames, request);
+        complete_memory(process, frames, ipc, request);
     }
     ACTIVE_IPC.store(core::ptr::null_mut(), Ordering::SeqCst);
     ACTIVE_SURFACE.store(core::ptr::null_mut(), Ordering::SeqCst);
@@ -1511,9 +1538,71 @@ fn record_latency(process: &mut Process, resumed: bool) {
     assert!(slot.replace(lateness).is_none(), "wake timed twice");
 }
 
+/// Kill the selected OOM victim at once (0054-D5): finish OutOfMemory, detach
+/// and release its threads, close its handles, and destroy its address space
+/// immediately; the zombie keeps only the outcome, and reap skips the destroy.
+fn kill_oom_victim(slot: usize, frames: &mut FrameAllocator<'_>, ipc: &mut Ipc) {
+    // SAFETY: The scheduler selected this occupied slot and holds no other
+    // reference to it; the victim is not running (BSP-only, IF=0 until 0051).
+    let process = unsafe { sched::process(slot) };
+    serial::println!(
+        "MIRROR_OOM_KILL class={} pid={}",
+        process.memory_class.name(),
+        process.pid
+    );
+    process.finish(Outcome::OutOfMemory);
+    process.release_threads();
+    release_handles(process, ipc);
+    // SAFETY: every published pointer is clear and no handler retains a
+    // reference into the victim's tree; its frames return to the pool at once.
+    unsafe { process.space.destroy(frames) }.expect("OOM victim address space");
+    process.space_destroyed = true;
+}
+
+/// 0054-D5: a frame-starved materialize kills one lower-class victim per round
+/// and retries, bounded, stopping when no candidate remains.
+fn materialize_or_kill(
+    process: &mut Process,
+    frames: &mut FrameAllocator<'_>,
+    ipc: &mut Ipc,
+    address: u64,
+    length: usize,
+    write: bool,
+) -> Result<(), vm::VmError> {
+    loop {
+        // SAFETY: The saved faulting instruction has not resumed. The
+        // allocator is unique and all affected user mappings are inactive.
+        let result = unsafe {
+            process.vm.materialize(
+                &mut process.space,
+                frames,
+                process.direct_map,
+                address,
+                length,
+                write,
+            )
+        };
+        match result {
+            Err(vm::VmError::NoFrames) => {
+                let requester = Some((sched::slot_of(process), process.memory_class));
+                let Some(victim) = sched::select_victim(requester) else {
+                    return Err(vm::VmError::NoFrames);
+                };
+                kill_oom_victim(victim, frames, ipc);
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Complete bounded VM work with the kernel root active and no interrupt frames
 /// or published process borrow. Disjoint I/O sessions remain borrowed by resume.
-fn complete_memory(process: &mut Process, frames: &mut FrameAllocator<'_>, request: MemoryRequest) {
+fn complete_memory(
+    process: &mut Process,
+    frames: &mut FrameAllocator<'_>,
+    ipc: &mut Ipc,
+    request: MemoryRequest,
+) {
     assert!(ACTIVE.load(Ordering::SeqCst).is_null());
     assert!(!arch::interrupts_enabled());
     match request {
@@ -1561,18 +1650,7 @@ fn complete_memory(process: &mut Process, frames: &mut FrameAllocator<'_>, reque
             process.thread_mut().state = State::Ready;
         }
         MemoryRequest::Fault { address, error } => {
-            // SAFETY: The saved faulting instruction has not resumed. The
-            // allocator is unique and all affected user mappings are inactive.
-            let result = unsafe {
-                process.vm.materialize(
-                    &mut process.space,
-                    frames,
-                    process.direct_map,
-                    address,
-                    1,
-                    error & 2 != 0,
-                )
-            };
+            let result = materialize_or_kill(process, frames, ipc, address, 1, error & 2 != 0);
             if result.is_ok() {
                 #[cfg(feature = "boot-smoke")]
                 {
@@ -1582,6 +1660,8 @@ fn complete_memory(process: &mut Process, frames: &mut FrameAllocator<'_>, reque
             } else {
                 // Unresolvable demand faults retain the original diagnostic,
                 // terminate this process and let the scheduler reclaim its VM.
+                // 0054-D5: with no candidate left, the self-kill is the last
+                // resort.
                 let frame = process.thread().context.frame;
                 record_fault(process, &frame, address);
             }
@@ -1593,19 +1673,14 @@ fn complete_memory(process: &mut Process, frames: &mut FrameAllocator<'_>, reque
         } => {
             // SAFETY: Complete access validation preceded this deferral; repeat
             // it in materialize before allocating or performing syscall work.
-            let result = unsafe {
-                process.vm.materialize(
-                    &mut process.space,
-                    frames,
-                    process.direct_map,
-                    address,
-                    length,
-                    writable,
-                )
-            };
+            // 0054-D5: frame starvation kills a lower-class victim and retries.
+            let result = materialize_or_kill(process, frames, ipc, address, length, writable);
             if let Err(error) = result {
-                process.thread_mut().context.frame.rax =
-                    (if error == -12 { -12_i64 } else { -14_i64 }) as u64;
+                process.thread_mut().context.frame.rax = (if error.errno() == -12 {
+                    -12_i64
+                } else {
+                    -14_i64
+                }) as u64;
                 process.thread_mut().state = State::Ready;
                 return;
             }
@@ -1851,9 +1926,13 @@ impl ShellRuntime<'_> {
         assert!(child.handles.is_empty());
         let before = frames.stats().unwrap().allocated_frames;
         let owned = child.space.owned_page_count() + child.space.owned_table_count();
-        // SAFETY: The scheduler restored its kernel root and cleared every
-        // active pointer before considering a finished process for reclamation.
-        unsafe { child.space.destroy(frames) }.expect("application address-space cleanup");
+        // 0054-D5: an OOM victim's space was destroyed at kill time.
+        if !child.space_destroyed {
+            // SAFETY: The scheduler restored its kernel root and cleared every
+            // active pointer before considering a finished process for
+            // reclamation.
+            unsafe { child.space.destroy(frames) }.expect("application address-space cleanup");
+        }
         #[cfg(feature = "boot-smoke")]
         child.check_charges_zero();
         assert_eq!(frames.stats().unwrap().allocated_frames + owned, before);
@@ -1867,6 +1946,8 @@ impl ShellRuntime<'_> {
             | Outcome::InvalidContext { .. }
             | Outcome::InvalidTls { .. } => (3, 13, "fault"),
             Outcome::BudgetExhausted => (3, 0, "budget"),
+            // 0054-D6: the shell reads an OOM kill as FAULTED with detail 0.
+            Outcome::OutOfMemory => (3, 0, "oom"),
         };
         if state == 3 {
             self.windows.faults += 1;
@@ -2472,9 +2553,12 @@ pub fn run_shell(
     // shell's entry; reap checks that it finished.
     let mut desktop = unsafe { sched::reap(shell) };
     sched::assert_drained();
-    // SAFETY: The shell and children are stopped; all active pointers are clear
-    // and no resource retains a reference to the shell's private address space.
-    unsafe { desktop.space.destroy(frames) }.expect("shell address-space cleanup");
+    // 0054-D5: an OOM victim's space was destroyed at kill time.
+    if !desktop.space_destroyed {
+        // SAFETY: The shell and children are stopped; all active pointers are
+        // clear and no resource retains a reference to the shell's space.
+        unsafe { desktop.space.destroy(frames) }.expect("shell address-space cleanup");
+    }
     #[cfg(feature = "boot-smoke")]
     desktop.check_charges_zero();
     // Each session ends at its own frame baseline.

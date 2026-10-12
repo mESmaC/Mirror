@@ -400,36 +400,45 @@ impl Vm {
         address: u64,
         length: usize,
         write: bool,
-    ) -> Result<(), i64> {
-        if !self.preflight(space, address, length, write)? {
+    ) -> Result<(), VmError> {
+        if !self
+            .preflight(space, address, length, write)
+            .map_err(VmError::from_errno)?
+        {
             return Ok(());
         }
-        let (first, end) = user_pages(address, length)?.unwrap();
+        let (first, end) = user_pages(address, length)
+            .map_err(VmError::from_errno)?
+            .unwrap();
         // A valid contiguous range containing a missing page is anonymous and
         // bounded by this process's reservation quota. This fixed bitmap keeps
         // rollback off the heap and well below the kernel stack limit.
         if first < ARENA_START || end > ARENA_END || end - first > RESERVED_LIMIT {
-            return Err(EFAULT);
+            return Err(VmError::Fault);
         }
         let mut new_pages = [0_u64; RESIDENT_BITMAP_WORDS];
         let mut count = 0_u64;
         #[cfg(feature = "boot-smoke")]
         let mut installed = 0;
         for (index, page) in (first..end).step_by(PAGE_SIZE as usize).enumerate() {
-            if space.translate(page).map_err(paging_error)?.is_none() {
+            if space
+                .translate(page)
+                .map_err(VmError::from_paging)?
+                .is_none()
+            {
                 new_pages[index / 64] |= 1 << (index % 64);
                 count += 1;
             }
         }
         if self.committed + count * PAGE_SIZE > self.committed_limit {
-            return Err(ENOMEM);
+            return Err(VmError::QuotaExceeded);
         }
         // 0054-D4: preflight this operation's worst-case frames — the data
         // pages plus their page-table pages — against the reserve floor. One
         // check per operation, so no partial operation straddles the floor.
         let worst_case = count + count / 512 + 2;
         if !frames.preflight_reserve(worst_case as usize, self.may_draw_reserve) {
-            return Err(ENOMEM);
+            return Err(VmError::NoFrames);
         }
         for (index, page) in (first..end).step_by(PAGE_SIZE as usize).enumerate() {
             if new_pages[index / 64] & (1 << (index % 64)) == 0 {
@@ -441,12 +450,14 @@ impl Vm {
                     .allocation_budget
                     .is_some_and(|budget| installed == budget)
                 {
-                    return Err(ENOMEM);
+                    return Err(VmError::NoFrames);
                 }
-                let physical = frames.allocate().ok_or(ENOMEM)?;
+                let physical = frames.allocate().ok_or(VmError::NoFrames)?;
                 let result = (|| {
-                    let destination = direct_map.checked_add(physical).ok_or(EFAULT)?;
-                    destination.checked_add(PAGE_SIZE - 1).ok_or(EFAULT)?;
+                    let destination = direct_map.checked_add(physical).ok_or(VmError::Fault)?;
+                    destination
+                        .checked_add(PAGE_SIZE - 1)
+                        .ok_or(VmError::Fault)?;
                     let permissions = self
                         .regions
                         .containing(page)
@@ -459,7 +470,7 @@ impl Vm {
                         (destination as *mut u8).write_bytes(0, PAGE_SIZE as usize);
                         space.map_page(page, physical, permissions, frames)
                     }
-                    .map_err(paging_error)
+                    .map_err(VmError::from_paging)
                 })();
                 if result.is_err() {
                     // SAFETY: map_page transfers ownership only on success;
@@ -552,6 +563,48 @@ fn paging_error(error: PagingError) -> i64 {
         PagingError::OutOfFrames => ENOMEM,
         PagingError::UserAccessDenied => EACCES,
         _ => EFAULT,
+    }
+}
+
+/// Why a VM operation failed (0054-D5): frame exhaustion is distinct from the
+/// per-process quota, so victim selection can tell them apart; both become
+/// -12 at the syscall boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VmError {
+    /// The process's own reserve/commit limit was reached.
+    QuotaExceeded,
+    /// The frame pool or the reserve floor could not serve the operation.
+    NoFrames,
+    /// The address or span is invalid.
+    Fault,
+    /// The protection or ownership check failed.
+    AccessDenied,
+}
+
+impl VmError {
+    /// The syscall-boundary errno (0054-D5: NoFrames becomes -12 only here).
+    pub fn errno(self) -> i64 {
+        match self {
+            VmError::QuotaExceeded | VmError::NoFrames => ENOMEM,
+            VmError::Fault => EFAULT,
+            VmError::AccessDenied => EACCES,
+        }
+    }
+
+    fn from_paging(error: PagingError) -> Self {
+        match error {
+            PagingError::OutOfFrames => VmError::NoFrames,
+            PagingError::UserAccessDenied => VmError::AccessDenied,
+            _ => VmError::Fault,
+        }
+    }
+
+    fn from_errno(code: i64) -> Self {
+        match code {
+            ENOMEM => VmError::QuotaExceeded,
+            EACCES => VmError::AccessDenied,
+            _ => VmError::Fault,
+        }
     }
 }
 
@@ -714,7 +767,7 @@ pub fn self_test(
         let before = frames.stats().unwrap().allocated_frames;
         assert_eq!(
             vm.materialize(&mut space, frames, direct_map, readonly, 1, true),
-            Err(EACCES)
+            Err(VmError::AccessDenied)
         );
         assert_eq!(frames.stats().unwrap().allocated_frames, before);
         vm.materialize(&mut space, frames, direct_map, readonly, 1, false)
@@ -760,7 +813,7 @@ pub fn self_test(
                 3 * PAGE_SIZE as usize,
                 true
             ),
-            Err(ENOMEM)
+            Err(VmError::NoFrames)
         );
         vm.allocation_budget = None;
         assert_eq!(vm.stats(), before_stats);
@@ -801,7 +854,7 @@ pub fn self_test(
                 COMMITTED_LIMIT as usize,
                 true
             ),
-            Err(ENOMEM)
+            Err(VmError::QuotaExceeded)
         );
         assert_eq!(frames.stats().unwrap().allocated_frames, before);
         assert!(space.translate(quota).unwrap().is_none());
