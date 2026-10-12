@@ -14,6 +14,11 @@
 //! signals waiters, in queue order (0030-D6). The scheduler completes the
 //! signaled waits, with any user copy, before its next dispatch.
 //!
+//! A finished process stays in the process table as a zombie. Once the
+//! scheduler regains control it releases the process's thread entries; the
+//! zombie keeps its outcome, counters and address space until its session
+//! validates and reaps it, which destroys the address space (0030-D5).
+//!
 //! A signal also asks for a reschedule at the next trap exit: the syscall
 //! that signaled, the tick that reached a deadline, or a PS/2 IRQ that
 //! completed input while a thread waits for it. The interrupted thread then
@@ -1019,10 +1024,17 @@ pub(super) fn run(
         assert!(!arch::interrupts_enabled());
         assert_unpublished();
         // A finished process's endpoints close before any peer's receive is
-        // checked, so a blocked peer observes closure (readme, IPC).
+        // checked, so a blocked peer observes closure (readme, IPC). Every
+        // thread context was saved on its way back here, so the process then
+        // gives up its thread entries and stays a zombie until reaped
+        // (0030-D5).
         for slot in process_slots() {
             // SAFETY: The scheduler holds no other process reference.
-            release_handles(unsafe { process(slot) }, &mut session.ipc);
+            let process = unsafe { process(slot) };
+            release_handles(process, &mut session.ipc);
+            if process.finished() && !process.zombie() {
+                process.release_threads();
+            }
         }
         if let Some(runtime) = &mut session.runtime {
             runtime.reclaim_finished(frames, &mut session.ipc);

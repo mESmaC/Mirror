@@ -478,6 +478,23 @@ impl Process {
             let _ = state;
         }
     }
+
+    /// Release a finished process's thread entries, once no thread context
+    /// is in use. The zombie keeps only its outcome, counters, handles and
+    /// address space until its session validates and reaps it (0030-D5).
+    fn release_threads(&mut self) {
+        assert!(self.finished(), "released a live process's threads");
+        for index in 0..thread_abi::MAX_THREADS {
+            if self.members[index] != sched::NO_SLOT {
+                self.remove_member(index);
+            }
+        }
+    }
+
+    /// A finished process that holds no thread entry.
+    fn zombie(&self) -> bool {
+        self.finished() && self.members.iter().all(|&slot| slot == sched::NO_SLOT)
+    }
 }
 
 /// Print `MIRROR_SCHED_READY` once, before the first session, in every
@@ -511,6 +528,7 @@ pub fn run_init(
     assert!(deadline_reached(3, u64::MAX - 2));
     test_load_rollback(kernel, frames, bytes, &image, direct_map);
     vm::self_test(kernel, frames, direct_map);
+    table_bounds_self_test(kernel, frames, bytes, &image, direct_map);
     run_pair(
         kernel,
         frames,
@@ -564,6 +582,137 @@ fn test_load_rollback(
     serial::println!("MIRROR_USER_LOAD_ROLLBACK_OK");
 }
 
+/// Fill the process and thread tables, check that both refuse more with
+/// EAGAIN, and check that tearing every entry down restores the frame
+/// baseline exactly (spec 0030a, acceptance 5). Case 1 fills both tables
+/// with 64 processes of four threads, finishes them into zombies, which give
+/// up every thread entry but keep their process slots, and reaps them. Case 2
+/// fills only the thread table, with 16 processes of sixteen threads, so a
+/// process create fails for want of a main-thread entry before it allocates
+/// anything. No entry ever runs: threads are created ready and queued.
+#[cfg(feature = "boot-smoke")]
+fn table_bounds_self_test(
+    kernel: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    bytes: &[u8],
+    image: &elf::Image,
+    direct_map: u64,
+) {
+    let allocated =
+        |frames: &FrameAllocator<'_>| frames.stats().expect("recycling required").allocated_frames;
+    sched::assert_drained();
+    let baseline = allocated(frames);
+    let start = thread_abi::ThreadStart {
+        entry: image.entry,
+        stack: STACK_TOP - 8,
+        argument: 0,
+        fs: 0,
+        gs: 0,
+    };
+    let mut slots = [0; sched::PROCESS_SLOTS];
+
+    // Case 1: both tables full.
+    for slot in &mut slots {
+        *slot = load_process(kernel, frames, bytes, image, direct_map, 0)
+            .expect("table-bounds process");
+        // SAFETY: A fresh slot that nothing else references.
+        let process = unsafe { sched::process(*slot) };
+        for _ in 1..sched::THREAD_SLOTS / sched::PROCESS_SLOTS {
+            add_thread(process, *slot, &start).expect("table-bounds thread");
+        }
+    }
+    assert!(
+        !sched::has_room(1, 0) && !sched::has_room(0, 1),
+        "the tables did not fill"
+    );
+    let full = allocated(frames);
+    let refused = load_process(kernel, frames, bytes, image, direct_map, 0);
+    assert_eq!(
+        refused.map_err(|error| error.errno()),
+        Err(-11),
+        "a full process table took a process"
+    );
+    // SAFETY: An occupied slot that nothing else references.
+    let process = unsafe { sched::process(slots[0]) };
+    assert_eq!(
+        add_thread(process, slots[0], &start),
+        Err(-11),
+        "a full thread table took a thread"
+    );
+    assert_eq!(allocated(frames), full, "a refused create allocated frames");
+    for &slot in &slots {
+        // SAFETY: As above; one entry is borrowed at a time.
+        let process = unsafe { sched::process(slot) };
+        process.finish(Outcome::Terminated);
+        process.release_threads();
+        assert!(process.zombie());
+    }
+    assert!(
+        sched::has_room(0, sched::THREAD_SLOTS) && !sched::has_room(1, 0),
+        "zombies kept thread entries or gave up process slots"
+    );
+    let refused = load_process(kernel, frames, bytes, image, direct_map, 0);
+    assert_eq!(
+        refused.map_err(|error| error.errno()),
+        Err(-11),
+        "a table of zombies took a process"
+    );
+    for &slot in &slots {
+        // SAFETY: No reference to the zombie is live.
+        let mut zombie = unsafe { sched::reap(slot) };
+        assert_eq!(zombie.outcome, Some(Outcome::Terminated));
+        // SAFETY: Its root has never been active, and nothing references
+        // its tree.
+        unsafe { zombie.space.destroy(frames) }.expect("table-bounds teardown");
+    }
+    sched::assert_drained();
+    assert_eq!(allocated(frames), baseline, "table-bounds frame leak");
+
+    // Case 2: only the thread table full.
+    let count = sched::THREAD_SLOTS / thread_abi::MAX_THREADS;
+    for slot in &mut slots[..count] {
+        *slot = load_process(kernel, frames, bytes, image, direct_map, 0)
+            .expect("table-bounds process");
+        // SAFETY: A fresh slot that nothing else references.
+        let process = unsafe { sched::process(*slot) };
+        for _ in 1..thread_abi::MAX_THREADS {
+            add_thread(process, *slot, &start).expect("table-bounds thread");
+        }
+        assert_eq!(
+            add_thread(process, *slot, &start),
+            Err(-11),
+            "a full process took a thread"
+        );
+    }
+    let free = sched::PROCESS_SLOTS - count;
+    assert!(
+        sched::has_room(free, 0) && !sched::has_room(free + 1, 0) && !sched::has_room(0, 1),
+        "only the thread table should be full"
+    );
+    let full = allocated(frames);
+    let refused = load_process(kernel, frames, bytes, image, direct_map, 0);
+    assert_eq!(
+        refused.map_err(|error| error.errno()),
+        Err(-11),
+        "a full thread table took a process"
+    );
+    assert_eq!(allocated(frames), full, "a refused create allocated frames");
+    for &slot in &slots[..count] {
+        // SAFETY: The process never ran, and nothing references it.
+        let mut process = unsafe { sched::discard(slot) };
+        // SAFETY: Its root has never been active, and nothing references
+        // its tree.
+        unsafe { process.space.destroy(frames) }.expect("table-bounds teardown");
+    }
+    sched::assert_drained();
+    assert_eq!(allocated(frames), baseline, "table-bounds frame leak");
+    serial::println!(
+        "MIRROR_SCHED_BOUNDS_OK processes={} threads={}",
+        sched::PROCESS_SLOTS,
+        sched::THREAD_SLOTS
+    );
+}
+
 #[derive(Debug)]
 enum CreateError {
     /// The process or thread table has no room (EAGAIN, 0030-D4).
@@ -571,11 +720,45 @@ enum CreateError {
     Paging(#[expect(dead_code, reason = "load panics print it through Debug")] PagingError),
 }
 
+impl CreateError {
+    /// The error a launch returns to its caller.
+    fn errno(&self) -> i64 {
+        match self {
+            Self::TableFull => -11,
+            Self::Paging(_) => -12,
+        }
+    }
+}
+
 /// Load a process into the process table, with its main thread queued, and
 /// return its slot. Room for both entries is checked before anything is
 /// allocated; on failure no entry exists and every frame the load took is
 /// released. The caller seeds handles, policy and access before it runs.
 fn create_process(
+    kernel: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    bytes: &[u8],
+    image: &elf::Image,
+    direct_map: u64,
+    argument: u64,
+) -> Result<usize, CreateError> {
+    let slot = load_process(kernel, frames, bytes, image, direct_map, argument)?;
+    // SAFETY: The slot was just filled, and nothing else references it.
+    let process = unsafe { sched::process(slot) };
+    serial::println!(
+        "Native process: pid={} entry={:#x} root={:#x} pages={} tables={}",
+        process.pid,
+        image.entry,
+        process.space.root_physical_address(),
+        process.space.owned_page_count(),
+        process.space.owned_table_count()
+    );
+    Ok(slot)
+}
+
+/// `create_process` without its report, which the table-bounds self-test
+/// would otherwise print for every entry it fills.
+fn load_process(
     kernel: &PageTables,
     frames: &mut FrameAllocator<'_>,
     bytes: &[u8],
@@ -723,14 +906,6 @@ fn create_process(
     let process = unsafe { sched::process(slot) };
     process.members[0] = thread;
     sched::enqueue(thread);
-    serial::println!(
-        "Native process: pid={} entry={:#x} root={:#x} pages={} tables={}",
-        pid,
-        image.entry,
-        process.space.root_physical_address(),
-        process.space.owned_page_count(),
-        process.space.owned_table_count()
-    );
     Ok(slot)
 }
 
@@ -838,16 +1013,33 @@ fn run_pair(
         ipc.is_drained(),
         "IPC messages or endpoint references leaked"
     );
-    // SAFETY: Both processes finished, ACTIVE is clear, and nothing references
-    // either entry; reap checks that every thread finished too.
-    let mut processes = unsafe { [sched::reap(first), sched::reap(second)] };
+    // Both processes are zombies now: finished, with their handles closed and
+    // their thread entries released. Validation reads their outcomes and
+    // counters in the table; only then are they reaped (0030-D5).
+    {
+        // SAFETY: Two distinct occupied slots. The scheduler has returned and
+        // ACTIVE is clear, so nothing else references either entry until
+        // these shared borrows end with this block, before the reap below.
+        let [owner, peer] = unsafe { [sched::process(first), sched::process(second)] };
+        let processes: [&Process; 2] = [owner, peer];
+        assert!(
+            processes
+                .iter()
+                .all(|process| process.zombie() && process.handles.is_empty()),
+            "a finished process kept its threads or handles"
+        );
+        validate_pair(processes, scenario, stats, surface);
+    }
+    // SAFETY: Validation's borrows have ended, ACTIVE is clear, and nothing
+    // references either entry; reap checks that each finished.
+    let mut zombies = unsafe { [sched::reap(first), sched::reap(second)] };
     sched::assert_drained();
-    for process in &mut processes {
-        assert!(process.handles.is_empty());
+    for zombie in &mut zombies {
         // SAFETY: All contexts are finished, ACTIVE is clear, the kernel root
         // is active, and no handler retains a reference into either user tree.
-        unsafe { process.space.destroy(frames) }.expect("release user address space");
+        unsafe { zombie.space.destroy(frames) }.expect("release user address space");
     }
+    // Each session ends at its own frame baseline.
     assert_eq!(
         frames.stats().unwrap().allocated_frames,
         before,
@@ -855,6 +1047,17 @@ fn run_pair(
     );
     serial::println!("MIRROR_USER_CLEANUP_OK allocated={}", before);
     serial::println!("MIRROR_VM_CLEANUP_OK allocated={}", before);
+}
+
+/// Validate a finished init pair's zombies, which stay in the table until
+/// this returns, and report the pair's markers.
+#[cfg(feature = "boot-smoke")]
+fn validate_pair(
+    processes: [&Process; 2],
+    scenario: u64,
+    stats: sched::Stats,
+    surface: Option<surface::Session<'_, '_>>,
+) {
     assert_eq!(
         processes[1].surface_tiles, 0,
         "peer painted without authority"
@@ -904,8 +1107,8 @@ fn run_pair(
     // session releases its exclusive display borrow back to the kernel console.
     assert!(processes.iter().all(|process| process.handles.is_empty()));
     serial::println!("MIRROR_USER_SURFACE_CLEANUP_OK handles_reclaimed=1");
-    validate_process(&processes[0], scenario);
-    validate_process(&processes[1], 0);
+    validate_process(processes[0], scenario);
+    validate_process(processes[1], 0);
     // Spec 0030a, acceptance 2: only role 0 fills its thread table, and the
     // kernel saw it hold every slot at once; role 1 keeps the 3-worker battery.
     assert!(
@@ -1358,10 +1561,7 @@ impl ShellRuntime<'_> {
             self.direct_map,
             kind,
         )
-        .map_err(|error| match error {
-            CreateError::TableFull => -11,
-            CreateError::Paging(_) => -12,
-        })?;
+        .map_err(|error| error.errno())?;
         // SAFETY: A fresh slot, distinct from the shell's, that nothing else
         // references; this borrow ends before any rollback removes it.
         let child = unsafe { sched::process(slot) };
@@ -1836,7 +2036,18 @@ fn create_thread(process: &mut Process, frame: &TrapFrame) -> Result<u64, i64> {
     {
         return Err(-14);
     }
-    // A full process or a full thread table both refuse with EAGAIN.
+    let owner = usize::from(process.thread().process);
+    add_thread(process, owner, &start)
+}
+
+/// Add a ready, queued thread to `process`, which occupies table slot
+/// `owner`, and return its ID. A full process or a full thread table both
+/// refuse with EAGAIN (0030-D4).
+fn add_thread(
+    process: &mut Process,
+    owner: usize,
+    start: &thread_abi::ThreadStart,
+) -> Result<u64, i64> {
     let index = process
         .members
         .iter()
@@ -1845,9 +2056,8 @@ fn create_thread(process: &mut Process, frame: &TrapFrame) -> Result<u64, i64> {
     if !sched::has_room(0, 1) {
         return Err(-11);
     }
-    // The running thread's own entry is the process's current member; this
+    // A running thread's own entry is the process's current member; this
     // insert touches only a vacant slot and the table's occupancy bitmap.
-    let owner = usize::from(process.thread().process);
     let slot = sched::insert_thread(|slot| {
         let mut thread = Thread::new(start.entry, start.stack, start.argument, owner, slot);
         thread.context.frame.fs_base = start.fs;
@@ -2000,54 +2210,66 @@ pub fn run_shell(
             .close(frames, desktop, &mut ipc, pid, Outcome::SessionEnded)
             .expect("shell child cancellation");
     }
-    // SAFETY: The shell finished, every app has been reaped, and nothing
-    // references the shell's entry or threads.
+    // The shell is a zombie now: finished, with its thread entries released.
+    // Validation reads its outcome and counters in the table; only then is
+    // it reaped (0030-D5).
+    let outcome = {
+        // SAFETY: The scheduler has returned and every app has been reaped,
+        // so nothing else references the shell's entry until this borrow
+        // ends with this block, before the reap below.
+        let desktop = unsafe { sched::process(shell) };
+        release_handles(desktop, &mut ipc);
+        assert!(desktop.zombie(), "the finished shell kept its threads");
+        assert!(desktop.handles.is_empty() && ipc.is_drained());
+        assert!(
+            ACTIVE.load(Ordering::SeqCst).is_null()
+                && ACTIVE_WINDOWS.load(Ordering::SeqCst).is_null()
+        );
+        assert_eq!(
+            surface.totals(),
+            (desktop.surface_tiles, desktop.surface_pixels)
+        );
+        let outcome = desktop.outcome.expect("shell ended without outcome");
+        if smoke {
+            validate_shell(desktop, outcome, &runtime.windows);
+        }
+        outcome
+    };
+    // SAFETY: The validation borrow has ended, and nothing references the
+    // shell's entry; reap checks that it finished.
     let mut desktop = unsafe { sched::reap(shell) };
-    release_handles(&mut desktop, &mut ipc);
-    assert!(desktop.handles.is_empty() && ipc.is_drained());
-    assert!(
-        ACTIVE.load(Ordering::SeqCst).is_null() && ACTIVE_WINDOWS.load(Ordering::SeqCst).is_null()
-    );
     sched::assert_drained();
-    assert_eq!(
-        surface.totals(),
-        (desktop.surface_tiles, desktop.surface_pixels)
-    );
     // SAFETY: The shell and children are stopped; all active pointers are clear
     // and no resource retains a reference to the shell's private address space.
     unsafe { desktop.space.destroy(frames) }.expect("shell address-space cleanup");
+    // Each session ends at its own frame baseline.
     assert_eq!(
         frames.stats().unwrap().allocated_frames,
         before,
         "shell frame leak"
     );
-    let outcome = desktop.outcome.expect("shell ended without outcome");
-    if smoke {
-        assert_eq!(outcome, Outcome::Exit(0), "shell smoke failed");
-        assert!(desktop.desktop_checks, "shell checks marker missing");
-        assert!(
-            runtime.windows.launches >= 3 && runtime.windows.closes >= 2,
-            "application lifecycle checks missing"
-        );
-        assert!(
-            runtime.windows.faults >= 1,
-            "application fault containment missing"
-        );
-        assert!(
-            runtime.windows.preemptions > 0,
-            "applications were never preempted"
-        );
-        serial::println!(
-            "MIRROR_SHELL_TESTS_OK launches={} closes={} faults={} preemptions={}",
-            runtime.windows.launches,
-            runtime.windows.closes,
-            runtime.windows.faults,
-            runtime.windows.preemptions
-        );
-    }
     serial::println!(
         "MIRROR_SHELL_CLEANUP_OK apps_reclaimed=1 outcome={:?}",
         outcome
+    );
+}
+
+/// Validate the smoke shell's zombie and its session's app lifecycle counts.
+fn validate_shell(desktop: &Process, outcome: Outcome, windows: &windows::Session) {
+    assert_eq!(outcome, Outcome::Exit(0), "shell smoke failed");
+    assert!(desktop.desktop_checks, "shell checks marker missing");
+    assert!(
+        windows.launches >= 3 && windows.closes >= 2,
+        "application lifecycle checks missing"
+    );
+    assert!(windows.faults >= 1, "application fault containment missing");
+    assert!(windows.preemptions > 0, "applications were never preempted");
+    serial::println!(
+        "MIRROR_SHELL_TESTS_OK launches={} closes={} faults={} preemptions={}",
+        windows.launches,
+        windows.closes,
+        windows.faults,
+        windows.preemptions
     );
 }
 

@@ -661,6 +661,17 @@ try {
     if ($preemptLines -ne 2 -or $preemptValid -ne 2) {
         throw "Both native process runs must report MIRROR_PREEMPT_OK with wake_lateness and ipc_lateness of at most one tick. See $serialLog."
     }
+    # Table bounds (spec 0030a, acceptance 5): before the first session, the
+    # kernel fills both tables, checks EAGAIN, and restores its frame baseline
+    # exactly, once with both tables full and once with only the thread table.
+    $bounds = @([regex]::Matches($serial, '(?m)^MIRROR_SCHED_BOUNDS_OK(?:\s|$)'))
+    $boundsValid = @([regex]::Matches($serial, '(?m)^MIRROR_SCHED_BOUNDS_OK processes=64 threads=256\r?$'))
+    $firstSession = [regex]::Match($serial, '(?m)^Native process: ')
+    $schedReady = [regex]::Match($serial, '(?m)^MIRROR_SCHED_READY ')
+    if ($bounds.Count -ne 1 -or $boundsValid.Count -ne 1 -or -not $firstSession.Success -or
+        $boundsValid[0].Index -le $schedReady.Index -or $boundsValid[0].Index -ge $firstSession.Index) {
+        throw "Mirror must report MIRROR_SCHED_BOUNDS_OK processes=64 threads=256 exactly once, after MIRROR_SCHED_READY and before the first session. See $serialLog."
+    }
     if ($serial -notmatch '(?m)^MIRROR_TLS_READY[^\r\n]* fsgsbase=0(?:\s|$)') {
         throw 'Mirror must keep direct user FS/GS base instructions disabled.'
     }
