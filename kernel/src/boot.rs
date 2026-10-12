@@ -174,6 +174,9 @@ pub enum SmokeMode {
     /// The 0054-D5 scenario: a normal requester and a background victim
     /// replace the relaunch pair, and the armed frame budget drives a kill.
     OomOrder,
+    /// The lifted class limits (0054-D5's values): a normal requester and a
+    /// protected process replace the relaunch pair (1024 MiB boot).
+    ClassLimits,
     User(u64),
 }
 
@@ -250,6 +253,7 @@ pub fn smoke_mode() -> SmokeMode {
         b"mirror.test=reset-from-triple-fault" => SmokeMode::Reset(ResetTest::TripleFault),
         b"mirror.test=reset-suppressed" => SmokeMode::Reset(ResetTest::Suppressed),
         b"mirror.test=oom-order" => SmokeMode::OomOrder,
+        b"mirror.test=class-limits" => SmokeMode::ClassLimits,
         _ => panic!("unknown smoke-test command line"),
     };
     assert!(tokens.next().is_none(), "multiple smoke-test arguments");

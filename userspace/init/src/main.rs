@@ -1137,18 +1137,102 @@ fn oom_victim() -> ! {
     }
 }
 
+/// Read SYS_VM_STATS without the battery's fixed-limit assertions (0054-D5's
+/// scenario classes report lifted values). Returns the five u64 fields.
+fn limit_stats() -> (u64, u64, u64, u64, u64) {
+    let mut bytes = [0_u8; STATS_SIZE];
+    require(
+        syscall(
+            SYS_VM_STATS,
+            bytes.as_mut_ptr() as u64,
+            STATS_SIZE as u64,
+            0,
+        ) == STATS_SIZE as i64,
+        200,
+    );
+    require(u32::from_le_bytes(bytes[..4].try_into().unwrap()) == 1, 201);
+    (
+        vm_word(&bytes, 8),
+        vm_word(&bytes, 16),
+        vm_word(&bytes, 24),
+        vm_word(&bytes, 32),
+        vm_word(&bytes, 40),
+    )
+}
+
+/// 0054-D5's class-limits requester (normal class): the lifted 1 GiB/512 MiB
+/// values report through SYS_VM_STATS; reservations take no frames up to the
+/// 1 GiB bound and fail one page past it; a small commit exercises the lifted
+/// values (the 256/512 MiB commit-bound proof runs in the kernel's own test,
+/// where materializing that much takes no resume cycles).
+fn class_limits_requester() -> ! {
+    let console = syscall(SYS_BOOT_HANDLE, 0, 0, 0);
+    require(console > 0, 60);
+    let console = console as u64;
+    let (_, _, _, reserved_limit, committed_limit) = limit_stats();
+    require(reserved_limit == 1024 * 1024 * 1024, 210);
+    require(committed_limit == 512 * 1024 * 1024, 211);
+    // Reserve the full GiB, then fail one page past it.
+    let base = syscall(SYS_VM_RESERVE, 0, 1024 * 1024 * 1024, PROT_READ_WRITE);
+    require(base >= ARENA_START as i64, 212);
+    require(
+        syscall(SYS_VM_RESERVE, 0, PAGE_SIZE, PROT_READ_WRITE) == ENOMEM,
+        213,
+    );
+    // Commit 64 pages one at a time (demand faults), then check the reading.
+    for page in 0..64u64 {
+        // SAFETY: the reservation owns this page; the write faults it in.
+        unsafe { ((base as u64 + page * PAGE_SIZE) as *mut u8).write_volatile(1) };
+    }
+    let (_, committed, _, _, _) = limit_stats();
+    require(committed == 64 * PAGE_SIZE, 214);
+    write(
+        console,
+        b"Mirror init: class limits passed
+",
+    );
+    exit(0);
+}
+
+/// 0054-D5's class-limits protected process: reserve past 4 GiB (no frames)
+/// and report it through SYS_VM_STATS.
+fn class_limits_protected() -> ! {
+    let console = syscall(SYS_BOOT_HANDLE, 0, 0, 0);
+    require(console > 0, 60);
+    let console = console as u64;
+    let big = syscall(
+        SYS_VM_RESERVE,
+        0,
+        (4 * 1024 + 1) * 1024 * 1024,
+        PROT_READ_WRITE,
+    );
+    require(big >= ARENA_START as i64, 215);
+    let (reserved, committed, _, reserved_limit, _) = limit_stats();
+    require(reserved == (4 * 1024 + 1) * 1024 * 1024, 216);
+    require(committed == 0, 217);
+    require(reserved_limit == ARENA_END - ARENA_START, 218);
+    write(console, b"Mirror init: protected reserved past 4 GiB\n");
+    exit(0);
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn init_main(launch: u64) -> ! {
     let probe = launch & 0xff;
     let role = launch >> 8;
     // 0054-D5: roles 2 and 3 are the OomOrder scenario's requester and victim;
-    // the probe bound is unchanged.
-    require(role <= 3 && probe <= 22 && (role == 0 || probe == 0), 33);
+    // roles 4 and 5 are the class-limits pair. The probe bound is unchanged.
+    require(role <= 5 && probe <= 22 && (role == 0 || probe == 0), 33);
     if role == 2 {
         oom_requester();
     }
     if role == 3 {
         oom_victim();
+    }
+    if role == 4 {
+        class_limits_requester();
+    }
+    if role == 5 {
+        class_limits_protected();
     }
     fpu::check_initial();
     tls::check_initial();

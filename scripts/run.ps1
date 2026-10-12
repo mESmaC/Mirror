@@ -22,7 +22,7 @@ param(
     [switch]$LegacyPic,
     [switch]$PitTimer,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
-    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation', 'Ps2BatTimeout', 'Ps2StaleScancode', 'VmmouseError', 'Reset', 'ResetFromKbc', 'ResetFromCf9', 'ResetFromTripleFault', 'ResetSuppressed', 'OomOrder')][string]$Fault = 'None',
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation', 'Ps2BatTimeout', 'Ps2StaleScancode', 'VmmouseError', 'Reset', 'ResetFromKbc', 'ResetFromCf9', 'ResetFromTripleFault', 'ResetSuppressed', 'OomOrder', 'ClassLimits')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -338,10 +338,15 @@ $testMode = switch ($Fault) {
     'ResetFromTripleFault' { 'reset-from-triple-fault' }
     'ResetSuppressed' { 'reset-suppressed' }
     'OomOrder' { 'oom-order' }
+    'ClassLimits' { 'class-limits' }
     default { $null }
 }
 $kernelArguments = @()
 if ($null -ne $testMode) { $kernelArguments += "mirror.test=$testMode" }
+# 0054-D5's commit proof needs frames that allow the 512 MiB bound.
+if ($Fault -eq 'ClassLimits' -and $MemoryMiB -ne 1024) {
+    throw 'The class-limits scenario needs -MemoryMiB 1024.'
+}
 if ($LegacyPic) { $kernelArguments += 'mirror.irq=pic' }
 if ($PitTimer) { $kernelArguments += 'mirror.timer=pit' }
 if ($kernelArguments.Count -gt 0) { $bootConfig += "`n    cmdline: $($kernelArguments -join ' ')`n" }
@@ -533,8 +538,8 @@ try {
     # 0054-D5: the OomOrder scenario runs one battery pair plus its requester
     # and victim instead of the relaunch pair, so init's per-process and
     # per-pair counts halve.
-    $initRuns = if ($Fault -eq 'OomOrder') { 2 } else { 4 }
-    $pairRuns = if ($Fault -eq 'OomOrder') { 1 } else { 2 }
+    $initRuns = if ($Fault -in @('OomOrder', 'ClassLimits')) { 2 } else { 4 }
+    $pairRuns = if ($Fault -in @('OomOrder', 'ClassLimits')) { 1 } else { 2 }
     # A reset case restarts after every self-test, and -no-reboot turns the
     # guest reset into a QEMU exit with code 0 (spec 0058a, D11).
     $resetCase = $Fault -like 'Reset*'
@@ -1029,6 +1034,18 @@ try {
     }
     elseif ($oomKills.Count -ne 0 -or $requesterDone.Count -ne 0) {
         throw "Mirror unexpectedly ran OOM victim selection. See $serialLog."
+    }
+    # 0054-D5's lifted class limits, in the 1024 MiB boot: the normal
+    # requester and the protected process both complete.
+    $limitLines = [regex]::Matches($serial, '(?m)^user: Mirror init: class limits passed\\n\r?$')
+    $protectedLine = [regex]::Matches($serial, '(?m)^user: Mirror init: protected reserved past 4 GiB\\n\r?$')
+    if ($Fault -eq 'ClassLimits') {
+        if ($MemoryMiB -ne 1024 -or $limitLines.Count -ne 1 -or $protectedLine.Count -ne 1) {
+            throw "The class-limits scenario needs the 1024 MiB boot and both completions. See $serialLog."
+        }
+    }
+    elseif ($limitLines.Count -ne 0 -or $protectedLine.Count -ne 0) {
+        throw "Mirror unexpectedly ran the class-limits scenario. See $serialLog."
     }
     $threadScenarios = @{
         ThreadLastExit = 'MIRROR_THREAD_LAST_EXIT_OK'

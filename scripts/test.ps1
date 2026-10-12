@@ -118,6 +118,10 @@ try {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Release:$release -Fault $fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
             Save-MirrorSmokeLogs "$profile-$fault"
         }
+        # 0054-D5's lifted class limits need the 1024 MiB boot, where frames
+        # allow the 512 MiB commit bound.
+        & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Release:$release -Fault ClassLimits -MemoryMiB 1024 -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+        Save-MirrorSmokeLogs "$profile-ClassLimits"
         # The legacy VirtIO fixture holds the suite's only write, flush,
         # write-error and dirty-shutdown checks until AHCI gains a write path
         # (0014-D5, spec 0062).

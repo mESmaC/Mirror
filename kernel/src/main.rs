@@ -472,6 +472,7 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
             | boot::SmokeMode::Ps2StaleScancode
             | boot::SmokeMode::VmmouseError
             | boot::SmokeMode::OomOrder
+            | boot::SmokeMode::ClassLimits
             | boot::SmokeMode::SmpTlbTimeout => {
                 interrupts::arm_expected_page_fault(paging::TEST_ADDRESS)
             }

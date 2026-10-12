@@ -223,9 +223,18 @@ enum MemoryClass {
 }
 
 impl MemoryClass {
-    /// (reserved, committed) limits in bytes. Today's values for every class.
+    /// (reserved, committed) limits in bytes. With the reserve floor and the
+    /// victim order in place (0054-D4/D5), normal, agent and background lift to
+    /// 1 GiB / 512 MiB; protected is bounded by the arena and free memory; the
+    /// test class keeps today's values so init's battery passes unchanged.
     fn limits(self) -> (u64, u64) {
-        (vm_abi::RESERVED_LIMIT, vm_abi::COMMITTED_LIMIT)
+        match self {
+            MemoryClass::Protected => (vm_abi::ARENA_END - vm_abi::ARENA_START, u64::MAX),
+            MemoryClass::Normal | MemoryClass::Agent | MemoryClass::Background => {
+                (1024 * 1024 * 1024, 512 * 1024 * 1024)
+            }
+            MemoryClass::Test => (vm_abi::RESERVED_LIMIT, vm_abi::COMMITTED_LIMIT),
+        }
     }
 
     /// 0054-D4: only the protected class may draw the reserve floor.
@@ -626,10 +635,10 @@ pub fn run_init(
     // exercise frame reuse and continuation recovery after both exit and fault.
     // 0059-D1: a session's seeding is a heap safe point.
     heap::ensure(kernel, frames, direct_map);
-    // 0054-D5's scenario replaces the relaunch pair with its requester/victim
-    // pair.
+    // 0054-D5's scenarios replace the relaunch pair with their own pairs.
     let oom_order = matches!(boot::smoke_mode(), boot::SmokeMode::OomOrder);
-    if !oom_order {
+    let class_limits = matches!(boot::smoke_mode(), boot::SmokeMode::ClassLimits);
+    if !oom_order && !class_limits {
         // 0059 test 2's second step: the relaunch pair holds the heap
         // near-full at its first loop top, so its next loop-top ensure grows
         // mid-session.
@@ -643,6 +652,8 @@ pub fn run_init(
     }
     if oom_order {
         run_oom_pair(kernel, frames, bytes, &image, direct_map);
+    } else if class_limits {
+        run_limits_pair(kernel, frames, bytes, &image, direct_map);
     } else {
         run_pair(kernel, frames, bytes, &image, direct_map, 0, display);
     }
@@ -1270,7 +1281,190 @@ fn run_pair(
     );
 }
 
-/// The OomOrder scenario (0054-D5, acceptance 2): a normal requester and a
+/// The class-limits scenario (0054-D5, acceptance 4): a normal requester and
+/// a protected process replace the relaunch pair in the 1024 MiB boot. The
+/// requester reserves to its lifted bound and one page past (no frames),
+/// commits past today's 256 MiB cap, and fails one page past its 512 MiB
+/// commit bound; the protected process reserves past 4 GiB.
+#[cfg(feature = "boot-smoke")]
+fn run_limits_pair(
+    kernel: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    bytes: &[u8],
+    image: &elf::Image,
+    direct_map: u64,
+) {
+    let before = frames.stats().expect("recycling required").allocated_frames;
+    let heap_before = heap::stats().size;
+    // Acceptance 4's commit half, in-kernel (no resume cycles): with the
+    // normal class's lifted values, commit 256 MiB — past today's cap — then
+    // to the 512 MiB bound, and fail one page past it where frames allow (the
+    // 1024 MiB boot), with the frame baseline restored exactly.
+    {
+        // SAFETY: Same exclusive, inactive process construction as
+        // test_load_rollback; the root never activates.
+        let mut space = unsafe { UserAddressSpace::new(kernel, frames) }.unwrap();
+        let (reserved_limit, committed_limit) = MemoryClass::Normal.limits();
+        let mut vm = vm::Vm::new(reserved_limit, committed_limit, false);
+        let base = vm
+            .reserve(0, 512 * 1024 * 1024 + PAGE_SIZE, vm_abi::PROT_READ_WRITE)
+            .unwrap();
+        // SAFETY: the kernel root is active, the space is inactive, and the
+        // allocator is unique; each span stays within the fixed bitmap bound.
+        unsafe {
+            vm.materialize(
+                &mut space,
+                frames,
+                direct_map,
+                base,
+                256 * 1024 * 1024,
+                true,
+            )
+            .unwrap();
+        }
+        assert_eq!(vm.stats().committed_bytes, 256 * 1024 * 1024);
+        // SAFETY: as above, for the second half of the bound.
+        unsafe {
+            vm.materialize(
+                &mut space,
+                frames,
+                direct_map,
+                base + 256 * 1024 * 1024,
+                256 * 1024 * 1024,
+                true,
+            )
+            .unwrap();
+        }
+        assert_eq!(vm.stats().committed_bytes, 512 * 1024 * 1024);
+        let before_quota = frames.stats().unwrap().allocated_frames;
+        assert_eq!(
+            // SAFETY: as above; the quota failure changes nothing.
+            unsafe {
+                vm.materialize(
+                    &mut space,
+                    frames,
+                    direct_map,
+                    base + 512 * 1024 * 1024,
+                    PAGE_SIZE as usize,
+                    true,
+                )
+            },
+            Err(vm::VmError::QuotaExceeded)
+        );
+        assert_eq!(frames.stats().unwrap().allocated_frames, before_quota);
+        // SAFETY: the session owns the span; release returns every frame.
+        unsafe { vm.release(&mut space, frames, base, 512 * 1024 * 1024 + PAGE_SIZE) }.unwrap();
+        // SAFETY: the root was never active and nothing references its tree.
+        unsafe { space.destroy(frames) }.unwrap();
+        assert_eq!(frames.stats().unwrap().allocated_frames, before);
+    }
+    let requester = create_process(
+        kernel,
+        frames,
+        bytes,
+        image,
+        direct_map,
+        4 << 8,
+        MemoryClass::Normal,
+    )
+    .expect("load class-limits requester");
+    let protected = create_process(
+        kernel,
+        frames,
+        bytes,
+        image,
+        direct_map,
+        5 << 8,
+        MemoryClass::Protected,
+    )
+    .expect("load class-limits protected");
+    let tables_peak: usize = [requester, protected]
+        .into_iter()
+        .map(|slot| {
+            // SAFETY: Seeding holds one process reference at a time.
+            unsafe { sched::process(slot) }.space.owned_table_count()
+        })
+        .sum();
+    // Console access only: this pair runs no IPC.
+    let mut ipc = Ipc::new();
+    for slot in [requester, protected] {
+        // SAFETY: Seeding holds one process reference at a time.
+        let process = unsafe { sched::process(slot) };
+        let handle = process
+            .handles
+            .insert(Object::Console, capability::WRITE)
+            .expect("bootstrap capability");
+        ipc.grant(Capability {
+            object: Object::Console,
+            rights: capability::WRITE,
+        });
+        process.boot_handles[0] = handle;
+    }
+    let mut session = sched::Session {
+        ipc,
+        surface: None,
+        input: None,
+        runtime: None,
+        end: sched::End::Pair {
+            first: requester,
+            second: protected,
+            scenario: 0,
+        },
+    };
+    sched::run(&mut session, kernel, frames, direct_map);
+    assert!(session.ipc.is_drained(), "IPC endpoints leaked");
+    {
+        // SAFETY: Two distinct occupied slots, and no other reference.
+        let pair = unsafe { [sched::process(requester), sched::process(protected)] };
+        assert_eq!(
+            pair[0].outcome,
+            Some(Outcome::Exit(0)),
+            "requester: {:?}",
+            pair[0].outcome
+        );
+        assert_eq!(
+            pair[1].outcome,
+            Some(Outcome::Exit(0)),
+            "protected: {:?}",
+            pair[1].outcome
+        );
+    }
+    // SAFETY: Validation's borrows have ended, ACTIVE is clear, and nothing
+    // references either entry; reap checks that each finished.
+    let mut zombies = unsafe { [sched::reap(requester), sched::reap(protected)] };
+    sched::assert_drained();
+    for zombie in &mut zombies {
+        // 0054-D5: an OOM victim's space was destroyed at kill time.
+        if !zombie.space_destroyed {
+            // SAFETY: All contexts are finished, ACTIVE is clear, the kernel
+            // root is active, and no handler retains a reference into the tree.
+            unsafe { zombie.space.destroy(frames) }.expect("release user address space");
+        }
+        zombie.check_charges_zero();
+    }
+    assert_eq!(
+        frames.stats().unwrap().allocated_frames,
+        // 0050-D2's shared rule, heap term: heap pages committed this session
+        // are not a leak.
+        before + (heap::stats().size - heap_before) / PAGE_SIZE as usize,
+        "user frame leak"
+    );
+    serial::println!("MIRROR_USER_CLEANUP_OK allocated={}", before);
+    serial::println!("MIRROR_VM_CLEANUP_OK allocated={}", before);
+    // 0059 acceptance test 4: the leak probe runs at the boot's last drain.
+    if CHARGE_PROBE.swap(false, Ordering::Relaxed) {
+        let zombie = &mut zombies[0];
+        zombie.surface_frames = 1;
+        assert!(!zombie.charges_zero(), "reap check missed a leaked charge");
+        zombie.surface_frames = 0;
+        assert!(zombie.charges_zero(), "a repaired charge must pass");
+    }
+    serial::println!(
+        "MIRROR_HEAP_CHARGE_OK tables_peak={} surfaces_peak=0",
+        tables_peak
+    );
+}
+
 /// background victim replace the relaunch pair. The armed kernel-wide frame
 /// budget shrinks only this scenario: the requester's commits exhaust it, the
 /// victim dies OutOfMemory, and the retry succeeds. The budget lifts before
