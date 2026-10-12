@@ -542,8 +542,18 @@ function Invoke-MirrorHygieneProbe {
         if ($deadline.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw "The shell launcher did not appear. See $bootScreen and $serialLog." }
         Start-Sleep -Milliseconds 100
     } while ($true)
-    Send-MirrorPointerMotion $Process (-2560) (-1600)
-    Send-MirrorPointerMotion $Process 64 776
+    # The Notes launcher sits at surface pixel (64,776). Default kernels print
+    # no shell READY marker, so the desktop origin comes from the framebuffer
+    # size: one absolute move gets there (spec 0017c), and -RelativePointer
+    # clamps to the corner and moves by relative PS/2 motion instead.
+    $desktop = Get-MirrorDesktopRectangle
+    if ($RelativePointer) {
+        Send-MirrorPointerMotion $Process (-2560) (-1600)
+        Send-MirrorPointerMotion $Process 64 776
+    }
+    else {
+        Send-MirrorPointerPosition $Process ($desktop.X + 64) ($desktop.Y + 776)
+    }
     Send-MirrorPointerButton $Process 'left' $true
     Start-Sleep -Milliseconds 40
     Send-MirrorPointerButton $Process 'left' $false
@@ -555,9 +565,7 @@ function Invoke-MirrorHygieneProbe {
     }
 
     # Step 3: Notes receives the sentinel and pointer motion with empty serial.
-    # Default kernels print no shell READY marker, so the desktop origin comes
-    # from the framebuffer size; step 2 left the pointer on the Notes launcher.
-    $desktop = Get-MirrorDesktopRectangle
+    # Step 2 left the pointer on the Notes launcher.
     Invoke-MirrorHygieneInput $Process 'notes' 'zqxjvw' ($desktop.X + 64) ($desktop.Y + 776)
 
     # Step 4: Esc ends the shell session; repeat on the kernel console, whose
