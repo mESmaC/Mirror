@@ -7,7 +7,7 @@ Small, self-contained specs. Each one covers one bounded piece of work that a si
 
 ## Spec map (v1)
 
-The former M0's specs are drafted in this folder (see each file's Status), as is side spec 0029: most sit in Phase 0, 0015b now sits in Phase 11, and 0019 splits across Phases 1 and 6 (RD8). Phase 1's 0030a, 0050 and 0059 are confirmed and on `main` (2026-10-12). The vmrun lane (0015c, 0015d) and Phase 1's 0019a, 0019c, 0019d and 0054a, with 0054a's unnumbered reserve and OOM follow-up (review item C8, awaiting Cameron), are drafted on author branches, not yet on `main`. 0058a and the rest of the specs of Phases 1-11 are planned, not yet drafted. Each one is sized for one agent and cites the ledger IDs it implements.
+The former M0's specs are drafted in this folder (see each file's Status), as is side spec 0029: most sit in Phase 0, 0015b now sits in Phase 11, and 0019 splits across Phases 1 and 6 (RD8). Phase 1's 0030a, 0050 and 0059 are confirmed and on `main` (2026-10-12). The vmrun lane (0015c, 0015d) and Phase 1's 0019a, 0019c, 0019d and 0054a, with 0054a's unnumbered reserve and OOM follow-up (review item C8, awaiting Cameron), are drafted on author branches, not yet on `main`. 0058a is drafted and implemented on `claude/0058a-reboot`; the rest of the specs of Phases 1-11 are planned, not yet drafted. Each one is sized for one agent and cites the ledger IDs it implements.
 
 The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-10-11 (decisions.md, Phases). Items marked NEW or split are the re-plan's proposals: each is confirmed, and numbered or lettered, when its phase comes up (RD24). On 2026-10-12 Cameron confirmed RS6, RD1's Phase 0 items (the vmrun lane, the G11 docs commit and 0058a), RD2, RD6, RD7, RD8, RD16 and RD21, and RD24's numbers for the vmrun lane and three Phase 1 items: 0015c and 0015d (the vmrun lane), 0019a, 0019c and 0019d (0019's Phase 1 slices), 0030a, and 0059 (kernel heap v2). RD6 and RD7 confirm the 0054, 0056 and 0058 splits by name. The re-plan's other RS and RD decisions are taken when its Due column says.
 
@@ -29,7 +29,7 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 - 0017a PS/2: separate keyboard and mouse loss handling, mouse coalescing and resync. Done (2026-10-12)
 - 0017b PS/2: time-based init timeouts and init order. Done (2026-10-12)
 - 0017c Absolute pointing on VMware: vmmouse protocol (S1a, S1d). Implemented (2026-10-12); the GUI half of check 7 is deferred (Cameron, 2026-10-12)
-- 0058a (split): reboot without AML (FADT reset register, then 8042, then 0xCF9, then triple fault) and a console `restart` command. Confirmed (2026-10-12: RD1, RD7); not yet drafted
+- 0058a (split): reboot without AML (FADT reset register, then 8042, then 0xCF9, then triple fault) and a console `restart` command. Confirmed (2026-10-12: RD1, RD7); drafted and implemented on `claude/0058a-reboot`, its VMware checks (tests 7-9) pending
 - 0018 Performance baseline harness: the four gates, measured on Linux and Windows VMs in the host's ULM monitor mode (G7, G7a, O3). Its Linux and Windows baseline track runs in parallel; its Mirror rows follow Phase 4
 - 0013 showed VMware handing off in xAPIC mode (2026-10-11), so 0055a stays in Phase 1 (RD11). If 0017c check 7 needs a Tools-running state, 0087a moves here (RD10).
 

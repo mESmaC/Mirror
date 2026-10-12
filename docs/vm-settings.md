@@ -103,7 +103,7 @@ rtc.diffFromUTC = "0"
 monitor_control.restrict_backdoor = "TRUE"
 ```
 
-**Left unset.** `keyboard.queryScancodeSet`, which must not be `"FALSE"` (0017b, open question 1), and `chipset.motherboardLayout`.
+**Left unset.** `keyboard.queryScancodeSet`, which must not be `"FALSE"` (0017b, open question 1), and `chipset.motherboardLayout`. Also `acpi.exposeHardReset`, whose missing-key default should have the firmware describe the 0xCF9 reset register that `restart` writes first, and `gui.silentRebootOnOsCrash`, so a triple fault, the last restart method, is not silenced (0058-D6; 0058a's test 7 checks the first).
 
 ## Display
 
