@@ -105,6 +105,21 @@ monitor_control.restrict_backdoor = "TRUE"
 
 **Left unset.** `keyboard.queryScancodeSet`, which must not be `"FALSE"` (0017b, open question 1), and `chipset.motherboardLayout`. Also `acpi.exposeHardReset`, whose missing-key default should have the firmware describe the 0xCF9 reset register that `restart` writes first, and `gui.silentRebootOnOsCrash`, so a triple fault, the last restart method, is not silenced (0058-D6; 0058a's test 7 checks the first).
 
+## Daily VM (G11)
+
+Cameron's daily-drive VM (ledger G11, RD16) uses every reference setting above, with these differences: 20 GB of memory and 12 vCPUs on the 32 GB, 20-core host, NAT networking, and VMware's VNC server on localhost for headless driving (0018-D3's keys). The serial file sits beside the `.vmx`. Spec 0067 adds its pool disks later.
+
+```
+memsize = "20480"
+numvcpus = "12"
+ethernet0.connectionType = "nat"
+RemoteDisplay.vnc.enabled = "TRUE"
+RemoteDisplay.vnc.ip = "127.0.0.1"
+RemoteDisplay.vnc.port = "5901"
+```
+
+Leave `RemoteDisplay.vnc.password` and `RemoteDisplay.vnc.keyMap` unset: the server listens only on localhost. VMware drops the first pointer event after power-on, so a VNC driver sends one priming move first (0017c).
+
 ## Display
 
 Mirror supports any display size (ledger S1c). The default image pins no display mode. Until spec 0069, Mirror uses the GOP mode that firmware and Limine pick, and until 0027a lifts the cap the desktop is capped at a centered 1280x800 (`kernel/src/surface.rs`).
