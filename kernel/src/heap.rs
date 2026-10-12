@@ -58,6 +58,8 @@ struct KernelAllocator {
     /// The largest failed allocation awaiting growth: (key, packed layout),
     /// guarded by this allocator's lock. The key is size + align - 1 (0059-D1).
     shortfall: UnsafeCell<(u64, u64)>,
+    /// The slab layer's live pages (0059-D2), guarded by the same lock.
+    slabs: UnsafeCell<SlabState>,
 }
 
 // SAFETY: Every access to the heap is protected by the acquire/release lock.
@@ -72,6 +74,9 @@ impl KernelAllocator {
             locked: AtomicBool::new(false),
             heap: UnsafeCell::new(Heap::empty()),
             shortfall: UnsafeCell::new((0, 0)),
+            slabs: UnsafeCell::new(SlabState {
+                pages: [0; SLAB_PAGE_LIMIT],
+            }),
         }
     }
 
@@ -88,6 +93,20 @@ impl KernelAllocator {
             allocator: self,
             restore_interrupts,
             _same_cpu: PhantomData,
+        }
+    }
+
+    /// Record a missed layout for the next safe point (0059-D1), keeping the
+    /// largest pending one by its size + align - 1 key. The caller holds the
+    /// heap lock.
+    fn note_shortfall_locked(&self, layout: Layout) {
+        let key = layout_key(layout);
+        let shortfall = self.shortfall.get();
+        // SAFETY: the caller holds the heap lock, so the cell is owned.
+        unsafe {
+            if key > (*shortfall).0 {
+                *shortfall = (key, pack_layout(layout));
+            }
         }
     }
 }
@@ -139,31 +158,40 @@ unsafe impl GlobalAlloc for KernelAllocator {
             return core::ptr::null_mut();
         }
         let mut heap = self.lock();
+        // Slab classes serve from their pages first (0059-D2).
+        if slab_class(layout).is_some() {
+            let pointer = slab_alloc(&mut heap, &self.slabs, layout);
+            if !pointer.is_null() {
+                return pointer;
+            }
+            // A slab refill miss records a page-sized shortfall (0059-D1), so a
+            // safe point grows for it even when first-fit serves this object.
+            let page_layout = Layout::from_size_align(PAGE_SIZE as usize, PAGE_SIZE as usize)
+                .expect("page layout");
+            self.note_shortfall_locked(page_layout);
+        }
         match heap.allocate_first_fit(layout) {
             Ok(pointer) => pointer.as_ptr(),
             Err(()) => {
                 // 0059-D1: record the miss for the next safe point, keeping the
                 // largest pending layout by its size + align - 1 key.
-                let key = layout_key(layout);
-                let shortfall = self.shortfall.get();
-                // SAFETY: the heap lock is held above, so this cell is owned.
-                unsafe {
-                    if key > (*shortfall).0 {
-                        *shortfall = (key, pack_layout(layout));
-                    }
-                }
+                self.note_shortfall_locked(layout);
                 core::ptr::null_mut()
             }
         }
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        let mut heap = self.lock();
+        // The page table decides: a slab-served pointer's page is tracked
+        // (0059-D2); a first-fit-served one's is not, even with a slab layout.
+        if slab_class(layout).is_some() && slab_tracked(&self.slabs, pointer) {
+            slab_free(&mut heap, &self.slabs, pointer, layout);
+            return;
+        }
         // SAFETY: GlobalAlloc requires a non-null live allocation from this
         // allocator and exactly its original layout, relinquished by the caller.
-        unsafe {
-            self.lock()
-                .deallocate(NonNull::new_unchecked(pointer), layout)
-        };
+        unsafe { heap.deallocate(NonNull::new_unchecked(pointer), layout) };
     }
 }
 
@@ -694,6 +722,176 @@ pub fn ensure(tables: &PageTables, frames: &mut FrameAllocator<'_>, offset: u64)
     }
 }
 
+// ---- Slab caches (0059-D2) ----
+
+/// Size classes 16..=2048 bytes by powers of two; one 4 KiB arena page per
+/// slab page; a layout routes to a slab only when max(size, align) rounded up
+/// to a power of two lands in that range. Everything else keeps first-fit.
+const SLAB_CLASS_COUNT: usize = 8;
+const SLAB_MIN_SHIFT: u32 = 4; // 16 bytes
+const SLAB_PAGE_LIMIT: usize = 64; // at most 64 live slab pages (256 KiB)
+/// Bits per slab page's object bitmap: enough for the densest class (class 16
+/// keeps (4096 - 64) / 16 = 252 objects).
+const SLAB_BITMAP_WORDS: usize = 4;
+
+/// One slab page's header, at the page's base. Objects live after it, starting
+/// at the next class-size boundary.
+#[repr(C)]
+struct SlabPage {
+    class: u8,
+    used: u16,
+    /// Bit i is 1 while object i is free; bits at or past the page's capacity
+    /// are always 0.
+    bitmap: [u64; SLAB_BITMAP_WORDS],
+}
+
+/// The live slab pages, by arena virtual address (0 = an empty slot). Guarded
+/// by the heap lock, like the free list.
+struct SlabState {
+    pages: [u64; SLAB_PAGE_LIMIT],
+}
+
+/// The size class serving a layout (0059-D2), or None to keep first-fit.
+fn slab_class(layout: Layout) -> Option<usize> {
+    let class = layout.size().max(layout.align()).next_power_of_two();
+    if !(SLAB_MIN_SHIFT..SLAB_MIN_SHIFT + SLAB_CLASS_COUNT as u32).contains(&class.trailing_zeros())
+    {
+        return None;
+    }
+    Some((class.trailing_zeros() - SLAB_MIN_SHIFT) as usize)
+}
+
+/// The class's object size in bytes.
+fn slab_class_size(class: usize) -> usize {
+    1 << (SLAB_MIN_SHIFT + class as u32)
+}
+
+/// The class's object-area offset: the header rounded up to the class size, so
+/// every object is class-size aligned (0059-D2).
+fn slab_object_area(class: usize) -> usize {
+    size_of::<SlabPage>().next_multiple_of(slab_class_size(class))
+}
+
+/// The class's objects per page.
+fn slab_capacity(class: usize) -> usize {
+    (PAGE_SIZE as usize - slab_object_area(class)) / slab_class_size(class)
+}
+
+/// Allocate one object of the class from a live page or a fresh page (0059-D2).
+/// Returns null when no live page has a free object and no fresh page is
+/// available (or the page table is full); the caller then falls back to
+/// first-fit, which records the shortfall on its own miss.
+///
+/// The heap lock is held throughout, so the page table and the pages are
+/// exclusively owned here.
+fn slab_alloc(heap: &mut Heap, slabs: &UnsafeCell<SlabState>, layout: Layout) -> *mut u8 {
+    let Some(class) = slab_class(layout) else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: the heap lock is held by the caller, so the slab state is
+    // exclusively owned here.
+    let state = unsafe { &mut *slabs.get() };
+    for &page in state.pages.iter().filter(|page| **page != 0) {
+        // SAFETY: a live slab page is owned by the slab layer, mapped in the
+        // arena for the kernel's lifetime, and exclusively owned under the lock.
+        let header = unsafe { &mut *(page as *mut SlabPage) };
+        if header.class as usize != class {
+            continue;
+        }
+        let capacity = slab_capacity(class);
+        for (word, bits) in header.bitmap.iter_mut().enumerate() {
+            if *bits == 0 {
+                continue;
+            }
+            let bit = bits.trailing_zeros() as usize;
+            let index = word * 64 + bit;
+            if index >= capacity {
+                continue; // the bits past the page's capacity are never set
+            }
+            *bits &= !(1 << bit);
+            header.used += 1;
+            let offset = slab_object_area(class) + index * slab_class_size(class);
+            return (page as usize + offset) as *mut u8;
+        }
+    }
+    // No live page serves it: refill from the free list.
+    let page_layout =
+        Layout::from_size_align(PAGE_SIZE as usize, PAGE_SIZE as usize).expect("page layout");
+    let Ok(page) = heap.allocate_first_fit(page_layout) else {
+        return core::ptr::null_mut();
+    };
+    let Some(slot) = state.pages.iter_mut().find(|slot| **slot == 0) else {
+        // The page table is full: release the page and decline to first-fit.
+        // SAFETY: the refill's own fresh allocation, released with its layout.
+        unsafe { heap.deallocate(page, page_layout) };
+        return core::ptr::null_mut();
+    };
+    let page_va = page.as_ptr() as u64;
+    *slot = page_va;
+    let capacity = slab_capacity(class);
+    assert!(
+        capacity <= SLAB_BITMAP_WORDS * 64,
+        "slab capacity over bitmap"
+    );
+    let mut bitmap = [0u64; SLAB_BITMAP_WORDS];
+    for index in 0..capacity {
+        bitmap[index / 64] |= 1 << (index % 64);
+    }
+    // SAFETY: the fresh page is exclusively owned by the slab layer here, and
+    // the header write covers exactly the page's header.
+    unsafe {
+        (page_va as *mut SlabPage).write(SlabPage {
+            class: class as u8,
+            used: 1,
+            bitmap,
+        });
+    }
+    // The first object of the new page is object 0.
+    // SAFETY: the header is initialized above and exclusively owned.
+    unsafe { (*(page_va as *mut SlabPage)).bitmap[0] &= !1 };
+    (page_va as usize + slab_object_area(class)) as *mut u8
+}
+
+/// Whether the pointer's page is a live slab page (0059-D2).
+fn slab_tracked(slabs: &UnsafeCell<SlabState>, pointer: *mut u8) -> bool {
+    let page = pointer as u64 & !(PAGE_SIZE - 1);
+    // SAFETY: a read-only membership check under the heap lock.
+    let state = unsafe { &*slabs.get() };
+    state.pages.contains(&page)
+}
+
+/// Free one slab object (0059-D2); its empty page returns to the free list.
+fn slab_free(heap: &mut Heap, slabs: &UnsafeCell<SlabState>, pointer: *mut u8, layout: Layout) {
+    let class = slab_class(layout).expect("slab free of a non-slab layout");
+    let page = pointer as u64 & !(PAGE_SIZE - 1);
+    // SAFETY: the heap lock is held by the caller.
+    let state = unsafe { &mut *slabs.get() };
+    let Some(slot) = state.pages.iter_mut().find(|slot| **slot == page) else {
+        panic!("slab free of an untracked page");
+    };
+    // SAFETY: the table tracks this page as a live slab page.
+    let header = unsafe { &mut *(page as *mut SlabPage) };
+    assert_eq!(
+        header.class as usize, class,
+        "slab free with a mismatched class"
+    );
+    let index =
+        (pointer as usize - page as usize - slab_object_area(class)) / slab_class_size(class);
+    let (word, bit) = (index / 64, index % 64);
+    assert!(header.bitmap[word] & (1 << bit) == 0, "slab double free");
+    header.bitmap[word] |= 1 << bit;
+    header.used -= 1;
+    if header.used == 0 {
+        // The empty page returns to the free list, so coalescing is unchanged.
+        *slot = 0;
+        let page_layout =
+            Layout::from_size_align(PAGE_SIZE as usize, PAGE_SIZE as usize).expect("page layout");
+        // SAFETY: the page is no longer referenced by the slab layer, and it is
+        // released with its exact refill layout.
+        unsafe { heap.deallocate(NonNull::new_unchecked(page as *mut u8), page_layout) };
+    }
+}
+
 /// Grow once by MAX_GROW_PAGES, retaining a live allocation and an older user root.
 ///
 /// # Safety
@@ -1025,6 +1223,43 @@ pub fn self_test() {
         unsafe { ALLOCATOR.dealloc(pointer, layouts[index]) };
     }
     assert_eq!(stats(), baseline);
+
+    // 0059-D2: slabs. Cycle every size class: allocate one page's worth of
+    // objects plus one (forcing a refill), pattern-check, and free. Every
+    // emptied page returns to the free list, proven by the stats restoration
+    // here and the whole-heap reuse below. The large-alignment case bypasses
+    // the slabs entirely.
+    assert!(slab_class(Layout::from_size_align(71, 32768).unwrap()).is_none());
+    let slab_baseline = stats();
+    let mut pointers = [core::ptr::null_mut(); 257];
+    for class in 0..SLAB_CLASS_COUNT {
+        let size = slab_class_size(class);
+        let layout = Layout::from_size_align(size, size).unwrap();
+        let count = slab_capacity(class) + 1;
+        assert!(count <= 257, "slab test count over the pointer array");
+        for slot in pointers.iter_mut().take(count) {
+            // SAFETY: a valid nonzero layout; null is checked before use.
+            *slot = unsafe { ALLOCATOR.alloc(layout) };
+            assert!(!slot.is_null(), "slab allocation failed");
+            // SAFETY: the fresh object owns `size` writable bytes.
+            unsafe { slot.write_bytes(0x60 + class as u8, size) };
+        }
+        for slot in pointers.iter().take(count) {
+            // SAFETY: each object remains live; its first and last bytes were
+            // written and still hold the class's pattern.
+            unsafe {
+                assert_eq!(slot.read(), 0x60 + class as u8);
+                assert_eq!(slot.add(size - 1).read(), 0x60 + class as u8);
+            }
+        }
+        for slot in pointers.iter_mut().take(count) {
+            // SAFETY: each object is freed exactly once with its original
+            // layout.
+            unsafe { ALLOCATOR.dealloc(*slot, layout) };
+            *slot = core::ptr::null_mut();
+        }
+        assert_eq!(stats(), slab_baseline, "slab cycle leaked a page");
+    }
 
     for impossible in [
         Layout::from_size_align(isize::MAX as usize, 1).unwrap(),
