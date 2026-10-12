@@ -3427,6 +3427,10 @@ pub fn run_shell(
         runtime: Some(runtime),
         end: sched::End::Shell { shell },
     };
+    // SAFETY: Seeding owns the table with no published process borrow. Only
+    // the selected interactive shell contributes perf milestones and memory.
+    let shell_pid = unsafe { sched::process(shell) }.pid;
+    crate::perf::start_session(shell_pid, frames);
     sched::run(&mut session, kernel, frames, direct_map);
     let sched::Session {
         mut ipc,
@@ -4085,6 +4089,8 @@ fn receive_input(
     {
         return -14;
     }
+    // A checked physical Input poll counts even when its queue is empty.
+    crate::perf::input_poll(process.pid);
     let Some(event) = session.peek() else {
         return -11;
     };
@@ -4270,6 +4276,9 @@ fn surface_present(process: &mut Process, handle: u64, address: u64, length: u64
         Ok(pixels) => {
             process.surface_tiles += 1;
             process.surface_pixels += pixels as u64;
+            if pixels != 0 {
+                crate::perf::frame(process.pid);
+            }
             length as i64
         }
         Err(_) => -22,

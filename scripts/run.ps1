@@ -3,6 +3,7 @@ param(
     [switch]$Release,
     [switch]$Smoke,
     [switch]$Trace,
+    [AllowEmptyString()][string]$Perf,
     [switch]$NoBuild,
     [switch]$Graphical,
     [switch]$NoDisplayDevice,
@@ -22,7 +23,7 @@ param(
     [switch]$LegacyPic,
     [switch]$PitTimer,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
-    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'ThreadStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation', 'Ps2BatTimeout', 'Ps2StaleScancode', 'VmmouseError', 'Reset', 'ResetFromKbc', 'ResetFromCf9', 'ResetFromTripleFault', 'ResetSuppressed', 'OomOrder', 'ClassLimits')][string]$Fault = 'None',
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'ThreadStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation', 'Ps2BatTimeout', 'Ps2StaleScancode', 'VmmouseError', 'Reset', 'ResetFromKbc', 'ResetFromCf9', 'ResetFromTripleFault', 'ResetSuppressed', 'OomOrder', 'ClassLimits', 'PerfInvalid')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -197,6 +198,9 @@ function Assert-MirrorSmpMarkers {
 
 . (Join-Path $PSScriptRoot 'common.ps1')
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
+$perfToken = $null
+if ($PSBoundParameters.ContainsKey('Perf')) { $perfToken = ConvertTo-MirrorPerfToken -Items $Perf }
+if ($Fault -eq 'PerfInvalid' -and $null -ne $perfToken) { throw '-Fault PerfInvalid cannot be combined with -Perf.' }
 if ($Fault -ne 'None' -and -not $Smoke) {
     throw '-Fault requires -Smoke; intentional faults are excluded from normal kernels.'
 }
@@ -343,6 +347,9 @@ $testMode = switch ($Fault) {
     default { $null }
 }
 $kernelArguments = @()
+if ($null -ne $perfToken) { $kernelArguments += $perfToken }
+# Raw host injection exercises strict smoke command-line parsing; no SmokeMode.
+if ($Fault -eq 'PerfInvalid') { $kernelArguments += 'mirror.perf=bogus' }
 if ($null -ne $testMode) { $kernelArguments += "mirror.test=$testMode" }
 # 0054-D5's commit proof needs frames that allow the 512 MiB bound.
 if ($Fault -eq 'ClassLimits' -and $MemoryMiB -ne 1024) {
@@ -524,6 +531,11 @@ try {
     $stderrStream.Dispose()
     $stderrStream = $null
     $serial = [System.IO.File]::ReadAllText($serialLog)
+    if ($Fault -eq 'PerfInvalid') { Assert-MirrorPerfMarkers -Serial $serial -Flavor Smoke -Invalid }
+    elseif ($null -ne $perfToken) {
+        Assert-MirrorPerfMarkers -Serial $serial -Items $Perf -Flavor Smoke -WithoutHpet ([bool]($NoHpet -or $Fault -eq 'ClockActivation')) -WithoutDisplay ([bool]$NoDisplayDevice) -WithoutSession ([bool]$NoKeyboard)
+    }
+    else { Assert-MirrorNoPerf -Serial $serial }
     if (-not $NoTestDisk -and (Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash -ne $testDiskHash) {
         throw 'The read-only block fixture was modified during the boot.'
     }
@@ -532,6 +544,17 @@ try {
         throw 'The AHCI read-only probe modified its disposable disk image.'
     }
     $expectedTlbTimeout = $Fault -eq 'SmpTlbTimeout'
+    if ($Fault -eq 'PerfInvalid') {
+        $panic = [regex]::Matches($serial, '(?m)^MIRROR_PANIC:[^\r\n]*\r?\nunknown smoke-test command line\r?$')
+        if ($qemuExitCode -ne 35 -or $panic.Count -ne 1 -or
+            [regex]::Matches($serial, '(?im)^(?:MIRROR_PANIC|PANIC|\[panic\])(?::|\s|$)').Count -ne 1 -or
+            [regex]::Matches($serial, '(?m)^unknown smoke-test command line\r?$').Count -ne 1 -or
+            $serial -match '(?m)^MIRROR_(?:BOOT_OK|TEST_EXPECT_FATAL|EXCEPTION)(?:\s|$)') {
+            throw 'PerfInvalid must fail strict smoke parsing with the exact unknown-command-line panic and exit 35.'
+        }
+        Write-Host 'PerfInvalid rejected the raw invalid token with one OFF and the expected panic.'
+        return
+    }
     if (-not $expectedTlbTimeout -and $serial -match '(?im)^(?:MIRROR_PANIC|PANIC|\[panic\])') {
         throw "Mirror reported a panic. See $serialLog."
     }

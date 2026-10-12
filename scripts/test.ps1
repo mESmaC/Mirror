@@ -84,8 +84,11 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Rust formatting check failed.' }
     & cargo fmt --all --manifest-path $imageToolManifest -- --check
     if ($LASTEXITCODE -ne 0) { throw 'mirror-image formatting check failed.' }
-    & cargo test --locked -p mirror-desktop-protocol -p mirror-window-protocol -p mirror-vm-protocol -p mirror-thread-protocol -p mirror-clock-protocol -p mirror-sync -p mirror-acpi -p mirror-ui-tokens -p mirror-ext2-layout --target x86_64-pc-windows-msvc
+    & cargo test --locked -p mirror-desktop-protocol -p mirror-window-protocol -p mirror-vm-protocol -p mirror-thread-protocol -p mirror-clock-protocol -p mirror-perf-protocol -p mirror-sync -p mirror-acpi -p mirror-ui-tokens -p mirror-ext2-layout --target x86_64-pc-windows-msvc
     if ($LASTEXITCODE -ne 0) { throw 'Native protocol, synchronization, ACPI parser, UI token and ext2 layout tests failed.' }
+    # Exercise the actual host assertions in the supported inbox PowerShell.
+    & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test-perf.ps1')
+    if ($LASTEXITCODE -ne 0) { throw 'PowerShell 5.1 perf fixtures failed.' }
     & cargo test --locked --target x86_64-pc-windows-msvc --manifest-path $imageToolManifest
     if ($LASTEXITCODE -ne 0) { throw 'mirror-image host tests failed.' }
     & cargo clippy --locked --workspace -- -D warnings
@@ -245,6 +248,12 @@ try {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -NoKeyboard:$case.NoKeyboard -NoHpet:$case.NoHpet -Fault $case.Fault -Release:$release -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
             Save-MirrorSmokeLogs "$profile-$($case.Name)"
         }
+        & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Perf 'boot,1,burn' -Release:$release -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+        Save-MirrorSmokeLogs "$profile-PerfSmoke"
+        & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Fault PageFault -Perf boot -Release:$release -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+        Save-MirrorSmokeLogs "$profile-PerfPageFault"
+        & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Fault PerfInvalid -Release:$release -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+        Save-MirrorSmokeLogs "$profile-PerfInvalid"
         if ((Get-FileHash -LiteralPath $diskImage -Algorithm SHA256).Hash -ne $diskImageHash) {
             throw "The $profile smoke cases changed build/mirror.img."
         }
@@ -279,6 +288,14 @@ try {
         & (Join-Path $PSScriptRoot 'capture.ps1') -NoBuild -Hygiene -CpuCount 4 -Release:$release -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
         foreach ($artifact in @('hygiene-boot.serial.log', 'hygiene-boot.stderr.log', 'hygiene-boot.png', 'hygiene-notes-before.png', 'hygiene-notes-typed.png', 'hygiene-notes-pointer.png', 'hygiene-console-before.png', 'hygiene-console-typed.png', 'hygiene-console-pointer.png')) {
             Copy-Item -LiteralPath (Join-Path $repositoryRoot "build/$artifact") -Destination (Join-Path $logDirectory "$profile-$artifact") -Force
+        }
+        # Two bounded default-flavor marker captures per profile: at most four
+        # minutes total, without input arming or finite input/burn collection.
+        foreach ($case in @(@{ Name = 'PerfMem'; Items = 'mem'; NoHpet = $false }, @{ Name = 'PerfNoHpet'; Items = '1,burn'; NoHpet = $true })) {
+            & (Join-Path $PSScriptRoot 'capture.ps1') -NoBuild -PerfCapture -Perf $case.Items -PerfScenario Markers -NoHpet:$case.NoHpet -CpuCount 4 -Release:$release -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+            foreach ($artifact in @('serial.log', 'stderr.log', 'png')) {
+                Copy-Item -LiteralPath (Join-Path $repositoryRoot "build/perf-boot.$artifact") -Destination (Join-Path $logDirectory "$profile-$($case.Name).$artifact") -Force
+            }
         }
     }
 

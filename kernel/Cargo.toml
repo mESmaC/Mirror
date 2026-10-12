@@ -20,6 +20,7 @@ mirror-vm-protocol = { path = "../crates/vm-protocol" }
 mirror-thread-protocol = { path = "../crates/thread-protocol" }
 mirror-acpi = { path = "../crates/acpi" }
 mirror-clock-protocol = { path = "../crates/clock-protocol" }
+mirror-perf-protocol = { path = "../crates/perf-protocol" }
 
 [features]
 test-trace = []

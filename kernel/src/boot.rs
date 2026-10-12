@@ -125,14 +125,14 @@ pub fn info() -> BootInfo {
 /// available during UEFI startup, then select Mirror's legacy PIC backend.
 pub fn legacy_pic() -> bool {
     command_line()
-        .split(|byte| byte.is_ascii_whitespace())
+        .split(|byte| mirror_perf_protocol::is_ascii_whitespace(*byte))
         .any(|token| token == b"mirror.irq=pic")
 }
 
 /// Keep the PIT time source while retaining APIC device routing and SMP.
 pub fn pit_timer() -> bool {
     command_line()
-        .split(|byte| byte.is_ascii_whitespace())
+        .split(|byte| mirror_perf_protocol::is_ascii_whitespace(*byte))
         .any(|token| token == b"mirror.timer=pit")
 }
 
@@ -142,6 +142,13 @@ fn command_line() -> &'static [u8] {
         .expect("missing kernel command line")
         .cmdline()
         .to_bytes()
+}
+
+/// Early perf configuration tolerates a missing response and allocates nothing.
+pub fn perf_command_line() -> Option<&'static [u8]> {
+    CMDLINE
+        .get_response()
+        .map(|response| response.cmdline().to_bytes())
 }
 
 #[cfg(feature = "boot-smoke")]
@@ -201,9 +208,12 @@ pub fn smoke_mode() -> SmokeMode {
     // Ignore only the recognized policy token; other unknown arguments and
     // multiple fault selectors must retain the strict smoke-test rejection.
     let mut tokens = command_line()
-        .split(|byte| byte.is_ascii_whitespace())
+        .split(|byte| mirror_perf_protocol::is_ascii_whitespace(*byte))
         .filter(|token| {
-            !token.is_empty() && *token != b"mirror.irq=pic" && *token != b"mirror.timer=pit"
+            !token.is_empty()
+                && *token != b"mirror.irq=pic"
+                && *token != b"mirror.timer=pit"
+                && !(crate::perf::configured() && token.starts_with(b"mirror.perf="))
         });
     let mode = match tokens.next().unwrap_or(b"") {
         b"" => SmokeMode::Normal,

@@ -1,6 +1,190 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function ConvertTo-MirrorPerfToken {
+    param([AllowNull()][AllowEmptyString()][string]$Items)
+    $token = "mirror.perf=$Items"
+    if ([string]::IsNullOrEmpty($Items) -or $token.Length -gt 64 -or $Items -cmatch '[^\x21-\x7e]') {
+        throw 'Perf requires a nonempty ASCII item list whose mirror.perf= token is at most 64 bytes.'
+    }
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($item in $Items.Split(',')) {
+        if ($item -cnotmatch '^(?:boot|1|mem|burn|flip|telemetry|agent)$' -or -not $seen.Add($item)) {
+            throw "Invalid or repeated Perf item '$item'."
+        }
+    }
+    if (($seen.Contains('mem') -and $seen.Contains('1')) -or ($seen.Contains('burn') -and -not $seen.Contains('1'))) {
+        throw 'Perf forbids mem with 1 and requires 1 with burn.'
+    }
+    return $token
+}
+
+function Assert-MirrorNoPerf {
+    param([AllowEmptyString()][string]$Serial)
+    if ($Serial -cmatch '(?m)^MIRROR_PERF_') { throw 'A tokenless boot emitted a PERF record.' }
+}
+
+function ConvertFrom-MirrorPerfCounter {
+    param([string]$Text)
+    $value = [uint64]0
+    if ($Text -cnotmatch '^[0-9]+$' -or
+        -not [uint64]::TryParse($Text, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$value) -or
+        $value -eq [uint64]::MaxValue) {
+        throw "Invalid or saturated PERF counter '$Text'."
+    }
+    return $value
+}
+
+function Assert-MirrorPerfMarkers {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [AllowEmptyString()][string]$Items,
+        [ValidateSet('Smoke', 'Trace', 'Default')][string]$Flavor = 'Default',
+        [bool]$WithoutHpet = $false,
+        [bool]$WithoutDisplay = $false,
+        [bool]$WithoutSession = $false,
+        [ValidateSet('None', 'clock', 'display', 'input', 'userspace', 'frame', 'shell_ready')][string]$FatalEndpoint = 'None',
+        [switch]$Invalid,
+        [ValidateRange(-1, 2147483647)][int]$ExpectedMemSamples = -1
+    )
+    $records = @([regex]::Matches($Serial, '(?m)^MIRROR_PERF_[^\n]*') | ForEach-Object {
+        # Remove only a CRLF terminator; an embedded/repeated CR is malformed.
+        [pscustomobject]@{ Value = ($_.Value -creplace '\r$', ''); Index = $_.Index }
+    })
+    # Limine can leave cursor-position CSI escapes on the banner's line. Only
+    # this firmware prefix is tolerated; PERF record schemas stay exact.
+    $banner = [regex]::Match($Serial, '(?m)(?:^|(?:\x1b\[[0-9;]*H)+)Mirror kernel [^\r\n]+')
+    if (-not $banner.Success -or $records.Count -eq 0 -or $records[0].Index -le $banner.Index) {
+        throw 'PERF configuration must follow the kernel banner.'
+    }
+    $trace = [regex]::Matches($Serial, '(?m)^MIRROR_TRACE_ON(?:\s|$)')
+    if (($trace.Count -gt 0 -and $records[0].Index -ge $trace[0].Index) -or
+        ($Flavor -eq 'Default' -and $trace.Count -ne 0)) { throw 'PERF configuration must precede trace initialization.' }
+    if ($Invalid) {
+        if ($records.Count -ne 1 -or $records[0].Value -cne 'MIRROR_PERF_OFF reason=invalid') {
+            throw 'Invalid perf configuration must emit exactly one OFF and no other PERF records.'
+        }
+        return
+    }
+    $null = ConvertTo-MirrorPerfToken -Items $Items
+    $requested = $Items.Split(',')
+    $inputRequested = $requested -ccontains '1'
+    $memRequested = $inputRequested -or ($requested -ccontains 'mem')
+    $burnRequested = $requested -ccontains 'burn'
+    $on = 'MIRROR_PERF_ON v=1 mem={0} input={1} burn={2}' -f [int]$memRequested, [int]$inputRequested, [int]$burnRequested
+    if ($records[0].Value -cne $on) { throw "Expected exact PERF configuration '$on'." }
+    $events = @('clock')
+    if (-not $WithoutDisplay) { $events += 'display' }
+    $events += 'input'
+    $session = $Flavor -ne 'Smoke' -and -not $WithoutDisplay -and -not $WithoutSession
+    if ($session) { $events += @('userspace', 'frame', 'shell_ready') }
+    if ($FatalEndpoint -ne 'None') {
+        $endpoint = [Array]::IndexOf($events, $FatalEndpoint)
+        if ($endpoint -lt 0) { throw 'The requested fatal endpoint is unavailable in this boot.' }
+        $events = @($events[0..$endpoint])
+    }
+    # An explicitly early fatal prefix has not yet made the session decision.
+    $decisionReached = $FatalEndpoint -eq 'None' -or $FatalEndpoint -in @('userspace', 'frame', 'shell_ready')
+    $skips = @()
+    if ($decisionReached) {
+        foreach ($item in @('input', 'mem', 'burn', 'flip', 'telemetry', 'agent')) {
+            $wanted = switch ($item) {
+                'input' { $inputRequested }
+                'mem' { $memRequested }
+                'burn' { $burnRequested }
+                default { $requested -ccontains $item }
+            }
+            if (-not $wanted) { continue }
+            $reason = if ($item -in @('flip', 'telemetry', 'agent')) { 'unavailable' }
+            elseif ($Flavor -eq 'Smoke') { 'smoke' }
+            elseif ($WithoutHpet) { 'no_clock' }
+            elseif (-not $session) { 'no_session' }
+            elseif ($item -ne 'mem') { 'unavailable' }
+            else { $null }
+            if ($null -ne $reason) { $skips += "MIRROR_PERF_SKIPPED item=$item reason=$reason" }
+        }
+    }
+    $eventIndex = 0
+    $skipIndex = 0
+    $previousTime = [uint64]0
+    $previousMem = [uint64]0
+    $memCount = 0
+    $userspaceIndex = -1
+    $inputIndex = -1
+    $lastSkipIndex = -1
+    $firstMemIndex = -1
+    foreach ($record in @($records | Select-Object -Skip 1)) {
+        $line = $record.Value
+        if ($line -cmatch '^MIRROR_PERF_T event=(clock|display|input|userspace|frame|shell_ready) ns=([0-9]+|none)( since_entry_ns=none)?$') {
+            $event = $Matches[1]
+            $stamp = $Matches[2]
+            $suffix = $Matches[3]
+            if ($eventIndex -ge $events.Count -or $event -cne $events[$eventIndex] -or
+                (($event -eq 'clock') -ne ($suffix -ceq ' since_entry_ns=none'))) { throw 'Unexpected PERF milestone schema, count or order.' }
+            if ($WithoutHpet -ne ($stamp -ceq 'none')) { throw 'PERF milestone clock availability mismatch.' }
+            if (-not $WithoutHpet) {
+                $time = ConvertFrom-MirrorPerfCounter $stamp
+                if ($time -lt $previousTime) { throw 'PERF milestone timestamps decreased.' }
+                $previousTime = $time
+            }
+            if ($event -eq 'display') {
+                $display = [regex]::Match($Serial, '(?m)^MIRROR_FRAMEBUFFER_READY(?:\s|$)')
+                if (-not $display.Success -or $display.Index -ge $record.Index) { throw 'PERF display must follow framebuffer readiness.' }
+            }
+            if ($event -eq 'input') { $inputIndex = $record.Index }
+            if ($event -eq 'userspace') {
+                if ($skipIndex -ne $skips.Count) { throw 'PERF skips must precede interactive userspace.' }
+                $userspaceIndex = $record.Index
+            }
+            $eventIndex++
+        }
+        elseif ($line -cmatch '^MIRROR_PERF_SKIPPED ') {
+            if ($skipIndex -ge $skips.Count -or $line -cne $skips[$skipIndex] -or $inputIndex -lt 0 -or $userspaceIndex -ge 0 -or $memCount -ne 0) {
+                throw 'Unexpected PERF skip schema, reason, count or order.'
+            }
+            $lastSkipIndex = $record.Index
+            $skipIndex++
+        }
+        elseif ($line -cmatch '^MIRROR_PERF_MEM ns=([0-9]+|none) available_kib=([0-9]+|none) pool_kib=([0-9]+|none)$') {
+            $stamp = $Matches[1]
+            $available = $Matches[2]
+            $pool = $Matches[3]
+            if (-not $memRequested -or -not $session -or $userspaceIndex -lt 0 -or $skipIndex -ne $skips.Count) {
+                throw 'PERF memory requires the requested interactive session after all skips.'
+            }
+            if ($WithoutHpet -ne ($stamp -ceq 'none') -or (($available -ceq 'none') -ne ($pool -ceq 'none'))) { throw 'PERF memory availability mismatch.' }
+            if ($available -cne 'none') {
+                $availableValue = ConvertFrom-MirrorPerfCounter $available
+                $poolValue = ConvertFrom-MirrorPerfCounter $pool
+                if ($availableValue -gt $poolValue -or ($availableValue % 4) -ne 0 -or ($poolValue % 4) -ne 0) { throw 'Invalid PERF allocator frame arithmetic.' }
+            }
+            if ($WithoutHpet) {
+                if ($memCount -ne 0) { throw 'PERF emitted periodic memory without HPET.' }
+            }
+            else {
+                $time = ConvertFrom-MirrorPerfCounter $stamp
+                if ($memCount -gt 0 -and ($time -lt $previousMem -or ($time - $previousMem) -lt [uint64]10000000000)) { throw 'PERF memory samples are less than ten seconds apart.' }
+                $previousMem = $time
+            }
+            if ($memCount -eq 0) { $firstMemIndex = $record.Index }
+            $memCount++
+        }
+        else { throw "Unknown or malformed PERF record '$line'." }
+    }
+    if ($eventIndex -ne $events.Count -or $skipIndex -ne $skips.Count) { throw 'Required PERF milestones or skips are missing.' }
+    $needsMem = $memRequested -and $session -and ($events -contains 'userspace')
+    if (($needsMem -and $memCount -eq 0) -or (-not $needsMem -and $memCount -ne 0) -or
+        ($ExpectedMemSamples -ge 0 -and $memCount -ne $ExpectedMemSamples)) { throw 'Unexpected PERF memory sample count.' }
+    if ($firstMemIndex -ge 0) {
+        $frame = [regex]::Match($Serial, '(?m)^MIRROR_PERF_T event=frame ')
+        if ($frame.Success -and $firstMemIndex -gt $frame.Index) { throw 'Initial PERF memory must precede the first frame.' }
+        $end = [regex]::Match($Serial, '(?m)^MIRROR_(?:SHELL_CLEANUP_OK|CONSOLE_READY)(?:\s|$)')
+        if ($end.Success -and @($records | Where-Object { $_.Value.StartsWith('MIRROR_PERF_MEM ') -and $_.Index -gt $end.Index }).Count -ne 0) { throw 'PERF memory continued after the interactive session.' }
+    }
+    $desktopSkipped = [regex]::Match($Serial, '(?m)^MIRROR_DESKTOP_SKIPPED(?:\s|$)')
+    if ($desktopSkipped.Success -and $lastSkipIndex -gt $desktopSkipped.Index) { throw 'PERF skips must precede DESKTOP_SKIPPED.' }
+}
+
 function Assert-MirrorToolchain {
     param([string]$RustcVersion)
 

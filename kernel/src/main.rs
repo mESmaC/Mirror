@@ -31,6 +31,7 @@ mod memory;
 mod mouse;
 mod paging;
 mod pci;
+mod perf;
 mod pointer;
 mod ps2;
 mod reset;
@@ -55,8 +56,10 @@ const _: &str = include_str!("../linker.ld");
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     arch::disable_interrupts();
+    perf::init(boot::perf_command_line());
     serial::init();
     serial::println!("Mirror kernel 0.1.0 | x86_64");
+    perf::announce();
     // Trace and smoke kernels announce their test serial output once, before
     // PCI discovery. A default kernel never prints it (spec 0010).
     #[cfg(feature = "test-trace")]
@@ -217,6 +220,7 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
         &mut tables,
         &mut frames,
     );
+    perf::milestone(mirror_perf_protocol::Event::Clock);
     timer::init();
 
     let devices = pci::probe();
@@ -242,6 +246,7 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
                     info.bpp,
                     info.byte_len
                 );
+                perf::milestone(mirror_perf_protocol::Event::Display);
                 Some(driver)
             }
             Err(error) => {
@@ -362,6 +367,8 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
     if mouse_ready {
         timer::enable_mouse_irq();
     }
+    perf::milestone(mirror_perf_protocol::Event::Input);
+    perf::select_session(display.is_some() && (keyboard_ready || mouse_ready));
 
     // SAFETY: BSP owns the hierarchy and allocator, IF=0, no AP or retained
     // user root has been released. Runtime leaf changes keep these tables pinned.

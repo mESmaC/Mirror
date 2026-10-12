@@ -1263,6 +1263,7 @@ pub(super) fn run(
             runtime.sample_charge_peaks(unsafe { process(shell) });
         }
         if session.ended() {
+            crate::perf::end_session();
             // Only a finished process is reclaimed above, and a ready thread's
             // process is live, so its slot is still occupied. The caller
             // finishes the session's remaining processes, which unqueues it.
@@ -1271,6 +1272,9 @@ pub(super) fn run(
             }
             return stats;
         }
+        // BSP/IF=0 and the allocator is borrowed only here, outside dispatch.
+        // Check the end rule first so a finished session gets no more samples.
+        crate::perf::sample_memory(frames);
         let now = timer::ticks();
         begin_pass();
         complete_waits(session, now);

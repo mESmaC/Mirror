@@ -3,6 +3,10 @@ param(
     [switch]$NoBuild,
     [switch]$Release,
     [switch]$Hygiene,
+    [AllowEmptyString()][string]$Perf,
+    [switch]$PerfCapture,
+    [ValidateSet('Markers')][string]$PerfScenario = 'Markers',
+    [switch]$NoHpet,
     [switch]$RelativePointer,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
     [string]$QemuPath = $env:QEMU_PATH,
@@ -13,30 +17,36 @@ param(
 
 . (Join-Path $PSScriptRoot 'common.ps1')
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
+$perfToken = $null
+if ($PSBoundParameters.ContainsKey('Perf')) { $perfToken = ConvertTo-MirrorPerfToken -Items $Perf }
+if ($Hygiene -and ($PerfCapture -or $null -ne $perfToken)) { throw '-Hygiene is tokenless and cannot be combined with -Perf or -PerfCapture.' }
+if ($PerfCapture -and $null -eq $perfToken) { throw '-PerfCapture requires -Perf <items>.' }
+if ($PSBoundParameters.ContainsKey('PerfScenario') -and -not $PerfCapture) { throw '-PerfScenario requires -PerfCapture.' }
+$defaultCapture = $Hygiene -or $PerfCapture
 # Captures synchronize on the test-trace console oracles, so they boot a trace
 # kernel. The hygiene probe boots the default kernel, which prints neither those
 # oracles nor user content (spec 0010).
-if (-not $NoBuild) { & (Join-Path $PSScriptRoot 'build.ps1') -Release:$Release -Trace:(-not $Hygiene) }
+if (-not $NoBuild) { & (Join-Path $PSScriptRoot 'build.ps1') -Release:$Release -Trace:(-not $defaultCapture) }
 $qemu = Get-MirrorQemu -RequestedPath $QemuPath -RepositoryRoot $repositoryRoot
 $qemuDirectory = Split-Path -Parent $qemu
 $codePath = Get-MirrorFirmware -RequestedPath $FirmwareCode -QemuDirectory $qemuDirectory -Names @('edk2-x86_64-code.fd', 'OVMF_CODE.fd', 'OVMF_CODE.4m.fd') -ParameterName 'FirmwareCode'
 $varsTemplate = Get-MirrorFirmware -RequestedPath $FirmwareVars -QemuDirectory $qemuDirectory -Names @('edk2-i386-vars.fd', 'OVMF_VARS.fd', 'OVMF_VARS.4m.fd') -ParameterName 'FirmwareVars'
 $buildDirectory = Join-Path $repositoryRoot 'build'
 $espDirectory = Join-Path $buildDirectory 'esp'
-# Captures boot the image read-only with its own limine.conf and no SMBIOS
-# config (spec 0015a). build.ps1 writes the image only after restaging
+# Tokenless captures boot the image's embedded config. Perf uses an SMBIOS
+# override (0019a-D12), leaving the image read-only. build.ps1 restages
 # build/esp and verifies it against that tree, so the staged limine.conf is
 # the one the image holds.
 $diskImage = Join-Path $buildDirectory 'mirror.img'
 if (-not (Test-Path -LiteralPath $diskImage -PathType Leaf) -or (Get-Item -LiteralPath $diskImage).Length -ne 1073741824) {
     throw "The disk image is missing or incomplete: $diskImage. Run scripts/build.ps1 first."
 }
-if ($Hygiene -and [System.IO.File]::ReadAllText((Join-Path $espDirectory 'limine.conf')) -match 'mirror\.perf=') {
-    throw 'The hygiene probe boots without a mirror.perf= token, so the timing-marker exception (spec 0010-D4) stays off.'
+if ($null -eq $perfToken -and [System.IO.File]::ReadAllText((Join-Path $espDirectory 'limine.conf')) -match 'mirror\.perf=') {
+    throw 'A tokenless capture requires staging without a mirror.perf= token.'
 }
 $varsPath = Join-Path $buildDirectory 'capture.vars.fd'
 Copy-Item -LiteralPath $varsTemplate -Destination $varsPath -Force
-$captureName = if ($Hygiene) { 'hygiene-boot' } elseif ($RelativePointer) { 'relative-boot' } else { 'normal-boot' }
+$captureName = if ($PerfCapture) { 'perf-boot' } elseif ($Hygiene) { 'hygiene-boot' } elseif ($RelativePointer) { 'relative-boot' } else { 'normal-boot' }
 $serialLog = Join-Path $buildDirectory "$captureName.serial.log"
 $screenshot = Join-Path $buildDirectory 'normal-boot.png'
 $consoleScreenshot = Join-Path $buildDirectory 'normal-console.png'
@@ -67,7 +77,7 @@ function Read-MirrorSerial {
 function Assert-MirrorCaptureSmp {
     param([string]$Serial, [int]$RequestedCpus)
     Assert-MirrorTimer -Serial $Serial -Smoke $false -UseLegacyPic $false -ForcePit $false
-    Assert-MirrorClock -Serial $Serial -Smoke $false -WithoutHpet $false
+    Assert-MirrorClock -Serial $Serial -Smoke $false -WithoutHpet ([bool]$NoHpet)
     Assert-MirrorHeapGrowth -Serial $Serial -RequestedCpus $RequestedCpus -Smoke $false -UseLegacyPic $false
     Assert-MirrorDriverCatalog -Serial $Serial -Smoke $false -LegacyDisk $false
     Assert-MirrorAhciMarkers -Serial $Serial -Attached $true -Smoke $false
@@ -84,8 +94,8 @@ function Assert-MirrorCaptureSmp {
     Assert-MirrorHardening -Serial $Serial -OnlineCpus $RequestedCpus -SmepSmap $true -Umip $false
     # And the BSP's speculative-execution exposure (spec 0016b).
     Assert-MirrorCpuVulnerability -Serial $Serial
-    # Every capture ends with the console's restart (spec 0058a, test 5).
-    Assert-MirrorReset -Serial $Serial -Smoke $false -ConsoleRestart $true
+    # Markers observes a live shell; ordinary captures end with restart.
+    Assert-MirrorReset -Serial $Serial -Smoke $false -ConsoleRestart (-not $PerfCapture) -WithoutHpet ([bool]$NoHpet)
     if ($Serial -match '(?m)^MIRROR_(?:SMP_SKIPPED|SMP_CPU_FAILED|SMP_GUARD_OK|SMP_UNMAP_OK|SMP_TLB_TIMEOUT_ARMED|SHARED_TIMEOUT_\w+|SHARED_VM_SKIPPED|SHARED_OFFLINE_OK)(?:\s|$)') {
         throw 'Normal capture skipped SMP, lost a CPU, or ran an injected guard fault.'
     }
@@ -121,11 +131,11 @@ function Assert-MirrorCaptureSmp {
     }
     $phases = @(
         @{ Name = 'boot'; Rounds = 8 },
-        @{ Name = 'after_userspace'; Rounds = 4 },
-        @{ Name = 'after_desktop'; Rounds = 4 }
+        @{ Name = 'after_userspace'; Rounds = 4 }
     )
+    if (-not $PerfCapture) { $phases += @{ Name = 'after_desktop'; Rounds = 4 } }
     if ([regex]::Matches($Serial, '(?m)^MIRROR_SMP_IPI_OK(?:\s|$)').Count -ne $phases.Count) {
-        throw 'Normal capture must complete exactly three SMP rendezvous phases.'
+        throw 'Capture must complete exactly the expected SMP rendezvous phases.'
     }
     $previous = $ready[0].Index
     $sharedPattern = '(?m)^MIRROR_SHARED_VM_READY pages=512 cpus={0} rounds=1 reclaimed=3 borrowed_root=1\r?$' -f $RequestedCpus
@@ -150,6 +160,7 @@ function Assert-MirrorCaptureSmp {
 
 function Read-MirrorQmp {
     param([System.Diagnostics.Process]$Process, [int]$TimeoutMs = 5000)
+    if ($PerfCapture) { $TimeoutMs = [Math]::Min($TimeoutMs, (Get-MirrorPerfRemainingMs)) }
     $line = $Process.StandardOutput.ReadLineAsync()
     if (-not $line.Wait($TimeoutMs)) { throw 'QMP response timed out.' }
     $value = $line.GetAwaiter().GetResult()
@@ -403,6 +414,7 @@ function Wait-MirrorKernelFlavor {
     # kernel fails fast instead of timing out on an oracle it never prints.
     $deadline = [System.Diagnostics.Stopwatch]::StartNew()
     do {
+        if ($PerfCapture) { $null = Get-MirrorPerfRemainingMs }
         if ($Process.HasExited) { throw 'Kernel exited before PCI discovery.' }
         $serial = Read-MirrorSerial
         if ($serial -match '(?m)^(?:MIRROR_PANIC|MIRROR_EXCEPTION)(?:\s|:|$)') {
@@ -410,10 +422,10 @@ function Wait-MirrorKernelFlavor {
         }
         if ($serial -match '(?m)^MIRROR_PCI_READY(?:\s|$)') {
             $traced = $serial -match '(?m)^MIRROR_TRACE_ON(?:\s|$)'
-            if ($Hygiene -and $traced) {
-                throw 'The hygiene probe needs the default kernel, but this kernel printed MIRROR_TRACE_ON. Run scripts/build.ps1 without -Trace or -Smoke.'
+            if ($defaultCapture -and $traced) {
+                throw 'Hygiene and PerfCapture need a default kernel; build without -Trace or -Smoke.'
             }
-            if (-not $Hygiene -and -not $traced) {
+            if (-not $defaultCapture -and -not $traced) {
                 throw 'Captures need a trace kernel, but this kernel printed no MIRROR_TRACE_ON before PCI discovery. Run scripts/build.ps1 -Trace.'
             }
             return
@@ -658,20 +670,81 @@ function Invoke-MirrorRestart {
     }
 }
 
+function Get-MirrorPerfRemainingMs {
+    # Reserve the last five seconds of the 60-second process budget for quit.
+    $remaining = 55000 - [int]$perfRuntime.ElapsedMilliseconds
+    if ($remaining -le 0) { throw 'PerfCapture reached its bounded observation deadline.' }
+    return $remaining
+}
+
+function Invoke-MirrorPerfCapture {
+    param([System.Diagnostics.Process]$Process)
+    Add-Type -AssemblyName System.Drawing
+    $screen = Join-Path $buildDirectory 'perf-boot.png'
+    $readyAt = $null
+    $items = $Perf.Split(',')
+    $memory = ($items -ccontains 'mem') -or ($items -ccontains '1')
+    do {
+        $null = Get-MirrorPerfRemainingMs
+        if ($Process.HasExited) { throw 'Kernel exited during PerfCapture.' }
+        $serial = Read-MirrorSerial
+        if ($serial -match '(?m)^(?:MIRROR_PANIC|MIRROR_EXCEPTION|MIRROR_USER_FAULT|MIRROR_SHELL_CLEANUP_OK|MIRROR_CONSOLE_READY)(?:\s|:|$)') {
+            throw "PerfCapture lost its interactive session. See $serialLog."
+        }
+        if ($null -eq $readyAt) {
+            Save-MirrorScreenshot $Process $screen
+            $image = [System.Drawing.Bitmap]::new($screen)
+            try {
+                if ($image.Width -ne 1280 -or $image.Height -ne 800) { throw 'PerfCapture requires the daily 1280x800 QEMU display.' }
+                $ready = $true
+                foreach ($point in @(@(20, 760, 0x3B4A6B), @(21, 761, 0x232E44), @(107, 791, 0x3B4A6B), @(116, 760, 0x3B4A6B), @(117, 761, 0x232E44), @(215, 791, 0x3B4A6B))) {
+                    if (($image.GetPixel($point[0], $point[1]).ToArgb() -band 0xFFFFFF) -ne $point[2]) { $ready = $false; break }
+                }
+            }
+            finally { $image.Dispose() }
+            if ($ready -and $serial -cmatch '(?m)^MIRROR_PERF_T event=shell_ready ns=') { $readyAt = $perfRuntime.ElapsedMilliseconds }
+        }
+        $count = [regex]::Matches($serial, '(?m)^MIRROR_PERF_MEM ').Count
+        if ($null -ne $readyAt -and ((-not $memory) -or
+                ($NoHpet -and ($perfRuntime.ElapsedMilliseconds - $readyAt) -ge 12000) -or
+                (-not $NoHpet -and $count -ge 3))) { break }
+        Start-Sleep -Milliseconds 100
+    } while ($true)
+    # No arming key, pointer movement or input-measurement claim in Markers.
+    Complete-MirrorCapture $Process
+    Write-Host "PerfCapture Markers passed (Perf=$Perf, no_hpet=$NoHpet); no input measurement was run. Log: $serialLog"
+}
+
 function Complete-MirrorCapture {
     param([System.Diagnostics.Process]$Process)
     # QMP permits quit to terminate before returning a response. Require clean
     # process exit below rather than interpreting that allowed EOF as failure.
     $Process.StandardInput.WriteLine('{"execute":"quit"}')
     $Process.StandardInput.Flush()
-    if (-not $Process.WaitForExit(5000)) { throw 'QEMU did not exit after the capture.' }
+    $quitBudget = if ($PerfCapture) { [Math]::Max(1, [Math]::Min(5000, 60000 - [int]$perfRuntime.ElapsedMilliseconds)) } else { 5000 }
+    if (-not $Process.WaitForExit($quitBudget)) { throw 'QEMU did not exit after the capture.' }
     $Process.WaitForExit()
     if ($Process.ExitCode -ne 0) { throw "QEMU capture exited with code $($Process.ExitCode)." }
     # Read the complete log after exit, so later input cannot hide an AP failure.
     # These are trace or default builds; smoke-only self-tests and injected faults are absent.
     $serial = Read-MirrorSerial
+    if ($null -ne $perfToken) {
+        $perfChecks = @{ Serial = $serial; Items = $Perf; Flavor = $(if ($PerfCapture) { 'Default' } else { 'Trace' }); WithoutHpet = [bool]$NoHpet }
+        if ($PerfCapture) {
+            $perfChecks.ExpectedMemSamples = if (($Perf.Split(',') -ccontains 'mem') -or ($Perf.Split(',') -ccontains '1')) { if ($NoHpet) { 1 } else { 3 } } else { 0 }
+        }
+        Assert-MirrorPerfMarkers @perfChecks
+    }
+    else { Assert-MirrorNoPerf -Serial $serial }
     if ($Hygiene) { Assert-MirrorHygieneLog $serial }
-    else { Assert-MirrorTraceMarker -Serial $serial -Expected $true }
+    else { Assert-MirrorTraceMarker -Serial $serial -Expected (-not $PerfCapture) }
+    if ($PerfCapture) {
+        if ($perfRuntime.ElapsedMilliseconds -gt 60000) { throw 'PerfCapture exceeded its 60-second process cap.' }
+        foreach ($marker in @('MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_SCHEDULER_OK', 'MIRROR_IPC_OK', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_USER_SURFACE_OK', 'MIRROR_USER_SURFACE_CLEANUP_OK', 'MIRROR_USER_CLOCK_OK', 'MIRROR_AHCI_READ_OK', 'MIRROR_HEAP_CHARGE_OK')) {
+            if ($serial -match "(?m)^$marker(?:\s|$)") { throw "PerfCapture unexpectedly ran an init/fixture check: $marker." }
+        }
+        if ([regex]::Matches($serial, '(?m)^MIRROR_BOOT_OK\r?$').Count -ne 1 -or $serial -match '(?m)^user:') { throw 'PerfCapture requires one ordinary boot and no trace userspace output.' }
+    }
     Assert-MirrorPointerMode $serial
     Assert-MirrorSchedReady -Serial $serial
     if ($serial -match '(?m)^MIRROR_CONSOLE_INPUT_LOST(?:\s|$)') { throw "The capture lost console input. See $serialLog." }
@@ -689,6 +762,7 @@ function Complete-MirrorCapture {
 # with SMEP and SMAP on (0016-D6). q35 keeps its default vmport, so captures
 # point through the vmmouse; -RelativePointer turns it off (0017-D18).
 $machine = if ($RelativePointer) { 'q35,accel=tcg,vmport=off' } else { 'q35,accel=tcg' }
+if ($NoHpet) { $machine += ',hpet=off' }
 $qemuArguments = @(
     '-machine', $machine, '-cpu', 'qemu64,+smep,+smap', '-m', '256', '-smp', "$CpuCount",
     '-display', 'none', '-vga', 'std', '-monitor', 'none', '-qmp', 'stdio',
@@ -698,6 +772,12 @@ $qemuArguments = @(
     '-drive', "if=none,id=mirror-disk,format=raw,readonly=on,file=$(ConvertTo-QemuOptionValue $diskImage)",
     '-device', 'virtio-blk-pci,drive=mirror-disk,disable-legacy=on,bootindex=0', '-serial', "file:$serialLog"
 )
+if ($null -ne $perfToken) {
+    $config = [System.IO.File]::ReadAllText((Join-Path $repositoryRoot 'boot/limine.conf')) + "`n    cmdline: $perfToken`n"
+    $smbiosConfig = Join-Path $buildDirectory 'capture-limine-smbios.txt'
+    [System.IO.File]::WriteAllText($smbiosConfig, "limine:config:$config")
+    $qemuArguments += @('-smbios', "type=11,path=$(ConvertTo-QemuOptionValue $smbiosConfig)")
+}
 # Captures use the V1 device profile: the e1000 NIC and the AHCI SATA fixture.
 # The QEMU ATA model needs a writable backend, so the fixture is the fresh
 # disposable copy build/ahci-test.img, verified in full after QEMU exits.
@@ -744,12 +824,18 @@ $process.StartInfo = $start
 $stderr = $null
 $started = $false
 try {
+    $perfRuntime = [System.Diagnostics.Stopwatch]::StartNew()
     if (-not $process.Start()) { throw 'Could not start QEMU.' }
     $started = $true
     $stderr = $process.StandardError.ReadToEndAsync()
     $greeting = Read-MirrorQmp $process
     if (-not $greeting.PSObject.Properties['QMP']) { throw 'Missing QMP greeting.' }
     Invoke-MirrorQmp $process 'qmp_capabilities'
+    if ($PerfCapture) {
+        Wait-MirrorKernelFlavor $process
+        Invoke-MirrorPerfCapture $process
+        return
+    }
     Assert-MirrorAbsoluteRejected $process
     Wait-MirrorKernelFlavor $process
     $framebufferSize = Wait-MirrorPointerMode $process

@@ -86,6 +86,17 @@ pub struct VerifySummary {
 /// directory. Fails before creating any output if the ESP tree is invalid or
 /// does not fit the ESP, and removes its temporary files on any failure.
 pub fn write_disk(esp_tree: &Path, image: &Path, vmdk: &Path) -> Result<DiskSummary> {
+    write_disk_with_perf(esp_tree, image, vmdk, false)
+}
+
+/// Like `write_disk`, with the dedicated performance CID when `perf` is true.
+/// Only the descriptor identity changes; the staged tree defines the image.
+pub fn write_disk_with_perf(
+    esp_tree: &Path,
+    image: &Path,
+    vmdk: &Path,
+    perf: bool,
+) -> Result<DiskSummary> {
     let image_name = vmdk::image_file_name(image)?;
     if !same_directory(image, vmdk)? {
         return Err(Error::new(format!(
@@ -108,7 +119,8 @@ pub fn write_disk(esp_tree: &Path, image: &Path, vmdk: &Path) -> Result<DiskSumm
     let esp_volume = esp::build(&tree)?;
     let root = ext2::format()?;
     let tables = gpt::tables();
-    let descriptor = vmdk::descriptor(&image_name)?;
+    let descriptor = vmdk::descriptor(&image_name, perf)?;
+    vmdk::validate(&descriptor, &image_name, perf)?;
 
     let mut image_output = output::Pending::create(image)?;
     let image_context = format!("cannot write {}", image_output.temporary().display());
@@ -148,6 +160,9 @@ pub fn write_disk(esp_tree: &Path, image: &Path, vmdk: &Path) -> Result<DiskSumm
         .write_all(descriptor.as_bytes())
         .and_then(|_| vmdk_output.file().flush())
         .map_err(|error| Error::io(&vmdk_context, error))?;
+    let written_descriptor = fs::read_to_string(vmdk_output.temporary())
+        .map_err(|error| Error::io("cannot read back the VMDK descriptor", error))?;
+    vmdk::validate(&written_descriptor, &image_name, perf)?;
 
     image_output.commit()?;
     vmdk_output.commit()?;

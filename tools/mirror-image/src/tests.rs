@@ -529,7 +529,7 @@ fn ext2_superblock_descriptors_bitmaps_and_free_counts_agree() {
 
 #[test]
 fn vmdk_descriptor_has_the_d9_header_and_one_flat_extent() {
-    let descriptor = vmdk::descriptor("mirror.img").unwrap();
+    let descriptor = vmdk::descriptor("mirror.img", false).unwrap();
     let lines: Vec<&str> = descriptor.lines().collect();
     assert_eq!(
         lines[..5],
@@ -565,8 +565,57 @@ fn vmdk_descriptor_has_the_d9_header_and_one_flat_extent() {
         assert!(!descriptor.contains(forbidden), "{forbidden}");
     }
     assert!(descriptor.ends_with('\n'));
-    assert!(vmdk::descriptor("mirror\".img").is_err());
-    assert!(vmdk::descriptor("").is_err());
+    assert!(vmdk::descriptor("mirror\".img", false).is_err());
+    assert!(vmdk::descriptor("", false).is_err());
+}
+
+#[test]
+fn vmdk_validation_checks_both_identities_and_the_complete_schema() {
+    for perf in [false, true] {
+        let descriptor = vmdk::descriptor("mirror.img", perf).unwrap();
+        vmdk::validate(&descriptor, "mirror.img", perf).unwrap();
+        assert!(vmdk::validate(&descriptor, "mirror.img", !perf).is_err());
+        assert!(vmdk::validate(&descriptor, "different.img", perf).is_err());
+        // Every required record is checked, not merely CID presence.
+        for line in descriptor
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            let removed = descriptor.replace(&format!("{line}\n"), "");
+            assert!(
+                vmdk::validate(&removed, "mirror.img", perf).is_err(),
+                "missing {line}"
+            );
+            let duplicate = format!("{descriptor}{line}\n");
+            assert!(
+                vmdk::validate(&duplicate, "mirror.img", perf).is_err(),
+                "duplicate {line}"
+            );
+            let changed = descriptor.replace(line, &format!("{line}1"));
+            assert!(
+                vmdk::validate(&changed, "mirror.img", perf).is_err(),
+                "changed {line}"
+            );
+        }
+        for extra in [
+            "ddb.uuid.image = \"unexpected\"",
+            "ddb.iofilters = \"unexpected\"",
+            "ddb.sidecars = \"unexpected\"",
+            "unknown=1",
+            "RDONLY 2097152 FLAT \"mirror.img\" 0",
+            "\u{e9}",
+        ] {
+            assert!(
+                vmdk::validate(&format!("{descriptor}{extra}\n"), "mirror.img", perf).is_err(),
+                "{extra}"
+            );
+        }
+    }
+    let equals_name = vmdk::descriptor("mirror=perf.img", true).unwrap();
+    vmdk::validate(&equals_name, "mirror=perf.img", true).unwrap();
+    let daily = vmdk::descriptor("mirror.img", false).unwrap();
+    let perf = vmdk::descriptor("mirror.img", true).unwrap();
+    assert_eq!(daily.replace("CID=4d495252", "CID=50455246"), perf);
 }
 
 fn fill(file: &mut fs::File, buffer: &mut [u8]) -> usize {
@@ -681,6 +730,19 @@ fn disk_images_are_byte_identical_and_verify() {
     patch(second_image, marker, b"M");
     let error = verify(&esp, second_image).unwrap_err().to_string();
     assert!(error.contains("marker"), "{error}");
+}
+
+#[test]
+fn perf_disk_writer_uses_the_separate_descriptor_identity() {
+    let scratch = Scratch::new("perf-disk");
+    let esp = staged_esp(&scratch);
+    let image = scratch.join("mirror.img");
+    let vmdk = scratch.join("mirror.vmdk");
+    write_disk_with_perf(&esp, &image, &vmdk, true).unwrap();
+    verify(&esp, &image).unwrap();
+    let descriptor = fs::read_to_string(vmdk).unwrap();
+    vmdk::validate(&descriptor, "mirror.img", true).unwrap();
+    assert!(vmdk::validate(&descriptor, "mirror.img", false).is_err());
 }
 
 #[test]

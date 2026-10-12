@@ -73,11 +73,16 @@ dependencies = [
  "linked_list_allocator",
  "mirror-acpi",
  "mirror-clock-protocol",
+ "mirror-perf-protocol",
  "mirror-thread-protocol",
  "mirror-ui-tokens",
  "mirror-vm-protocol",
  "mirror-window-protocol",
 ]
+
+[[package]]
+name = "mirror-perf-protocol"
+version = "0.1.0"
 
 [[package]]
 name = "mirror-sync"
