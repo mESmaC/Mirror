@@ -402,6 +402,43 @@ function Assert-MirrorSchedReady {
     }
 }
 
+function Assert-MirrorKernelVa {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [Parameter(Mandatory = $true)][int]$OnlineCpus,
+        [Parameter(Mandatory = $true)][bool]$Smoke
+    )
+
+    # Spec 0050-D4. Every flavor pins the kernel VA window's tables before SMP
+    # startup seals kernel mappings and reports the window exactly once.
+    $names = [regex]::Matches($Serial, '(?m)^MIRROR_KVA_READY(?:\s|$)')
+    $records = [regex]::Matches($Serial, '(?m)^MIRROR_KVA_READY base=0xffffd40000000000 size=33554432\r?$')
+    if ($names.Count -ne 1 -or $records.Count -ne 1) {
+        throw 'Mirror must report MIRROR_KVA_READY base=0xffffd40000000000 size=33554432 exactly once.'
+    }
+    $startup = [regex]::Matches($Serial, '(?m)^MIRROR_SMP_(?:READY|SKIPPED)(?:\s|$)')
+    if ($startup.Count -ne 1 -or $records[0].Index -ge $startup[0].Index) {
+        throw 'MIRROR_KVA_READY must precede SMP startup.'
+    }
+    # Only smoke kernels run the window's self-test (0050, acceptance test 4),
+    # after SMP startup, so it probes every online CPU, and before the
+    # scheduler report. It fills all 455 stack spans and trims them in 33
+    # batches of up to 256 pages.
+    $tests = [regex]::Matches($Serial, '(?m)^MIRROR_KVA_TESTS_OK(?:\s|$)')
+    if ($Smoke) {
+        $pattern = '(?m)^MIRROR_KVA_TESTS_OK cpus={0} spans=455 trimmed=455 batches=33 reuse=1 rollback=1 degraded=1\r?$' -f $OnlineCpus
+        $valid = [regex]::Matches($Serial, $pattern)
+        $sched = [regex]::Match($Serial, '(?m)^MIRROR_SCHED_READY(?:\s|$)')
+        if ($tests.Count -ne 1 -or $valid.Count -ne 1 -or $valid[0].Index -le $startup[0].Index -or
+            -not $sched.Success -or $valid[0].Index -ge $sched.Index) {
+            throw "A smoke kernel must pass the kernel VA self-test on $OnlineCpus CPU(s) exactly once, after SMP startup and before the scheduler report."
+        }
+    }
+    elseif ($tests.Count -ne 0) {
+        throw 'Only smoke kernels run the kernel VA self-test.'
+    }
+}
+
 function Assert-MirrorStacks {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,

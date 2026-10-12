@@ -41,7 +41,8 @@ const FAILED: u32 = 3;
 const CANCELLED: u32 = 4;
 const OP_PROOF: u32 = 1;
 const OP_INVALIDATE_RANGE: u32 = 2;
-const MAX_INVALIDATE_PAGES: u64 = 256;
+/// The most pages one shootdown command covers; kernel_va batches trims by it.
+pub(crate) const MAX_INVALIDATE_PAGES: u64 = 256;
 const OP_READ_SHARED: u32 = 3;
 #[cfg(feature = "boot-smoke")]
 const OP_GUARD_FAULT: u32 = 4;
@@ -648,6 +649,7 @@ fn invalidation_range_valid(address: u64, pages: u64) -> bool {
     [
         (paging::SHARED_BASE, paging::SHARED_PAGES as u64 * PAGE_SIZE),
         (crate::heap::HEAP_START, crate::heap::HEAP_MAX_SIZE as u64),
+        (crate::kernel_va::BASE, crate::kernel_va::SIZE as u64),
     ]
     .into_iter()
     .any(|(start, bytes)| {
@@ -814,7 +816,8 @@ pub(crate) fn prepare_kernel_update() -> Result<KernelUpdate, &'static str> {
 }
 
 impl KernelUpdate {
-    /// Complete one already-published shared-window or heap PTE change.
+    /// Complete one already-published shared-window, heap or kernel VA PTE
+    /// change.
     ///
     /// # Safety
     /// The caller must satisfy invalidate_range's contract for this one page.
@@ -828,11 +831,13 @@ impl KernelUpdate {
     /// per target. Any failure stops the BSP before a retired frame is returned.
     ///
     /// # Safety
-    /// The caller owns every aligned page in the range, wholly inside either
-    /// the shared window or reserved heap, and excludes live access throughout
-    /// the update. No IRQ-needed lock or allocator guard may be held. Removed
-    /// frames and page tables remain allocated until this call returns. Call
-    /// on the same BSP/root with IF=0 that prepared this ticket.
+    /// The range lies wholly inside the shared window, the reserved heap or
+    /// the kernel VA window. The caller owns every changed page in it and
+    /// excludes live access to them throughout the update; an unchanged page
+    /// keeps its mapping, and invalidation only drops cached copies of it. No
+    /// IRQ-needed lock or allocator guard may be held. Removed frames and page
+    /// tables remain allocated until this call returns. Call on the same
+    /// BSP/root with IF=0 that prepared this ticket.
     pub(crate) unsafe fn invalidate_range(self, address: u64, pages: usize) {
         let pages = pages as u64;
         assert!(
@@ -865,14 +870,16 @@ impl KernelUpdate {
     }
 }
 
-/// Read one caller-owned shared-window or heap page on every CPU and verify the
-/// value and per-CPU sequence proof. This deliberately warms each CPU's TLB.
+/// Read one caller-owned shared-window, heap or kernel VA page on every CPU
+/// and verify the value and per-CPU sequence proof. This deliberately warms
+/// each CPU's TLB.
 ///
 /// # Safety
 /// Run on BSP with IF=0, holding no IRQ-needed lock. The aligned page must be
-/// initialized and mapped readable in the shared window or reserved heap. It
-/// remains allocated, mapped and immutable until all commands complete. No
-/// allocator guard may be held, and no Rust reference spans an IPI read.
+/// initialized and mapped readable in the shared window, the reserved heap or
+/// the kernel VA window. It remains allocated, mapped and immutable until all
+/// commands complete. No allocator guard may be held, and no Rust reference
+/// spans an IPI read.
 pub(crate) unsafe fn probe_shared_page(address: u64, expected: u64) -> usize {
     assert!(
         invalidation_range_valid(address, 1),

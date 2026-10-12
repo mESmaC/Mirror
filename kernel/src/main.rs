@@ -23,6 +23,7 @@ mod heap;
 mod input;
 mod interrupts;
 mod ipc;
+mod kernel_va;
 mod kernel_vm;
 mod keyboard;
 mod memory;
@@ -352,6 +353,11 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
     // SAFETY: BSP owns the hierarchy and allocator, IF=0, no AP or retained
     // user root has been released. Runtime leaf changes keep these tables pinned.
     unsafe { tables.prepare_shared_window(&mut frames) }.expect("shared kernel window");
+    // The kernel VA window's tables are pinned before smp::init seals kernel
+    // mappings, and every flavor reports the window once (spec 0050-D4).
+    // SAFETY: As above: the BSP alone, IF=0, the active root and its sole
+    // allocator, before AP release and before any retained user root.
+    unsafe { kernel_va::init(&mut tables, &mut frames) };
     smp::init(&boot, topology.as_ref(), &mut tables, &mut frames);
     // Every flavor reports each online CPU's stacks, then the BSP region,
     // then each online CPU's protections and the BSP's speculative-execution
@@ -363,6 +369,13 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
     kernel_vm::init(&tables, &mut frames, boot.direct_map_offset);
     #[cfg(feature = "boot-smoke")]
     kernel_vm::heap_window_self_test(&tables, &mut frames, boot.direct_map_offset);
+    // SAFETY: The BSP with IF=0 on the active kernel root, after SMP startup,
+    // with the sole allocator and its HHDM. No client uses the window yet and
+    // no IRQ-needed lock is held.
+    #[cfg(feature = "boot-smoke")]
+    unsafe {
+        kernel_va::self_test(&tables, &mut frames, boot.direct_map_offset)
+    };
     grow_kernel_heap(&tables, &mut frames, boot.direct_map_offset, "boot");
     // The process and thread tables are .bss statics; every flavor reports
     // them once, before the first session or the skipped-desktop path.

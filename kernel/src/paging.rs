@@ -5,9 +5,11 @@
 //! Private user roots borrow supervisor-only upper mappings and own their lower
 //! tables and leaves. Page-table handles and the allocator stay on the BSP;
 //! software mutation requires interrupts disabled there. Before AP release,
-//! arbitrary kernel mappings are sealed. Prepared heap and 2 MiB scratch windows
-//! permit changes to 4 KiB leaves through synchronous TLB shootdowns; their table
-//! hierarchy remains pinned. APs retain the kernel root and never access
+//! arbitrary kernel mappings are sealed. Prepared heap, kernel VA and 2 MiB
+//! scratch windows permit changes to 4 KiB leaves. Removals complete through
+//! synchronous TLB shootdowns; the kernel VA window maps absent leaves locally
+//! (spec 0050-D3). Every window's table hierarchy remains pinned. APs retain
+//! the kernel root and never access
 //! private user mappings or their physical pages. Huge-page splitting and
 //! arbitrary shared hierarchy changes remain unsupported.
 //! Bootloader-reclaimable memory stays reserved for the stack and
@@ -49,6 +51,14 @@ const _: () = {
     assert!(HEAP_TABLES > 0);
     assert!(crate::heap::HEAP_MAX_SIZE.is_multiple_of(ENTRIES * PAGE_SIZE as usize));
     assert!(crate::heap::HEAP_START.is_multiple_of(ENTRIES as u64 * PAGE_SIZE));
+};
+/// Leaf tables of the kernel VA window (spec 0050-D3): 16 for 32 MiB.
+pub const KVA_TABLES: usize = crate::kernel_va::SIZE / (ENTRIES * PAGE_SIZE as usize);
+const KVA_END: u64 = crate::kernel_va::BASE + crate::kernel_va::SIZE as u64;
+const _: () = {
+    assert!(KVA_TABLES > 0);
+    assert!(crate::kernel_va::SIZE.is_multiple_of(ENTRIES * PAGE_SIZE as usize));
+    assert!(crate::kernel_va::BASE.is_multiple_of(ENTRIES as u64 * PAGE_SIZE));
 };
 
 // Released APs require permanently retained kernel table paths. Only the
@@ -94,6 +104,10 @@ pub enum PagingError {
     HeapWindowNotPrepared,
     HeapWindowReserved,
     InvalidHeapRange,
+    KvaWindowAlreadyPrepared,
+    KvaWindowNotPrepared,
+    KvaWindowReserved,
+    InvalidKvaRange,
 }
 
 pub struct PageTables {
@@ -103,6 +117,7 @@ pub struct PageTables {
     owned_tables: usize,
     shared_table: Option<u64>,
     heap_tables: Option<[u64; HEAP_TABLES]>,
+    kva_tables: Option<[u64; KVA_TABLES]>,
     // A page-table handle cannot be sent to another CPU or concurrently shared.
     _boot_cpu_only: PhantomData<*mut ()>,
 }
@@ -478,6 +493,181 @@ impl PageTables {
                 .contains(&address)
     }
 
+    /// Pin the kernel VA window's complete hierarchy while every leaf is
+    /// absent (spec 0050-D3): a PDPT, a PD and 16 leaf PTs for 32 MiB. Empty
+    /// parent tables allocated before an error remain owned by this hierarchy,
+    /// as for the heap window.
+    ///
+    /// # Safety
+    /// Run once on the BSP with IF=0 and this root active, before AP release
+    /// and before creating any retained userspace root, which copies the upper
+    /// PML4 entries. Own the allocator and the whole window; only kernel_va
+    /// changes its leaves, and the table paths stay for the kernel's lifetime.
+    pub unsafe fn prepare_kva_window(
+        &mut self,
+        frames: &mut FrameAllocator<'_>,
+    ) -> Result<(), PagingError> {
+        if self.kva_tables.is_some() {
+            return Err(PagingError::KvaWindowAlreadyPrepared);
+        }
+        if KERNEL_SHARED.load(Ordering::Acquire) {
+            return Err(PagingError::KernelMappingsShared);
+        }
+        self.check_active()?;
+        self.check_write_back_cache()?;
+        // Nothing may map the window already, a huge HHDM leaf on a machine
+        // with enough RAM to reach PML4 slot 424 included.
+        for page in 0..crate::kernel_va::PAGES {
+            if self
+                .translate(crate::kernel_va::BASE + page as u64 * PAGE_SIZE)?
+                .is_some()
+            {
+                return Err(PagingError::AlreadyMapped);
+            }
+        }
+        let mut tables = [0; KVA_TABLES];
+        for (index, table) in tables.iter_mut().enumerate() {
+            let address = crate::kernel_va::BASE + (index * ENTRIES) as u64 * PAGE_SIZE;
+            *table = self.prepare_empty_leaf_table(address, frames)?;
+        }
+        self.kva_tables = Some(tables);
+        Ok(())
+    }
+
+    /// Publish a contiguous run of owned frames in the kernel VA window.
+    /// Every leaf was absent, and TLBs and paging-structure caches hold only
+    /// present entries (Intel SDM Vol. 3A 4.10.4.3; AMD APM Vol. 2 5.5.3), so
+    /// no CPU can hold a translation for the run: the map needs no local or
+    /// remote invalidation, whatever state the other CPUs are in (0050-D3).
+    /// Every error precedes all PTE writes.
+    ///
+    /// # Safety
+    /// Run on the BSP with IF=0 and this kernel root active. Exclusively own
+    /// distinct, initialized WB RAM frames and the absent run, which kernel_va
+    /// reserved. No access, reference or DMA may use the run until this
+    /// returns. Keep the frames until a successful unmap_kva_pages.
+    pub unsafe fn map_kva_pages(&self, address: u64, frames: &[u64]) -> Result<(), PagingError> {
+        self.check_kva_range(address, frames.len())?;
+        for (page, &physical) in frames.iter().enumerate() {
+            self.check_physical(physical)?;
+            let previous = self
+                .kva_leaf(address + page as u64 * PAGE_SIZE)?
+                .load(Ordering::Acquire);
+            if previous & PRESENT != 0 {
+                return Err(PagingError::AlreadyMapped);
+            }
+            if previous != 0 {
+                return Err(PagingError::InvalidTable);
+            }
+        }
+        for (page, &physical) in frames.iter().enumerate() {
+            // The exclusive BSP writer preflighted every absent leaf. Atomic
+            // stores publish complete entries; no fallible path follows them.
+            self.kva_leaf(address + page as u64 * PAGE_SIZE)
+                .expect("preflighted kernel VA leaf")
+                .store(
+                    physical | PRESENT | WRITABLE | NO_EXECUTE,
+                    Ordering::Release,
+                );
+        }
+        Ok(())
+    }
+
+    /// Withdraw `leaves`, (address, frame) pairs in strictly increasing
+    /// address order inside the cover, then invalidate the whole cover of
+    /// 1..=256 pages with one shootdown. Pages in the cover that are not
+    /// leaves keep their mappings; invalidation only drops cached copies.
+    /// Every recoverable error, an unavailable transport included, precedes
+    /// all PTE writes. After publication a failed shootdown halts, so a frame
+    /// never returns while another CPU may still translate to it.
+    ///
+    /// # Safety
+    /// Run on the BSP with IF=0 and this kernel root active. Own every leaf's
+    /// frame, and end every access, reference, DMA, TSS or IST use of its page
+    /// on every CPU. IRQ and NMI paths must not use the window. Hold no lock
+    /// an IRQ handler needs: the shootdown waits with IF briefly enabled.
+    pub unsafe fn unmap_kva_pages(
+        &self,
+        cover: u64,
+        cover_pages: usize,
+        leaves: &[(u64, u64)],
+    ) -> Result<(), PagingError> {
+        self.check_kva_range(cover, cover_pages)?;
+        if leaves.is_empty() || cover_pages > crate::smp::MAX_INVALIDATE_PAGES as usize {
+            return Err(PagingError::InvalidKvaRange);
+        }
+        let end = cover + cover_pages as u64 * PAGE_SIZE;
+        let accessed_dirty = (1 << 5) | (1 << 6);
+        let mut previous = None;
+        for &(address, physical) in leaves {
+            check_page_address(address)?;
+            if !(cover..end).contains(&address) || previous.is_some_and(|last| address <= last) {
+                return Err(PagingError::InvalidKvaRange);
+            }
+            previous = Some(address);
+            self.check_physical(physical)?;
+            let entry = self.kva_leaf(address)?.load(Ordering::Acquire);
+            if entry & PRESENT == 0 {
+                return Err(PagingError::NotMapped);
+            }
+            if entry & !accessed_dirty != physical | PRESENT | WRITABLE | NO_EXECUTE {
+                return Err(PagingError::InvalidTable);
+            }
+        }
+        let update = crate::smp::prepare_kernel_update()
+            .map_err(|_| PagingError::SharedUpdateUnavailable)?;
+        for &(address, _) in leaves {
+            // Atomic exchange tolerates hardware setting A/D after the
+            // preflight load without tearing the withdrawn frame identity.
+            self.kva_leaf(address)
+                .expect("preflighted kernel VA removal")
+                .swap(0, Ordering::AcqRel);
+        }
+        // SAFETY: The ticket and full preflight precede removal. The caller
+        // keeps every withdrawn frame until all CPUs acknowledge the cover.
+        unsafe { update.invalidate_range(cover, cover_pages) };
+        Ok(())
+    }
+
+    fn check_kva_range(&self, address: u64, pages: usize) -> Result<(), PagingError> {
+        check_page_address(address)?;
+        if pages == 0
+            || address < crate::kernel_va::BASE
+            || (pages as u64)
+                .checked_mul(PAGE_SIZE)
+                .and_then(|bytes| address.checked_add(bytes))
+                .is_none_or(|end| end > KVA_END)
+        {
+            return Err(PagingError::InvalidKvaRange);
+        }
+        self.check_active()?;
+        if self.kva_tables.is_none() {
+            return Err(PagingError::KvaWindowNotPrepared);
+        }
+        Ok(())
+    }
+
+    // Range validation precedes calls; pinned PTs also keep these references
+    // valid when the BSP temporarily enables interrupts during a shootdown.
+    fn kva_leaf(&self, address: u64) -> Result<&AtomicU64, PagingError> {
+        let tables = self
+            .kva_tables
+            .as_ref()
+            .ok_or(PagingError::KvaWindowNotPrepared)?;
+        let page = (address - crate::kernel_va::BASE) as usize / PAGE_SIZE as usize;
+        let physical = *tables
+            .get(page / ENTRIES)
+            .ok_or(PagingError::InvalidKvaRange)?;
+        let table = self.table_pointer(physical)?;
+        // SAFETY: Retained full PT, aligned atomic entry, no ordinary reference
+        // aliases it. Software writes are exclusive to this BSP handle.
+        Ok(unsafe { AtomicU64::from_ptr(table.add(page % ENTRIES)) })
+    }
+
+    fn kva_reserved(&self, address: u64) -> bool {
+        self.kva_tables.is_some() && (crate::kernel_va::BASE..KVA_END).contains(&address)
+    }
+
     /// Restore the kernel root after executing an isolated user address space.
     ///
     /// # Safety
@@ -613,6 +803,9 @@ impl PageTables {
         if self.heap_reserved(address) {
             return Err(PagingError::HeapWindowReserved);
         }
+        if self.kva_reserved(address) {
+            return Err(PagingError::KvaWindowReserved);
+        }
         check_page_address(address)?;
         self.check_physical(physical)?;
         self.check_active()?;
@@ -665,7 +858,8 @@ impl PageTables {
     /// Run only on the boot CPU with interrupts disabled and this root active.
     /// Remove mappings before publishing this root to APs; removal is rejected
     /// once share_with_secondaries has sealed the hierarchy.
-    /// Prepared windows and heap guards reject this general mapping API.
+    /// Prepared windows, the kernel VA window and heap guards reject this
+    /// general mapping API.
     /// No live reference or subsequent access may depend on the removed alias.
     /// In particular, keep the executing code, stack, and HHDM of all table
     /// frames mapped. The caller must handle any remaining physical aliases.
@@ -678,6 +872,9 @@ impl PageTables {
         }
         if self.heap_reserved(address) {
             return Err(PagingError::HeapWindowReserved);
+        }
+        if self.kva_reserved(address) {
+            return Err(PagingError::KvaWindowReserved);
         }
         check_page_address(address)?;
         self.check_active()?;
@@ -1501,6 +1698,7 @@ pub unsafe fn take_ownership(
         owned_tables: 0,
         shared_table: None,
         heap_tables: None,
+        kva_tables: None,
         _boot_cpu_only: PhantomData,
     };
     let code_address = take_ownership as *const () as u64;

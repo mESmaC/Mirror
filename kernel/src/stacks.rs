@@ -32,7 +32,7 @@ pub const MAX_PAGES: usize = 64;
 /// Guarded stacks live in the kernel half only.
 const KERNEL_HALF: u64 = 0xffff_8000_0000_0000;
 
-const ARENA: u64 = 0xffff_d100_0000_0000;
+pub(crate) const ARENA: u64 = 0xffff_d100_0000_0000;
 const SCHEDULER_PAGES: usize = 64;
 const RSP0_PAGES: usize = 16;
 /// Every CPU has guarded IST1 (#DF), IST2 (NMI) and IST3 (#MC) stacks of

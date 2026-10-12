@@ -27,7 +27,7 @@ use crate::{
 };
 
 // Dedicated platform mappings must not consume reserved heap growth pages.
-const DEVICE_WINDOW: u64 = 0xffff_d300_0000_0000;
+pub(crate) const DEVICE_WINDOW: u64 = 0xffff_d300_0000_0000;
 const _: () = assert!(
     DEVICE_WINDOW >= crate::heap::HEAP_START + crate::heap::HEAP_MAX_SIZE as u64 + PAGE_SIZE
 );
