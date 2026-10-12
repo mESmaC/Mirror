@@ -22,7 +22,7 @@ Either one writes Workstation's defaults, which the checks depend on: `pciBridge
 
 ## Reference
 
-Confirmed by spec 0015a's check 9 on 2026-10-11, on the install below, in a VM created as above with exactly the settings on this page. Changing a value means rerunning that check.
+Confirmed by spec 0015a's check 9 on 2026-10-11, on the install below, in a VM created as above with exactly the settings on this page. Changing a value means rerunning that check. The backdoor key (below) was added on 2026-10-12 under 0017-D19, after check 9: 0017c's check 7 booted with it (vmmouse READY, pointing exact), but check 9 has not been rerun with it.
 
 | Field | Value |
 | --- | --- |
@@ -97,7 +97,7 @@ msg.autoAnswer = "TRUE"
 rtc.diffFromUTC = "0"
 ```
 
-**Backdoor.** Limit the VMware backdoor to CPL0 (0017-D19), so no Mirror user process can reach the host RPC or clipboard channel. Workstation 26.0.1 accepts it in ULM mode, and the vmmouse still works.
+**Backdoor.** Limit the VMware backdoor to CPL0 (0017-D19), so no Mirror user process can reach the host RPC or clipboard channel. Workstation 26.0.1 accepts it in ULM mode and the vmmouse still works; its CPL3 enforcement under ULM has not been probed.
 
 ```
 monitor_control.restrict_backdoor = "TRUE"

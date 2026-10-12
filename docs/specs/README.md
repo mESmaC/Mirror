@@ -79,7 +79,7 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 - NEW: toolkit core: layout, button, text field, scroll view, focus model with focus-visible rings, theming from `mirror-ui-tokens`, element trees
 - NEW: 0027e window manager: any number of windows, resize, maximize, snap, z-layers, cursor shapes, the titlebar geometry, a minimal taskbar, an app-crash notice
 - 0060a (split): device objects, BAR sizing, runtime MMIO with write-combining, polled lifetime
-- 0087a (split): the VMware guest RPC (TCLO) core: reset and ping, `tools.set.version`, capability registration
+- 0087a (split): the VMware guest RPC (TCLO) core: reset and ping, `tools.set.version`, capability registration; backdoor access stays at CPL0, so a userspace service goes through a kernel broker (0017-D19)
 - 0069 VMware SVGA II display driver: mode setting, and live resize driven by guest RPC (TCLO) resize requests (S1a, S1c; after 0060). Placement is decided when 0069 comes up (decisions.md Pending): a GuestRpc/TCLO core split out of 0087 and placed before 0069, or mode setting only, with live resize moving to 0087. Adds a FIFO-aware kernel console and crash screen, a QEMU `-vga vmware` profile, and clamps multi-display topology requests to display 0
 - 0087b (split): host text clipboard
 - NEW: frame-time and idle budget: p95 frame times at 1920x1080, memory per window, host CPU while idle; then 0018's Mirror rows
@@ -137,7 +137,7 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 - 0088 Desktop apps: file manager, settings, system and task monitor (G10; with Kimi)
 - NEW: HD Audio output, mixer and volume (S22)
 - NEW: screenshots: PNG codec, a capture tool on 0027a's capture API, image preview
-- 0087 VMware guest services: RPC channel, host clipboard sharing, shared folders (A20, S20); its RPC core may move ahead of 0069 (S1c, see 0069). The HGFS shared-folder remainder
+- 0087 VMware guest services: RPC channel, host clipboard sharing, shared folders (A20, S20); its RPC core may move ahead of 0069 (S1c, see 0069). Backdoor access stays at CPL0, so a userspace service goes through a kernel broker (0017-D19). The HGFS shared-folder remainder
 
 **Phase 10: Harness product layer**
 - 0041 Capability presets and grants: read-only/full, grant sources, delegation (A4-A7); development rule full access = root (A5a), ceiling per O7; clipboard access as a grantable, audited capability (A20)
