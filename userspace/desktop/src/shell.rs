@@ -28,6 +28,10 @@ const INK: [u8; 4] = DEFAULT.text_primary.rgbx();
 struct Pending {
     events: [Option<Event>; PENDING_EVENTS],
     length: usize,
+    /// A pointer Reset that did not fit behind queued keys and focus changes
+    /// (spec 0017a-D3). It goes in as soon as a pop makes room, and pointer
+    /// events are dropped until it does, so a pointer loss never costs a key.
+    reset_owed: bool,
 }
 
 impl Pending {
@@ -35,10 +39,17 @@ impl Pending {
         Self {
             events: [None; PENDING_EVENTS],
             length: 0,
+            reset_owed: false,
         }
     }
 
     fn push(&mut self, event: Event, focused: bool) {
+        if let Event::Pointer { .. } = event {
+            self.settle_reset();
+            if self.reset_owed {
+                return;
+            }
+        }
         if let Event::Pointer { buttons, .. } = event
             && self.length != 0
             && let Some(Event::Pointer {
@@ -47,6 +58,16 @@ impl Pending {
             && buttons == previous
         {
             self.events[self.length - 1] = Some(event);
+            return;
+        }
+        if self.length == PENDING_EVENTS && matches!(event, Event::Pointer { .. }) {
+            // Pointer overflow costs pointer events only: drop the queued
+            // ones behind a Reset and keep every key (spec 0017a-D3).
+            self.reset_pointer();
+            if self.length < PENDING_EVENTS {
+                self.events[self.length] = Some(event);
+                self.length += 1;
+            }
             return;
         }
         if self.length == PENDING_EVENTS {
@@ -61,6 +82,7 @@ impl Pending {
             };
             self.events[1] = Some(Event::Focus(focused));
             self.length = 2;
+            self.reset_owed = false;
             return;
         }
         self.events[self.length] = Some(event);
@@ -71,6 +93,34 @@ impl Pending {
         self.events.copy_within(1..self.length, 0);
         self.length -= 1;
         self.events[self.length] = None;
+        self.settle_reset();
+    }
+
+    /// Record a pointer loss for this app (spec 0017a-D3). Queued pointer
+    /// events predate the loss and Reset clears the app's pointer state, so
+    /// they are dropped; keys and focus changes keep their order, and the
+    /// Reset follows them (app Reset touches only pointer state).
+    fn reset_pointer(&mut self) {
+        let mut kept = 0;
+        for index in 0..self.length {
+            let event = self.events[index];
+            if !matches!(event, Some(Event::Pointer { .. } | Event::Reset)) {
+                self.events[kept] = event;
+                kept += 1;
+            }
+        }
+        self.events[kept..self.length].fill(None);
+        self.length = kept;
+        self.reset_owed = true;
+        self.settle_reset();
+    }
+
+    fn settle_reset(&mut self) {
+        if self.reset_owed && self.length < PENDING_EVENTS {
+            self.events[self.length] = Some(Event::Reset);
+            self.length += 1;
+            self.reset_owed = false;
+        }
     }
 }
 
@@ -440,8 +490,10 @@ impl Shell {
                     self.capture = Capture::None;
                     self.buttons = 0;
                     self.clicks_armed = false;
-                    for slot in 0..protocol::MAX_APPS {
-                        self.enqueue(slot, Event::Reset);
+                    for window in self.windows.iter_mut().flatten() {
+                        if window.state == protocol::RUNNING {
+                            window.pending.reset_pointer();
+                        }
                     }
                 }
             }
@@ -1386,6 +1438,50 @@ fn policy_checks() {
             && shell.buttons == 1
             && shell.clicks_armed,
         173,
+    );
+    // A pointer loss into an app queue already full of keys keeps all 16
+    // keys and owes the Reset, which goes in at the first pop; a pointer
+    // event that arrives meanwhile is dropped, not a key (codex's 0017a
+    // review).
+    let key = |ascii| Event::Key {
+        flags: 1,
+        kind: 1,
+        ascii,
+    };
+    let mut pending = Pending::new();
+    for index in 0..PENDING_EVENTS as u8 {
+        pending.push(key(b'a' + index), true);
+    }
+    pending.reset_pointer();
+    require(
+        pending.length == PENDING_EVENTS
+            && pending.reset_owed
+            && (0..PENDING_EVENTS)
+                .all(|index| pending.events[index] == Some(key(b'a' + index as u8))),
+        174,
+    );
+    pending.push(
+        Event::Pointer {
+            x: 1,
+            y: 1,
+            buttons: 1,
+        },
+        true,
+    );
+    require(
+        pending.length == PENDING_EVENTS
+            && pending.reset_owed
+            && pending.events[PENDING_EVENTS - 1] == Some(key(b'a' + PENDING_EVENTS as u8 - 1)),
+        175,
+    );
+    pending.pop();
+    require(
+        !pending.reset_owed
+            && pending.length == PENDING_EVENTS
+            && pending.events[0] == Some(key(b'b'))
+            && pending.events[PENDING_EVENTS - 2] == Some(key(b'a' + PENDING_EVENTS as u8 - 1))
+            && pending.events[PENDING_EVENTS - 1] == Some(Event::Reset),
+        176,
     );
 }
 
