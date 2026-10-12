@@ -399,47 +399,51 @@ function Invoke-MirrorHygieneProbe {
         throw "The default kernel ran the init battery. See $serialLog."
     }
 
-    # Step 2: launch Notes through the shell's launcher (capture-shell.ps1). The
-    # default shell prints no readiness or pointer oracle, so each attempt clamps
-    # the pointer at (0,0) and clicks, until the content-free lifecycle marker.
+    # Step 2: BOOT_OK precedes input-session creation, which drains old input.
+    # Wait for the actual shell launcher before sending one click. A stable boot
+    # screen alone cannot prove readiness, and retrying a slow, unacknowledged
+    # click can start a second Notes. Use the confirmed 0029 dark launcher pixels
+    # (shell.rs launcher/paint, ui-tokens DEFAULT), without a default serial oracle.
     $bootScreen = Join-Path $buildDirectory 'hygiene-boot.png'
-    Save-MirrorScreenshot $Process $bootScreen
-    $image = [System.IO.File]::ReadAllBytes($bootScreen)
-    if ([System.Text.Encoding]::ASCII.GetString($image, 12, 4) -cne 'IHDR') {
-        throw 'The first screendump has no PNG IHDR header.'
-    }
-    $width = ([int64]$image[16] -shl 24) -bor ([int64]$image[17] -shl 16) -bor ([int64]$image[18] -shl 8) -bor [int64]$image[19]
-    $height = ([int64]$image[20] -shl 24) -bor ([int64]$image[21] -shl 16) -bor ([int64]$image[22] -shl 8) -bor [int64]$image[23]
-    if ($width -ne 1280 -or $height -ne 800) {
-        throw "The hygiene probe requires a 1280x800 display; got ${width}x$height."
-    }
-    $launched = $false
-    for ($attempt = 0; $attempt -lt 10 -and -not $launched; $attempt++) {
-        Send-MirrorPointerMotion $Process (-2560) (-1600)
-        Send-MirrorPointerMotion $Process 64 776
-        Send-MirrorPointerButton $Process 'left' $true
-        Start-Sleep -Milliseconds 40
-        Send-MirrorPointerButton $Process 'left' $false
-        $clicked = [System.Diagnostics.Stopwatch]::StartNew()
-        do {
-            if ($Process.HasExited) { throw 'Kernel exited during the launcher click.' }
-            $serial = Read-MirrorSerial
-            if ($serial -match '(?m)^(?:MIRROR_PANIC|MIRROR_EXCEPTION|MIRROR_USER_FAULT)(?:\s|:|$)') {
-                throw "Kernel or shell faulted during the launcher click. See $serialLog."
+    Add-Type -AssemblyName System.Drawing
+    $deadline = [System.Diagnostics.Stopwatch]::StartNew()
+    do {
+        if ($Process.HasExited) { throw 'Kernel exited before the shell launcher appeared.' }
+        $serial = Read-MirrorSerial
+        if ($serial -match '(?m)^(?:MIRROR_PANIC|MIRROR_EXCEPTION|MIRROR_USER_FAULT|MIRROR_SHELL_CLEANUP_OK|MIRROR_CONSOLE_READY)(?:\s|:|$)') {
+            throw "Kernel or shell failed before the launcher appeared. See $serialLog."
+        }
+        Save-MirrorScreenshot $Process $bootScreen
+        $image = [System.Drawing.Bitmap]::new($bootScreen)
+        try {
+            if ($image.Width -ne 1280 -or $image.Height -ne 800) {
+                throw "The hygiene probe requires a 1280x800 display; got $($image.Width)x$($image.Height)."
             }
-            $starts = [regex]::Matches($serial, '(?m)^MIRROR_APP_STARTED(?:\s|$)').Count
-            if ($starts -gt 0) {
-                # A second start, or a start of another kind, fails the probe.
-                if ($starts -ne 1 -or [regex]::Matches($serial, '(?m)^MIRROR_APP_STARTED pid=[1-9][0-9]* kind=0\r?$').Count -ne 1) {
-                    throw "The launcher must start exactly one Notes application (MIRROR_APP_STARTED pid=N kind=0). See $serialLog."
+            $launcherReady = $true
+            foreach ($point in @(
+                    @(20, 760, 0x3B4A6B), @(21, 761, 0x232E44), @(107, 791, 0x3B4A6B),
+                    @(116, 760, 0x3B4A6B), @(117, 761, 0x232E44), @(215, 791, 0x3B4A6B))) {
+                if (($image.GetPixel($point[0], $point[1]).ToArgb() -band 0xFFFFFF) -ne $point[2]) {
+                    $launcherReady = $false
+                    break
                 }
-                $launched = $true
-                break
             }
-            Start-Sleep -Milliseconds 100
-        } while ($clicked.Elapsed.TotalSeconds -lt 3)
+        } finally { $image.Dispose() }
+        if ($launcherReady) { break }
+        if ($deadline.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw "The shell launcher did not appear. See $bootScreen and $serialLog." }
+        Start-Sleep -Milliseconds 100
+    } while ($true)
+    Send-MirrorPointerMotion $Process (-2560) (-1600)
+    Send-MirrorPointerMotion $Process 64 776
+    Send-MirrorPointerButton $Process 'left' $true
+    Start-Sleep -Milliseconds 40
+    Send-MirrorPointerButton $Process 'left' $false
+    Wait-MirrorDesktopMessage $Process '(?m)^MIRROR_APP_STARTED(?:\s|$)'
+    $serial = Read-MirrorSerial
+    if ([regex]::Matches($serial, '(?m)^MIRROR_APP_STARTED(?:\s|$)').Count -ne 1 -or
+        [regex]::Matches($serial, '(?m)^MIRROR_APP_STARTED pid=[1-9][0-9]* kind=0\r?$').Count -ne 1) {
+        throw "The launcher must start exactly one Notes application (MIRROR_APP_STARTED pid=N kind=0). See $serialLog."
     }
-    if (-not $launched) { throw "Notes did not start after 10 launcher clicks. See $serialLog." }
 
     # Step 3: Notes receives the sentinel and pointer motion with empty serial.
     Invoke-MirrorHygieneInput $Process 'notes' 'zqxjvw'

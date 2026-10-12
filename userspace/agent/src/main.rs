@@ -21,6 +21,9 @@ const SYS_RECV_WAIT: u64 = 10;
 const SYS_SURFACE_INFO: u64 = 13;
 const SYS_INPUT_POLL: u64 = 16;
 const ETIMEDOUT: i64 = -110;
+// Each RECV_WAIT waits at most 100 ticks. Give a slow demo desktop up to ten
+// receive windows without resending a request whose outcome is still unknown.
+const REPLY_WAIT_WINDOWS: usize = 10;
 
 global_asm!(
     ".section .text.entry,\"ax\"",
@@ -104,7 +107,13 @@ impl Client {
     }
 
     fn receive(&self, bytes: &mut [u8; 64]) -> i64 {
-        syscall(SYS_RECV_WAIT, self.receive, bytes.as_mut_ptr() as u64, 64)
+        for _ in 0..REPLY_WAIT_WINDOWS {
+            let result = syscall(SYS_RECV_WAIT, self.receive, bytes.as_mut_ptr() as u64, 64);
+            if result != ETIMEDOUT {
+                return result;
+            }
+        }
+        ETIMEDOUT
     }
 
     fn call(&mut self, command: Command) -> Response {
@@ -116,8 +125,8 @@ impl Client {
         let bytes = request.encode().unwrap_or_else(|_| exit(7));
         require(self.send(&bytes), 8);
         let mut bytes = [0u8; 64];
-        // An ambiguous timeout is fatal for this client session: resending a
-        // mutation could apply it twice. The desktop remains independently usable.
+        // Exhausting the receive windows is fatal for this client session:
+        // resending a mutation could apply it twice. The desktop stays usable.
         require(self.receive(&mut bytes) == 64, 9);
         let response = Response::decode(&bytes).unwrap_or_else(|_| exit(10));
         require(
