@@ -614,6 +614,7 @@ function Complete-MirrorCapture {
     if ($Hygiene) { Assert-MirrorHygieneLog $serial }
     else { Assert-MirrorTraceMarker -Serial $serial -Expected $true }
     Assert-MirrorPointerMode $serial
+    Assert-MirrorSchedReady -Serial $serial
     if ($serial -match '(?m)^MIRROR_CONSOLE_INPUT_LOST(?:\s|$)') { throw "The capture lost console input. See $serialLog." }
     Assert-MirrorCaptureSmp -Serial $serial -RequestedCpus $CpuCount
     if ((Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash -ne $testDiskHash) {

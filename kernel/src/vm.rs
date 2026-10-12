@@ -245,7 +245,7 @@ impl Vm {
     /// Use its original allocator and exclude live references/DMA to its pages.
     pub unsafe fn release(
         &mut self,
-        space: &mut UserAddressSpace<'_>,
+        space: &mut UserAddressSpace,
         frames: &mut FrameAllocator<'_>,
         start: u64,
         length: u64,
@@ -281,7 +281,7 @@ impl Vm {
     /// references or DMA may rely on the old permissions during this operation.
     pub unsafe fn protect(
         &mut self,
-        space: &mut UserAddressSpace<'_>,
+        space: &mut UserAddressSpace,
         start: u64,
         length: u64,
         protection: u64,
@@ -321,7 +321,7 @@ impl Vm {
     }
 
     /// Caller retains the inactive, exclusive hierarchy used by protect.
-    unsafe fn restore_protection(&self, space: &mut UserAddressSpace<'_>, start: u64, end: u64) {
+    unsafe fn restore_protection(&self, space: &mut UserAddressSpace, start: u64, end: u64) {
         let mut cursor = start;
         while cursor < end {
             let Some(address) = space
@@ -344,7 +344,7 @@ impl Vm {
     /// a buffer. True means at least one granted page needs physical backing.
     pub fn preflight(
         &self,
-        space: &UserAddressSpace<'_>,
+        space: &UserAddressSpace,
         address: u64,
         length: usize,
         write: bool,
@@ -381,7 +381,7 @@ impl Vm {
     /// writable. No references or DMA may access the user's pages concurrently.
     pub unsafe fn materialize(
         &mut self,
-        space: &mut UserAddressSpace<'_>,
+        space: &mut UserAddressSpace,
         frames: &mut FrameAllocator<'_>,
         direct_map: u64,
         address: u64,

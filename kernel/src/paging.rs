@@ -19,6 +19,7 @@ use core::{
         x86_64::{__cpuid, CpuidResult},
     },
     marker::PhantomData,
+    ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
@@ -814,8 +815,10 @@ pub struct UserTranslation {
 /// never access this lower hierarchy or its owned physical pages. Borrowed
 /// table paths remain pinned; prepared shared leaves can change through the
 /// acknowledged shootdown protocol while this private root is inactive.
-pub struct UserAddressSpace<'kernel> {
-    kernel: &'kernel PageTables,
+/// The kernel hierarchy is held by pointer, not by lifetime, so a process
+/// table entry can own its space (spec 0030a); `new` states the contract.
+pub struct UserAddressSpace {
+    kernel: NonNull<PageTables>,
     root: u64,
     owned_tables: usize,
     owned_pages: usize,
@@ -828,7 +831,14 @@ struct OwnedPath {
     depth: usize,
 }
 
-impl<'kernel> UserAddressSpace<'kernel> {
+impl UserAddressSpace {
+    fn kernel(&self) -> &PageTables {
+        // SAFETY: `new`'s caller keeps the kernel tables at this address and
+        // alive until destroy. Every use is a shared read on the BSP with
+        // IF=0, and nothing mutates them through another reference meanwhile.
+        unsafe { self.kernel.as_ref() }
+    }
+
     /// Allocate an empty lower half and borrow the kernel's upper hierarchy.
     /// The upper PML4 entries always have U/S clear, irrespective of permissions
     /// below them. Bootloader lower mappings are never copied into this root.
@@ -841,8 +851,11 @@ impl<'kernel> UserAddressSpace<'kernel> {
     /// must be in the upper half. The prepared shared window, if used, must
     /// already exist. Borrowed table paths remain fixed; only prepared leaves
     /// may change, through the shared update methods with this root inactive.
+    /// `kernel` must stay at its address, unmoved and undropped, until this
+    /// space is destroyed; only the BSP, with IF=0, may use the space. The
+    /// boot tables live in `continue_boot`'s frame, which never returns.
     pub unsafe fn new(
-        kernel: &'kernel PageTables,
+        kernel: &PageTables,
         frames: &mut FrameAllocator<'_>,
     ) -> Result<Self, PagingError> {
         kernel.check_active()?;
@@ -851,7 +864,7 @@ impl<'kernel> UserAddressSpace<'kernel> {
         }
         let source = kernel.table_pointer(kernel.root)?;
         let mut space = Self {
-            kernel,
+            kernel: NonNull::from(kernel),
             root: 0,
             owned_tables: 0,
             owned_pages: 0,
@@ -901,14 +914,14 @@ impl<'kernel> UserAddressSpace<'kernel> {
     ) -> Result<(), PagingError> {
         check_user_address(address)?;
         check_page_address(address)?;
-        self.kernel.check_physical(physical)?;
+        self.kernel().check_physical(physical)?;
         self.check_inactive()?;
         if permissions.writable && permissions.executable {
             return Err(PagingError::InvalidUserPermissions);
         }
         let mut table_physical = self.root;
         for level in (2..=4).rev() {
-            let table = self.kernel.table_pointer(table_physical)?;
+            let table = self.kernel().table_pointer(table_physical)?;
             // SAFETY: Each table belongs to this root and the index is in range.
             let slot = unsafe { table.add(index(address, level)) };
             // SAFETY: This is an initialized, aligned table entry.
@@ -930,10 +943,10 @@ impl<'kernel> UserAddressSpace<'kernel> {
                 {
                     return Err(PagingError::InvalidUserPermissions);
                 }
-                table_physical = entry & self.kernel.physical_mask;
+                table_physical = entry & self.kernel().physical_mask;
             }
         }
-        let table = self.kernel.table_pointer(table_physical)?;
+        let table = self.kernel().table_pointer(table_physical)?;
         // SAFETY: This is the in-range leaf slot in our inactive hierarchy.
         let slot = unsafe { table.add(index(address, 1)) };
         // SAFETY: The table was initialized and is exclusively owned.
@@ -975,7 +988,7 @@ impl<'kernel> UserAddressSpace<'kernel> {
         while address < end {
             let mut physical = self.root;
             for level in (1..=4).rev() {
-                let table = self.kernel.table_pointer(physical)?;
+                let table = self.kernel().table_pointer(physical)?;
                 // SAFETY: The live owned hierarchy provides a full initialized
                 // table, and each index is within its 512 aligned entries.
                 let entry = unsafe { table.add(index(address, level)).read_volatile() };
@@ -988,8 +1001,8 @@ impl<'kernel> UserAddressSpace<'kernel> {
                 }
                 if level == 1 {
                     // A supervisor-only leaf is still owned physical memory.
-                    self.kernel
-                        .table_pointer(entry & self.kernel.physical_mask)?;
+                    self.kernel()
+                        .table_pointer(entry & self.kernel().physical_mask)?;
                     return Ok(Some(address));
                 }
                 if entry & HUGE != 0 {
@@ -998,7 +1011,7 @@ impl<'kernel> UserAddressSpace<'kernel> {
                 if entry & USER == 0 {
                     return Err(PagingError::UserAccessDenied);
                 }
-                physical = entry & self.kernel.physical_mask;
+                physical = entry & self.kernel().physical_mask;
             }
         }
         Ok(None)
@@ -1034,7 +1047,7 @@ impl<'kernel> UserAddressSpace<'kernel> {
         // is ignored because that child is about to be removed.
         let mut first_reclaimed_table = path.depth;
         for depth in (1..path.depth).rev() {
-            let table = self.kernel.table_pointer(path.frames[depth])?;
+            let table = self.kernel().table_pointer(path.frames[depth])?;
             let removed_index = index(address, 4 - depth as u32);
             let has_neighbor = (0..ENTRIES).any(|entry_index| {
                 // SAFETY: This is a full, initialized, exclusively owned table.
@@ -1052,7 +1065,8 @@ impl<'kernel> UserAddressSpace<'kernel> {
             // leaf before releasing the frame; no stale translation remains live.
             unsafe { path.slots[3].write_volatile(0) };
             // SAFETY: This exclusively owned leaf has no remaining active alias.
-            if unsafe { frames.deallocate(path.entries[3] & self.kernel.physical_mask) }.is_err() {
+            if unsafe { frames.deallocate(path.entries[3] & self.kernel().physical_mask) }.is_err()
+            {
                 // SAFETY: A rejected free retains the allocation and ownership.
                 unsafe { path.slots[3].write_volatile(path.entries[3]) };
                 return Err(PagingError::FrameReleaseFailed);
@@ -1139,7 +1153,7 @@ impl<'kernel> UserAddressSpace<'kernel> {
         let mut physical = self.root;
         for depth in 0..4 {
             let level = 4 - depth as u32;
-            let table = self.kernel.table_pointer(physical)?;
+            let table = self.kernel().table_pointer(physical)?;
             // SAFETY: The live owned table has exactly ENTRIES entries.
             let slot = unsafe { table.add(index(address, level)) };
             // SAFETY: The slot is initialized and no concurrent writer exists.
@@ -1159,10 +1173,10 @@ impl<'kernel> UserAddressSpace<'kernel> {
                     return Err(PagingError::UserAccessDenied);
                 }
             }
-            physical = entry & self.kernel.physical_mask;
+            physical = entry & self.kernel().physical_mask;
         }
         // Preflight the leaf's HHDM representation too, before any mutation.
-        self.kernel.table_pointer(physical)?;
+        self.kernel().table_pointer(physical)?;
         Ok(path)
     }
 
@@ -1175,7 +1189,7 @@ impl<'kernel> UserAddressSpace<'kernel> {
         let mut writable = true;
         let mut executable = true;
         for level in (1..=4).rev() {
-            let table = self.kernel.table_pointer(table_physical)?;
+            let table = self.kernel().table_pointer(table_physical)?;
             // SAFETY: Owned, live, initialized table and an in-range index.
             let entry = unsafe { table.add(index(address, level)).read_volatile() };
             if entry & PRESENT == 0 {
@@ -1188,7 +1202,7 @@ impl<'kernel> UserAddressSpace<'kernel> {
             executable &= entry & NO_EXECUTE == 0;
             if level == 1 {
                 return Ok(Some(UserTranslation {
-                    physical: (entry & self.kernel.physical_mask) | (address & (PAGE_SIZE - 1)),
+                    physical: (entry & self.kernel().physical_mask) | (address & (PAGE_SIZE - 1)),
                     writable,
                     executable,
                 }));
@@ -1196,7 +1210,7 @@ impl<'kernel> UserAddressSpace<'kernel> {
             if entry & HUGE != 0 {
                 return Err(PagingError::InvalidTable);
             }
-            table_physical = entry & self.kernel.physical_mask;
+            table_physical = entry & self.kernel().physical_mask;
         }
         Err(PagingError::InvalidTable)
     }
@@ -1239,7 +1253,7 @@ impl<'kernel> UserAddressSpace<'kernel> {
             // Preflight the whole HHDM page as well as its user permissions.
             // A later copy cannot encounter a direct-map representation error
             // after partially modifying its destination while tables are stable.
-            self.kernel.table_pointer(translation.physical)?;
+            self.kernel().table_pointer(translation.physical)?;
             if current == final_page {
                 return Ok(());
             }
@@ -1269,7 +1283,7 @@ impl<'kernel> UserAddressSpace<'kernel> {
             let page_offset = (current & (PAGE_SIZE - 1)) as usize;
             let count = (PAGE_SIZE as usize - page_offset).min(destination.len() - copied);
             let source = self
-                .kernel
+                .kernel()
                 .offset
                 .checked_add(translation.physical)
                 .ok_or(PagingError::DirectMapOverflow)?;
@@ -1307,7 +1321,7 @@ impl<'kernel> UserAddressSpace<'kernel> {
             let page_offset = (current & (PAGE_SIZE - 1)) as usize;
             let count = (PAGE_SIZE as usize - page_offset).min(source.len() - copied);
             let destination = self
-                .kernel
+                .kernel()
                 .offset
                 .checked_add(translation.physical)
                 .ok_or(PagingError::DirectMapOverflow)?;
@@ -1384,7 +1398,7 @@ impl<'kernel> UserAddressSpace<'kernel> {
 
     fn allocate_table(&mut self, frames: &mut FrameAllocator<'_>) -> Result<u64, PagingError> {
         let physical = frames.allocate().ok_or(PagingError::OutOfFrames)?;
-        let pointer = match self.kernel.table_pointer(physical) {
+        let pointer = match self.kernel().table_pointer(physical) {
             Ok(pointer) => pointer,
             Err(error) => {
                 // SAFETY: This fresh frame has no mapping or live references.
@@ -1406,7 +1420,7 @@ impl<'kernel> UserAddressSpace<'kernel> {
         count: usize,
         frames: &mut FrameAllocator<'_>,
     ) -> Result<(), PagingError> {
-        let table = self.kernel.table_pointer(physical)?;
+        let table = self.kernel().table_pointer(physical)?;
         for entry_index in 0..count {
             // SAFETY: The count is 256 at PML4 or 512 at each lower level.
             let slot = unsafe { table.add(entry_index) };
@@ -1418,7 +1432,7 @@ impl<'kernel> UserAddressSpace<'kernel> {
             if level > 1 && entry & HUGE != 0 {
                 return Err(PagingError::InvalidTable);
             }
-            let child = entry & self.kernel.physical_mask;
+            let child = entry & self.kernel().physical_mask;
             if level > 1 {
                 self.release_entries(child, level - 1, ENTRIES, frames)?;
             }
@@ -2245,7 +2259,7 @@ unsafe fn self_test_userspace(kernel: &PageTables, frames: &mut FrameAllocator<'
 
 #[cfg(feature = "boot-smoke")]
 unsafe fn self_test_copy_to_user(
-    user: &mut UserAddressSpace<'_>,
+    user: &mut UserAddressSpace,
     kernel: &PageTables,
     frames: &mut FrameAllocator<'_>,
     existing_data: u64,

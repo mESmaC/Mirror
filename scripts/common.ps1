@@ -385,6 +385,23 @@ function Assert-MirrorTraceMarker {
     }
 }
 
+function Assert-MirrorSchedReady {
+    param([Parameter(Mandatory = $true)][string]$Serial)
+
+    # Every flavor reports the process and thread tables once, with their
+    # fixed capacities, before the first session loads a process or the
+    # desktop is skipped (spec 0030a).
+    $names = [regex]::Matches($Serial, '(?m)^MIRROR_SCHED_READY(?:\s|$)')
+    $records = [regex]::Matches($Serial, '(?m)^MIRROR_SCHED_READY processes=64 threads=256 max_threads=16 regions=64\r?$')
+    if ($names.Count -ne 1 -or $records.Count -ne 1) {
+        throw 'Mirror must report MIRROR_SCHED_READY processes=64 threads=256 max_threads=16 regions=64 exactly once.'
+    }
+    $first = [regex]::Match($Serial, '(?m)^(?:Native process: |MIRROR_DESKTOP_SKIPPED(?:\s|$))')
+    if ($first.Success -and $first.Index -le $records[0].Index) {
+        throw 'MIRROR_SCHED_READY must precede the first session.'
+    }
+}
+
 function Assert-MirrorStacks {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,

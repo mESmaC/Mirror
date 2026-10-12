@@ -1,6 +1,12 @@
-//! Native BSP scheduling with finite probes and periodically limited services.
-//! IRQ/syscall handlers return to the scheduler before another process resumes.
-//! User buffers are checked and copied through the direct map before use.
+//! Native processes, their sessions and syscalls, with finite probes and
+//! periodically limited services. The scheduler and its process and thread
+//! tables are in `sched` (kernel/src/sched.rs, spec 0030a). IRQ/syscall
+//! handlers return to the scheduler before another thread resumes. User
+//! buffers are checked and copied through the direct map before use.
+
+// A child module, so the scheduler shares these private types (spec 0030a).
+#[path = "sched.rs"]
+mod sched;
 
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
@@ -13,7 +19,7 @@ use crate::{
     ipc::{Ipc, IpcError, MESSAGE_SIZE},
     memory::{FrameAllocator, PAGE_SIZE},
     paging::{PageTables, PagingError, UserAddressSpace, UserPermissions},
-    ps2, serial, stacks, surface, timer, vm, windows,
+    ps2, serial, surface, timer, vm, windows,
 };
 use mirror_clock_protocol as clock_abi;
 use mirror_thread_protocol as thread_abi;
@@ -95,8 +101,14 @@ enum State {
     Finished,
 }
 
+/// A thread-table entry (spec 0030a). It belongs to the process in slot
+/// `process`, which reaches it through its member list.
 struct Thread {
     id: u64,
+    /// The owning process's table slot.
+    process: u16,
+    /// This thread's own table slot, its run-queue key.
+    slot: u16,
     context: Context,
     state: State,
     joiner: Option<u64>,
@@ -106,11 +118,13 @@ struct Thread {
 }
 
 impl Thread {
-    fn new(entry: u64, stack: u64, argument: u64) -> Self {
+    fn new(entry: u64, stack: u64, argument: u64, process: usize, slot: u16) -> Self {
         let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
         assert!((1..=i64::MAX as u64).contains(&id), "thread IDs exhausted");
         Self {
             id,
+            process: u16::try_from(process).expect("process slot"),
+            slot,
             context: Context::new(entry, stack, argument),
             state: State::Ready,
             joiner: None,
@@ -119,6 +133,31 @@ impl Thread {
             quantum_left: QUANTUM_TICKS,
         }
     }
+
+    /// Mark a blocked thread ready and append it to the run queue. New
+    /// threads start ready and are queued by their creator.
+    fn wake(&mut self) {
+        assert!(
+            !matches!(
+                self.state,
+                State::Ready | State::Running | State::Exited(_) | State::Finished
+            ),
+            "woke a thread that was not waiting: {:?}",
+            self.state
+        );
+        self.state = State::Ready;
+        sched::enqueue(self.slot);
+    }
+}
+
+/// The session objects a process may use while it runs: the surface (both
+/// processes of init's pair, gated by the handle; the shell), physical input
+/// (the shell) and the app windows (the shell and its apps).
+#[derive(Clone, Copy, Default)]
+struct Access {
+    surface: bool,
+    input: bool,
+    windows: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -210,20 +249,24 @@ enum CpuPolicy {
 // Fields gated on `boot-smoke` are bookkeeping that only init's self-test
 // battery reads. Fields gated on `test-trace` feed only trace markers. Neither
 // exists in a default kernel (spec 0010).
-struct Process<'kernel> {
+struct Process {
     pid: u64,
-    space: UserAddressSpace<'kernel>,
+    space: UserAddressSpace,
     vm: vm::Vm,
     direct_map: u64,
+    access: Access,
     #[cfg(feature = "boot-smoke")]
     vm_checks: bool,
     #[cfg(feature = "boot-smoke")]
     demand_faults: u64,
     #[cfg(feature = "boot-smoke")]
     copy_faults: u64,
-    threads: [Option<Thread>; thread_abi::MAX_THREADS],
-    current_thread: usize,
-    next_thread: usize,
+    /// Thread-table slots of this process's threads by member index, or
+    /// NO_SLOT. The index is the process-local position that thread
+    /// creation fills lowest-first, up to MAX_THREADS.
+    members: [u16; thread_abi::MAX_THREADS],
+    /// The member index of the thread being run or completed.
+    current: usize,
     #[cfg(feature = "boot-smoke")]
     thread_checks: bool,
     #[cfg(feature = "boot-smoke")]
@@ -319,62 +362,80 @@ struct Process<'kernel> {
     input_timeouts: u64,
 }
 
-impl Process<'_> {
+impl Process {
+    /// The member thread at `index`, if any.
+    fn member(&self, index: usize) -> Option<&Thread> {
+        let slot = self.members[index];
+        // SAFETY: A member slot is an occupied thread entry that only this
+        // process reaches, through these accessors, which tie the borrow to
+        // the process's own. The scheduler reads entries directly only while
+        // it holds no process reference.
+        (slot != sched::NO_SLOT).then(|| unsafe { &*sched::thread_entry(slot) })
+    }
+
+    /// The member thread at `index`, if any, mutably.
+    fn member_mut(&mut self, index: usize) -> Option<&mut Thread> {
+        let slot = self.members[index];
+        // SAFETY: As in `member`; `&mut self` makes this the only borrow.
+        (slot != sched::NO_SLOT).then(|| unsafe { &mut *sched::thread_entry(slot) })
+    }
+
+    /// Every member thread, in member order.
+    fn threads(&self) -> impl Iterator<Item = &Thread> {
+        (0..thread_abi::MAX_THREADS).filter_map(|index| self.member(index))
+    }
+
+    /// Remove the member at `index` from this process and the thread table.
+    fn remove_member(&mut self, index: usize) {
+        let slot = core::mem::replace(&mut self.members[index], sched::NO_SLOT);
+        assert_ne!(slot, sched::NO_SLOT, "removed an empty member");
+        // SAFETY: The slot was this process's member, and no reference to
+        // it is live: member borrows are tied to this `&mut self`.
+        unsafe { sched::remove_thread(slot) };
+    }
+
     fn thread(&self) -> &Thread {
-        self.threads[self.current_thread]
-            .as_ref()
-            .expect("current thread")
+        self.member(self.current).expect("current thread")
     }
 
     fn thread_mut(&mut self) -> &mut Thread {
-        self.threads[self.current_thread]
-            .as_mut()
-            .expect("current thread")
+        self.member_mut(self.current).expect("current thread")
     }
 
     fn finished(&self) -> bool {
         self.outcome.is_some()
     }
 
+    /// Record the outcome and finish every thread, taking each off the run
+    /// queue. Threads keep their slots until the process is reaped.
     fn finish(&mut self, outcome: Outcome) {
         assert!(self.outcome.is_none());
         self.outcome = Some(outcome);
-        for thread in self.threads.iter_mut().flatten() {
+        for index in 0..thread_abi::MAX_THREADS {
+            let Some(thread) = self.member_mut(index) else {
+                continue;
+            };
+            let state = core::mem::replace(&mut thread.state, State::Finished);
+            sched::unqueue(thread.slot);
             #[cfg(feature = "boot-smoke")]
             {
-                if !matches!(thread.state, State::Exited(_)) {
+                if !matches!(state, State::Exited(_)) {
                     self.threads_cancelled += 1;
                 }
-                if matches!(thread.state, State::Waiting(_)) {
+                if matches!(state, State::Waiting(_)) {
                     self.sync_cancelled += 1;
                 }
             }
-            thread.state = State::Finished;
+            #[cfg(not(feature = "boot-smoke"))]
+            let _ = state;
         }
     }
+}
 
-    fn ready(&self) -> bool {
-        !self.finished()
-            && self
-                .threads
-                .iter()
-                .flatten()
-                .any(|thread| thread.state == State::Ready)
-    }
-
-    fn select_thread(&mut self) {
-        assert!(!self.finished());
-        let index = (0..self.threads.len())
-            .map(|offset| (self.next_thread + offset) % self.threads.len())
-            .find(|&index| {
-                self.threads[index]
-                    .as_ref()
-                    .is_some_and(|thread| thread.state == State::Ready)
-            })
-            .expect("process has no runnable thread");
-        self.current_thread = index;
-        self.next_thread = (index + 1) % self.threads.len();
-    }
+/// Print `MIRROR_SCHED_READY` once, before the first session, in every
+/// flavor (spec 0030a).
+pub fn report_scheduler() {
+    sched::report_ready();
 }
 
 /// Run init's self-test battery. Only smoke kernels run init: default and
@@ -455,24 +516,33 @@ fn test_load_rollback(
     serial::println!("MIRROR_USER_LOAD_ROLLBACK_OK");
 }
 
-/// Build a process in the caller's empty `slot`. A process holds
-/// MAX_THREADS thread contexts, so returning it by value would copy it through
-/// several temporaries per frame in a debug build and overflow the 256 KiB
-/// scheduler stack (spec 0030a). On failure the slot stays empty and every
-/// frame the load took is released.
-fn create_process<'kernel, 'slot>(
-    slot: &'slot mut Option<Process<'kernel>>,
-    kernel: &'kernel PageTables,
+#[derive(Debug)]
+enum CreateError {
+    /// The process or thread table has no room (EAGAIN, 0030-D4).
+    TableFull,
+    Paging(#[expect(dead_code, reason = "load panics print it through Debug")] PagingError),
+}
+
+/// Load a process into the process table, with its main thread queued, and
+/// return its slot. Room for both entries is checked before anything is
+/// allocated; on failure no entry exists and every frame the load took is
+/// released. The caller seeds handles, policy and access before it runs.
+fn create_process(
+    kernel: &PageTables,
     frames: &mut FrameAllocator<'_>,
     bytes: &[u8],
     image: &elf::Image,
     direct_map: u64,
     argument: u64,
-) -> Result<&'slot mut Process<'kernel>, PagingError> {
-    assert!(slot.is_none(), "process slot occupied");
+) -> Result<usize, CreateError> {
+    if !sched::has_room(1, 1) {
+        return Err(CreateError::TableFull);
+    }
     // SAFETY: The BSP is alone with IF=0, kernel root active, and the shared
     // upper mappings and unique allocator remain live throughout this run.
-    let mut space = unsafe { UserAddressSpace::new(kernel, frames) }?;
+    // The kernel tables live in continue_boot's frame, which never returns.
+    let mut space =
+        unsafe { UserAddressSpace::new(kernel, frames) }.map_err(CreateError::Paging)?;
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     assert!(
         (1..=i64::MAX as u64).contains(&pid),
@@ -481,22 +551,22 @@ fn create_process<'kernel, 'slot>(
     if let Err(error) = load(&mut space, frames, bytes, image, direct_map) {
         // SAFETY: This root has never been active; mapped frames belong to it.
         unsafe { space.destroy(frames) }.expect("failed-load cleanup");
-        return Err(error);
+        return Err(CreateError::Paging(error));
     }
-    *slot = Some(Process {
+    let slot = sched::insert_process(Process {
         pid,
         space,
         vm: vm::Vm::new(),
         direct_map,
+        access: Access::default(),
         #[cfg(feature = "boot-smoke")]
         vm_checks: false,
         #[cfg(feature = "boot-smoke")]
         demand_faults: 0,
         #[cfg(feature = "boot-smoke")]
         copy_faults: 0,
-        threads: [const { None }; thread_abi::MAX_THREADS],
-        current_thread: 0,
-        next_thread: 0,
+        members: [sched::NO_SLOT; thread_abi::MAX_THREADS],
+        current: 0,
         #[cfg(feature = "boot-smoke")]
         thread_checks: false,
         #[cfg(feature = "boot-smoke")]
@@ -591,8 +661,13 @@ fn create_process<'kernel, 'slot>(
         input_waits: 0,
         input_timeouts: 0,
     });
-    let process = slot.as_mut().expect("process slot just filled");
-    process.threads[0] = Some(Thread::new(image.entry, STACK_TOP - 8, argument));
+    let thread = sched::insert_thread(|thread| {
+        Thread::new(image.entry, STACK_TOP - 8, argument, slot, thread)
+    });
+    // SAFETY: The slot was just filled, and nothing else references it.
+    let process = unsafe { sched::process(slot) };
+    process.members[0] = thread;
+    sched::enqueue(thread);
     serial::println!(
         "Native process: pid={} entry={:#x} root={:#x} pages={} tables={}",
         pid,
@@ -601,7 +676,7 @@ fn create_process<'kernel, 'slot>(
         process.space.owned_page_count(),
         process.space.owned_table_count()
     );
-    Ok(process)
+    Ok(slot)
 }
 
 #[cfg(feature = "boot-smoke")]
@@ -616,43 +691,30 @@ fn run_pair(
 ) {
     // The framebuffer borrow belongs to this whole session, never to a user
     // mapping or handle. Only syscall handlers may reborrow it during resume.
-    let mut surface = display
+    let surface = display
         .map(surface::Session::new)
         .transpose()
         .expect("surface session");
     let before = frames.stats().expect("recycling required").allocated_frames;
-    let mut slots = [None, None];
-    create_process(
-        &mut slots[0],
-        kernel,
-        frames,
-        bytes,
-        image,
-        direct_map,
-        scenario,
-    )
-    .expect("load first native process");
-    if let Err(error) = create_process(
-        &mut slots[1],
-        kernel,
-        frames,
-        bytes,
-        image,
-        direct_map,
-        1 << 8,
-    ) {
-        // SAFETY: Neither process has been activated; the failed creation
-        // cleaned its own tree and this first process has no live users.
-        unsafe { slots[0].as_mut().unwrap().space.destroy(frames) }.expect("peer-load cleanup");
-        assert_eq!(frames.stats().unwrap().allocated_frames, before);
-        panic!("could not load peer: {error:?}");
-    }
-    let [Some(first), Some(second)] = slots else {
-        unreachable!("both processes were created");
+    let first = create_process(kernel, frames, bytes, image, direct_map, scenario)
+        .expect("load first native process");
+    let second = match create_process(kernel, frames, bytes, image, direct_map, 1 << 8) {
+        Ok(second) => second,
+        Err(error) => {
+            // SAFETY: The first process has never run and nothing references
+            // it; the failed creation already released its own frames.
+            let mut process = unsafe { sched::discard(first) };
+            // SAFETY: Its root has never been active, and no handler or
+            // other reference reaches its tree.
+            unsafe { process.space.destroy(frames) }.expect("peer-load cleanup");
+            assert_eq!(frames.stats().unwrap().allocated_frames, before);
+            panic!("could not load peer: {error:?}");
+        }
     };
-    let mut processes = [first, second];
     let mut ipc = Ipc::new();
-    for (index, process) in processes.iter_mut().enumerate() {
+    for (index, slot) in [first, second].into_iter().enumerate() {
+        // SAFETY: Seeding holds one process reference at a time.
+        let process = unsafe { sched::process(slot) };
         // Each process can send only to its peer's inbound channel. Console
         // access is an explicit bootstrap capability, independent of IPC rights.
         let grants = [
@@ -669,120 +731,61 @@ fn run_pair(
             process.boot_handles[slot] = handle;
         }
         assert_eq!(process.handles.len(), 3);
+        // Both processes see the surface session; only the handle grants use.
+        process.access.surface = surface.is_some();
     }
     if surface.is_some() {
-        let handle = processes[0]
+        // SAFETY: Seeding holds one process reference at a time.
+        let owner = unsafe { sched::process(first) };
+        let handle = owner
             .handles
             .insert(Object::Surface, capability::WRITE)
             .expect("bootstrap surface capability");
-        processes[0].boot_handles[3] = handle;
+        owner.boot_handles[3] = handle;
+        assert_eq!(owner.handles.len(), 4);
         // Trusted verification knows the owner's token but grants no entry to
         // the peer. Its real IPC fixture must receive and try this exact token.
-        processes[1].foreign_surface = handle;
-        assert_eq!(processes[0].handles.len(), 4);
+        // SAFETY: As above; the owner's borrow has ended.
+        unsafe { sched::process(second) }.foreign_surface = handle;
     }
-    assert_eq!(processes[1].handles.len(), 3);
-    assert_eq!(processes[1].boot_handles[3], 0);
-    assert!(processes.iter().all(|process| process.boot_handles[4] == 0));
-    assert!(ACTIVE_IPC.load(Ordering::SeqCst).is_null());
-    assert!(ACTIVE_SURFACE.load(Ordering::SeqCst).is_null());
-    assert!(ACTIVE_INPUT.load(Ordering::SeqCst).is_null());
-    assert_ne!(processes[0].pid, processes[1].pid);
-    assert_ne!(
-        processes[0].space.root_physical_address(),
-        processes[1].space.root_physical_address()
-    );
-    assert_ne!(
-        processes[0]
-            .space
-            .translate(STACK_BASE)
-            .unwrap()
-            .unwrap()
-            .physical,
-        processes[1]
-            .space
-            .translate(STACK_BASE)
-            .unwrap()
-            .unwrap()
-            .physical
-    );
-    let stack_top = stacks::bsp_rsp0_top();
-    assert!(ACTIVE.load(Ordering::SeqCst).is_null());
-    // SAFETY: The BSP's guarded RSP0 stack is mapped in the shared upper half
-    // of every root. IF=0 and no user process is active.
-    unsafe { interrupts::set_kernel_stack(stack_top) };
-    let mut cursor = 0;
-    let mut last = None;
-    let mut switches = 0;
-    let mut idle_ticks = 0;
-    while processes.iter().any(|process| !process.finished()) {
-        assert!(!arch::interrupts_enabled());
-        release_finished_handles(&mut processes, &mut ipc);
-        let now = timer::ticks();
-        for process in &mut processes {
-            wake_threads(process, &mut ipc, None, None, now);
-        }
-        let selected = (0..PROCESS_COUNT)
-            .map(|offset| (cursor + offset) % PROCESS_COUNT)
-            .find(|&index| processes[index].ready());
-        let Some(index) = selected else {
-            assert!(processes.iter().any(|process| !process.finished()
-                && process.threads.iter().flatten().any(|thread| matches!(
-                    thread.state,
-                    State::Sleeping(_) | State::Receiving(_) | State::Waiting(_)
-                ))));
-            let before_idle = timer::ticks();
-            let before_charge: u64 = processes.iter().map(|process| process.charged_ticks).sum();
-            // SAFETY: No active process or locks, kernel root restored, timer
-            // ready. STI's interrupt shadow closes the check-to-HLT wakeup race.
-            // The CPL0 IRQ path only acknowledges/increments; CLI restores IF=0.
-            unsafe { core::arch::asm!("sti", "hlt", "cli", options(nostack)) };
-            idle_ticks += timer::ticks().wrapping_sub(before_idle);
-            assert_eq!(
-                processes
-                    .iter()
-                    .map(|process| process.charged_ticks)
-                    .sum::<u64>(),
-                before_charge,
-                "idle charged user CPU ticks"
-            );
-            continue;
-        };
-        cursor = (index + 1) % PROCESS_COUNT;
-        if last != Some(index) {
-            switches += 1;
-            last = Some(index);
-        }
-        resume_process(
-            kernel,
-            frames,
-            &mut processes[index],
-            &mut ipc,
-            surface.as_mut(),
-            None,
-            None,
+    {
+        // SAFETY: Two distinct occupied slots, and no other reference.
+        let (owner, peer) = unsafe { (sched::process(first), sched::process(second)) };
+        assert_eq!(peer.handles.len(), 3);
+        assert_eq!(peer.boot_handles[3], 0);
+        assert!(owner.boot_handles[4] == 0 && peer.boot_handles[4] == 0);
+        assert_ne!(owner.pid, peer.pid);
+        assert_ne!(
+            owner.space.root_physical_address(),
+            peer.space.root_physical_address()
         );
-        if processes[index].outcome == Some(Outcome::BudgetExhausted) {
-            assert_eq!(index, 0, "peer exhausted its budget");
-            assert_eq!(scenario, 7, "unexpected budget exhaustion");
-            assert_eq!(
-                processes[1].outcome,
-                Some(Outcome::Exit(0)),
-                "CPU-bound task starved peer"
-            );
-            assert!(
-                processes[0].post_checks_preemptions > 0,
-                "CPU-only loop was never preempted"
-            );
-        }
+        assert_ne!(
+            owner.space.translate(STACK_BASE).unwrap().unwrap().physical,
+            peer.space.translate(STACK_BASE).unwrap().unwrap().physical
+        );
     }
-    release_finished_handles(&mut processes, &mut ipc);
+    let mut session = sched::Session {
+        ipc,
+        surface,
+        input: None,
+        runtime: None,
+        end: sched::End::Pair {
+            first,
+            second,
+            scenario,
+        },
+    };
+    let stats = sched::run(&mut session, kernel, frames);
+    let sched::Session { ipc, surface, .. } = session;
     assert!(ACTIVE_SURFACE.load(Ordering::SeqCst).is_null());
     assert!(ACTIVE_INPUT.load(Ordering::SeqCst).is_null());
     assert!(
         ipc.is_drained(),
         "IPC messages or endpoint references leaked"
     );
+    // SAFETY: Both processes finished, ACTIVE is clear, and nothing references
+    // either entry; reap checks that every thread finished too.
+    let mut processes = unsafe { [sched::reap(first), sched::reap(second)] };
     for process in &mut processes {
         assert!(process.handles.is_empty());
         // SAFETY: All contexts are finished, ACTIVE is clear, the kernel root
@@ -800,8 +803,8 @@ fn run_pair(
         processes[1].surface_tiles, 0,
         "peer painted without authority"
     );
-    // Taking the session releases its display borrow when this branch ends.
-    if let Some(session) = surface.take() {
+    // Dropping the session releases its display borrow when this branch ends.
+    if let Some(session) = surface {
         assert!(
             processes[0].surface_checks,
             "owner surface checks did not complete: {:?}",
@@ -896,15 +899,15 @@ fn run_pair(
     let yields: usize = processes.iter().map(|process| process.yields).sum();
     let sleeps: usize = processes.iter().map(|process| process.sleeps).sum();
     let preemptions: usize = processes.iter().map(|process| process.preemptions).sum();
-    assert!(switches >= 4, "processes did not alternate");
+    assert!(stats.switches >= 4, "processes did not alternate");
     serial::println!(
         "MIRROR_SCHEDULER_OK processes={} switches={} yields={} sleeps={} preemptions={} idle_ticks={}",
         PROCESS_COUNT,
-        switches,
+        stats.switches,
         yields,
         sleeps,
         preemptions,
-        idle_ticks
+        stats.idle_ticks
     );
 }
 
@@ -914,7 +917,7 @@ fn run_pair(
 fn resume_process(
     kernel: &PageTables,
     frames: &mut FrameAllocator<'_>,
-    process: &mut Process<'_>,
+    process: &mut Process,
     ipc: &mut Ipc,
     surface: Option<&mut surface::Session<'_, '_>>,
     input: Option<&mut input::Session<'_>>,
@@ -926,7 +929,8 @@ fn resume_process(
     assert!(ACTIVE_SURFACE.load(Ordering::SeqCst).is_null());
     assert!(ACTIVE_INPUT.load(Ordering::SeqCst).is_null());
     assert!(ACTIVE_WINDOWS.load(Ordering::SeqCst).is_null());
-    process.select_thread();
+    // The scheduler dequeued this thread and made it current.
+    assert!(!process.finished());
     assert_eq!(process.thread().state, State::Ready);
     process.thread_mut().state = State::Running;
     process.thread_mut().quantum_left = QUANTUM_TICKS;
@@ -990,11 +994,7 @@ fn resume_process(
 
 /// Complete bounded VM work with the kernel root active and no interrupt frames
 /// or published process borrow. Disjoint I/O sessions remain borrowed by resume.
-fn complete_memory(
-    process: &mut Process<'_>,
-    frames: &mut FrameAllocator<'_>,
-    request: MemoryRequest,
-) {
+fn complete_memory(process: &mut Process, frames: &mut FrameAllocator<'_>, request: MemoryRequest) {
     assert!(ACTIVE.load(Ordering::SeqCst).is_null());
     assert!(!arch::interrupts_enabled());
     match request {
@@ -1114,7 +1114,7 @@ fn complete_memory(
 /// Describe only authorized, bounded copy operations. Bad handles, wrong object
 /// types and malformed lengths keep their existing error precedence and cannot
 /// cause page allocation. Actual dispatch repeats all validation after page-in.
-fn syscall_buffer(process: &Process<'_>, frame: &TrapFrame) -> Option<(u64, usize, bool)> {
+fn syscall_buffer(process: &Process, frame: &TrapFrame) -> Option<(u64, usize, bool)> {
     let require = |handle, rights| {
         process
             .handles
@@ -1199,20 +1199,22 @@ fn syscall_buffer(process: &Process<'_>, frame: &TrapFrame) -> Option<(u64, usiz
     Some((range.0, range.1 as usize, range.2))
 }
 
-struct ShellRuntime<'kernel, 'image> {
-    kernel: &'kernel PageTables,
-    bytes: &'image [u8],
+/// The shell session's application state. Apps are process-table entries;
+/// `children` holds their slots by window index.
+struct ShellRuntime<'a> {
+    kernel: &'a PageTables,
+    bytes: &'a [u8],
     image: elf::Image,
     direct_map: u64,
-    children: [Option<Process<'kernel>>; windows::APP_COUNT],
+    children: [Option<usize>; windows::APP_COUNT],
     windows: windows::Session,
 }
 
-impl<'kernel> ShellRuntime<'kernel, '_> {
+impl ShellRuntime<'_> {
     fn launch(
         &mut self,
         frames: &mut FrameAllocator<'_>,
-        desktop: &mut Process<'kernel>,
+        desktop: &mut Process,
         kind: u64,
     ) -> Result<u64, i64> {
         let index = self
@@ -1223,8 +1225,7 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
             .ok_or(-11)?;
         assert!(self.children[index].is_none());
         let before = frames.stats().unwrap().allocated_frames;
-        let child = create_process(
-            &mut self.children[index],
+        let slot = create_process(
             self.kernel,
             frames,
             self.bytes,
@@ -1232,7 +1233,13 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
             self.direct_map,
             kind,
         )
-        .map_err(|_| -12)?;
+        .map_err(|error| match error {
+            CreateError::TableFull => -11,
+            CreateError::Paging(_) => -12,
+        })?;
+        // SAFETY: A fresh slot, distinct from the shell's, that nothing else
+        // references; this borrow ends before any rollback removes it.
+        let child = unsafe { sched::process(slot) };
         let pid = child.pid;
         let prepared = (|| {
             for (slot, object, rights) in [
@@ -1262,10 +1269,11 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
         let (application, handle) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
+                // SAFETY: The child has never run and its borrow has ended.
+                let mut child = unsafe { sched::discard(slot) };
                 // SAFETY: The child has never run, and failed resource creation
                 // released all offscreen pages before this address-space teardown.
                 unsafe { child.space.destroy(frames) }.expect("application-load rollback");
-                self.children[index] = None;
                 assert_eq!(frames.stats().unwrap().allocated_frames, before);
                 return Err(error);
             }
@@ -1275,6 +1283,8 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
             desktop.space.root_physical_address()
         );
         child.policy = CpuPolicy::Application(ServicePolicy::new(timer::ticks()));
+        child.access.windows = true;
+        self.children[index] = Some(slot);
         self.windows.applications[index] = Some(application);
         self.windows.launches += 1;
         serial::println!("MIRROR_APP_STARTED pid={} kind={}", pid, kind);
@@ -1282,12 +1292,14 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
     }
 
     fn reclaim(&mut self, index: usize, frames: &mut FrameAllocator<'_>, ipc: &mut Ipc) {
-        let mut child = self.children[index]
+        let slot = self.children[index]
             .take()
             .expect("reclaim live child slot");
-        assert!(child.finished());
+        // SAFETY: The scheduler holds no reference to the child; reap checks
+        // that it finished.
+        let mut child = unsafe { sched::reap(slot) };
         let outcome = child.outcome.expect("child ended without outcome");
-        release_finished_handles(core::slice::from_mut(&mut child), ipc);
+        release_handles(&mut child, ipc);
         assert!(child.handles.is_empty());
         let before = frames.stats().unwrap().allocated_frames;
         let owned = child.space.owned_page_count() + child.space.owned_table_count();
@@ -1323,10 +1335,10 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
 
     fn reclaim_finished(&mut self, frames: &mut FrameAllocator<'_>, ipc: &mut Ipc) {
         for index in 0..self.children.len() {
-            if self.children[index]
-                .as_ref()
-                .is_some_and(|child| child.finished())
-            {
+            if self.children[index].is_some_and(|slot| {
+                // SAFETY: The scheduler holds no other reference to the child.
+                unsafe { sched::process(slot) }.finished()
+            }) {
                 self.reclaim(index, frames, ipc);
             }
         }
@@ -1335,7 +1347,7 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
     fn close(
         &mut self,
         frames: &mut FrameAllocator<'_>,
-        desktop: &mut Process<'_>,
+        desktop: &mut Process,
         ipc: &mut Ipc,
         pid: u64,
         reason: Outcome,
@@ -1350,8 +1362,11 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
                     .is_some_and(|application| application.pid == pid)
             })
             .ok_or(-9)?;
-        if let Some(child) = &mut self.children[index] {
-            assert_ne!(child.thread().state, State::Running);
+        if let Some(slot) = self.children[index] {
+            // SAFETY: The child's slot is distinct from the shell's, and this
+            // borrow ends before reclaim removes the entry.
+            let child = unsafe { sched::process(slot) };
+            assert!(child.threads().all(|thread| thread.state != State::Running));
             if !child.finished() {
                 child.finish(reason);
             }
@@ -1376,19 +1391,11 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
     }
 }
 
-fn service_eligible(process: &mut Process<'_>, now: u64) -> bool {
-    let policy = match &mut process.policy {
-        CpuPolicy::Shell(policy) | CpuPolicy::Application(policy) => policy,
-        _ => panic!("invalid shell scheduling policy"),
-    };
-    policy.eligible(now) && process.ready()
-}
-
 /// Every wake runs with the kernel root active. Siblings may have changed a
 /// shared mapping or closed a shared handle while this thread was blocked, so
 /// the original checked receive helpers repeat permission/range validation.
 fn wake_threads(
-    process: &mut Process<'_>,
+    process: &mut Process,
     ipc: &mut Ipc,
     mut input: Option<&mut input::Session<'_>>,
     mut windows: Option<&mut windows::Session>,
@@ -1398,11 +1405,11 @@ fn wake_threads(
         return;
     }
     complete_joins(process);
-    for index in 0..process.threads.len() {
-        if process.threads[index].is_none() {
+    for index in 0..thread_abi::MAX_THREADS {
+        if process.member(index).is_none() {
             continue;
         }
-        process.current_thread = index;
+        process.current = index;
         let state = process.thread().state;
         if matches!(
             state,
@@ -1420,7 +1427,7 @@ fn wake_threads(
         }
         match state {
             State::Sleeping(deadline) if deadline_reached(now, deadline) => {
-                process.thread_mut().state = State::Ready;
+                process.thread_mut().wake();
             }
             State::Waiting(pending) if pending.expired(now) => {
                 complete_wait(process.thread_mut(), -110);
@@ -1450,7 +1457,7 @@ fn wake_threads(
                         process.ipc_closed_wakes += 1;
                     }
                     process.thread_mut().context.frame.rax = result as u64;
-                    process.thread_mut().state = State::Ready;
+                    process.thread_mut().wake();
                 }
             }
             State::InputWaiting(pending) => {
@@ -1484,7 +1491,7 @@ fn wake_threads(
                 }
                 if result != -11 {
                     process.thread_mut().context.frame.rax = result as u64;
-                    process.thread_mut().state = State::Ready;
+                    process.thread_mut().wake();
                 }
             }
             State::Ready
@@ -1508,14 +1515,14 @@ fn complete_wait(thread: &mut Thread, result: i64) {
         "wait charged user CPU ticks"
     );
     thread.context.frame.rax = result as u64;
-    thread.state = State::Ready;
+    thread.wake();
 }
 
 /// Compare and enqueue are one non-preemptible operation on the sole CPU.
 /// Deferred page-in also completes with IF=0 before another user can run. An
 /// SMP implementation must instead serialize the value check and wait queue
 /// with wake/invalidation under the same lock; disabling local IRQs won't do.
-fn wait_word(process: &mut Process<'_>, frame: &TrapFrame) -> Result<State, i64> {
+fn wait_word(process: &mut Process, frame: &TrapFrame) -> Result<State, i64> {
     assert!(!arch::interrupts_enabled());
     if !thread_abi::wait_arguments_valid(frame.rdi, frame.rsi, frame.rdx) {
         return Err(-22);
@@ -1552,7 +1559,7 @@ fn wait_word(process: &mut Process<'_>, frame: &TrapFrame) -> Result<State, i64>
 /// Wake only private wait keys in this process. Values are never read or
 /// written: a wake on untouched but readable reserved memory allocates nothing.
 /// Expired waits complete as timeouts and do not consume the caller's count.
-fn wake_word(process: &mut Process<'_>, frame: &TrapFrame) -> Result<u64, i64> {
+fn wake_word(process: &mut Process, frame: &TrapFrame) -> Result<u64, i64> {
     assert!(!arch::interrupts_enabled());
     if !thread_abi::wake_arguments_valid(frame.rdi, frame.rsi, frame.rdx) {
         return Err(-22);
@@ -1572,9 +1579,9 @@ fn wake_word(process: &mut Process<'_>, frame: &TrapFrame) -> Result<u64, i64> {
     let now = timer::ticks();
     let first = process.next_waiter;
     let mut woken = 0;
-    for offset in 0..process.threads.len() {
-        let index = (first + offset) % process.threads.len();
-        let Some(thread) = &mut process.threads[index] else {
+    for offset in 0..thread_abi::MAX_THREADS {
+        let index = (first + offset) % thread_abi::MAX_THREADS;
+        let Some(thread) = process.member_mut(index) else {
             continue;
         };
         let State::Waiting(pending) = thread.state else {
@@ -1592,7 +1599,7 @@ fn wake_word(process: &mut Process<'_>, frame: &TrapFrame) -> Result<u64, i64> {
         } else if woken < frame.rsi {
             complete_wait(thread, 0);
             woken += 1;
-            process.next_waiter = (index + 1) % process.threads.len();
+            process.next_waiter = (index + 1) % thread_abi::MAX_THREADS;
         }
     }
     #[cfg(feature = "boot-smoke")]
@@ -1602,11 +1609,14 @@ fn wake_word(process: &mut Process<'_>, frame: &TrapFrame) -> Result<u64, i64> {
     Ok(woken)
 }
 
-fn invalidate_waits(process: &mut Process<'_>, address: u64, length: u64) {
+fn invalidate_waits(process: &mut Process, address: u64, length: u64) {
     assert!(ACTIVE.load(Ordering::SeqCst).is_null());
     assert!(!arch::interrupts_enabled());
     let end = address.checked_add(length).expect("successful VM interval");
-    for thread in process.threads.iter_mut().flatten() {
+    for index in 0..thread_abi::MAX_THREADS {
+        let Some(thread) = process.member_mut(index) else {
+            continue;
+        };
         if let State::Waiting(pending) = thread.state
             && (address..end).contains(&pending.address)
         {
@@ -1619,30 +1629,32 @@ fn invalidate_waits(process: &mut Process<'_>, address: u64, length: u64) {
     }
 }
 
+/// The member index of the thread with this ID, if it belongs to `process`.
+fn member_by_id(process: &Process, tid: u64) -> Option<usize> {
+    (0..thread_abi::MAX_THREADS)
+        .find(|&index| process.member(index).is_some_and(|thread| thread.id == tid))
+}
+
 /// Reap only after resume_user has saved/scrubbed the exiting context's FPU
 /// state and released its raw pointer. A join result needs no user buffer and
 /// is delivered atomically in the waiting thread's saved RAX/RDX registers.
-fn complete_joins(process: &mut Process<'_>) {
+fn complete_joins(process: &mut Process) {
     assert!(ACTIVE.load(Ordering::SeqCst).is_null());
-    for index in 0..process.threads.len() {
-        let Some(target) = &process.threads[index] else {
+    for index in 0..thread_abi::MAX_THREADS {
+        let Some(target) = process.member(index) else {
             continue;
         };
         let (State::Exited(status), Some(waiter)) = (target.state, target.joiner) else {
             continue;
         };
         let tid = target.id;
-        let joiner = process
-            .threads
-            .iter_mut()
-            .flatten()
-            .find(|thread| thread.id == waiter)
-            .expect("join waiter exists");
+        let joiner = member_by_id(process, waiter).expect("join waiter exists");
+        let joiner = process.member_mut(joiner).expect("join waiter exists");
         assert_eq!(joiner.state, State::Joining(tid));
         joiner.context.frame.rax = 0;
         joiner.context.frame.rdx = status;
-        joiner.state = State::Ready;
-        process.threads[index] = None;
+        joiner.wake();
+        process.remove_member(index);
         #[cfg(feature = "boot-smoke")]
         {
             process.threads_joined += 1;
@@ -1650,7 +1662,7 @@ fn complete_joins(process: &mut Process<'_>) {
     }
 }
 
-fn create_thread(process: &mut Process<'_>, frame: &TrapFrame) -> Result<u64, i64> {
+fn create_thread(process: &mut Process, frame: &TrapFrame) -> Result<u64, i64> {
     if frame.rsi != thread_abi::THREAD_START_SIZE as u64 || frame.rdx != 0 {
         return Err(-22);
     }
@@ -1672,26 +1684,37 @@ fn create_thread(process: &mut Process<'_>, frame: &TrapFrame) -> Result<u64, i6
     {
         return Err(-14);
     }
+    // A full process or a full thread table both refuse with EAGAIN.
     let index = process
-        .threads
+        .members
         .iter()
-        .position(Option::is_none)
+        .position(|&member| member == sched::NO_SLOT)
         .ok_or(-11)?;
-    let mut thread = Thread::new(start.entry, start.stack, start.argument);
-    thread.context.frame.fs_base = start.fs;
-    thread.context.frame.gs_base = start.gs;
-    let tid = thread.id;
-    process.threads[index] = Some(thread);
+    if !sched::has_room(0, 1) {
+        return Err(-11);
+    }
+    // The running thread's own entry is the process's current member; this
+    // insert touches only a vacant slot and the table's occupancy bitmap.
+    let owner = usize::from(process.thread().process);
+    let slot = sched::insert_thread(|slot| {
+        let mut thread = Thread::new(start.entry, start.stack, start.argument, owner, slot);
+        thread.context.frame.fs_base = start.fs;
+        thread.context.frame.gs_base = start.gs;
+        thread
+    });
+    process.members[index] = slot;
+    sched::enqueue(slot);
+    let tid = process.member(index).expect("new thread").id;
     #[cfg(feature = "boot-smoke")]
     {
         process.threads_created += 1;
-        let live = process.threads.iter().flatten().count();
+        let live = process.threads().count();
         process.threads_peak = process.threads_peak.max(live);
     }
     Ok(tid)
 }
 
-fn join_thread(process: &mut Process<'_>, frame: &mut TrapFrame) -> Result<Option<State>, i64> {
+fn join_thread(process: &mut Process, frame: &mut TrapFrame) -> Result<Option<State>, i64> {
     if frame.rsi != 0 || frame.rdx != 0 {
         return Err(-22);
     }
@@ -1699,18 +1722,14 @@ fn join_thread(process: &mut Process<'_>, frame: &mut TrapFrame) -> Result<Optio
     if frame.rdi == current {
         return Err(-35);
     }
-    let index = process
-        .threads
-        .iter()
-        .position(|slot| slot.as_ref().is_some_and(|thread| thread.id == frame.rdi))
-        .ok_or(-3)?;
-    let target = process.threads[index].as_ref().unwrap();
+    let index = member_by_id(process, frame.rdi).ok_or(-3)?;
+    let target = process.member(index).expect("join target");
     if target.joiner.is_some() {
         return Err(-16);
     }
     if let State::Exited(status) = target.state {
         frame.rdx = status;
-        process.threads[index] = None;
+        process.remove_member(index);
         #[cfg(feature = "boot-smoke")]
         {
             process.threads_joined += 1;
@@ -1720,7 +1739,7 @@ fn join_thread(process: &mut Process<'_>, frame: &mut TrapFrame) -> Result<Optio
     // A bounded wait-for walk rejects cycles before claiming the target. All
     // joins are within one process; TIDs are never interpreted as slot indexes.
     let mut state = target.state;
-    for _ in 0..process.threads.len() {
+    for _ in 0..thread_abi::MAX_THREADS {
         let State::Joining(tid) = state else {
             break;
         };
@@ -1728,19 +1747,19 @@ fn join_thread(process: &mut Process<'_>, frame: &mut TrapFrame) -> Result<Optio
             return Err(-35);
         }
         state = process
-            .threads
-            .iter()
-            .flatten()
+            .threads()
             .find(|thread| thread.id == tid)
             .expect("join target exists")
             .state;
     }
-    process.threads[index].as_mut().unwrap().joiner = Some(current);
+    process.member_mut(index).expect("join target").joiner = Some(current);
     Ok(Some(State::Joining(frame.rdi)))
 }
 
 /// Supervise two native applications without granting them scanout or physical
-/// input. Lifecycle operations execute here after all syscall frames unwind.
+/// input. Lifecycle operations execute in the scheduler after all syscall
+/// frames unwind. The session ends when the shell finishes; its live apps are
+/// then closed with SessionEnded (0030-D1).
 pub fn run_shell(
     kernel: &PageTables,
     frames: &mut FrameAllocator<'_>,
@@ -1756,9 +1775,7 @@ pub fn run_shell(
     let before = frames.stats().unwrap().allocated_frames;
     let desktop_image = elf::parse(programs[0]).expect("invalid shell ELF");
     let image = elf::parse(programs[1]).expect("invalid application ELF");
-    let mut shell = None;
-    let desktop = create_process(
-        &mut shell,
+    let shell = create_process(
         kernel,
         frames,
         programs[0],
@@ -1767,19 +1784,7 @@ pub fn run_shell(
         2 + u64::from(smoke),
     )
     .expect("load native shell");
-    desktop.policy = CpuPolicy::Shell(ServicePolicy::new(timer::ticks()));
-    for (slot, object, rights) in [
-        (0, Object::Console, capability::WRITE),
-        (3, Object::Surface, capability::WRITE),
-        (4, Object::Input, capability::RECEIVE),
-        (5, Object::Supervisor, capability::WRITE),
-    ] {
-        desktop.boot_handles[slot] = desktop
-            .handles
-            .insert(object, rights)
-            .expect("shell bootstrap capability");
-    }
-    let mut runtime = ShellRuntime {
+    let runtime = ShellRuntime {
         kernel,
         bytes: programs[1],
         image,
@@ -1787,119 +1792,48 @@ pub fn run_shell(
         children: [None, None],
         windows: windows::Session::new(smoke),
     };
-    #[cfg(feature = "boot-smoke")]
     {
-        // Exhaust the supervisor's remaining handle slots after loading the
-        // shell, then force a launch to roll back its root and both buffers.
-        let baseline = frames.stats().unwrap().allocated_frames;
-        let mut temporary = [0; 8];
-        let mut count = 0;
-        loop {
-            match desktop
+        // SAFETY: Seeding holds the only reference to the shell's entry.
+        let desktop = unsafe { sched::process(shell) };
+        desktop.policy = CpuPolicy::Shell(ServicePolicy::new(timer::ticks()));
+        desktop.access = Access {
+            surface: true,
+            input: true,
+            windows: true,
+        };
+        for (slot, object, rights) in [
+            (0, Object::Console, capability::WRITE),
+            (3, Object::Surface, capability::WRITE),
+            (4, Object::Input, capability::RECEIVE),
+            (5, Object::Supervisor, capability::WRITE),
+        ] {
+            desktop.boot_handles[slot] = desktop
                 .handles
-                .insert(Object::Supervisor, capability::WRITE)
-            {
-                Ok(handle) => {
-                    temporary[count] = handle;
-                    count += 1;
-                }
-                Err(CapError::TableFull) => break,
-                Err(error) => panic!("rollback test handle failure: {error:?}"),
-            }
+                .insert(object, rights)
+                .expect("shell bootstrap capability");
         }
-        assert_eq!(runtime.launch(frames, desktop, 0), Err(-24));
-        assert_eq!(frames.stats().unwrap().allocated_frames, baseline);
-        assert!(runtime.children.iter().all(Option::is_none));
-        assert!(runtime.windows.applications.iter().all(Option::is_none));
-        for handle in &temporary[..count] {
-            desktop.handles.close(*handle).unwrap();
-        }
-        serial::println!("MIRROR_APP_LOAD_ROLLBACK_OK");
     }
-    let mut ipc = Ipc::new();
-    let mut surface = surface::Session::desktop(display).expect("shell scanout");
+    #[cfg(feature = "boot-smoke")]
+    let runtime = app_load_rollback_test(runtime, frames, shell);
+    let surface = surface::Session::desktop(display).expect("shell scanout");
     let (framebuffer, region) = surface.placement();
-    let mut input = input::Session::new(consumer, framebuffer, region);
-    let stack_top = stacks::bsp_rsp0_top();
-    // SAFETY: IF=0, no active users; the guarded RSP0 stack stays mapped in
-    // every root's shared upper half.
-    unsafe { interrupts::set_kernel_stack(stack_top) };
-    let mut cursor = 0;
-    while !desktop.finished() {
-        assert!(ACTIVE_WINDOWS.load(Ordering::SeqCst).is_null());
-        runtime.reclaim_finished(frames, &mut ipc);
-        let now = timer::ticks();
-        wake_threads(desktop, &mut ipc, Some(&mut input), None, now);
-        for index in 0..desktop.threads.len() {
-            if desktop.threads[index].is_none() {
-                continue;
-            }
-            desktop.current_thread = index;
-            match desktop.thread().state {
-                State::Launching(kind) => {
-                    let result = runtime
-                        .launch(frames, desktop, kind)
-                        .unwrap_or_else(|error| error as u64);
-                    desktop.thread_mut().context.frame.rax = result;
-                    desktop.thread_mut().state = State::Ready;
-                }
-                State::Closing(pid) => {
-                    let result = runtime
-                        .close(frames, desktop, &mut ipc, pid, Outcome::Terminated)
-                        .map_or_else(|error| error as u64, |()| 0);
-                    desktop.thread_mut().context.frame.rax = result;
-                    desktop.thread_mut().state = State::Ready;
-                }
-                _ => {}
-            }
-        }
-        for child in runtime.children.iter_mut().flatten() {
-            wake_threads(child, &mut ipc, None, Some(&mut runtime.windows), now);
-        }
-        let mut selected = None;
-        for offset in 0..=windows::APP_COUNT {
-            let index = (cursor + offset) % (windows::APP_COUNT + 1);
-            let ready = if index == 0 {
-                service_eligible(desktop, now)
-            } else {
-                runtime.children[index - 1]
-                    .as_mut()
-                    .is_some_and(|child| service_eligible(child, now))
-            };
-            if ready {
-                selected = Some(index);
-                break;
-            }
-        }
-        if let Some(index) = selected {
-            cursor = (index + 1) % (windows::APP_COUNT + 1);
-            if index == 0 {
-                resume_process(
-                    kernel,
-                    frames,
-                    desktop,
-                    &mut ipc,
-                    Some(&mut surface),
-                    Some(&mut input),
-                    Some(&mut runtime.windows),
-                );
-            } else {
-                resume_process(
-                    kernel,
-                    frames,
-                    runtime.children[index - 1].as_mut().unwrap(),
-                    &mut ipc,
-                    None,
-                    None,
-                    Some(&mut runtime.windows),
-                );
-            }
-        } else {
-            // SAFETY: No published context/resource pointers or locks; IF stayed
-            // clear from the queue checks through this atomic enable-and-sleep.
-            unsafe { core::arch::asm!("sti", "hlt", "cli", options(nostack)) };
-        }
-    }
+    let input = input::Session::new(consumer, framebuffer, region);
+    let mut session = sched::Session {
+        ipc: Ipc::new(),
+        surface: Some(surface),
+        input: Some(input),
+        runtime: Some(runtime),
+        end: sched::End::Shell { shell },
+    };
+    sched::run(&mut session, kernel, frames);
+    let sched::Session {
+        mut ipc,
+        surface,
+        runtime,
+        ..
+    } = session;
+    let surface = surface.expect("shell scanout");
+    let mut runtime = runtime.expect("shell runtime");
     runtime.reclaim_finished(frames, &mut ipc);
     let pids = runtime
         .windows
@@ -1907,14 +1841,24 @@ pub fn run_shell(
         .each_ref()
         .map(|application| application.as_ref().map(|application| application.pid));
     for pid in pids.into_iter().flatten() {
+        // SAFETY: The scheduler has returned; nothing else references the
+        // shell, and close reaches only the apps' own slots.
+        let desktop = unsafe { sched::process(shell) };
         runtime
             .close(frames, desktop, &mut ipc, pid, Outcome::SessionEnded)
             .expect("shell child cancellation");
     }
-    release_finished_handles(core::slice::from_mut(&mut *desktop), &mut ipc);
+    // SAFETY: The shell finished, every app has been reaped, and nothing
+    // references the shell's entry or threads.
+    let mut desktop = unsafe { sched::reap(shell) };
+    release_handles(&mut desktop, &mut ipc);
     assert!(desktop.handles.is_empty() && ipc.is_drained());
     assert!(
         ACTIVE.load(Ordering::SeqCst).is_null() && ACTIVE_WINDOWS.load(Ordering::SeqCst).is_null()
+    );
+    assert!(
+        sched::process_slots().next().is_none(),
+        "process left in the table"
     );
     assert_eq!(
         surface.totals(),
@@ -1958,6 +1902,50 @@ pub fn run_shell(
     );
 }
 
+/// Exhaust the supervisor's remaining handle slots after loading the shell,
+/// then force a launch to roll back its root, both buffers and its table
+/// entries.
+#[cfg(feature = "boot-smoke")]
+fn app_load_rollback_test<'a>(
+    mut runtime: ShellRuntime<'a>,
+    frames: &mut FrameAllocator<'_>,
+    shell: usize,
+) -> ShellRuntime<'a> {
+    // SAFETY: Seeding holds the only reference to the shell's entry, and the
+    // failed launch reaches only the slot it creates and discards.
+    let desktop = unsafe { sched::process(shell) };
+    let baseline = frames.stats().unwrap().allocated_frames;
+    let mut temporary = [0; 8];
+    let mut count = 0;
+    loop {
+        match desktop
+            .handles
+            .insert(Object::Supervisor, capability::WRITE)
+        {
+            Ok(handle) => {
+                temporary[count] = handle;
+                count += 1;
+            }
+            Err(CapError::TableFull) => break,
+            Err(error) => panic!("rollback test handle failure: {error:?}"),
+        }
+    }
+    assert_eq!(runtime.launch(frames, desktop, 0), Err(-24));
+    assert_eq!(frames.stats().unwrap().allocated_frames, baseline);
+    assert!(runtime.children.iter().all(Option::is_none));
+    assert!(runtime.windows.applications.iter().all(Option::is_none));
+    assert_eq!(
+        sched::process_slots().count(),
+        1,
+        "rollback left a table entry"
+    );
+    for handle in &temporary[..count] {
+        desktop.handles.close(*handle).unwrap();
+    }
+    serial::println!("MIRROR_APP_LOAD_ROLLBACK_OK");
+    runtime
+}
+
 #[cfg(feature = "boot-smoke")]
 fn service_policy_self_test() {
     for start in [0, 17, u64::MAX - 20] {
@@ -1990,19 +1978,18 @@ fn deadline_reached(now: u64, deadline: u64) -> bool {
     now.wrapping_sub(deadline) < (1 << 63)
 }
 
-fn release_finished_handles(processes: &mut [Process<'_>], ipc: &mut Ipc) {
-    for process in processes {
-        if process.finished() && !process.handles_closed {
-            while let Some(capability) = process.handles.take_one() {
-                ipc.release(capability);
-            }
-            process.handles_closed = true;
+/// Close a finished process's handles once, releasing its IPC endpoints.
+fn release_handles(process: &mut Process, ipc: &mut Ipc) {
+    if process.finished() && !process.handles_closed {
+        while let Some(capability) = process.handles.take_one() {
+            ipc.release(capability);
         }
+        process.handles_closed = true;
     }
 }
 
 #[cfg(feature = "boot-smoke")]
-fn validate_process(process: &Process<'_>, scenario: u64) {
+fn validate_process(process: &Process, scenario: u64) {
     let available = crate::clock::is_available();
     assert!(
         if available {
@@ -2043,13 +2030,6 @@ fn validate_process(process: &Process<'_>, scenario: u64) {
             && process.thread_preemptions > 0,
         "thread checks did not complete: {:?}",
         process.outcome
-    );
-    assert!(
-        process
-            .threads
-            .iter()
-            .flatten()
-            .all(|thread| thread.state == State::Finished)
     );
     serial::println!(
         "MIRROR_USER_THREADS_OK pid={} created={} joined={} exited={} cancelled={} preemptions={}",
@@ -2204,7 +2184,7 @@ fn validate_process(process: &Process<'_>, scenario: u64) {
 }
 
 fn load(
-    space: &mut UserAddressSpace<'_>,
+    space: &mut UserAddressSpace,
     frames: &mut FrameAllocator<'_>,
     bytes: &[u8],
     image: &elf::Image,
@@ -2256,7 +2236,7 @@ fn load(
 }
 
 fn map_initialized(
-    space: &mut UserAddressSpace<'_>,
+    space: &mut UserAddressSpace,
     frames: &mut FrameAllocator<'_>,
     direct_map: u64,
     address: u64,
@@ -2284,10 +2264,10 @@ fn map_initialized(
     result
 }
 
-fn with_active(frame: &TrapFrame, operation: impl FnOnce(&mut Process<'_>)) {
+fn with_active(frame: &TrapFrame, operation: impl FnOnce(&mut Process)) {
     assert_eq!(frame.cs & 3, 3, "userspace handler requires CPL3");
     assert!(!arch::interrupts_enabled());
-    let pointer = ACTIVE.load(Ordering::SeqCst).cast::<Process<'_>>();
+    let pointer = ACTIVE.load(Ordering::SeqCst).cast::<Process>();
     assert!(!pointer.is_null(), "no active process");
     // SAFETY: The owning scheduler suspends its stack while this is published. Only
     // this BSP, with IF=0, accesses it; no handler retains a reference or reenters
@@ -2365,7 +2345,7 @@ fn ipc_error(error: IpcError) -> i64 {
     }
 }
 
-fn channel_for(process: &Process<'_>, handle: u64, rights: u64) -> Result<usize, i64> {
+fn channel_for(process: &Process, handle: u64, rights: u64) -> Result<usize, i64> {
     let capability = process.handles.require(handle, rights).map_err(cap_error)?;
     match capability.object {
         Object::Channel(index) => Ok(index),
@@ -2374,7 +2354,7 @@ fn channel_for(process: &Process<'_>, handle: u64, rights: u64) -> Result<usize,
 }
 
 fn receive_input(
-    process: &mut Process<'_>,
+    process: &mut Process,
     session: &mut input::Session<'_>,
     handle: u64,
     address: u64,
@@ -2419,7 +2399,7 @@ fn receive_input(
 
 /// Init's console-text oracles. Only smoke kernels run init (spec 0010-D3).
 #[cfg(feature = "boot-smoke")]
-fn match_init_oracles(process: &mut Process<'_>, message: &[u8]) {
+fn match_init_oracles(process: &mut Process, message: &[u8]) {
     process.checks_passed |= message == CHECKS_PASSED;
     process.vm_checks |= message == b"Mirror init: VM checks passed\n";
     process.tls_checks |= message == b"Mirror init: TLS checks passed\n";
@@ -2445,7 +2425,7 @@ fn match_init_oracles(process: &mut Process<'_>, message: &[u8]) {
 /// The shell's console-text oracles and their markers. Only trace kernels
 /// match console text (spec 0010-D4).
 #[cfg(feature = "test-trace")]
-fn service_message(process: &mut Process<'_>, message: &[u8]) {
+fn service_message(process: &mut Process, message: &[u8]) {
     if !matches!(process.policy, CpuPolicy::Shell(_)) {
         return;
     }
@@ -2473,7 +2453,7 @@ fn service_message(process: &mut Process<'_>, message: &[u8]) {
     }
 }
 
-fn require_surface(process: &Process<'_>, handle: u64) -> Result<Option<u64>, i64> {
+fn require_surface(process: &Process, handle: u64) -> Result<Option<u64>, i64> {
     match process.handles.require(handle, capability::WRITE) {
         Ok(capability) if capability.object == Object::Surface => Ok(None),
         Ok(Capability {
@@ -2488,13 +2468,13 @@ fn require_surface(process: &Process<'_>, handle: u64) -> Result<Option<u64>, i6
 /// Init's peer must try, and be denied, its owner's exact surface token. Record
 /// each surface operation that rejected that token as a bad handle.
 #[cfg(feature = "boot-smoke")]
-fn note_foreign_surface(process: &mut Process<'_>, handle: u64, error: i64, operation: u8) {
+fn note_foreign_surface(process: &mut Process, handle: u64, error: i64, operation: u8) {
     if error == cap_error(CapError::BadHandle) && handle != 0 && handle == process.foreign_surface {
         process.foreign_surface_denials |= operation;
     }
 }
 
-fn surface_info(process: &mut Process<'_>, handle: u64, address: u64, length: u64) -> i64 {
+fn surface_info(process: &mut Process, handle: u64, address: u64, length: u64) -> i64 {
     let application = match require_surface(process, handle) {
         Ok(application) => application,
         Err(error) => {
@@ -2531,7 +2511,7 @@ fn surface_info(process: &mut Process<'_>, handle: u64, address: u64, length: u6
     surface::INFO_SIZE as i64
 }
 
-fn surface_present(process: &mut Process<'_>, handle: u64, address: u64, length: u64) -> i64 {
+fn surface_present(process: &mut Process, handle: u64, address: u64, length: u64) -> i64 {
     let application = match require_surface(process, handle) {
         Ok(application) => application,
         Err(error) => {
@@ -2567,7 +2547,7 @@ fn surface_present(process: &mut Process<'_>, handle: u64, address: u64, length:
     }
 }
 
-fn application_pid(process: &Process<'_>, handle: u64) -> Result<u64, i64> {
+fn application_pid(process: &Process, handle: u64) -> Result<u64, i64> {
     match process
         .handles
         .require(handle, capability::WRITE)
@@ -2581,7 +2561,7 @@ fn application_pid(process: &Process<'_>, handle: u64) -> Result<u64, i64> {
     }
 }
 
-fn application_info(process: &mut Process<'_>, handle: u64, address: u64, length: u64) -> i64 {
+fn application_info(process: &mut Process, handle: u64, address: u64, length: u64) -> i64 {
     let pid = match application_pid(process, handle) {
         Ok(pid) => pid,
         Err(error) => return error,
@@ -2602,7 +2582,7 @@ fn application_info(process: &mut Process<'_>, handle: u64, address: u64, length
     }
 }
 
-fn application_event(process: &mut Process<'_>, handle: u64, address: u64, length: u64) -> i64 {
+fn application_event(process: &mut Process, handle: u64, address: u64, length: u64) -> i64 {
     let pid = match application_pid(process, handle) {
         Ok(pid) => pid,
         Err(error) => return error,
@@ -2625,7 +2605,7 @@ fn application_event(process: &mut Process<'_>, handle: u64, address: u64, lengt
     }
 }
 
-fn application_read(process: &mut Process<'_>, handle: u64, address: u64, length: u64) -> i64 {
+fn application_read(process: &mut Process, handle: u64, address: u64, length: u64) -> i64 {
     let pid = match application_pid(process, handle) {
         Ok(pid) => pid,
         Err(error) => return error,
@@ -2657,7 +2637,7 @@ fn application_read(process: &mut Process<'_>, handle: u64, address: u64, length
 }
 
 fn receive_app_input(
-    process: &mut Process<'_>,
+    process: &mut Process,
     session: &mut windows::Session,
     handle: u64,
     address: u64,
@@ -2701,7 +2681,7 @@ fn receive_app_input(
     windows::EVENT_SIZE as i64
 }
 
-fn send(process: &mut Process<'_>, ipc: &mut Ipc, handle: u64, address: u64, length: u64) -> i64 {
+fn send(process: &mut Process, ipc: &mut Ipc, handle: u64, address: u64, length: u64) -> i64 {
     let channel = match channel_for(process, handle, capability::SEND) {
         Ok(channel) => channel,
         Err(error) => return error,
@@ -2732,7 +2712,7 @@ fn send(process: &mut Process<'_>, ipc: &mut Ipc, handle: u64, address: u64, len
 }
 
 fn receive(
-    process: &mut Process<'_>,
+    process: &mut Process,
     ipc: &mut Ipc,
     handle: u64,
     address: u64,
@@ -2822,7 +2802,7 @@ pub(crate) fn syscall(frame: &mut TrapFrame) {
     }
 }
 
-fn dispatch_syscall(process: &mut Process<'_>, frame: &mut TrapFrame) -> SyscallResult {
+fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResult {
     let mut result = -38_i64;
     let mut finished = false;
     let mut suspension = None;
@@ -3138,9 +3118,7 @@ fn dispatch_syscall(process: &mut Process<'_>, frame: &mut TrapFrame) -> Syscall
                         process.threads_exited += 1;
                     }
                     let last = process
-                        .threads
-                        .iter()
-                        .flatten()
+                        .threads()
                         .filter(|thread| !matches!(thread.state, State::Exited(_)))
                         .count()
                         == 1;
@@ -3220,9 +3198,7 @@ pub(crate) fn timer_tick(frame: &mut TrapFrame) {
             #[cfg(feature = "boot-smoke")]
             {
                 if process
-                    .threads
-                    .iter()
-                    .flatten()
+                    .threads()
                     .filter(|thread| !matches!(thread.state, State::Exited(_)))
                     .count()
                     > 1
@@ -3302,7 +3278,7 @@ pub(crate) fn fault(frame: &mut TrapFrame, cr2: u64) {
     interrupts::return_from_user(frame);
 }
 
-fn record_fault(process: &mut Process<'_>, frame: &TrapFrame, cr2: u64) {
+fn record_fault(process: &mut Process, frame: &TrapFrame, cr2: u64) {
     process.finish(Outcome::Fault {
         vector: frame.vector,
         error: frame.error,

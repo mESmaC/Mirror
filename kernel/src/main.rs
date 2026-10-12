@@ -361,6 +361,9 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
     #[cfg(feature = "boot-smoke")]
     kernel_vm::heap_window_self_test(&tables, &mut frames, boot.direct_map_offset);
     grow_kernel_heap(&tables, &mut frames, boot.direct_map_offset, "boot");
+    // The process and thread tables are .bss statics; every flavor reports
+    // them once, before the first session or the skipped-desktop path.
+    userspace::report_scheduler();
     // Only smoke kernels run init's self-test battery. Default and trace
     // kernels start the shell as the first userspace process (spec 0010-D3).
     // The rendezvous and heap-growth phase below run in every flavor.

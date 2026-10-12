@@ -635,6 +635,7 @@ try {
     Assert-MirrorUsbMarkers -Serial $serial -Attached ([bool]$Xhci) -UsbDevice $usbFixture -FullSpeed ([bool]$XhciFullSpeed) -WithoutHpet ([bool]$NoHpet) -Smoke $true -FaultMode $Fault
     # boot-smoke implies test-trace, so every smoke log carries one MIRROR_TRACE_ON.
     Assert-MirrorTraceMarker -Serial $serial -Expected $true
+    Assert-MirrorSchedReady -Serial $serial
     $markers += 'MIRROR_USER_SYNC_OK'
     if (@([regex]::Matches($serial, '(?m)^user: Mirror init: synchronization checks passed\\n\r?$')).Count -ne 4) {
         throw 'Both native processes must complete their synchronization checks before and after teardown/relaunch.'
