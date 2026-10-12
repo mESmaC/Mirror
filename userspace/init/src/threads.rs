@@ -13,8 +13,8 @@ use mirror_thread_protocol::{
 
 use crate::{
     EAGAIN, EBADF, EFAULT, EINVAL, KERNEL_BASE, PAGE_SIZE, PROT_NONE, PROT_READ_WRITE, RIGHT_WRITE,
-    SYS_BOOT_HANDLE, SYS_CLOSE, SYS_DUP, SYS_PID, SYS_SLEEP, SYS_WRITE, SYS_YIELD, exit, require,
-    syscall, vm_protect, vm_release, vm_reserve, vm_stats, vm_write, write,
+    SYS_BOOT_HANDLE, SYS_CLOSE, SYS_DUP, SYS_PID, SYS_SLEEP, SYS_TICKS, SYS_WRITE, SYS_YIELD, exit,
+    require, syscall, vm_protect, vm_release, vm_reserve, vm_stats, vm_write, write,
 };
 
 global_asm!(include_str!("threads.S"));
@@ -45,6 +45,14 @@ const CAPACITY_WORKERS: usize = MAX_THREADS - 1;
 const CAPACITY_STACK_PAGES: u64 = 4;
 const CAPACITY_STACKS: u64 = 0x1_0a00_0000;
 const CAPACITY_VALUE: u64 = 0x5eed_0030_a000_0000;
+/// The wake-preemption check's sleeper stack, one guardless RW reservation.
+const SLEEPER_STACK: u64 = 0x1_0c00_0000;
+const SLEEPER_STACK_PAGES: u64 = 4;
+/// The spinner spins this many ticks at least (spec 0030a, acceptance 4).
+const SPIN_TICKS: i64 = 4;
+/// Bounds the spin if the sleeper never runs, inside the peer's 100-tick
+/// receive deadline.
+const SPIN_LIMIT: i64 = 32;
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
@@ -98,6 +106,7 @@ static PARK_WORD: AtomicU32 = AtomicU32::new(0);
 static CAPACITY_GATE: AtomicU32 = AtomicU32::new(0);
 static CAPACITY_STARTED: AtomicU64 = AtomicU64::new(0);
 static CAPACITY_DONE: AtomicU64 = AtomicU64::new(0);
+static SLEEPER_WOKE: AtomicU64 = AtomicU64::new(0);
 
 unsafe extern "C" {
     fn mirror_thread_entry();
@@ -616,6 +625,55 @@ pub(super) fn check_capacity(console: u64) {
     vm_release(CAPACITY_STACKS, pages);
     require(vm_stats() == baseline, 590);
     write(console, b"Mirror init: thread capacity checks passed\n");
+}
+
+extern "C" fn preempt_sleeper(console: u64) -> ! {
+    // The raw entry contract: the argument arrives in RDI, with no TLS bases.
+    // The kernel times this thread's next sleep, from its deadline to its
+    // dispatch.
+    write(console, b"Mirror init: preempt sleep\n");
+    require(syscall(SYS_SLEEP, 1, 0, 0) == 0, 591);
+    SLEEPER_WOKE.store(1, Ordering::Release);
+    thread_exit(0)
+}
+
+/// The deadline half of spec 0030a's acceptance 4, run by role 0 inside its
+/// IPC checks while the peer waits for EOF. This thread is the spinner: the
+/// sleeper sleeps one tick, and that tick, which interrupts the spinner, must
+/// hand the CPU to the sleeper at once. The kernel times the sleeper's wake
+/// and checks that the spinner then resumes with the rest of its quantum.
+pub(super) fn check_wake_preemption(console: u64) {
+    let baseline = vm_stats();
+    vm_reserve(SLEEPER_STACK, SLEEPER_STACK_PAGES, PROT_READ_WRITE);
+    let top = SLEEPER_STACK + SLEEPER_STACK_PAGES * PAGE_SIZE;
+    // Commit the stack's top page here, so no demand fault interrupts the
+    // sleeper between its oracle line and its sleep.
+    vm_write(top - 8, 0);
+    store(&SLEEPER_WOKE, 0);
+    write(console, b"Mirror init: preempt spin\n");
+    let sleeper = create(ThreadStart {
+        entry: preempt_sleeper as *const () as u64,
+        stack: top - 8,
+        argument: console,
+        fs: 0,
+        gs: 0,
+    });
+    require(sleeper > 0, 592);
+    // The sleeper runs first and blocks; this thread then starts a fresh
+    // quantum in the same tick, so the sleeper's deadline falls inside it.
+    yield_now();
+    let start = syscall(SYS_TICKS, 0, 0, 0);
+    loop {
+        let elapsed = syscall(SYS_TICKS, 0, 0, 0) - start;
+        if elapsed >= SPIN_TICKS && load(&SLEEPER_WOKE) == 1 {
+            break;
+        }
+        require(elapsed < SPIN_LIMIT, 593);
+        core::hint::spin_loop();
+    }
+    require(join(sleeper as u64) == (0, 0), 594);
+    vm_release(SLEEPER_STACK, SLEEPER_STACK_PAGES);
+    require(vm_stats() == baseline, 595);
 }
 
 pub(super) fn scenario(scenario: u64) -> ! {

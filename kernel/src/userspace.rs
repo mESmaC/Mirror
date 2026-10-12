@@ -117,6 +117,30 @@ struct Thread {
     charged_ticks: u64,
     sleep_charge: u64,
     quantum_left: u64,
+    /// A wake displaced this thread with quantum left, so its next dispatch
+    /// keeps `quantum_left` instead of starting a new quantum (0030-D3).
+    displaced: bool,
+    /// The wake whose latency the kernel times for init's battery.
+    #[cfg(feature = "boot-smoke")]
+    probe: Option<LatencyProbe>,
+    /// When the timed wake became due, until the thread's next dispatch.
+    #[cfg(feature = "boot-smoke")]
+    due: Option<u64>,
+}
+
+/// A wake that role 0 of init's battery asks the kernel to time (spec 0030a,
+/// acceptance 4). Only the thread that writes the oracle line is flagged.
+#[cfg(feature = "boot-smoke")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LatencyProbe {
+    /// The next sleep: from its deadline to the sleeper's dispatch.
+    Sleep,
+    /// The next blocked receive: from the sending syscall's trap exit to the
+    /// receiver's dispatch.
+    Receive,
+    /// The next displacement by a wake: the thread must resume with the
+    /// rest of its quantum.
+    Spin,
 }
 
 impl Thread {
@@ -133,11 +157,17 @@ impl Thread {
             charged_ticks: 0,
             sleep_charge: 0,
             quantum_left: QUANTUM_TICKS,
+            displaced: false,
+            #[cfg(feature = "boot-smoke")]
+            probe: None,
+            #[cfg(feature = "boot-smoke")]
+            due: None,
         }
     }
 
-    /// Mark a blocked thread ready and append it to the run queue. New
-    /// threads start ready and are queued by their creator.
+    /// Mark a blocked thread ready and append it to the run queue as woken
+    /// in this completion pass. New threads start ready and are queued by
+    /// their creator.
     fn wake(&mut self) {
         assert!(
             !matches!(
@@ -148,7 +178,7 @@ impl Thread {
             self.state
         );
         self.state = State::Ready;
-        sched::enqueue(self.slot);
+        sched::enqueue_woken(self.slot);
     }
 }
 
@@ -315,6 +345,16 @@ struct Process {
     fpu_preemption_start: Option<usize>,
     #[cfg(feature = "boot-smoke")]
     fpu_preemptions: usize,
+    /// Ticks from a flagged sleeper's deadline to its dispatch.
+    #[cfg(feature = "boot-smoke")]
+    wake_lateness: Option<u64>,
+    /// Ticks from a flagged receive's sender trap exit to its dispatch.
+    #[cfg(feature = "boot-smoke")]
+    ipc_lateness: Option<u64>,
+    /// A flagged spinner resumed with the rest of its quantum after a wake
+    /// displaced it.
+    #[cfg(feature = "boot-smoke")]
+    spin_kept_quantum: bool,
     outcome: Option<Outcome>,
     #[cfg(feature = "boot-smoke")]
     checks_passed: bool,
@@ -617,6 +657,12 @@ fn create_process(
         fpu_preemption_start: None,
         #[cfg(feature = "boot-smoke")]
         fpu_preemptions: 0,
+        #[cfg(feature = "boot-smoke")]
+        wake_lateness: None,
+        #[cfg(feature = "boot-smoke")]
+        ipc_lateness: None,
+        #[cfg(feature = "boot-smoke")]
+        spin_kept_quantum: false,
         outcome: None,
         #[cfg(feature = "boot-smoke")]
         checks_passed: false,
@@ -912,6 +958,37 @@ fn run_pair(
         waits,
         timeouts
     );
+    // Acceptance 4: only role 0 times its wakes. A sleeper is dispatched by
+    // its deadline's own tick, a receiver as its sender's syscall exits, and
+    // the spinner they displace keeps the rest of its quantum. One tick of
+    // slack covers an IRQ held across a tick boundary by a critical section.
+    assert!(
+        processes[1].wake_lateness.is_none()
+            && processes[1].ipc_lateness.is_none()
+            && !processes[1].spin_kept_quantum,
+        "peer timed a wake"
+    );
+    let (Some(wake_lateness), Some(ipc_lateness)) =
+        (processes[0].wake_lateness, processes[0].ipc_lateness)
+    else {
+        panic!(
+            "wake preemption checks did not complete: sleep {:?}, receive {:?}",
+            processes[0].wake_lateness, processes[0].ipc_lateness
+        );
+    };
+    assert!(
+        processes[0].spin_kept_quantum,
+        "a displaced spinner lost its quantum"
+    );
+    assert!(
+        wake_lateness <= 1 && ipc_lateness <= 1,
+        "late wake: sleep {wake_lateness} ticks, receive {ipc_lateness} ticks"
+    );
+    serial::println!(
+        "MIRROR_PREEMPT_OK wake_lateness={} ipc_lateness={}",
+        wake_lateness,
+        ipc_lateness
+    );
     let yields: usize = processes.iter().map(|process| process.yields).sum();
     let sleeps: usize = processes.iter().map(|process| process.sleeps).sum();
     let preemptions: usize = processes.iter().map(|process| process.preemptions).sum();
@@ -948,8 +1025,21 @@ fn resume_process(
     // The scheduler dequeued this thread and made it current.
     assert!(!process.finished());
     assert_eq!(process.thread().state, State::Ready);
-    process.thread_mut().state = State::Running;
-    process.thread_mut().quantum_left = QUANTUM_TICKS;
+    let thread = process.thread_mut();
+    thread.state = State::Running;
+    // A thread that a wake displaced resumes its interrupted quantum; any
+    // other dispatch starts a new one (0030-D3).
+    let resumed = core::mem::take(&mut thread.displaced);
+    if resumed {
+        assert!(
+            (1..=QUANTUM_TICKS).contains(&thread.quantum_left),
+            "displaced thread has no quantum left"
+        );
+    } else {
+        thread.quantum_left = QUANTUM_TICKS;
+    }
+    #[cfg(feature = "boot-smoke")]
+    record_latency(process, resumed);
     process.dispatches += 1;
     // Save a copy, not a reference into a context that handlers can mutate.
     let context = process.thread().context.frame;
@@ -1006,6 +1096,32 @@ fn resume_process(
         State::Running,
         "process returned without transition"
     );
+}
+
+/// At a dispatch, record a flagged wake's latency, or that a flagged spinner
+/// resumed with the rest of its quantum (spec 0030a, acceptance 4). Each
+/// flag times one event and is then cleared.
+#[cfg(feature = "boot-smoke")]
+fn record_latency(process: &mut Process, resumed: bool) {
+    let now = timer::ticks();
+    let thread = process.thread_mut();
+    let probe = thread.probe;
+    if probe == Some(LatencyProbe::Spin) && resumed && thread.quantum_left < QUANTUM_TICKS {
+        thread.probe = None;
+        process.spin_kept_quantum = true;
+        return;
+    }
+    let Some(due) = thread.due.take() else {
+        return;
+    };
+    thread.probe = None;
+    let lateness = now.wrapping_sub(due);
+    let slot = match probe {
+        Some(LatencyProbe::Sleep) => &mut process.wake_lateness,
+        Some(LatencyProbe::Receive) => &mut process.ipc_lateness,
+        _ => unreachable!("timed a wake without its probe"),
+    };
+    assert!(slot.replace(lateness).is_none(), "wake timed twice");
 }
 
 /// Complete bounded VM work with the kernel root active and no interrupt frames
@@ -1449,13 +1565,13 @@ fn park(process: &mut Process, state: State) {
 /// same check. A wait that still cannot complete stays queued.
 fn complete_wait(
     process: &mut Process,
-    slot: u16,
-    preset: Option<i64>,
+    signal: sched::Signal,
     ipc: &mut Ipc,
     input: Option<&mut input::Session<'_>>,
     windows: Option<&mut windows::Session>,
     now: u64,
 ) {
+    let sched::Signal { slot, preset, at } = signal;
     assert!(ACTIVE.load(Ordering::SeqCst).is_null());
     process.current = process
         .members
@@ -1565,6 +1681,20 @@ fn complete_wait(
     if let Some(result) = result {
         thread.context.frame.rax = result as u64;
     }
+    // A flagged sleep is due at its deadline; a flagged receive that got a
+    // message, at the sending syscall's trap exit, when it was signaled.
+    #[cfg(feature = "boot-smoke")]
+    {
+        thread.due = match (thread.probe, state) {
+            (Some(LatencyProbe::Sleep), State::Sleeping(deadline)) => Some(deadline),
+            (Some(LatencyProbe::Receive), State::Receiving(_)) if result.is_some_and(|r| r > 0) => {
+                Some(at)
+            }
+            _ => None,
+        };
+    }
+    #[cfg(not(feature = "boot-smoke"))]
+    let _ = at;
     thread.wake();
 }
 
@@ -2449,6 +2579,17 @@ fn match_init_oracles(process: &mut Process, message: &[u8]) {
     process.ipc_checks |= message == IPC_CHECKS_PASSED;
     process.surface_checks |= message == SURFACE_CHECKS_PASSED;
     process.surface_denied_checks |= message == SURFACE_DENIED_CHECKS;
+    // Spec 0030a, acceptance 4: the writing thread asks for its next wake,
+    // or its next displacement, to be timed.
+    let probe = match message {
+        b"Mirror init: preempt sleep\n" => Some(LatencyProbe::Sleep),
+        b"Mirror init: preempt receive\n" => Some(LatencyProbe::Receive),
+        b"Mirror init: preempt spin\n" => Some(LatencyProbe::Spin),
+        _ => None,
+    };
+    if probe.is_some() {
+        process.thread_mut().probe = probe;
+    }
 }
 
 /// The shell's console-text oracles and their markers. Only trace kernels
@@ -2833,6 +2974,9 @@ pub(crate) fn syscall(frame: &mut TrapFrame) {
         interrupts::return_from_user(frame);
     } else if let Some(state) = outcome.suspension {
         suspend(frame, state);
+    } else if sched::take_reschedule() {
+        // The call signaled a wait: the threads it woke run first (0030-D3).
+        displace(frame);
     }
 }
 
@@ -3267,10 +3411,36 @@ pub(crate) fn timer_tick(frame: &mut TrapFrame) {
         interrupts::return_from_user(frame);
     } else if preempt {
         suspend(frame, State::Ready);
+    } else if sched::deadline_due(timer::ticks()) {
+        // The deadline's own tick hands the CPU to the waits it ends, and the
+        // charged thread keeps the rest of its quantum (0030-D3).
+        displace(frame);
+    }
+}
+
+/// A PS/2 IRQ interrupted CPL3, after its EOI. When it completed input that
+/// a thread waits for, the interrupted thread returns to the scheduler with
+/// no tick charged, its quantum unchanged and no preemption or throttle
+/// counted: an IRQ fires per byte, not per tick (0030-D2). The scheduler
+/// clears the arrival flag and wakes the waiters.
+pub(crate) fn input_interrupt(frame: &mut TrapFrame) {
+    if input::arrival_pending() && input::waiters() > 0 {
+        displace(frame);
     }
 }
 
 fn suspend(frame: &mut TrapFrame, state: State) {
+    park_current(frame, state, false);
+}
+
+/// Return the running thread to the scheduler still ready, so the threads
+/// that an event woke dispatch first. It keeps the rest of its quantum and
+/// then rejoins the run queue behind them (0030-D3).
+fn displace(frame: &mut TrapFrame) {
+    park_current(frame, State::Ready, true);
+}
+
+fn park_current(frame: &mut TrapFrame, state: State, displaced: bool) {
     // Validate before saving. Otherwise a malformed user stack could enter a
     // ready context and fail a kernel invariant on its next resume.
     prepare_return(frame);
@@ -3291,7 +3461,9 @@ fn suspend(frame: &mut TrapFrame, state: State) {
                 | State::Waiting(_)
                 | State::Exited(_)
         ));
-        process.thread_mut().context.frame = *frame;
+        let thread = process.thread_mut();
+        thread.context.frame = *frame;
+        thread.displaced = displaced;
         park(process, state);
     });
     // The current handler must unwind before the scheduler touches other tasks.

@@ -653,6 +653,14 @@ try {
     if (@([regex]::Matches($serial, '(?m)^user: Mirror init: wait queue checks passed\\n\r?$')).Count -ne 2) {
         throw 'The primary native process must complete its wait queue check before and after teardown/relaunch.'
     }
+    # Wakeup preemption (spec 0030a, acceptance 4): each pair's primary times
+    # a sleeper's and a receiver's dispatch, each at most one tick late. The
+    # fatal kernel faults run after both pairs, so every case reports twice.
+    $preemptLines = @([regex]::Matches($serial, '(?m)^MIRROR_PREEMPT_OK(?:\s|$)')).Count
+    $preemptValid = @([regex]::Matches($serial, '(?m)^MIRROR_PREEMPT_OK wake_lateness=[01] ipc_lateness=[01]\r?$')).Count
+    if ($preemptLines -ne 2 -or $preemptValid -ne 2) {
+        throw "Both native process runs must report MIRROR_PREEMPT_OK with wake_lateness and ipc_lateness of at most one tick. See $serialLog."
+    }
     if ($serial -notmatch '(?m)^MIRROR_TLS_READY[^\r\n]* fsgsbase=0(?:\s|$)') {
         throw 'Mirror must keep direct user FS/GS base instructions disabled.'
     }

@@ -776,6 +776,8 @@ fn drain_controller(state: &mut State) {
 
 /// IRQ1/vector 33 and IRQ12/vector 44 both drain the shared output port. The
 /// dispatcher acknowledges the proper PIC(s) after this bounded handler returns.
+/// A drain that stamped a record, a vmmouse drain's included, flags input
+/// arrival for the scheduler (spec 0030a, 0030-D2).
 pub(crate) fn handle_irq(vector: u8) {
     debug_assert!(!arch::interrupts_enabled());
     match vector {
@@ -784,7 +786,17 @@ pub(crate) fn handle_irq(vector: u8) {
         _ => panic!("invalid PS/2 IRQ vector"),
     }
     .fetch_add(1, Ordering::Relaxed);
+    let before = NEXT_SEQUENCE.load(Ordering::Relaxed);
     with_state(drain_controller);
+    if NEXT_SEQUENCE.load(Ordering::Relaxed) != before {
+        crate::input::note_arrival();
+    }
+}
+
+/// Whether a bounded drain left work for the next consumer poll: controller
+/// bytes past the IRQ's limit, or vmmouse packets past its 64-packet bound.
+pub(crate) fn drain_pending() -> bool {
+    with_state(|state| state.pending_drain) || vmmouse::pending()
 }
 
 /// Continue at most 32 deferred bytes, preserving IF. Call before borrowing any

@@ -1080,6 +1080,10 @@ fn dispatch(frame: &mut TrapFrame) {
             // IRQ after switching to LAPIC is acknowledged without scheduling.
             // Validate before saving and unwind before switching roots.
             crate::userspace::timer_tick(frame);
+        } else if matches!(frame.vector, 33 | 44) && frame.cs & 3 == 3 {
+            // After the EOI, never inside it: input that a thread waits for
+            // reschedules the interrupted user without charging it (0030-D2).
+            crate::userspace::input_interrupt(frame);
         }
         return;
     }

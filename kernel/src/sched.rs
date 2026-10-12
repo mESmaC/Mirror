@@ -14,6 +14,14 @@
 //! signals waiters, in queue order (0030-D6). The scheduler completes the
 //! signaled waits, with any user copy, before its next dispatch.
 //!
+//! A signal also asks for a reschedule at the next trap exit: the syscall
+//! that signaled, the tick that reached a deadline, or a PS/2 IRQ that
+//! completed input while a thread waits for it. The interrupted thread then
+//! returns to the scheduler still ready, keeping the rest of its quantum.
+//! Each completion pass appends the threads it wakes to the run queue, and
+//! the next dispatch takes the first eligible one, or else the interrupted
+//! thread, which rejoins the queue behind them (0030-D3).
+//!
 //! Only the BSP touches any of this, with IF=0: the scheduler between user
 //! entries, and the running thread's synchronous syscall and CPL3 IRQ handlers
 //! while the scheduler waits inside `resume_user`. CPL0 IRQ handlers and APs
@@ -170,6 +178,11 @@ struct RunQueue {
     length: u16,
     next: [u16; THREAD_SLOTS],
     queued: [bool; THREAD_SLOTS],
+    /// The scheduler's current completion pass, counted from 1.
+    pass: u64,
+    /// The pass that queued each thread as just woken, or 0. Dispatch takes
+    /// the current pass's threads first (0030-D3).
+    woken_in: [u64; THREAD_SLOTS],
 }
 
 static PROCESSES: Table<Process, PROCESS_SLOTS, { PROCESS_SLOTS / 64 }> = Table::new();
@@ -180,9 +193,15 @@ static RUN_QUEUE: Exclusive<RunQueue> = Exclusive::new(RunQueue {
     length: 0,
     next: [0; THREAD_SLOTS],
     queued: [false; THREAD_SLOTS],
+    pass: 0,
+    woken_in: [0; THREAD_SLOTS],
 });
 static WAITS: Exclusive<Waits> = Exclusive::new(Waits::new());
 static REPORTED: AtomicBool = AtomicBool::new(false);
+/// Set when an event signals a wait during a user slice, so the syscall that
+/// signaled returns to the scheduler instead of to its caller (0030-D3).
+/// Dispatch clears it.
+static RESCHEDULE: AtomicBool = AtomicBool::new(false);
 
 /// The event queue a blocked thread waits on (0030-D2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -202,6 +221,8 @@ const CHANNELS: usize = ipc::CHANNEL_COUNT;
 const APPS: usize = windows::APP_COUNT;
 /// Futex queues by process slot, then channels, device input and apps.
 const LISTS: usize = PROCESS_SLOTS + CHANNELS + 1 + APPS;
+/// The device-input queue's list index.
+const INPUT_LIST: usize = PROCESS_SLOTS + CHANNELS;
 
 impl Queue {
     fn list(self) -> usize {
@@ -214,7 +235,7 @@ impl Queue {
                 assert!(index < CHANNELS, "invalid channel queue");
                 PROCESS_SLOTS + index
             }
-            Self::Input => PROCESS_SLOTS + CHANNELS,
+            Self::Input => INPUT_LIST,
             Self::App(index) => {
                 assert!(index < APPS, "invalid app queue");
                 PROCESS_SLOTS + CHANNELS + 1 + index
@@ -410,6 +431,17 @@ struct Signals {
     signaled: [bool; THREAD_SLOTS],
     has_preset: [bool; THREAD_SLOTS],
     preset: [i64; THREAD_SLOTS],
+    /// The tick of each signal: for a syscall's event, its trap-exit tick,
+    /// since no tick is delivered while the handler runs with IF=0.
+    at: [u64; THREAD_SLOTS],
+}
+
+/// One signaled wait, taken for completion.
+#[derive(Clone, Copy)]
+pub(super) struct Signal {
+    pub(super) slot: u16,
+    pub(super) preset: Option<i64>,
+    pub(super) at: u64,
 }
 
 impl Signals {
@@ -420,11 +452,13 @@ impl Signals {
             signaled: [false; THREAD_SLOTS],
             has_preset: [false; THREAD_SLOTS],
             preset: [0; THREAD_SLOTS],
+            at: [0; THREAD_SLOTS],
         }
     }
 
-    /// Signal a wait once. Only a recheck may repeat; events that decide a
-    /// result skip waits that are already signaled.
+    /// Signal a wait once, and ask for a reschedule at the next trap exit.
+    /// Only a recheck may repeat; events that decide a result skip waits
+    /// that are already signaled.
     fn signal(&mut self, slot: u16, preset: Option<i64>) {
         let index = usize::from(slot);
         if self.signaled[index] {
@@ -434,15 +468,21 @@ impl Signals {
         self.signaled[index] = true;
         self.has_preset[index] = preset.is_some();
         self.preset[index] = preset.unwrap_or(0);
+        self.at[index] = timer::ticks();
         self.links.push(&mut self.list, slot);
+        RESCHEDULE.store(true, Ordering::Relaxed);
     }
 
-    fn take(&mut self, slot: u16) -> Option<i64> {
+    fn take(&mut self, slot: u16) -> Signal {
         let index = usize::from(slot);
         assert!(self.signaled[index]);
         self.links.remove(&mut self.list, slot);
         self.signaled[index] = false;
-        self.has_preset[index].then_some(self.preset[index])
+        Signal {
+            slot,
+            preset: self.has_preset[index].then_some(self.preset[index]),
+            at: self.at[index],
+        }
     }
 }
 
@@ -477,9 +517,18 @@ impl Waits {
         if let Some(list) = usize::from(self.list_of[index]).checked_sub(1) {
             self.links.remove(&mut self.lists[list], slot);
             self.list_of[index] = 0;
+            self.publish_input_waiters(list);
         }
         if self.deadlines.queued[index] {
             self.deadlines.remove(slot);
+        }
+    }
+
+    /// Mirror the device-input queue's length into the atomic that a CPL3
+    /// input IRQ reads, after list `list` changed (0030-D2).
+    fn publish_input_waiters(&self, list: usize) {
+        if list == INPUT_LIST {
+            input::set_waiters(usize::from(self.lists[INPUT_LIST].length));
         }
     }
 
@@ -514,6 +563,7 @@ pub(super) fn report_ready() {
 pub(super) fn assert_drained() {
     assert_eq!(PROCESSES.count(), 0, "process left in the table");
     assert_eq!(THREADS.count(), 0, "thread left in the table");
+    assert_eq!(input::waiters(), 0, "device-input waiter left counted");
     assert_eq!(
         RUN_QUEUE.with(|queue| queue.length),
         0,
@@ -627,6 +677,17 @@ pub(super) fn process_slots() -> impl Iterator<Item = usize> {
 
 /// Append a ready thread to the run queue.
 pub(super) fn enqueue(slot: u16) {
+    append(slot, false);
+}
+
+/// Append a thread that the current completion pass readied: a woken one,
+/// or an interrupted one that a wake displaced. Until the next pass these
+/// dispatch before older entries (0030-D3).
+pub(super) fn enqueue_woken(slot: u16) {
+    append(slot, true);
+}
+
+fn append(slot: u16, woken: bool) {
     let index = usize::from(slot);
     RUN_QUEUE.with(|queue| {
         assert!(!queue.queued[index], "thread queued twice");
@@ -637,8 +698,36 @@ pub(super) fn enqueue(slot: u16) {
         }
         queue.tail = slot;
         queue.queued[index] = true;
+        queue.woken_in[index] = if woken { queue.pass } else { 0 };
         queue.length += 1;
     });
+}
+
+/// Start a completion pass: threads woken earlier lose their precedence.
+fn begin_pass() {
+    RUN_QUEUE.with(|queue| {
+        queue.pass = queue
+            .pass
+            .checked_add(1)
+            .expect("scheduler passes exhausted");
+    });
+}
+
+/// Whether an event signaled a wait since the last dispatch, cleared by this
+/// read. The syscall that signaled then reschedules instead of returning.
+pub(super) fn take_reschedule() -> bool {
+    RESCHEDULE.swap(false, Ordering::Relaxed)
+}
+
+/// Whether a timed wait's deadline has been reached, so the tick that
+/// reached it reschedules (0030-D3).
+pub(super) fn deadline_due(now: u64) -> bool {
+    WAITS.with(|waits| {
+        waits
+            .deadlines
+            .first()
+            .is_some_and(|slot| deadline_reached(now, waits.deadlines.deadline[usize::from(slot)]))
+    })
 }
 
 /// Take a thread off the run queue if it is on it.
@@ -674,21 +763,30 @@ fn unlink(queue: &mut RunQueue, previous: Option<u16>, slot: u16) {
     queue.length -= 1;
 }
 
-/// Dequeue the first thread for which `runnable` holds, scanning at most the
-/// whole queue (THREAD_SLOTS entries).
+/// Dequeue the first thread for which `runnable` holds, preferring those
+/// that the current pass queued as woken. One scan of at most the whole
+/// queue (THREAD_SLOTS entries); `runnable` sees each entry at most once.
 fn dequeue_first(mut runnable: impl FnMut(u16) -> bool) -> Option<u16> {
     RUN_QUEUE.with(|queue| {
+        // The first runnable older entry and its predecessor.
+        let mut fallback = None;
         let mut previous = None;
         let mut current = queue.head;
         for _ in 0..queue.length {
-            if runnable(current) {
-                unlink(queue, previous, current);
-                return Some(current);
+            let woken = queue.woken_in[usize::from(current)] == queue.pass;
+            if (woken || fallback.is_none()) && runnable(current) {
+                if woken {
+                    unlink(queue, previous, current);
+                    return Some(current);
+                }
+                fallback = Some((previous, current));
             }
             previous = Some(current);
             current = queue.next[usize::from(current)];
         }
-        None
+        let (previous, slot) = fallback?;
+        unlink(queue, previous, slot);
+        Some(slot)
     })
 }
 
@@ -710,6 +808,7 @@ pub(super) fn block(slot: u16, queue: Option<Queue>, deadline: Option<u64>) {
             }
             waits.links.push(&mut waits.lists[list], slot);
             waits.list_of[index] = list as u16 + 1;
+            waits.publish_input_waiters(list);
         }
         if let Some(deadline) = deadline {
             waits.deadlines.insert(slot, deadline);
@@ -834,14 +933,11 @@ fn expire(now: u64) {
     });
 }
 
-/// The oldest signaled wait and its preset result, if any.
-fn next_signal() -> Option<(u16, Option<i64>)> {
+/// The oldest signaled wait, if any.
+fn next_signal() -> Option<Signal> {
     WAITS.with(|waits| {
         let signals = &mut waits.signals;
-        (signals.list.length != 0).then(|| {
-            let slot = signals.list.head;
-            (slot, signals.take(slot))
-        })
+        (signals.list.length != 0).then(|| signals.take(signals.list.head))
     })
 }
 
@@ -893,6 +989,16 @@ pub(super) struct Stats {
     pub(super) idle_ticks: u64,
 }
 
+/// A thread that came back from user mode still ready, to be queued again
+/// after the next completion pass.
+#[derive(Clone, Copy)]
+struct Returned {
+    slot: u16,
+    /// A wake displaced it with quantum left (0030-D3), so it dispatches
+    /// before older entries, behind the threads that pass wakes.
+    displaced: bool,
+}
+
 /// Run one session until its end rule holds. On return no thread runs, no
 /// session pointer is published, and the session's processes, finished or
 /// not, stay in the table for the caller to drain.
@@ -908,6 +1014,7 @@ pub(super) fn run(
     unsafe { interrupts::set_kernel_stack(stacks::bsp_rsp0_top()) };
     let mut stats = Stats::default();
     let mut last = None;
+    let mut returned: Option<Returned> = None;
     loop {
         assert!(!arch::interrupts_enabled());
         assert_unpublished();
@@ -921,10 +1028,26 @@ pub(super) fn run(
             runtime.reclaim_finished(frames, &mut session.ipc);
         }
         if session.ended() {
+            // Only a finished process is reclaimed above, and a ready thread's
+            // process is live, so its slot is still occupied. The caller
+            // finishes the session's remaining processes, which unqueues it.
+            if let Some(thread) = returned.take() {
+                enqueue(thread.slot);
+            }
             return stats;
         }
         let now = timer::ticks();
+        begin_pass();
         complete_waits(session, now);
+        // Queue the returned thread behind the threads this pass woke, before
+        // a shell close can finish its process and take it off the queue.
+        if let Some(thread) = returned.take() {
+            if thread.displaced {
+                enqueue_woken(thread.slot);
+            } else {
+                enqueue(thread.slot);
+            }
+        }
         match session.end {
             #[cfg(feature = "boot-smoke")]
             End::Pair { .. } => {}
@@ -940,7 +1063,7 @@ pub(super) fn run(
             stats.switches += 1;
             last = Some(owner);
         }
-        dispatch(session, kernel, frames, owner, slot);
+        returned = dispatch(session, kernel, frames, owner, slot);
         #[cfg(feature = "boot-smoke")]
         if let End::Pair {
             first,
@@ -966,13 +1089,18 @@ fn assert_unpublished() {
 /// first. A completion signals nothing, so each thread is taken at most once.
 fn complete_waits(session: &mut Session<'_, '_>, now: u64) {
     expire(now);
-    // Device input has no waker until 0030a step 4 adds the input IRQ's
-    // pending flag, so its waiters are rechecked on every pass meanwhile.
-    signal_queue(Queue::Input);
+    // The flag is cleared, with IF=0, before the device-input waiters are
+    // rechecked, so input that arrives later sets it again. Drain work that
+    // a PS/2 or vmmouse bound deferred continues in the waiters' recheck.
+    let arrived = input::take_arrival();
+    if arrived || crate::ps2::drain_pending() {
+        signal_queue(Queue::Input);
+    }
     for _ in 0..THREAD_SLOTS {
-        let Some((slot, preset)) = next_signal() else {
+        let Some(signal) = next_signal() else {
             return;
         };
+        let slot = signal.slot;
         // SAFETY: A signaled thread is occupied, since finishing a process
         // detaches its threads, and the scheduler holds no reference to it.
         let owner = usize::from(unsafe { (*thread_entry(slot)).process });
@@ -985,7 +1113,7 @@ fn complete_waits(session: &mut Session<'_, '_>, now: u64) {
             .as_mut()
             .filter(|_| process.access.windows)
             .map(|runtime| &mut runtime.windows);
-        complete_wait(process, slot, preset, &mut session.ipc, input, windows, now);
+        complete_wait(process, signal, &mut session.ipc, input, windows, now);
     }
     assert!(
         next_signal().is_none(),
@@ -1049,13 +1177,15 @@ fn select(now: u64) -> Option<u16> {
     })
 }
 
+/// Run one thread until it returns to the scheduler. A thread that comes back
+/// still ready is returned, for the next pass to queue again.
 fn dispatch(
     session: &mut Session<'_, '_>,
     kernel: &PageTables,
     frames: &mut FrameAllocator<'_>,
     owner: usize,
     slot: u16,
-) {
+) -> Option<Returned> {
     // SAFETY: The thread's owner is occupied, and the scheduler holds no other
     // reference to it. resume_process publishes it only across user entry.
     let process = unsafe { process(owner) };
@@ -1065,6 +1195,10 @@ fn dispatch(
         .position(|&member| member == slot)
         .expect("queued thread has no owner");
     let access = process.access;
+    // This pass completed the waits that scheduler work signaled, such as
+    // closing a finished process's endpoints. Only the slice's own signals
+    // may reschedule it.
+    RESCHEDULE.store(false, Ordering::Relaxed);
     resume_process(
         kernel,
         frames,
@@ -1078,10 +1212,13 @@ fn dispatch(
             .filter(|_| access.windows)
             .map(|runtime| &mut runtime.windows),
     );
-    // A preempted, yielding or completed thread rejoins the queue's tail.
-    if process.thread().state == State::Ready {
-        enqueue(slot);
-    }
+    // A preempted, yielding, displaced or completed thread rejoins the queue
+    // after the next completion pass, behind the threads it wakes.
+    let thread = process.thread();
+    (thread.state == State::Ready).then_some(Returned {
+        slot,
+        displaced: thread.displaced,
+    })
 }
 
 /// Halt until an interrupt when no queued thread may run. Some thread must
