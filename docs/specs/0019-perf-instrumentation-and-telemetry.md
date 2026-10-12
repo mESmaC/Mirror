@@ -13,7 +13,7 @@ Every kernel build, in every flavor, carries the perf instrumentation, and a boo
 - The host harness, gate methods and targets (0018, O3). The agent bench client (0045).
 - A router or placement policy (C1, C2, C4), or any runtime use of telemetry.
 - Persisting records: 0066 does that once the filesystem exists (ledger C3, amended 2026-10-09). NIC telemetry (0070). Multi-sector or queued reads (0061, 0062). VirtIO telemetry (S1).
-- AP measurements. The kernel console fallback (`run_console`, `main.rs:561`), which draws without a present and is neither traced nor sampled. Changes to the boot-smoke battery.
+- AP measurements. The kernel console fallback (`run_console`, `main.rs:563`), which draws without a present and is neither traced nor sampled. Changes to the boot-smoke battery.
 
 ## Decisions
 
@@ -46,7 +46,7 @@ item       = "boot" / "1" / "flip" / "telemetry" / "agent"
 - **Lexical rules.** Tokens split on ASCII whitespace, as in `boot.rs:132`. Matching is exact and case-sensitive. At most one perf token, no empty or repeated items, at most 64 bytes.
 - **Items.** Any valid token enables the milestones. `boot`: milestones only. `1`: memory samples and the input trace (0018's `mirror.perf=1`). `flip`: flip calibration. `telemetry`: C3 records. `agent`: reserved for 0045; until then the kernel prints `MIRROR_PERF_SKIPPED item=agent reason=unavailable`.
 - **Parsing.** `perf::init()` runs right after `arch::disable_interrupts()` in `_start` (`main.rs:53`), before `serial::init`. It reads the TSC, then the Limine command line without `command_line()`'s `expect` (`boot.rs:143-149`); it never panics, and a missing command line means perf is off. The result is stored once in a static, and each perf site tests it with one branch.
-- **Existing parsers.** `legacy_pic()` and `pit_timer()` (`boot.rs:130-141`) are unchanged. `smoke_mode()`'s filter (`boot.rs:180-184`) also skips a `mirror.perf=` token when `perf::config()` is valid, so it composes with one fault selector; an invalid or second perf token still panics with `unknown smoke-test command line`.
+- **Existing parsers.** `legacy_pic()` and `pit_timer()` (`boot.rs:130-141`) are unchanged. `smoke_mode()`'s filter (`boot.rs:182-186`) also skips a `mirror.perf=` token when `perf::config()` is valid, so it composes with one fault selector; an invalid or second perf token still panics with `unknown smoke-test command line`.
 
 ### Line format
 
@@ -73,7 +73,7 @@ Each `MIRROR_PERF_T` event prints at most once, in this order. A milestone that 
 3. `input`: after PS/2 init and IRQ enabling (`main.rs:316-342`).
 4. `userspace`: the kernel first resumes the shell, or the agent-demo desktop. In default and trace builds this is the first user process (0010-D3).
 5. `frame`: that process's first successful display-surface present (`userspace.rs:2802-2807`).
-6. `shell_ready`: that process's first input syscall after `frame` (15 or 16 on the Input object, `userspace.rs:3229-3255`). Shell: `shell.rs:1032-1036`. Desktop: `userspace/desktop/src/main.rs:350-360`; its input checks at `:161-184` precede `frame` and do not count.
+6. `shell_ready`: that process's first input syscall after `frame` (15 or 16 on the Input object, `userspace.rs:3229-3255`). Shell: `shell.rs:1071-1075`. Desktop: `userspace/desktop/src/main.rs:350-360`; its input checks at `:161-184` precede `frame` and do not count.
 
 ### Memory samples (0018-D6)
 
@@ -97,12 +97,12 @@ After the `after_userspace` heap growth (`main.rs:382-388`) and before the first
 - `MIRROR_PERF_TEL v=1 src= dst= op=<copy|read> pattern=<seq|rand> request_bytes= depth= span_bytes= count= elapsed_ns= min_ns= p50_ns= p95_ns= max_ns=`
   - Copies are `src=0 dst=0`; reads are `src=1 dst=0`. Throughput is count × request_bytes / elapsed_ns. Copies are too short to time singly, so their per-request fields are `none`. Consumers reject an unknown `v`.
 - **Memory benchmark**, just before `probe_ahci_device` (`main.rs:280`), with one CPU running. It copies 4 KiB pages through the direct map from source to destination frames, allocated one at a time and listed in the source frames themselves, so it uses no heap; all are freed afterwards. Two spans: 32 KiB, and min(64 MiB, free memory / 8). Each span gets one untimed warm-up pass, then is copied repeatedly until 256 MiB have been copied or 1 s has passed.
-- **Storage benchmark**, in the AHCI probe after its existing reads succeed and before shutdown (`main.rs:986-1001`): 256 sequential reads from LBA 0, then 256 reads at fixed-seed xorshift64 LBAs over the capacity, each timed. Each pattern stops at 2 s, and `count` records the reads done. Reads go to a stack buffer and allocate no frame, so the DMA accounting assert (`main.rs:1006-1010`) holds.
+- **Storage benchmark**, in the AHCI probe after its existing reads succeed and before shutdown (`main.rs:988-1003`): 256 sequential reads from LBA 0, then 256 reads at fixed-seed xorshift64 LBAs over the capacity, each timed. Each pattern stops at 2 s, and `count` records the reads done. Reads go to a stack buffer and allocate no frame, so the DMA accounting assert (`main.rs:1008-1012`) holds.
 - **Without HPET**, both benchmarks print `SKIPPED item=telemetry reason=no_clock`; DEV records still print. Without `telemetry`, each site costs one branch.
 
 ### Files
 
-- **`crates/perf-protocol`** (`mirror-perf-protocol`, D11): `#![no_std]` and `#![forbid(unsafe_code)]` (0011-D6), `[lints] workspace = true` (0011-D5), no dependencies. It holds the token parser, family and identifier names, a formatter for each line into a fixed buffer, min/p50/p95/max over a slice, and a line parser for tests and host tools. It joins the root `members` (`Cargo.toml:2`) and the host-test command (`test.ps1:77`).
+- **`crates/perf-protocol`** (`mirror-perf-protocol`, D11): `#![no_std]` and `#![forbid(unsafe_code)]` (0011-D6), `[lints] workspace = true` (0011-D5), no dependencies. It holds the token parser, family and identifier names, a formatter for each line into a fixed buffer, min/p50/p95/max over a slice, and a line parser for tests and host tools. It joins the root `members` (`Cargo.toml:2`) and the host-test command (`test.ps1:78`).
 - **`kernel/src/perf.rs`**: config, milestone hooks, input ring, sampler, flip and benchmarks. Hooks: `main.rs` (milestone, benchmark and flip sites), `clock.rs:71` (the TSC/HPET pair), `ahci.rs` (SPD and BDF getters), `framebuffer.rs` (a full-screen fill), `ps2.rs`, `keyboard.rs` and `mouse.rs` (start stamps), `userspace.rs` (present, input syscall, idle point, sampler), `boot.rs` (smoke filter, non-panicking command-line read).
 - **Scripts (D12):**
   - A `-Perf` capture boots the SMBIOS config instead of the image's embedded one. `run.ps1` checks `-Perf` against D4's grammar; under `-Smoke`, an invalid list expects `MIRROR_PERF_OFF`, the `unknown smoke-test command line` panic and exit 35.
@@ -111,7 +111,7 @@ After the `after_userspace` heap growth (`main.rs:382-388`) and before the first
 
 ## Acceptance tests
 
-1. **Host tests.** `test.ps1:77` adds `-p mirror-perf-protocol`.
+1. **Host tests.** `test.ps1:78` adds `-p mirror-perf-protocol`.
    - Grammar: accepts `boot`, `1`, `1,flip`, `telemetry,boot` and `agent`, and ignores other tokens (`mirror.test=page-fault`, `mirror.irq=pic`). Rejects `mirror.perf=`, `1,`, `,1`, `BOOT`, `1,1`, `2`, two perf tokens, a 65-byte token and a non-ASCII byte.
    - Lines: every family round-trips through format and parse, every value fits the vocabulary, and INPUT and MEM lines hold only decimals and `none`.
    - Statistics on known vectors: odd and even lengths, a single sample, all values equal.

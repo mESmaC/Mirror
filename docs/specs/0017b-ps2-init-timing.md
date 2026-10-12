@@ -1,6 +1,12 @@
 # 0017b: PS/2 init timing and order
 
-Status: confirmed (2026-10-09)
+Status: done (2026-10-12, branch `claude/0017b-ps2-init-timing`: cdf6c6a and e8b4360, review fix in 14cb7b2). All acceptance tests pass. `scripts/test.ps1` (951 s) and `-AgentDemo` (1084 s) each ran 138 smoke boots on the final tip, on top of 0017a and the merged test-flakes fix (58461e0). Earlier rebases of these commits passed the same suites and targeted checks. Across both suites `MIRROR_PS2_INIT` reports 0 to 3 ms in every case but `Ps2BatTimeout`, whose BAT wait expires at 4000 ms on both clocks, with init at 4001 or 4002 ms. Test 6 passed in VMware Workstation 26.0.1: 10 of 10 cold boots showed `MIRROR_KEYBOARD_READY ... set=2`, `MIRROR_MOUSE_READY`, `MIRROR_PS2_INIT elapsed_ms=1 clock=hpet` and no `MIRROR_PS2_TIMEOUT`, with VMware's F0 00 reply 0x41 accepted as set 2 (D9, amended 2026-10-11). The Interfaces keep their d411146 line numbers. (Confirmed 2026-10-09.)
+
+Implementation notes (2026-10-12):
+- The init clock samples once per status read. With no usable HPET it sums PIT channel 0 deltas, so a wrap missed while the VM is descheduled can only lengthen a wait.
+- Acceptance test 4 before and after the reorder: on cdf6c6a, which lands the fault first, `Ps2StaleScancode` gave `MIRROR_KEYBOARD_SKIPPED reason=Configuration`; on e8b4360 it gives `MIRROR_PS2_INJECTED stale=1`, `MIRROR_KEYBOARD_READY` and `MIRROR_MOUSE_READY`.
+- The F0 00 readback accepts 0x02 or 0x41 (D9's amendment). Any other reply still skips the keyboard with `reason=WrongScanSet`.
+- Test 6 ran on this branch before it was rebased onto 0017a's later review fixes (fe4eab5, eb4df90, 30fe1b5 and 529800a). The rebases changed no 0017b line.
 Depends on: 0017a (M0 order only; both edit `kernel/src/ps2.rs`). The manual VMware check also needs 0013 and 0015a's disk image; the QEMU tests need neither. 0017c (absolute pointing) follows this spec.
 Ledger: S1a, G1, G3a (related: G7, S7a, S10)
 
