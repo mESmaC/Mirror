@@ -1130,8 +1130,10 @@ extern "C" fn init_main(launch: u64) -> ! {
     threads::check(console, pid as u64);
     if role == 0 {
         // Both roles run the battery at once, so only one fills its thread
-        // table: a pair session then peaks at 16 + 4 live threads.
+        // table: a pair session then peaks at 16 + 4 live threads. The FIFO
+        // wait-queue check follows with nine (spec 0030a, acceptance 3).
         threads::check_capacity(console);
+        sync::check_wait_queue(console);
     }
     sync::check(console);
 

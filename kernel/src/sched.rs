@@ -1,10 +1,18 @@
-//! Kernel-owned process and thread tables and the run queue (spec 0030a).
+//! Kernel-owned process and thread tables, the run queue and the wait queues
+//! (spec 0030a).
 //!
 //! Processes and threads live in fixed-capacity `.bss` tables, not in the
 //! stack frames of per-session loops. One FIFO run queue holds every ready
 //! thread. `run` dispatches threads, not processes: it takes the first queued
 //! thread whose process its CPU policy allows to run, and it idles in HLT when
 //! none may. Sessions stay sequential, and each ends by its own rule.
+//!
+//! A blocked thread sits on the FIFO queue of the event that completes it
+//! (its process's address waits, an IPC channel, device input or one app's
+//! routed input) and, when its wait is timed, on one deadline heap; a joiner
+//! waits on its target's `joiner` field instead (0030-D2). An event only
+//! signals waiters, in queue order (0030-D6). The scheduler completes the
+//! signaled waits, with any user copy, before its next dispatch.
 //!
 //! Only the BSP touches any of this, with IF=0: the scheduler between user
 //! entries, and the running thread's synchronous syscall and CPL3 IRQ handlers
@@ -25,11 +33,15 @@ use core::{
 
 use super::{
     ACTIVE, ACTIVE_INPUT, ACTIVE_IPC, ACTIVE_SURFACE, ACTIVE_WINDOWS, CpuPolicy, Outcome, Process,
-    ShellRuntime, State, Thread, release_handles, resume_process, thread_abi, vm_abi, wake_threads,
+    ShellRuntime, State, Thread, complete_wait, deadline_reached, release_handles, resume_process,
+    thread_abi, vm_abi,
 };
 use crate::{
-    arch, input, interrupts, ipc::Ipc, memory::FrameAllocator, paging::PageTables, serial, stacks,
-    surface, timer,
+    arch, input, interrupts,
+    ipc::{self, Ipc},
+    memory::FrameAllocator,
+    paging::PageTables,
+    serial, stacks, surface, timer, windows,
 };
 
 /// Process-table capacity (0030-D4).
@@ -169,7 +181,315 @@ static RUN_QUEUE: Exclusive<RunQueue> = Exclusive::new(RunQueue {
     next: [0; THREAD_SLOTS],
     queued: [false; THREAD_SLOTS],
 });
+static WAITS: Exclusive<Waits> = Exclusive::new(Waits::new());
 static REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// The event queue a blocked thread waits on (0030-D2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Queue {
+    /// An address wait. Each process has one queue for all its addresses;
+    /// a wake selects that address's entries, which keep their FIFO order.
+    Futex { process: u16, address: u64 },
+    /// A receive on an IPC channel, by channel index.
+    Channel(usize),
+    /// A wait for device input, in the session that owns the input lease.
+    Input,
+    /// A wait for one app's routed input, by window index.
+    App(usize),
+}
+
+const CHANNELS: usize = ipc::CHANNEL_COUNT;
+const APPS: usize = windows::APP_COUNT;
+/// Futex queues by process slot, then channels, device input and apps.
+const LISTS: usize = PROCESS_SLOTS + CHANNELS + 1 + APPS;
+
+impl Queue {
+    fn list(self) -> usize {
+        match self {
+            Self::Futex { process, .. } => {
+                assert!(usize::from(process) < PROCESS_SLOTS);
+                usize::from(process)
+            }
+            Self::Channel(index) => {
+                assert!(index < CHANNELS, "invalid channel queue");
+                PROCESS_SLOTS + index
+            }
+            Self::Input => PROCESS_SLOTS + CHANNELS,
+            Self::App(index) => {
+                assert!(index < APPS, "invalid app queue");
+                PROCESS_SLOTS + CHANNELS + 1 + index
+            }
+        }
+    }
+}
+
+/// A FIFO of thread slots linked through a `Links` array. Its fields mean
+/// nothing while it is empty, so the all-zero value is the empty list.
+#[derive(Clone, Copy)]
+struct List {
+    head: u16,
+    tail: u16,
+    length: u16,
+}
+
+impl List {
+    const EMPTY: Self = Self {
+        head: 0,
+        tail: 0,
+        length: 0,
+    };
+}
+
+/// Doubly linked list links by thread slot. A slot's links are valid only
+/// while it is on one of the lists that this array links.
+struct Links {
+    next: [u16; THREAD_SLOTS],
+    previous: [u16; THREAD_SLOTS],
+}
+
+impl Links {
+    const fn new() -> Self {
+        Self {
+            next: [0; THREAD_SLOTS],
+            previous: [0; THREAD_SLOTS],
+        }
+    }
+
+    fn push(&mut self, list: &mut List, slot: u16) {
+        if list.length == 0 {
+            list.head = slot;
+        } else {
+            self.next[usize::from(list.tail)] = slot;
+            self.previous[usize::from(slot)] = list.tail;
+        }
+        list.tail = slot;
+        list.length = list.length.checked_add(1).expect("list overflow");
+    }
+
+    fn remove(&mut self, list: &mut List, slot: u16) {
+        let index = usize::from(slot);
+        assert_ne!(list.length, 0, "removed from an empty list");
+        if list.head == slot {
+            list.head = self.next[index];
+        } else {
+            self.next[usize::from(self.previous[index])] = self.next[index];
+        }
+        if list.tail == slot {
+            list.tail = self.previous[index];
+        } else {
+            self.previous[usize::from(self.next[index])] = self.previous[index];
+        }
+        list.length -= 1;
+    }
+
+    /// The list's slots in FIFO order; at most `length` steps.
+    fn slots(&self, list: List) -> impl Iterator<Item = u16> + '_ {
+        let mut current = list.head;
+        (0..list.length).map(move |_| {
+            let slot = current;
+            current = self.next[usize::from(slot)];
+            slot
+        })
+    }
+}
+
+/// Timed waits by deadline, a binary min-heap of thread slots. Equal
+/// deadlines expire in the order they were set, so expiry is deterministic.
+struct Deadlines {
+    heap: [u16; THREAD_SLOTS],
+    length: u16,
+    /// Each queued slot's index in `heap`.
+    position: [u16; THREAD_SLOTS],
+    queued: [bool; THREAD_SLOTS],
+    deadline: [u64; THREAD_SLOTS],
+    order: [u64; THREAD_SLOTS],
+    next_order: u64,
+}
+
+impl Deadlines {
+    const fn new() -> Self {
+        Self {
+            heap: [0; THREAD_SLOTS],
+            length: 0,
+            position: [0; THREAD_SLOTS],
+            queued: [false; THREAD_SLOTS],
+            deadline: [0; THREAD_SLOTS],
+            order: [0; THREAD_SLOTS],
+            next_order: 0,
+        }
+    }
+
+    /// Deadlines are tick counts within 1000 ticks of now, so the wrapping
+    /// difference orders them, as `deadline_reached` compares them.
+    fn earlier(&self, first: u16, second: u16) -> bool {
+        let (first, second) = (usize::from(first), usize::from(second));
+        match self.deadline[first].wrapping_sub(self.deadline[second]) {
+            0 => self.order[first] < self.order[second],
+            difference => difference >= 1 << 63,
+        }
+    }
+
+    fn place(&mut self, index: usize, slot: u16) {
+        self.heap[index] = slot;
+        self.position[usize::from(slot)] = index as u16;
+    }
+
+    fn sift_up(&mut self, mut index: usize) {
+        let slot = self.heap[index];
+        while index > 0 {
+            let parent = (index - 1) / 2;
+            if !self.earlier(slot, self.heap[parent]) {
+                break;
+            }
+            self.place(index, self.heap[parent]);
+            index = parent;
+        }
+        self.place(index, slot);
+    }
+
+    fn sift_down(&mut self, mut index: usize) {
+        let slot = self.heap[index];
+        let length = usize::from(self.length);
+        loop {
+            let left = 2 * index + 1;
+            if left >= length {
+                break;
+            }
+            let right = left + 1;
+            let child = if right < length && self.earlier(self.heap[right], self.heap[left]) {
+                right
+            } else {
+                left
+            };
+            if !self.earlier(self.heap[child], slot) {
+                break;
+            }
+            self.place(index, self.heap[child]);
+            index = child;
+        }
+        self.place(index, slot);
+    }
+
+    fn insert(&mut self, slot: u16, deadline: u64) {
+        let index = usize::from(slot);
+        assert!(!self.queued[index], "deadline set twice");
+        self.queued[index] = true;
+        self.deadline[index] = deadline;
+        self.order[index] = self.next_order;
+        self.next_order += 1;
+        let end = usize::from(self.length);
+        self.length += 1;
+        self.place(end, slot);
+        self.sift_up(end);
+    }
+
+    fn remove(&mut self, slot: u16) {
+        assert!(self.queued[usize::from(slot)], "removed an unset deadline");
+        self.queued[usize::from(slot)] = false;
+        let index = usize::from(self.position[usize::from(slot)]);
+        self.length -= 1;
+        let last = usize::from(self.length);
+        if index != last {
+            self.place(index, self.heap[last]);
+            self.sift_down(index);
+            self.sift_up(index);
+        }
+    }
+
+    fn first(&self) -> Option<u16> {
+        (self.length != 0).then_some(self.heap[0])
+    }
+}
+
+/// Waits that an event or an expired deadline signaled, in signal order,
+/// for the scheduler's next completion pass. A preset result, when an event
+/// already decided the outcome, completes the wait without a recheck.
+struct Signals {
+    list: List,
+    links: Links,
+    signaled: [bool; THREAD_SLOTS],
+    has_preset: [bool; THREAD_SLOTS],
+    preset: [i64; THREAD_SLOTS],
+}
+
+impl Signals {
+    const fn new() -> Self {
+        Self {
+            list: List::EMPTY,
+            links: Links::new(),
+            signaled: [false; THREAD_SLOTS],
+            has_preset: [false; THREAD_SLOTS],
+            preset: [0; THREAD_SLOTS],
+        }
+    }
+
+    /// Signal a wait once. Only a recheck may repeat; events that decide a
+    /// result skip waits that are already signaled.
+    fn signal(&mut self, slot: u16, preset: Option<i64>) {
+        let index = usize::from(slot);
+        if self.signaled[index] {
+            assert!(preset.is_none(), "a decided wait was signaled again");
+            return;
+        }
+        self.signaled[index] = true;
+        self.has_preset[index] = preset.is_some();
+        self.preset[index] = preset.unwrap_or(0);
+        self.links.push(&mut self.list, slot);
+    }
+
+    fn take(&mut self, slot: u16) -> Option<i64> {
+        let index = usize::from(slot);
+        assert!(self.signaled[index]);
+        self.links.remove(&mut self.list, slot);
+        self.signaled[index] = false;
+        self.has_preset[index].then_some(self.preset[index])
+    }
+}
+
+/// Every blocked thread's queues. All fields start zero, so the static lands
+/// in .bss.
+struct Waits {
+    lists: [List; LISTS],
+    links: Links,
+    /// Each thread's event list index plus one, or zero when on none.
+    list_of: [u16; THREAD_SLOTS],
+    /// A futex waiter's word address.
+    address: [u64; THREAD_SLOTS],
+    deadlines: Deadlines,
+    signals: Signals,
+}
+
+impl Waits {
+    const fn new() -> Self {
+        Self {
+            lists: [List::EMPTY; LISTS],
+            links: Links::new(),
+            list_of: [0; THREAD_SLOTS],
+            address: [0; THREAD_SLOTS],
+            deadlines: Deadlines::new(),
+            signals: Signals::new(),
+        }
+    }
+
+    /// Take a thread off its event queue and the deadline heap, if on them.
+    fn release(&mut self, slot: u16) {
+        let index = usize::from(slot);
+        if let Some(list) = usize::from(self.list_of[index]).checked_sub(1) {
+            self.links.remove(&mut self.lists[list], slot);
+            self.list_of[index] = 0;
+        }
+        if self.deadlines.queued[index] {
+            self.deadlines.remove(slot);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lists.iter().all(|list| list.length == 0)
+            && self.list_of.iter().all(|&list| list == 0)
+            && self.deadlines.length == 0
+            && self.signals.list.length == 0
+    }
+}
 
 /// Print `MIRROR_SCHED_READY` once, before the first session, in every
 /// flavor. The tables are statics, so setup only checks that they are empty.
@@ -178,9 +498,7 @@ pub(super) fn report_ready() {
         !REPORTED.swap(true, Ordering::SeqCst),
         "scheduler reported twice"
     );
-    assert_eq!(PROCESSES.count(), 0);
-    assert_eq!(THREADS.count(), 0);
-    assert_eq!(RUN_QUEUE.with(|queue| queue.length), 0);
+    assert_drained();
     serial::println!(
         "MIRROR_SCHED_READY processes={} threads={} max_threads={} regions={}",
         PROCESS_SLOTS,
@@ -188,6 +506,20 @@ pub(super) fn report_ready() {
         thread_abi::MAX_THREADS,
         vm_abi::MAX_REGIONS
     );
+}
+
+/// Check that no process, thread, queued thread or wait remains, as before
+/// the first session and after each session's drain: a stale link can then
+/// never wake a reused slot.
+pub(super) fn assert_drained() {
+    assert_eq!(PROCESSES.count(), 0, "process left in the table");
+    assert_eq!(THREADS.count(), 0, "thread left in the table");
+    assert_eq!(
+        RUN_QUEUE.with(|queue| queue.length),
+        0,
+        "thread left queued"
+    );
+    assert!(WAITS.with(|waits| waits.is_empty()), "wait left queued");
 }
 
 /// Whether both tables can take this many more entries.
@@ -224,14 +556,14 @@ pub(super) fn thread_entry(slot: u16) -> *mut Thread {
     THREADS.entry(usize::from(slot))
 }
 
-/// Remove a thread from the table and the run queue. A thread owns no
-/// resource beyond its entry, so it is simply dropped.
+/// Remove a thread from the table, the run queue and every wait queue. A
+/// thread owns no resource beyond its entry, so it is simply dropped.
 ///
 /// # Safety
 /// `slot` is occupied and no reference to its entry is live. Its owner drops
 /// the slot from its member list.
 pub(super) unsafe fn remove_thread(slot: u16) {
-    unqueue(slot);
+    detach(slot);
     // SAFETY: The caller guarantees an occupied, unreferenced entry.
     let _thread = unsafe { THREADS.remove(usize::from(slot)) };
 }
@@ -360,6 +692,159 @@ fn dequeue_first(mut runnable: impl FnMut(u16) -> bool) -> Option<u16> {
     })
 }
 
+/// Attach a thread that has just blocked to its event queue, if it has one,
+/// and to the deadline heap when its wait is timed.
+pub(super) fn block(slot: u16, queue: Option<Queue>, deadline: Option<u64>) {
+    WAITS.with(|waits| {
+        let index = usize::from(slot);
+        assert!(
+            waits.list_of[index] == 0
+                && !waits.deadlines.queued[index]
+                && !waits.signals.signaled[index],
+            "thread blocked twice"
+        );
+        if let Some(queue) = queue {
+            let list = queue.list();
+            if let Queue::Futex { address, .. } = queue {
+                waits.address[index] = address;
+            }
+            waits.links.push(&mut waits.lists[list], slot);
+            waits.list_of[index] = list as u16 + 1;
+        }
+        if let Some(deadline) = deadline {
+            waits.deadlines.insert(slot, deadline);
+        }
+    });
+}
+
+/// Signal one blocked thread's wait, with its result when the event decided
+/// it. The thread stays on its queues until the scheduler completes it.
+pub(super) fn signal(slot: u16, preset: Option<i64>) {
+    WAITS.with(|waits| waits.signals.signal(slot, preset));
+}
+
+/// Signal every wait on `queue`, in FIFO order, for a recheck.
+pub(super) fn signal_queue(queue: Queue) {
+    WAITS.with(|waits| {
+        let Waits {
+            lists,
+            links,
+            signals,
+            ..
+        } = waits;
+        for slot in links.slots(lists[queue.list()]) {
+            signals.signal(slot, None);
+        }
+    });
+}
+
+/// Decide an explicit wake of `process`'s waits on `address`, in FIFO order:
+/// up to `count` waits whose deadline has not passed get result 0, and each
+/// passed one gets ETIMEDOUT without counting. Returns (woken, timed out).
+pub(super) fn wake_address(process: u16, address: u64, count: u64, now: u64) -> (u64, u64) {
+    let list = Queue::Futex { process, address }.list();
+    WAITS.with(|waits| {
+        let Waits {
+            lists,
+            links,
+            address: keys,
+            deadlines,
+            signals,
+            ..
+        } = waits;
+        let (mut woken, mut expired) = (0, 0);
+        for slot in links.slots(lists[list]) {
+            let index = usize::from(slot);
+            if keys[index] != address || signals.signaled[index] {
+                continue;
+            }
+            if deadlines.queued[index] && deadline_reached(now, deadlines.deadline[index]) {
+                signals.signal(slot, Some(-110));
+                expired += 1;
+            } else if woken < count {
+                signals.signal(slot, Some(0));
+                woken += 1;
+            }
+        }
+        (woken, expired)
+    })
+}
+
+/// Cancel `process`'s undecided address waits in `start..end` with EFAULT,
+/// in FIFO order, and return how many were cancelled.
+pub(super) fn cancel_addresses(process: u16, start: u64, end: u64) -> u64 {
+    let list = Queue::Futex {
+        process,
+        address: start,
+    }
+    .list();
+    WAITS.with(|waits| {
+        let Waits {
+            lists,
+            links,
+            address: keys,
+            signals,
+            ..
+        } = waits;
+        let mut cancelled = 0;
+        for slot in links.slots(lists[list]) {
+            let index = usize::from(slot);
+            if (start..end).contains(&keys[index]) && !signals.signaled[index] {
+                signals.signal(slot, Some(-14));
+                cancelled += 1;
+            }
+        }
+        cancelled
+    })
+}
+
+/// Take a completed wait off its event queue and the deadline heap.
+pub(super) fn release(slot: u16) {
+    WAITS.with(|waits| {
+        assert!(!waits.signals.signaled[usize::from(slot)]);
+        waits.release(slot);
+    });
+}
+
+/// Take a thread off the run queue and every wait queue, as a finishing
+/// process does for each of its threads.
+pub(super) fn detach(slot: u16) {
+    unqueue(slot);
+    WAITS.with(|waits| {
+        if waits.signals.signaled[usize::from(slot)] {
+            waits.signals.take(slot);
+        }
+        waits.release(slot);
+    });
+}
+
+/// Signal every timed wait whose deadline has been reached, earliest first.
+fn expire(now: u64) {
+    WAITS.with(|waits| {
+        for _ in 0..THREAD_SLOTS {
+            let Some(slot) = waits.deadlines.first() else {
+                return;
+            };
+            if !deadline_reached(now, waits.deadlines.deadline[usize::from(slot)]) {
+                return;
+            }
+            waits.deadlines.remove(slot);
+            waits.signals.signal(slot, None);
+        }
+    });
+}
+
+/// The oldest signaled wait and its preset result, if any.
+fn next_signal() -> Option<(u16, Option<i64>)> {
+    WAITS.with(|waits| {
+        let signals = &mut waits.signals;
+        (signals.list.length != 0).then(|| {
+            let slot = signals.list.head;
+            (slot, signals.take(slot))
+        })
+    })
+}
+
 /// How one sequential session ends.
 #[derive(Clone, Copy)]
 pub(super) enum End {
@@ -439,7 +924,7 @@ pub(super) fn run(
             return stats;
         }
         let now = timer::ticks();
-        wake(session, now);
+        complete_waits(session, now);
         match session.end {
             #[cfg(feature = "boot-smoke")]
             End::Pair { .. } => {}
@@ -476,23 +961,36 @@ fn assert_unpublished() {
     assert!(ACTIVE_WINDOWS.load(Ordering::SeqCst).is_null());
 }
 
-/// Complete joins and poll every blocked thread's wake condition, process by
-/// process in slot order. Wait queues replace this poll in 0030a step 3.
-fn wake(session: &mut Session<'_, '_>, now: u64) {
-    for slot in process_slots() {
+/// Complete the signaled waits in signal order (0030-D2), after every return
+/// from user mode and every idle wakeup. Expired deadlines are signaled
+/// first. A completion signals nothing, so each thread is taken at most once.
+fn complete_waits(session: &mut Session<'_, '_>, now: u64) {
+    expire(now);
+    // Device input has no waker until 0030a step 4 adds the input IRQ's
+    // pending flag, so its waiters are rechecked on every pass meanwhile.
+    signal_queue(Queue::Input);
+    for _ in 0..THREAD_SLOTS {
+        let Some((slot, preset)) = next_signal() else {
+            return;
+        };
+        // SAFETY: A signaled thread is occupied, since finishing a process
+        // detaches its threads, and the scheduler holds no reference to it.
+        let owner = usize::from(unsafe { (*thread_entry(slot)).process });
         // SAFETY: The scheduler holds no other process reference.
-        let process = unsafe { process(slot) };
-        if process.finished() {
-            continue;
-        }
+        let process = unsafe { process(owner) };
+        assert!(!process.finished(), "finished process left a signaled wait");
         let input = session.input.as_mut().filter(|_| process.access.input);
         let windows = session
             .runtime
             .as_mut()
             .filter(|_| process.access.windows)
             .map(|runtime| &mut runtime.windows);
-        wake_threads(process, &mut session.ipc, input, windows, now);
+        complete_wait(process, slot, preset, &mut session.ipc, input, windows, now);
     }
+    assert!(
+        next_signal().is_none(),
+        "a completion signaled another wait"
+    );
 }
 
 /// Run the shell's deferred launch and close calls, which create and reap

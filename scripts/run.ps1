@@ -648,6 +648,11 @@ try {
     if (@([regex]::Matches($serial, '(?m)^user: Mirror init: thread capacity checks passed\\n\r?$')).Count -ne 2) {
         throw 'The primary native process must complete its thread capacity check before and after teardown/relaunch.'
     }
+    # The primary alone then checks FIFO wake order (spec 0030a, acceptance
+    # 3); the kernel asserts that its peer did not.
+    if (@([regex]::Matches($serial, '(?m)^user: Mirror init: wait queue checks passed\\n\r?$')).Count -ne 2) {
+        throw 'The primary native process must complete its wait queue check before and after teardown/relaunch.'
+    }
     if ($serial -notmatch '(?m)^MIRROR_TLS_READY[^\r\n]* fsgsbase=0(?:\s|$)') {
         throw 'Mirror must keep direct user FS/GS base instructions disabled.'
     }

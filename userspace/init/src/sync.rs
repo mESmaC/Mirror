@@ -11,8 +11,8 @@ use mirror_thread_protocol::{
 
 use crate::{
     EAGAIN, EFAULT, EINVAL, ETIMEDOUT, KERNEL_BASE, PAGE_SIZE, PROT_NONE, PROT_READ,
-    PROT_READ_WRITE, SYS_SLEEP, SYS_VM_PROTECT, SYS_VM_RELEASE, SYS_YIELD, exit, require, syscall,
-    vm_protect, vm_release, vm_reserve, vm_stats, vm_write, write,
+    PROT_READ_WRITE, SYS_SLEEP, SYS_TICKS, SYS_VM_PROTECT, SYS_VM_RELEASE, SYS_YIELD, exit,
+    require, syscall, vm_protect, vm_release, vm_reserve, vm_stats, vm_write, write,
 };
 
 const STACKS: u64 = 0x1_0700_0000;
@@ -27,6 +27,11 @@ const INCREMENTS: u64 = 8;
 /// MAX_THREADS leaves the battery's semantics and indexing unchanged (spec
 /// 0030a, 0030-D4). Wake counts of MAX_THREADS still mean "every waiter".
 const WORKERS: usize = 3;
+/// The wait-queue check's waiters, with their stacks in one RW reservation.
+const QUEUE_WAITERS: usize = 8;
+const QUEUE_STACK_PAGES: u64 = 4;
+const QUEUE_STACKS: u64 = 0x1_0b00_0000;
+const QUEUE_TIMEOUT: u64 = 5;
 
 struct Task {
     address: AtomicU64,
@@ -54,6 +59,9 @@ static TASKS: [Task; WORKERS] = [const { Task::new() }; WORKERS];
 static WORDS: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
 static GATE: AtomicU32 = AtomicU32::new(0);
 static COUNTER: Mutex<u64> = Mutex::new(0);
+static QUEUE_WORD: AtomicU32 = AtomicU32::new(0);
+static QUEUE_STARTED: AtomicU64 = AtomicU64::new(0);
+static QUEUE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[repr(align(4))]
 struct ReadonlyWord(u32);
@@ -134,7 +142,7 @@ fn launch(index: usize, mode: u32, address: u64, expected: u32, timeout: u64) ->
     tid as u64
 }
 
-fn join(tid: u64, expected: i64) {
+fn join_value(tid: u64) -> (i64, u64) {
     let result: i64;
     let value: u64;
     // SAFETY: JOIN's second return register carries the full thread exit value.
@@ -148,7 +156,11 @@ fn join(tid: u64, expected: i64) {
             options(nostack),
         );
     }
-    require(result == 0 && value == expected as u64, 604);
+    (result, value)
+}
+
+fn join(tid: u64, expected: i64) {
+    require(join_value(tid) == (0, expected as u64), 604);
 }
 
 extern "C" fn worker(argument: u64) -> ! {
@@ -378,6 +390,97 @@ fn check_mutex() {
     }
     let guard = COUNTER.try_lock().unwrap();
     require(*guard == INCREMENTS * TASKS.len() as u64, 655);
+}
+
+extern "C" fn queue_worker(index: u64) -> ! {
+    // The raw entry contract: the argument arrives in RDI, with no TLS bases.
+    require(index < QUEUE_WAITERS as u64, 658);
+    // Counted immediately before the wait; the creator settles afterwards.
+    QUEUE_STARTED.fetch_add(1, Ordering::AcqRel);
+    let result = wait(address(&QUEUE_WORD), 0, WAIT_FOREVER);
+    // The ticket comes first, so ticket order is the order in which the
+    // woken waiters ran. A fresh dispatch has a full two-tick quantum, so
+    // no preemption falls between the wait's return and this increment.
+    let ticket = QUEUE_SEQUENCE.fetch_add(1, Ordering::AcqRel);
+    require(result == 0, 659);
+    syscall(SYS_THREAD_EXIT, ticket, 0, 0);
+    // SAFETY: A successful native thread exit never returns to its entry point.
+    unsafe { asm!("ud2", options(noreturn, nostack)) }
+}
+
+/// Acceptance 3 of spec 0030a, run in role 0 only, after its capacity check:
+/// eight threads block on one word, one at a time, and a single wake of
+/// MAX_THREADS releases all of them in the order they blocked, as a shared
+/// sequence counter shows. Each completion also makes the kernel assert that
+/// its blocked thread was charged no ticks. A timed wait that nothing wakes
+/// returns ETIMEDOUT at its deadline. The stacks share one guardless RW
+/// reservation, released before the synchronization checks run.
+pub(super) fn check_wait_queue(console: u64) {
+    let baseline = vm_stats();
+    let pages = QUEUE_WAITERS as u64 * QUEUE_STACK_PAGES;
+    vm_reserve(QUEUE_STACKS, pages, PROT_READ_WRITE);
+    require(vm_stats().regions == baseline.regions + 1, 660);
+    QUEUE_WORD.store(0, Ordering::Release);
+    QUEUE_STARTED.store(0, Ordering::Release);
+    QUEUE_SEQUENCE.store(0, Ordering::Release);
+    let word = address(&QUEUE_WORD);
+    let mut tids = [0_u64; QUEUE_WAITERS];
+    for (index, tid) in tids.iter_mut().enumerate() {
+        let start = ThreadStart {
+            entry: queue_worker as *const () as u64,
+            stack: QUEUE_STACKS + (index as u64 + 1) * QUEUE_STACK_PAGES * PAGE_SIZE - 8,
+            argument: index as u64,
+            fs: 0,
+            gs: 0,
+        }
+        .encode();
+        let created = syscall(
+            SYS_THREAD_CREATE,
+            start.as_ptr() as u64,
+            THREAD_START_SIZE as u64,
+            0,
+        );
+        require(created > 0, 661);
+        *tid = created as u64;
+        // Each waiter blocks before the next one starts, which fixes the
+        // order in which they joined the queue.
+        for _ in 0..4096 {
+            if QUEUE_STARTED.load(Ordering::Acquire) == index as u64 + 1 {
+                break;
+            }
+            yield_now();
+        }
+        require(
+            QUEUE_STARTED.load(Ordering::Acquire) == index as u64 + 1,
+            662,
+        );
+        settle();
+    }
+    // Let ticks pass while all eight are blocked.
+    require(syscall(SYS_SLEEP, 2, 0, 0) == 0, 663);
+    require(QUEUE_SEQUENCE.load(Ordering::Acquire) == 0, 664);
+    require(wake(word, MAX_THREADS as u64) == QUEUE_WAITERS as i64, 665);
+    for (index, tid) in tids.into_iter().enumerate() {
+        require(join_value(tid) == (0, index as u64), 666);
+    }
+    require(
+        QUEUE_SEQUENCE.load(Ordering::Acquire) == QUEUE_WAITERS as u64,
+        667,
+    );
+    require(wake(word, MAX_THREADS as u64) == 0, 668);
+    let before = syscall(SYS_TICKS, 0, 0, 0);
+    require(wait(word, 0, QUEUE_TIMEOUT) == ETIMEDOUT, 669);
+    require(
+        syscall(SYS_TICKS, 0, 0, 0) - before >= QUEUE_TIMEOUT as i64,
+        670,
+    );
+    vm_release(QUEUE_STACKS, pages);
+    require(vm_stats() == baseline, 671);
+    write(
+        console,
+        b"Mirror init: wait queue checks passed
+",
+    );
 }
 
 pub(super) fn check(console: u64) {

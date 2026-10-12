@@ -40,9 +40,11 @@ const SURFACE_DENIED_CHECKS: &[u8] = b"Mirror init: surface denied\n";
 const PROCESS_COUNT: usize = 2;
 const QUANTUM_TICKS: u64 = 2;
 // Finite init probes include register/preemption loops and 20 thread creations,
-// plus 15 more in role 0's capacity check (spec 0030a). Leave headroom for the
-// complete debug workload, including IRQs delivered on syscall return. This finite lifetime allowance is shared by all its threads;
-// it does not change the independent recurring budgets of ordinary services.
+// plus 15 more in role 0's capacity check and 8 in its wait-queue check (spec
+// 0030a). Leave headroom for the complete debug workload, including IRQs
+// delivered on syscall return. This finite lifetime allowance is shared by all
+// its threads; it does not change the independent recurring budgets of
+// ordinary services.
 const USER_TICK_BUDGET: u64 = 128;
 const MAX_SLEEP_TICKS: u64 = 1000;
 const RECEIVE_TIMEOUT: u64 = 100;
@@ -180,6 +182,8 @@ struct PendingReceive {
     address: u64,
     capacity: usize,
     deadline: u64,
+    /// The channel whose queue the receiver waits on.
+    channel: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,6 +191,8 @@ struct PendingInput {
     handle: u64,
     address: u64,
     deadline: u64,
+    /// Device input or one app's routed input.
+    queue: sched::Queue,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,6 +282,8 @@ struct Process {
     #[cfg(feature = "boot-smoke")]
     capacity_checks: bool,
     #[cfg(feature = "boot-smoke")]
+    wait_queue_checks: bool,
+    #[cfg(feature = "boot-smoke")]
     threads_joined: u64,
     #[cfg(feature = "boot-smoke")]
     threads_exited: u64,
@@ -283,7 +291,6 @@ struct Process {
     threads_cancelled: u64,
     #[cfg(feature = "boot-smoke")]
     thread_preemptions: u64,
-    next_waiter: usize,
     #[cfg(feature = "boot-smoke")]
     sync_checks: bool,
     #[cfg(feature = "boot-smoke")]
@@ -407,7 +414,8 @@ impl Process {
     }
 
     /// Record the outcome and finish every thread, taking each off the run
-    /// queue. Threads keep their slots until the process is reaped.
+    /// queue and every wait queue. Threads keep their slots until the process
+    /// is reaped.
     fn finish(&mut self, outcome: Outcome) {
         assert!(self.outcome.is_none());
         self.outcome = Some(outcome);
@@ -416,7 +424,7 @@ impl Process {
                 continue;
             };
             let state = core::mem::replace(&mut thread.state, State::Finished);
-            sched::unqueue(thread.slot);
+            sched::detach(thread.slot);
             #[cfg(feature = "boot-smoke")]
             {
                 if !matches!(state, State::Exited(_)) {
@@ -576,6 +584,8 @@ fn create_process(
         #[cfg(feature = "boot-smoke")]
         capacity_checks: false,
         #[cfg(feature = "boot-smoke")]
+        wait_queue_checks: false,
+        #[cfg(feature = "boot-smoke")]
         threads_joined: 0,
         #[cfg(feature = "boot-smoke")]
         threads_exited: 0,
@@ -583,7 +593,6 @@ fn create_process(
         threads_cancelled: 0,
         #[cfg(feature = "boot-smoke")]
         thread_preemptions: 0,
-        next_waiter: 0,
         #[cfg(feature = "boot-smoke")]
         sync_checks: false,
         #[cfg(feature = "boot-smoke")]
@@ -786,6 +795,7 @@ fn run_pair(
     // SAFETY: Both processes finished, ACTIVE is clear, and nothing references
     // either entry; reap checks that every thread finished too.
     let mut processes = unsafe { [sched::reap(first), sched::reap(second)] };
+    sched::assert_drained();
     for process in &mut processes {
         assert!(process.handles.is_empty());
         // SAFETY: All contexts are finished, ACTIVE is clear, the kernel root
@@ -860,6 +870,12 @@ fn run_pair(
         "thread capacity checks did not complete: peaks {} and {}",
         processes[0].threads_peak,
         processes[1].threads_peak
+    );
+    // Acceptance 3: only role 0 checks FIFO wake order, after its capacity
+    // check. Each completion asserted that its blocked thread was not charged.
+    assert!(
+        processes[0].wait_queue_checks && !processes[1].wait_queue_checks,
+        "wait queue checks did not complete"
     );
     assert_eq!(
         processes
@@ -1027,14 +1043,16 @@ fn complete_memory(process: &mut Process, frames: &mut FrameAllocator<'_>, reque
                 }
                 _ => unreachable!("invalid deferred VM operation"),
             };
-            if result.is_ok()
-                && (frame.rax == vm_abi::SYS_VM_RELEASE
-                    || (frame.rax == vm_abi::SYS_VM_PROTECT && frame.rdx == vm_abi::PROT_NONE))
-            {
+            if result.is_ok() && frame.rax != vm_abi::SYS_VM_RESERVE {
                 // Invalidate the old wait key before any sibling can run or
                 // re-reserve this address. Failed transactional changes leave
                 // waiters untouched. No backing page or raw pointer is pinned.
-                invalidate_waits(process, frame.rdi, frame.rsi);
+                invalidate_waits(
+                    process,
+                    frame.rdi,
+                    frame.rsi,
+                    frame.rax == vm_abi::SYS_VM_RELEASE || frame.rdx == vm_abi::PROT_NONE,
+                );
             }
             process.thread_mut().context.frame.rax = result.unwrap_or_else(|error| error) as u64;
             process.thread_mut().state = State::Ready;
@@ -1096,16 +1114,7 @@ fn complete_memory(process: &mut Process, frames: &mut FrameAllocator<'_>, reque
             let outcome = dispatch_syscall(process, &mut frame);
             process.thread_mut().context.frame = frame;
             if !outcome.finished {
-                process.thread_mut().state = outcome.suspension.unwrap_or(State::Ready);
-                if matches!(
-                    process.thread().state,
-                    State::Sleeping(_)
-                        | State::Receiving(_)
-                        | State::InputWaiting(_)
-                        | State::Waiting(_)
-                ) {
-                    process.thread_mut().sleep_charge = process.thread().charged_ticks;
-                }
+                park(process, outcome.suspension.unwrap_or(State::Ready));
             }
         }
     }
@@ -1391,131 +1400,187 @@ impl ShellRuntime<'_> {
     }
 }
 
-/// Every wake runs with the kernel root active. Siblings may have changed a
-/// shared mapping or closed a shared handle while this thread was blocked, so
-/// the original checked receive helpers repeat permission/range validation.
-fn wake_threads(
-    process: &mut Process,
-    ipc: &mut Ipc,
-    mut input: Option<&mut input::Session<'_>>,
-    mut windows: Option<&mut windows::Session>,
-    now: u64,
-) {
-    if process.finished() {
-        return;
-    }
-    complete_joins(process);
-    for index in 0..thread_abi::MAX_THREADS {
-        if process.member(index).is_none() {
-            continue;
+/// Record the current thread's suspension (0030-D2). A blocking state
+/// snapshots the thread's charge and attaches it to its event queue and, for
+/// a timed wait, the deadline heap. A joiner waits on its target's `joiner`
+/// field, so an exit signals that joiner instead.
+fn park(process: &mut Process, state: State) {
+    let owner = process.thread().process;
+    let (queue, deadline) = match state {
+        State::Sleeping(deadline) => (None, Some(deadline)),
+        State::Receiving(pending) => (
+            Some(sched::Queue::Channel(pending.channel)),
+            Some(pending.deadline),
+        ),
+        State::InputWaiting(pending) => (Some(pending.queue), Some(pending.deadline)),
+        State::Waiting(pending) => (
+            Some(sched::Queue::Futex {
+                process: owner,
+                address: pending.address,
+            }),
+            pending.deadline,
+        ),
+        State::Joining(_) => (None, None),
+        State::Exited(_) => {
+            if let Some(tid) = process.thread().joiner {
+                let joiner = member_by_id(process, tid).expect("join waiter exists");
+                sched::signal(process.members[joiner], None);
+            }
+            process.thread_mut().state = state;
+            return;
         }
-        process.current = index;
-        let state = process.thread().state;
-        if matches!(
-            state,
-            State::Sleeping(_)
-                | State::Receiving(_)
-                | State::InputWaiting(_)
-                | State::Joining(_)
-                | State::Waiting(_)
-        ) {
-            assert_eq!(
-                process.thread().charged_ticks,
-                process.thread().sleep_charge,
-                "blocked thread charged user CPU ticks"
-            );
+        _ => {
+            process.thread_mut().state = state;
+            return;
         }
-        match state {
-            State::Sleeping(deadline) if deadline_reached(now, deadline) => {
-                process.thread_mut().wake();
-            }
-            State::Waiting(pending) if pending.expired(now) => {
-                complete_wait(process.thread_mut(), -110);
-                #[cfg(feature = "boot-smoke")]
-                {
-                    process.sync_timeouts += 1;
-                }
-            }
-            State::Receiving(pending) => {
-                let mut result = receive(
-                    process,
-                    ipc,
-                    pending.handle,
-                    pending.address,
-                    pending.capacity,
-                );
-                if result == -11 && deadline_reached(now, pending.deadline) {
-                    result = -110;
-                    #[cfg(feature = "boot-smoke")]
-                    {
-                        process.ipc_timeouts += 1;
-                    }
-                }
-                if result != -11 {
-                    #[cfg(feature = "boot-smoke")]
-                    if result == -32 {
-                        process.ipc_closed_wakes += 1;
-                    }
-                    process.thread_mut().context.frame.rax = result as u64;
-                    process.thread_mut().wake();
-                }
-            }
-            State::InputWaiting(pending) => {
-                // Resolve the capability afresh: it may have been closed by a
-                // sibling since the wait began. Session availability is tied
-                // to process authority, never to the thread that issued it.
-                let mut result = match process.handles.require(pending.handle, capability::RECEIVE)
-                {
-                    Ok(cap) => match cap.object {
-                        Object::Input => receive_input(
-                            process,
-                            input.as_deref_mut().expect("input owner session"),
-                            pending.handle,
-                            pending.address,
-                            input::EVENT_SIZE as u64,
-                        ),
-                        Object::AppInput(pid) if pid == process.pid => receive_app_input(
-                            process,
-                            windows.as_deref_mut().expect("application input session"),
-                            pending.handle,
-                            pending.address,
-                            windows::EVENT_SIZE as u64,
-                        ),
-                        _ => -13,
-                    },
-                    Err(error) => cap_error(error),
-                };
-                if result == -11 && deadline_reached(now, pending.deadline) {
-                    result = -110;
-                    process.input_timeouts += 1;
-                }
-                if result != -11 {
-                    process.thread_mut().context.frame.rax = result as u64;
-                    process.thread_mut().wake();
-                }
-            }
-            State::Ready
-            | State::Sleeping(_)
-            | State::Joining(_)
-            | State::Waiting(_)
-            | State::Exited(_)
-            | State::Launching(_)
-            | State::Closing(_) => {}
-            State::Running | State::Memory(_) | State::Finished => {
-                panic!("invalid thread suspension")
-            }
-        }
-    }
+    };
+    let thread = process.thread_mut();
+    thread.state = state;
+    thread.sleep_charge = thread.charged_ticks;
+    sched::block(thread.slot, queue, deadline);
 }
 
-fn complete_wait(thread: &mut Thread, result: i64) {
-    assert!(matches!(thread.state, State::Waiting(_)));
+/// Complete one signaled wait, in the scheduler with the kernel root active,
+/// never in the handler that signaled it (0030-D2). A preset result decided
+/// by the event completes an address wait as is. Otherwise the condition is
+/// checked again: siblings may have changed a shared mapping or closed a
+/// shared handle meanwhile, so the checked receive helpers repeat permission
+/// and range validation. Readiness or closure beats a deadline reached in the
+/// same check. A wait that still cannot complete stays queued.
+fn complete_wait(
+    process: &mut Process,
+    slot: u16,
+    preset: Option<i64>,
+    ipc: &mut Ipc,
+    input: Option<&mut input::Session<'_>>,
+    windows: Option<&mut windows::Session>,
+    now: u64,
+) {
+    assert!(ACTIVE.load(Ordering::SeqCst).is_null());
+    process.current = process
+        .members
+        .iter()
+        .position(|&member| member == slot)
+        .expect("signaled thread has no owner");
+    let state = process.thread().state;
     assert_eq!(
-        thread.charged_ticks, thread.sleep_charge,
-        "wait charged user CPU ticks"
+        process.thread().charged_ticks,
+        process.thread().sleep_charge,
+        "blocked thread charged user CPU ticks"
     );
-    thread.context.frame.rax = result as u64;
+    assert!(
+        preset.is_none() || matches!(state, State::Waiting(_)),
+        "preset result for a {state:?} wait"
+    );
+    // The result for RAX, or None to keep the one the syscall saved.
+    let result = match state {
+        State::Sleeping(deadline) => {
+            assert!(deadline_reached(now, deadline), "sleep signaled early");
+            None
+        }
+        State::Waiting(pending) => Some(preset.unwrap_or_else(|| {
+            assert!(pending.expired(now), "address wait signaled early");
+            #[cfg(feature = "boot-smoke")]
+            {
+                process.sync_timeouts += 1;
+            }
+            -110
+        })),
+        State::Receiving(pending) => {
+            let mut result = receive(
+                process,
+                ipc,
+                pending.handle,
+                pending.address,
+                pending.capacity,
+            );
+            if result == -11 && deadline_reached(now, pending.deadline) {
+                result = -110;
+                #[cfg(feature = "boot-smoke")]
+                {
+                    process.ipc_timeouts += 1;
+                }
+            }
+            if result == -11 {
+                return;
+            }
+            #[cfg(feature = "boot-smoke")]
+            if result == -32 {
+                process.ipc_closed_wakes += 1;
+            }
+            Some(result)
+        }
+        State::InputWaiting(pending) => {
+            // Resolve the capability afresh: it may have been closed by a
+            // sibling since the wait began. Session availability is tied
+            // to process authority, never to the thread that issued it.
+            let mut result = match process.handles.require(pending.handle, capability::RECEIVE) {
+                Ok(cap) => match cap.object {
+                    Object::Input => receive_input(
+                        process,
+                        input.expect("input owner session"),
+                        pending.handle,
+                        pending.address,
+                        input::EVENT_SIZE as u64,
+                    ),
+                    Object::AppInput(pid) if pid == process.pid => receive_app_input(
+                        process,
+                        windows.expect("application input session"),
+                        pending.handle,
+                        pending.address,
+                        windows::EVENT_SIZE as u64,
+                    ),
+                    _ => -13,
+                },
+                Err(error) => cap_error(error),
+            };
+            if result == -11 && deadline_reached(now, pending.deadline) {
+                result = -110;
+                process.input_timeouts += 1;
+            }
+            if result == -11 {
+                return;
+            }
+            Some(result)
+        }
+        State::Joining(tid) => {
+            // The target's exit signaled this join after its context was
+            // saved and its pointer released, so it is reaped here.
+            let target = member_by_id(process, tid).expect("join target exists");
+            let State::Exited(status) = process.member(target).expect("join target").state else {
+                panic!("join signaled before its target exited");
+            };
+            process.thread_mut().context.frame.rdx = status;
+            process.remove_member(target);
+            #[cfg(feature = "boot-smoke")]
+            {
+                process.threads_joined += 1;
+            }
+            Some(0)
+        }
+        _ => panic!("signaled a thread that is not waiting: {state:?}"),
+    };
+    sched::release(slot);
+    let thread = process.thread_mut();
+    if let Some(result) = result {
+        thread.context.frame.rax = result as u64;
+    }
     thread.wake();
+}
+
+/// Signal this process's receive and input waits for a recheck, on `handle`
+/// only or on any. A closed handle or a changed mapping can fail them.
+fn signal_handle_waits(process: &Process, handle: Option<u64>) {
+    for thread in process.threads() {
+        let waited = match thread.state {
+            State::Receiving(pending) => pending.handle,
+            State::InputWaiting(pending) => pending.handle,
+            _ => continue,
+        };
+        if handle.is_none_or(|handle| handle == waited) {
+            sched::signal(thread.slot, None);
+        }
+    }
 }
 
 /// Compare and enqueue are one non-preemptible operation on the sole CPU.
@@ -1559,6 +1624,7 @@ fn wait_word(process: &mut Process, frame: &TrapFrame) -> Result<State, i64> {
 /// Wake only private wait keys in this process. Values are never read or
 /// written: a wake on untouched but readable reserved memory allocates nothing.
 /// Expired waits complete as timeouts and do not consume the caller's count.
+/// Waiters are selected in FIFO order (0030-D6); the scheduler completes them.
 fn wake_word(process: &mut Process, frame: &TrapFrame) -> Result<u64, i64> {
     assert!(!arch::interrupts_enabled());
     if !thread_abi::wake_arguments_valid(frame.rdi, frame.rsi, frame.rdx) {
@@ -1576,90 +1642,46 @@ fn wake_word(process: &mut Process, frame: &TrapFrame) -> Result<u64, i64> {
             false,
         )
         .map_err(|_| -14)?;
-    let now = timer::ticks();
-    let first = process.next_waiter;
-    let mut woken = 0;
-    for offset in 0..thread_abi::MAX_THREADS {
-        let index = (first + offset) % thread_abi::MAX_THREADS;
-        let Some(thread) = process.member_mut(index) else {
-            continue;
-        };
-        let State::Waiting(pending) = thread.state else {
-            continue;
-        };
-        if pending.address != frame.rdi {
-            continue;
-        }
-        if pending.expired(now) {
-            complete_wait(thread, -110);
-            #[cfg(feature = "boot-smoke")]
-            {
-                process.sync_timeouts += 1;
-            }
-        } else if woken < frame.rsi {
-            complete_wait(thread, 0);
-            woken += 1;
-            process.next_waiter = (index + 1) % thread_abi::MAX_THREADS;
-        }
-    }
+    let (woken, expired) = sched::wake_address(
+        process.thread().process,
+        frame.rdi,
+        frame.rsi,
+        timer::ticks(),
+    );
     #[cfg(feature = "boot-smoke")]
     {
         process.sync_wakes += woken;
+        process.sync_timeouts += expired;
     }
+    #[cfg(not(feature = "boot-smoke"))]
+    let _ = expired;
     Ok(woken)
 }
 
-fn invalidate_waits(process: &mut Process, address: u64, length: u64) {
+/// After a successful release or protection change of `length` bytes at
+/// `address`, cancel the process's address waits in that range when the
+/// change removed access, and recheck its receive and input waits, whose
+/// buffers may no longer be writable.
+fn invalidate_waits(process: &mut Process, address: u64, length: u64, cancel: bool) {
     assert!(ACTIVE.load(Ordering::SeqCst).is_null());
     assert!(!arch::interrupts_enabled());
     let end = address.checked_add(length).expect("successful VM interval");
-    for index in 0..thread_abi::MAX_THREADS {
-        let Some(thread) = process.member_mut(index) else {
-            continue;
-        };
-        if let State::Waiting(pending) = thread.state
-            && (address..end).contains(&pending.address)
+    if cancel {
+        let cancelled = sched::cancel_addresses(process.thread().process, address, end);
+        #[cfg(feature = "boot-smoke")]
         {
-            complete_wait(thread, -14);
-            #[cfg(feature = "boot-smoke")]
-            {
-                process.sync_invalidations += 1;
-            }
+            process.sync_invalidations += cancelled;
         }
+        #[cfg(not(feature = "boot-smoke"))]
+        let _ = cancelled;
     }
+    signal_handle_waits(process, None);
 }
 
 /// The member index of the thread with this ID, if it belongs to `process`.
 fn member_by_id(process: &Process, tid: u64) -> Option<usize> {
     (0..thread_abi::MAX_THREADS)
         .find(|&index| process.member(index).is_some_and(|thread| thread.id == tid))
-}
-
-/// Reap only after resume_user has saved/scrubbed the exiting context's FPU
-/// state and released its raw pointer. A join result needs no user buffer and
-/// is delivered atomically in the waiting thread's saved RAX/RDX registers.
-fn complete_joins(process: &mut Process) {
-    assert!(ACTIVE.load(Ordering::SeqCst).is_null());
-    for index in 0..thread_abi::MAX_THREADS {
-        let Some(target) = process.member(index) else {
-            continue;
-        };
-        let (State::Exited(status), Some(waiter)) = (target.state, target.joiner) else {
-            continue;
-        };
-        let tid = target.id;
-        let joiner = member_by_id(process, waiter).expect("join waiter exists");
-        let joiner = process.member_mut(joiner).expect("join waiter exists");
-        assert_eq!(joiner.state, State::Joining(tid));
-        joiner.context.frame.rax = 0;
-        joiner.context.frame.rdx = status;
-        joiner.wake();
-        process.remove_member(index);
-        #[cfg(feature = "boot-smoke")]
-        {
-            process.threads_joined += 1;
-        }
-    }
 }
 
 fn create_thread(process: &mut Process, frame: &TrapFrame) -> Result<u64, i64> {
@@ -1856,10 +1878,7 @@ pub fn run_shell(
     assert!(
         ACTIVE.load(Ordering::SeqCst).is_null() && ACTIVE_WINDOWS.load(Ordering::SeqCst).is_null()
     );
-    assert!(
-        sched::process_slots().next().is_none(),
-        "process left in the table"
-    );
+    sched::assert_drained();
     assert_eq!(
         surface.totals(),
         (desktop.surface_tiles, desktop.surface_pixels)
@@ -1983,8 +2002,17 @@ fn release_handles(process: &mut Process, ipc: &mut Ipc) {
     if process.finished() && !process.handles_closed {
         while let Some(capability) = process.handles.take_one() {
             ipc.release(capability);
+            endpoint_released(capability);
         }
         process.handles_closed = true;
+    }
+}
+
+/// A released channel reference can close the channel or discard its
+/// messages, so its receivers recheck their waits.
+fn endpoint_released(capability: Capability) {
+    if let Object::Channel(index) = capability.object {
+        sched::signal_queue(sched::Queue::Channel(index));
     }
 }
 
@@ -2407,6 +2435,7 @@ fn match_init_oracles(process: &mut Process, message: &[u8]) {
     process.clock_unavailable |= message == b"Mirror init: clock unavailable\n";
     process.thread_checks |= message == b"Mirror init: thread checks passed\n";
     process.capacity_checks |= message == b"Mirror init: thread capacity checks passed\n";
+    process.wait_queue_checks |= message == b"Mirror init: wait queue checks passed\n";
     process.sync_checks |= message == b"Mirror init: synchronization checks passed\n";
     if message == b"Mirror init: FPU preemption begin\n" {
         process.fpu_preemption_start = Some(process.preemptions);
@@ -2598,9 +2627,13 @@ fn application_event(process: &mut Process, handle: u64, address: u64, length: u
     }
     match with_windows(|session| {
         windows::validate_event(&event, session.smoke && cfg!(feature = "boot-smoke"))?;
-        session.get_mut(pid)?.enqueue(event)
+        let index = session.index(pid)?;
+        session.get_mut(pid)?.enqueue(event).map(|()| index)
     }) {
-        Ok(()) => 0,
+        Ok(index) => {
+            sched::signal_queue(sched::Queue::App(index));
+            0
+        }
         Err(error) => error,
     }
 }
@@ -2705,6 +2738,7 @@ fn send(process: &mut Process, ipc: &mut Ipc, handle: u64, address: u64, length:
     match ipc.send(channel, &buffer[..length as usize]) {
         Ok(length) => {
             process.ipc_sent += 1;
+            sched::signal_queue(sched::Queue::Channel(channel));
             length as i64
         }
         Err(error) => ipc_error(error),
@@ -2936,11 +2970,16 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                     {
                         process.ipc_waits += 1;
                     }
+                    // Only an open, empty channel the handle may receive
+                    // from returns -11.
+                    let channel = channel_for(process, frame.rdi, capability::RECEIVE)
+                        .expect("blocked receive has a channel");
                     suspension = Some(State::Receiving(PendingReceive {
                         handle: frame.rdi,
                         address: frame.rsi,
                         capacity: frame.rdx as usize,
                         deadline: timer::ticks().wrapping_add(RECEIVE_TIMEOUT),
+                        channel,
                     }));
                 }
             }
@@ -2948,6 +2987,8 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                 result = match process.handles.close(frame.rdi) {
                     Ok(capability) => {
                         with_ipc(|ipc| ipc.release(capability));
+                        endpoint_released(capability);
+                        signal_handle_waits(process, Some(frame.rdi));
                         0
                     }
                     Err(error) => cap_error(error),
@@ -2993,10 +3034,20 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                 };
                 if frame.rax == 15 && result == -11 {
                     process.input_waits += 1;
+                    // An empty routed queue implies the app's window exists.
+                    let queue = if routed {
+                        sched::Queue::App(
+                            with_windows(|session| session.index(process.pid))
+                                .expect("blocked app input has a window"),
+                        )
+                    } else {
+                        sched::Queue::Input
+                    };
                     suspension = Some(State::InputWaiting(PendingInput {
                         handle: frame.rdi,
                         address: frame.rsi,
                         deadline: timer::ticks().wrapping_add(RECEIVE_TIMEOUT),
+                        queue,
                     }));
                 }
             }
@@ -3241,17 +3292,7 @@ fn suspend(frame: &mut TrapFrame, state: State) {
                 | State::Exited(_)
         ));
         process.thread_mut().context.frame = *frame;
-        if matches!(
-            state,
-            State::Sleeping(_)
-                | State::Receiving(_)
-                | State::InputWaiting(_)
-                | State::Joining(_)
-                | State::Waiting(_)
-        ) {
-            process.thread_mut().sleep_charge = process.thread().charged_ticks;
-        }
-        process.thread_mut().state = state;
+        park(process, state);
     });
     // The current handler must unwind before the scheduler touches other tasks.
     interrupts::return_from_user(frame);

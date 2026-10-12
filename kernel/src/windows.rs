@@ -382,6 +382,18 @@ impl Session {
             .find(|application| application.pid == pid)
             .ok_or(-9)
     }
+
+    /// The window index of the app with this PID.
+    pub fn index(&self, pid: u64) -> Result<usize, i64> {
+        self.applications
+            .iter()
+            .position(|entry| {
+                entry
+                    .as_ref()
+                    .is_some_and(|application| application.pid == pid)
+            })
+            .ok_or(-9)
+    }
 }
 
 fn word(bytes: &[u8], offset: usize) -> u32 {
