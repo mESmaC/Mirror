@@ -294,6 +294,10 @@ struct Process<'kernel> {
     handles: HandleTable,
     boot_handles: [u64; 6],
     handles_closed: bool,
+    /// The surface pixel frames charged to this process (0059-D3; the shell
+    /// carries its apps' surfaces). Boot-smoke only: the zero-at-reap check.
+    #[cfg(feature = "boot-smoke")]
+    surface_frames: u64,
     #[cfg(feature = "boot-smoke")]
     ipc_checks: bool,
     ipc_sent: usize,
@@ -361,6 +365,18 @@ impl Process<'_> {
             }
             thread.state = State::Finished;
         }
+    }
+
+    /// 0059-D3 (boot-smoke): at reap, after the address space is destroyed,
+    /// every charged frame must be back: no surface frames, no page tables.
+    #[cfg(feature = "boot-smoke")]
+    fn check_charges_zero(&self) {
+        assert_eq!(self.surface_frames, 0, "surface frames leaked at reap");
+        assert_eq!(
+            self.space.owned_table_count(),
+            0,
+            "page-table frames leaked at reap"
+        );
     }
 
     fn ready(&self) -> bool {
@@ -558,6 +574,8 @@ fn create_process<'kernel>(
         boot_handles: [0; 6],
         handles_closed: false,
         #[cfg(feature = "boot-smoke")]
+        surface_frames: 0,
+        #[cfg(feature = "boot-smoke")]
         ipc_checks: false,
         ipc_sent: 0,
         ipc_received: 0,
@@ -624,6 +642,7 @@ fn run_pair(
         .transpose()
         .expect("surface session");
     let before = frames.stats().expect("recycling required").allocated_frames;
+    let heap_before = heap::stats().size;
     let mut first = create_process(kernel, frames, bytes, image, direct_map, scenario)
         .expect("load first native process");
     let second = match create_process(kernel, frames, bytes, image, direct_map, 1 << 8) {
@@ -637,6 +656,13 @@ fn run_pair(
         }
     };
     let mut processes = [first, second];
+    // 0059-D4: the pair's charge peak is set at seeding; nothing here charges
+    // surfaces. Printed at the drain (boot-smoke).
+    #[cfg(feature = "boot-smoke")]
+    let tables_peak: usize = processes
+        .iter()
+        .map(|process| process.space.owned_table_count())
+        .sum();
     let mut ipc = Ipc::new();
     for (index, process) in processes.iter_mut().enumerate() {
         // Each process can send only to its peer's inbound channel. Console
@@ -777,14 +803,23 @@ fn run_pair(
         // SAFETY: All contexts are finished, ACTIVE is clear, the kernel root
         // is active, and no handler retains a reference into either user tree.
         unsafe { process.space.destroy(frames) }.expect("release user address space");
+        #[cfg(feature = "boot-smoke")]
+        process.check_charges_zero();
     }
     assert_eq!(
         frames.stats().unwrap().allocated_frames,
-        before,
+        // 0050-D2's shared rule, heap term: heap pages committed this session
+        // are not a leak (a mid-session growth is 0059's test 2's case).
+        before + (heap::stats().size - heap_before) / PAGE_SIZE as usize,
         "user frame leak"
     );
     serial::println!("MIRROR_USER_CLEANUP_OK allocated={}", before);
     serial::println!("MIRROR_VM_CLEANUP_OK allocated={}", before);
+    #[cfg(feature = "boot-smoke")]
+    serial::println!(
+        "MIRROR_HEAP_CHARGE_OK tables_peak={} surfaces_peak=0",
+        tables_peak
+    );
     assert_eq!(
         processes[1].surface_tiles, 0,
         "peer painted without authority"
@@ -1191,6 +1226,7 @@ pub fn run_desktop(
 ) {
     assert!(!arch::interrupts_enabled());
     let before = frames.stats().expect("recycling required").allocated_frames;
+    let heap_before = heap::stats().size;
     let (desktop_outcome, agent_outcome) = {
         // Validate both immutable modules before acquiring either address space.
         let desktop_image = elf::parse(programs[0]).expect("invalid native desktop ELF");
@@ -1226,6 +1262,12 @@ pub fn run_desktop(
         agent.policy = CpuPolicy::Agent(ServicePolicy::new(now));
         let mut processes = [desktop, agent];
         let mut ipc = Ipc::new();
+        // 0059-D4: the session's charge peak is set at seeding.
+        #[cfg(feature = "boot-smoke")]
+        let tables_peak: usize = processes
+            .iter()
+            .map(|process| process.space.owned_table_count())
+            .sum();
         let mut surface = surface::Session::desktop(display).expect("desktop surface");
         let (framebuffer, region) = surface.placement();
         let mut input = input::Session::new(consumer, framebuffer, region);
@@ -1338,11 +1380,19 @@ pub fn run_desktop(
             // SAFETY: Both processes are finished, all handlers unwound, every
             // published pointer is clear, and the kernel root is active with IF=0.
             unsafe { process.space.destroy(frames) }.expect("service address-space cleanup");
+            #[cfg(feature = "boot-smoke")]
+            process.check_charges_zero();
         }
         assert_eq!(
             frames.stats().unwrap().allocated_frames,
-            before,
+            // 0050-D2's shared rule, heap term (0059).
+            before + (heap::stats().size - heap_before) / PAGE_SIZE as usize,
             "desktop/agent frame leak"
+        );
+        #[cfg(feature = "boot-smoke")]
+        serial::println!(
+            "MIRROR_HEAP_CHARGE_OK tables_peak={} surfaces_peak=0",
+            tables_peak
         );
         let process = &processes[0];
         let outcome = process.outcome.expect("desktop finished without outcome");
@@ -1459,12 +1509,21 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
             // The unique allocator and persistent HHDM own all acquired pages.
             let mut application =
                 unsafe { windows::Application::new(pid, kind as u32, frames, self.direct_map) }?;
+            // 0059-D3: the shell carries the app's surface frames.
+            #[cfg(feature = "boot-smoke")]
+            {
+                desktop.surface_frames += windows::SURFACE_PAGES as u64;
+            }
             match desktop
                 .handles
                 .insert(Object::Application(pid), capability::WRITE)
             {
                 Ok(handle) => Ok((application, handle)),
                 Err(error) => {
+                    #[cfg(feature = "boot-smoke")]
+                    {
+                        desktop.surface_frames -= windows::SURFACE_PAGES as u64;
+                    }
                     // SAFETY: No application resource or handle was published.
                     unsafe { application.destroy(frames) };
                     Err(cap_error(error))
@@ -1506,6 +1565,8 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
         // SAFETY: The scheduler restored its kernel root and cleared every
         // active pointer before considering a finished process for reclamation.
         unsafe { child.space.destroy(frames) }.expect("application address-space cleanup");
+        #[cfg(feature = "boot-smoke")]
+        child.check_charges_zero();
         assert_eq!(frames.stats().unwrap().allocated_frames + owned, before);
         self.windows.preemptions += child.preemptions;
         let (state, detail, reason) = match outcome {
@@ -1573,6 +1634,11 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
         desktop.handles.revoke_application(pid);
         let mut application = self.windows.applications[index].take().unwrap();
         let before = frames.stats().unwrap().allocated_frames;
+        // 0059-D3: the shell's surface charge is released with the destroy.
+        #[cfg(feature = "boot-smoke")]
+        {
+            desktop.surface_frames -= windows::SURFACE_PAGES as u64;
+        }
         // SAFETY: No child or handler can access the removed resource, whose
         // pages have never been mapped into either application address space.
         unsafe { application.destroy(frames) };
@@ -1972,6 +2038,7 @@ pub fn run_shell(
     #[cfg(feature = "boot-smoke")]
     windows::self_test(frames, direct_map);
     let before = frames.stats().unwrap().allocated_frames;
+    let heap_before = heap::stats().size;
     let desktop_image = elf::parse(programs[0]).expect("invalid shell ELF");
     let image = elf::parse(programs[1]).expect("invalid application ELF");
     let mut desktop = create_process(
@@ -2040,11 +2107,26 @@ pub fn run_shell(
     // SAFETY: IF=0, no active users; the guarded RSP0 stack stays mapped in
     // every root's shared upper half.
     unsafe { interrupts::set_kernel_stack(stack_top) };
+    #[cfg(feature = "boot-smoke")]
+    let (mut tables_peak, mut surfaces_peak) = (desktop.space.owned_table_count() as u64, 0);
     let mut cursor = 0;
     while !desktop.finished() {
         assert!(ACTIVE_WINDOWS.load(Ordering::SeqCst).is_null());
         // 0059-D1: the loop top is a heap safe point.
         heap::ensure(kernel, frames, direct_map);
+        #[cfg(feature = "boot-smoke")]
+        {
+            // 0059-D4: the session's charge peaks, sampled at every loop top
+            // (one iteration after any launch, close or reclaim).
+            let tables: u64 = runtime
+                .children
+                .iter()
+                .flatten()
+                .map(|child| child.space.owned_table_count() as u64)
+                .sum();
+            tables_peak = tables_peak.max(desktop.space.owned_table_count() as u64 + tables);
+            surfaces_peak = surfaces_peak.max(desktop.surface_frames);
+        }
         runtime.reclaim_finished(frames, &mut ipc);
         let now = timer::ticks();
         wake_threads(&mut desktop, &mut ipc, Some(&mut input), None, now);
@@ -2141,10 +2223,19 @@ pub fn run_shell(
     // SAFETY: The shell and children are stopped; all active pointers are clear
     // and no resource retains a reference to the shell's private address space.
     unsafe { desktop.space.destroy(frames) }.expect("shell address-space cleanup");
+    #[cfg(feature = "boot-smoke")]
+    desktop.check_charges_zero();
     assert_eq!(
         frames.stats().unwrap().allocated_frames,
-        before,
+        // 0050-D2's shared rule, heap term (0059).
+        before + (heap::stats().size - heap_before) / PAGE_SIZE as usize,
         "shell frame leak"
+    );
+    #[cfg(feature = "boot-smoke")]
+    serial::println!(
+        "MIRROR_HEAP_CHARGE_OK tables_peak={} surfaces_peak={}",
+        tables_peak,
+        surfaces_peak
     );
     let outcome = desktop.outcome.expect("shell ended without outcome");
     if smoke {
