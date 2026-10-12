@@ -618,6 +618,7 @@ try {
         throw 'Mirror reported the SMAP entry check on a CPU without SMAP.'
     }
     Assert-MirrorHeapGrowth -Serial $serial -RequestedCpus $CpuCount -Smoke $true -UseLegacyPic ([bool]$LegacyPic)
+    Assert-MirrorFramePool -Serial $serial
     Assert-MirrorDriverCatalog -Serial $serial -Smoke $true -LegacyDisk ($DeviceProfile -eq 'LegacyVirtio' -and -not $NoTestDisk) -XhciAttached ([bool]$Xhci)
     if ($CrowdedPci) {
         # Spec 0013, test 11. Below slot 0x15, bus 0 holds q35's host bridge,

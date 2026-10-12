@@ -766,6 +766,7 @@ try {
     foreach ($marker in @('MIRROR_BOOT_OK', 'MIRROR_PCI_READY', 'MIRROR_FRAMEBUFFER_READY', 'MIRROR_FRAMEBUFFER_PRESENTED', 'MIRROR_AHCI_READY', 'MIRROR_AHCI_PROBE_OK fixture=0 reads=1', 'MIRROR_AHCI_CLEANUP_OK', 'MIRROR_BLOCK_SKIPPED', 'MIRROR_KEYBOARD_READY', 'MIRROR_MOUSE_READY', 'MIRROR_POINTER_READY')) {
         if ($serial -notmatch "(?m)^$marker(?:\s|$)") { throw "Normal boot missing $marker. See $serialLog." }
     }
+    Assert-MirrorFramePool -Serial $serial
     # Trace kernels run no init battery and recognize no fixture (spec 0010).
     foreach ($marker in @('MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_SCHEDULER_OK', 'MIRROR_IPC_OK', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_USER_SURFACE_OK', 'MIRROR_USER_SURFACE_CLEANUP_OK', 'MIRROR_USER_CLOCK_OK', 'MIRROR_AHCI_READ_OK', 'MIRROR_HEAP_CHARGE_OK')) {
         if ($serial -match "(?m)^$marker(?:\s|$)") { throw "Trace boot unexpectedly reported $marker. See $serialLog." }

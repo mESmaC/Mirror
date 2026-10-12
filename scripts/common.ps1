@@ -972,6 +972,29 @@ function Assert-MirrorHeapGrowth {
     }
 }
 
+function Assert-MirrorFramePool {
+    param([Parameter(Mandatory = $true)][string]$Serial)
+
+    # 0054-D3: exactly one complete pool record per boot, in every flavor. The
+    # script recomputes every derived field: the refcount array is two bytes
+    # per frame in its own page-aligned span beside the 2-bit bitmap's span.
+    $records = [regex]::Matches($Serial, '(?m)^MIRROR_FRAME_POOL total=([0-9]+) allocated=([0-9]+) metadata=([0-9]+) free=([0-9]+) refcount_meta=([0-9]+)\r?$')
+    if ($records.Count -ne 1 -or [regex]::Matches($Serial, '(?m)^MIRROR_FRAME_POOL(?:\s|$)').Count -ne 1) {
+        throw 'Mirror must report its frame pool exactly once, with every field.'
+    }
+    $total = [uint64]$records[0].Groups[1].Value
+    $allocated = [uint64]$records[0].Groups[2].Value
+    $metadata = [uint64]$records[0].Groups[3].Value
+    $free = [uint64]$records[0].Groups[4].Value
+    $refcountMeta = [uint64]$records[0].Groups[5].Value
+    $bitmapFrames = [uint64][decimal]::Ceiling([decimal][decimal]::Ceiling($total / 4) / 4096)
+    $refcountFrames = [uint64][decimal]::Ceiling(($total * 2) / 4096)
+    if ($refcountMeta -ne $total * 2 -or $metadata -ne $bitmapFrames + $refcountFrames -or
+        $free -ne $total - $allocated - $metadata) {
+        throw 'Frame pool accounting does not match the bitmap and refcount spans.'
+    }
+}
+
 function ConvertTo-QemuOptionValue {
     param([Parameter(Mandatory = $true)][string]$Value)
     # QEMU's comma-separated option syntax escapes a literal comma by doubling it.

@@ -43,6 +43,10 @@ pub enum FrameError {
     NeverAllocated,
     AlreadyFree,
     MetadataReserved,
+    /// 0054-D1: a share would push the frame's u16 refcount past 65535.
+    ShareLimit,
+    /// 0054-D1: a contiguous release requires refcount 1 on every page.
+    Shared,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -54,8 +58,12 @@ pub enum ContiguousError {
 
 struct Recycling {
     bitmap: *mut u8,
+    /// 0054-D1: the per-frame u16 refcount array, in its own reserved span.
+    refcounts: *mut u16,
     #[cfg(feature = "boot-smoke")]
     physical: u64,
+    #[cfg(feature = "boot-smoke")]
+    refcounts_physical: u64,
     #[cfg(feature = "boot-smoke")]
     direct_map_offset: u64,
     stats: FrameStats,
@@ -82,6 +90,21 @@ impl Recycling {
             let byte = self.bitmap.add(index / 4);
             byte.write((byte.read() & !(3 << shift)) | (state << shift));
         }
+    }
+
+    /// The frame's share count (0054-D1): meaningful only while ALLOCATED.
+    fn count(&self, index: usize) -> u16 {
+        assert!(index < self.stats.total_frames);
+        // SAFETY: enable_recycling reserves two bytes per frame and its caller
+        // preserves the exclusive, writable direct mapping.
+        unsafe { self.refcounts.add(index).read() }
+    }
+
+    fn set_count(&mut self, index: usize, value: u16) {
+        assert!(index < self.stats.total_frames);
+        // SAFETY: The refcount array is exclusively owned, initialized, and
+        // mapped for this allocator's lifetime. The checked index bounds it.
+        unsafe { self.refcounts.add(index).write(value) };
     }
 }
 
@@ -112,6 +135,7 @@ impl<'a> FrameAllocator<'a> {
                 .find(|&index| recycling.state(index) == RECYCLED)
                 .expect("recycled-frame accounting mismatch");
             recycling.set_state(index, ALLOCATED);
+            recycling.set_count(index, 1);
             recycling.recycled_hint = index + 1;
             recycling.stats.recycled_frames -= 1;
             recycling.stats.allocated_frames += 1;
@@ -134,6 +158,7 @@ impl<'a> FrameAllocator<'a> {
                         }
                         assert_eq!(recycling.state(index), NEVER_ALLOCATED);
                         recycling.set_state(index, ALLOCATED);
+                        recycling.set_count(index, 1);
                         recycling.stats.allocated_frames += 1;
                         recycling.stats.never_allocated_frames -= 1;
                     }
@@ -196,6 +221,7 @@ impl<'a> FrameAllocator<'a> {
                 _ => unreachable!("complete free run was preflighted"),
             }
             recycling.set_state(index, ALLOCATED);
+            recycling.set_count(index, 1);
         }
         recycling.stats.allocated_frames += pages;
         // The recycled hint remains a valid lower bound even if this run
@@ -242,42 +268,78 @@ impl<'a> FrameAllocator<'a> {
             return Err(RecyclingError::NoUsableFrames);
         }
         let bitmap_bytes = total_frames.div_ceil(4);
-        let metadata_bytes = align_up(bitmap_bytes as u64)
+        // 0054-D1: the refcount array lives in its own span beside the bitmap,
+        // two bytes per frame, reserved through the same mechanism.
+        let refcount_bytes = (total_frames as u64)
+            .checked_mul(2)
+            .ok_or(RecyclingError::MetadataTooLarge)?;
+        let bitmap_span = align_up(bitmap_bytes as u64)
             .filter(|&bytes| bytes <= isize::MAX as u64)
             .ok_or(RecyclingError::MetadataTooLarge)?;
-        let metadata_frames = (metadata_bytes / PAGE_SIZE) as usize;
-        let physical = self
-            .entries
-            .iter()
-            .enumerate()
-            .skip(self.region)
-            .find_map(|(region, entry)| {
-                let (base, end) = usable_bounds(entry)?;
-                let start = if region == self.region {
-                    self.next.max(base)
-                } else {
-                    base
-                };
-                (start.checked_add(metadata_bytes)? <= end).then_some(start)
-            })
+        let refcount_span = align_up(refcount_bytes)
+            .filter(|&bytes| bytes <= isize::MAX as u64)
+            .ok_or(RecyclingError::MetadataTooLarge)?;
+        let metadata_frames = ((bitmap_span + refcount_span) / PAGE_SIZE) as usize;
+        // Find one contiguous span per metadata array. The refcount span must
+        // not overlap the bitmap span; both start at page-aligned addresses.
+        let find_span = |bytes: u64, exclude: Option<(u64, u64)>| {
+            self.entries
+                .iter()
+                .enumerate()
+                .skip(self.region)
+                .find_map(|(region, entry)| {
+                    let (base, end) = usable_bounds(entry)?;
+                    let mut start = if region == self.region {
+                        self.next.max(base)
+                    } else {
+                        base
+                    };
+                    if let Some((excluded_base, excluded_end)) = exclude
+                        && start < excluded_end
+                        && excluded_base < start.saturating_add(bytes)
+                    {
+                        start = excluded_end;
+                    }
+                    (start.checked_add(bytes)? <= end).then_some(start)
+                })
+        };
+        let physical = find_span(bitmap_span, None).ok_or(RecyclingError::NoMetadataSpace)?;
+        let refcounts_physical = find_span(refcount_span, Some((physical, physical + bitmap_span)))
             .ok_or(RecyclingError::NoMetadataSpace)?;
         let address = offset
             .checked_add(physical)
             .filter(|&address| address != 0)
             .ok_or(RecyclingError::DirectMapOverflow)?;
         address
-            .checked_add(metadata_bytes - 1)
+            .checked_add(bitmap_span - 1)
+            .ok_or(RecyclingError::DirectMapOverflow)?;
+        let refcounts_address = offset
+            .checked_add(refcounts_physical)
+            .filter(|&address| address != 0)
+            .ok_or(RecyclingError::DirectMapOverflow)?;
+        refcounts_address
+            .checked_add(refcount_span - 1)
             .ok_or(RecyclingError::DirectMapOverflow)?;
         let bitmap = address as *mut u8;
-        // SAFETY: The selected pages are a contiguous, previously unallocated
-        // USABLE span covered by the caller's direct-map and exclusivity contract.
-        // The checked byte count is nonzero and fits in isize.
-        unsafe { bitmap.write_bytes(0, metadata_bytes as usize) };
+        let refcounts = refcounts_address as *mut u16;
+        // SAFETY: The selected pages are contiguous, previously unallocated
+        // USABLE spans covered by the caller's direct-map and exclusivity
+        // contract. The checked byte counts are nonzero and fit in isize.
+        unsafe {
+            bitmap.write_bytes(0, bitmap_span as usize);
+            refcounts.write_bytes(0, (refcount_span / 2) as usize);
+        }
         let metadata_index = self.index_of(physical).expect("metadata in usable RAM");
+        let refcounts_index = self
+            .index_of(refcounts_physical)
+            .expect("refcounts in usable RAM");
         let mut recycling = Recycling {
             bitmap,
+            refcounts,
             #[cfg(feature = "boot-smoke")]
             physical,
+            #[cfg(feature = "boot-smoke")]
+            refcounts_physical,
             #[cfg(feature = "boot-smoke")]
             direct_map_offset: offset,
             stats: FrameStats {
@@ -293,8 +355,14 @@ impl<'a> FrameAllocator<'a> {
         // when memory-map entries are not sorted by physical address.
         for index in 0..allocated_frames {
             recycling.set_state(index, ALLOCATED);
+            // 0054-D1: every frame live at boot holds one reference, so the
+            // boot test frames still free (main.rs's early frame checks).
+            recycling.set_count(index, 1);
         }
-        for index in metadata_index..metadata_index + metadata_frames {
+        for index in metadata_index..metadata_index + (bitmap_span / PAGE_SIZE) as usize {
+            recycling.set_state(index, METADATA);
+        }
+        for index in refcounts_index..refcounts_index + (refcount_span / PAGE_SIZE) as usize {
             recycling.set_state(index, METADATA);
         }
         self.recycling = Some(recycling);
@@ -329,10 +397,49 @@ impl<'a> FrameAllocator<'a> {
             RECYCLED => Err(FrameError::AlreadyFree),
             METADATA => Err(FrameError::MetadataReserved),
             ALLOCATED => {
+                // 0054-D1: a shared frame recycles only when its count reaches
+                // zero; dropping one reference changes no state or accounting.
+                let count = recycling.count(index);
+                if count > 1 {
+                    recycling.set_count(index, count - 1);
+                    return Ok(());
+                }
                 recycling.set_state(index, RECYCLED);
                 recycling.recycled_hint = recycling.recycled_hint.min(index);
                 recycling.stats.allocated_frames -= 1;
                 recycling.stats.recycled_frames += 1;
+                Ok(())
+            }
+            _ => unreachable!("two-bit frame state"),
+        }
+    }
+
+    /// Add one reference to an allocated frame (0054-D1): it recycles only
+    /// when its count returns to zero. Fails with `ShareLimit` at 65535,
+    /// leaving the count unchanged. METADATA and free frames are rejected.
+    /// Callers follow deallocate's BSP + IF=0 rule; no memory contents move.
+    // Only 0054-D1's tests call this until 0025's shared memory and the ELF
+    // loader v2 arrive.
+    #[cfg_attr(not(feature = "boot-smoke"), allow(dead_code))]
+    pub fn share(&mut self, frame: u64) -> Result<(), FrameError> {
+        if self.recycling.is_none() {
+            return Err(FrameError::RecyclingDisabled);
+        }
+        if !frame.is_multiple_of(PAGE_SIZE) {
+            return Err(FrameError::UnalignedAddress);
+        }
+        let index = self.index_of(frame).ok_or(FrameError::NotUsable)?;
+        let recycling = self.recycling.as_mut().expect("bitmap initialized");
+        match recycling.state(index) {
+            NEVER_ALLOCATED => Err(FrameError::NeverAllocated),
+            RECYCLED => Err(FrameError::AlreadyFree),
+            METADATA => Err(FrameError::MetadataReserved),
+            ALLOCATED => {
+                let count = recycling.count(index);
+                if count == u16::MAX {
+                    return Err(FrameError::ShareLimit);
+                }
+                recycling.set_count(index, count + 1);
                 Ok(())
             }
             _ => unreachable!("two-bit frame state"),
@@ -371,6 +478,9 @@ impl<'a> FrameAllocator<'a> {
                 NEVER_ALLOCATED => return Err(FrameError::NeverAllocated),
                 RECYCLED => return Err(FrameError::AlreadyFree),
                 METADATA => return Err(FrameError::MetadataReserved),
+                // 0054-D1: a contiguous run is owned outright only while every
+                // page holds exactly one reference.
+                ALLOCATED if recycling.count(*index) != 1 => return Err(FrameError::Shared),
                 ALLOCATED => {}
                 _ => unreachable!("two-bit frame state"),
             }
@@ -563,9 +673,13 @@ fn self_test_contiguous() {
         Err(ContiguousError::RecyclingDisabled)
     );
     let mut bitmap = [0u8; COUNT.div_ceil(4)];
+    // 0054-D1: the private count array beside the private bitmap.
+    let mut counts = [0u16; COUNT];
     let mut recycling = Recycling {
         bitmap: bitmap.as_mut_ptr(),
+        refcounts: counts.as_mut_ptr(),
         physical: 0x1000,
+        refcounts_physical: 0,
         direct_map_offset: 0,
         stats: FrameStats {
             total_frames: COUNT,
@@ -598,6 +712,9 @@ fn self_test_contiguous() {
     ];
     for (index, state) in initial.into_iter().enumerate() {
         recycling.set_state(index, state);
+        if state == ALLOCATED {
+            recycling.set_count(index, 1);
+        }
     }
     // This private bitmap, rather than a mapped synthetic physical address,
     // remains writable and exclusively owned until the allocator is dropped.
@@ -730,6 +847,7 @@ pub fn self_test_recycling(frames: &mut FrameAllocator<'_>) {
     let before = frames.stats().expect("recycling must be enabled");
     let recycling = frames.recycling.as_ref().expect("frame bitmap");
     let metadata = recycling.physical;
+    let refcounts_metadata = recycling.refcounts_physical;
     let offset = recycling.direct_map_offset;
     let virgin = (0..before.total_frames)
         .find(|&index| recycling.state(index) == NEVER_ALLOCATED)
@@ -752,6 +870,10 @@ pub fn self_test_recycling(frames: &mut FrameAllocator<'_>) {
         assert_eq!(frames.deallocate(reserved), Err(FrameError::NotUsable));
         assert_eq!(
             frames.deallocate(metadata),
+            Err(FrameError::MetadataReserved)
+        );
+        assert_eq!(
+            frames.deallocate(refcounts_metadata),
             Err(FrameError::MetadataReserved)
         );
         assert_eq!(frames.deallocate(virgin), Err(FrameError::NeverAllocated));
@@ -786,6 +908,93 @@ pub fn self_test_recycling(frames: &mut FrameAllocator<'_>) {
     // SAFETY: This is a rejected double free, not an ownership transfer.
     unsafe { assert_eq!(frames.deallocate(first), Err(FrameError::AlreadyFree)) };
     assert_eq!(frames.stats(), Some(after_release));
+
+    // 0054 acceptance 2: a shared frame recycles only when its count reaches
+    // zero, with the two references freed in either order.
+    let shared_a = frames.allocate().expect("shared frame A");
+    let shared_b = frames.allocate().expect("shared frame B");
+    frames.share(shared_a).expect("share A");
+    frames.share(shared_b).expect("share B");
+    let before_shares = frames.stats().unwrap();
+    // SAFETY: each deallocate drops one of the test's two references; the other
+    // keeps the frame live, so the second call is the sole remaining owner.
+    unsafe {
+        frames
+            .deallocate(shared_a)
+            .expect("drop A's first reference");
+        frames
+            .deallocate(shared_b)
+            .expect("drop B's first reference");
+        assert_eq!(frames.stats(), Some(before_shares));
+        frames
+            .deallocate(shared_a)
+            .expect("drop A's last reference");
+        frames
+            .deallocate(shared_b)
+            .expect("drop B's last reference");
+    }
+    let after_shares = frames.stats().unwrap();
+    assert_eq!(
+        after_shares.allocated_frames,
+        before_shares.allocated_frames - 2
+    );
+    // The ShareLimit boundary: a count at u16::MAX rejects the next share and
+    // stays unchanged. The test sets the boundary directly; 65534 increments
+    // would prove nothing more.
+    let limit = frames.allocate().expect("share-limit frame");
+    let limit_index = frames.index_of(limit).expect("test frame indexed");
+    frames.share(limit).expect("share before the boundary");
+    frames
+        .recycling
+        .as_mut()
+        .expect("bitmap initialized")
+        .set_count(limit_index, u16::MAX);
+    assert_eq!(frames.share(limit), Err(FrameError::ShareLimit));
+    assert_eq!(
+        frames.recycling.as_ref().unwrap().count(limit_index),
+        u16::MAX,
+        "a rejected share changed the count"
+    );
+    // SAFETY: restore the limit frame to one reference, then free it; the test
+    // owns it outright and no alias exists.
+    unsafe {
+        frames.recycling.as_mut().unwrap().set_count(limit_index, 1);
+        frames.deallocate(limit).expect("release share-limit frame");
+    }
+    // A contiguous run with any count above 1 is rejected before any change.
+    let run = frames
+        .allocate_contiguous_dma32(2)
+        .expect("two-page share run");
+    frames.share(run).expect("share the run's first page");
+    let before_run = frames.stats().unwrap();
+    // SAFETY: an invalid transition probe; the run stays fully allocated.
+    unsafe {
+        assert_eq!(
+            frames.deallocate_contiguous(run, 2),
+            Err(FrameError::Shared)
+        );
+    }
+    assert_eq!(frames.stats(), Some(before_run));
+    // SAFETY: drop the extra reference, then the whole run the test owns.
+    unsafe {
+        frames
+            .deallocate(run)
+            .expect("drop the run's extra reference");
+        frames
+            .deallocate_contiguous(run, 2)
+            .expect("release the run");
+    }
+    // Rejected non-allocated shares, now that every test frame is released:
+    // the recycled, metadata and never-allocated states.
+    assert_eq!(frames.share(shared_a), Err(FrameError::AlreadyFree));
+    assert_eq!(frames.share(metadata), Err(FrameError::MetadataReserved));
+    assert_eq!(frames.share(virgin), Err(FrameError::NeverAllocated));
+    assert_eq!(frames.share(virgin + 1), Err(FrameError::UnalignedAddress));
+    assert_eq!(
+        frames.stats().unwrap().allocated_frames,
+        before_shares.allocated_frames - 2,
+        "share tests must restore the frame baseline"
+    );
     let reused = frames.allocate().expect("recycled test frame");
     // Allocation chooses the earliest recycled index, so any previously recycled
     // frames remaining after our two allocations follow first in bitmap order.

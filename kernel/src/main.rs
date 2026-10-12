@@ -186,11 +186,13 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
     );
     let frame_stats = frames.stats().expect("frame accounting");
     serial::println!(
-        "MIRROR_FRAME_POOL total={} allocated={} metadata={} free={}",
+        "MIRROR_FRAME_POOL total={} allocated={} metadata={} free={} refcount_meta={}",
         frame_stats.total_frames,
         frame_stats.allocated_frames,
         frame_stats.metadata_frames,
-        frame_stats.recycled_frames + frame_stats.never_allocated_frames
+        frame_stats.recycled_frames + frame_stats.never_allocated_frames,
+        // 0054-D3: the refcount array's exact bytes (two per frame, own span).
+        frame_stats.total_frames * 2,
     );
     let discovered = acpi::discover(&boot, &mut tables, &mut frames);
     reset::init(discovered.reset);
