@@ -749,8 +749,21 @@ function Assert-MirrorHeapGrowth {
         [bool]$UseLegacyPic
     )
 
-    if ($Serial -match '(?m)^MIRROR_HEAP_GROW_SKIPPED(?:\s|$)') {
-        throw 'Heap growth was skipped.'
+    # 0059-D1/D4: the boot and after_userspace growths must succeed in every
+    # flavor, so their skip records always fail the run. boot-smoke's capacity
+    # self-test reports its one accepted AtCap skip (heap.rs capacity test); any
+    # other skip, or that one outside smoke, fails.
+    $skipped = [regex]::Matches($Serial, '(?m)^MIRROR_HEAP_GROW_SKIPPED phase=(boot|after_userspace|auto) reason=(LimitExceeded|OutOfFrames)\r?$')
+    if ([regex]::Matches($Serial, '(?m)^MIRROR_HEAP_GROW_SKIPPED(?:\s|$)').Count -ne $skipped.Count) {
+        throw 'Every heap growth skip record must be complete.'
+    }
+    foreach ($skip in $skipped) {
+        if ($skip.Groups[1].Value -ne 'auto' -or $skip.Groups[2].Value -cne 'LimitExceeded') {
+            throw 'Heap growth may skip only the capacity self-test auto phase with LimitExceeded.'
+        }
+    }
+    if ($skipped.Count -ne [int]$Smoke) {
+        throw 'Only a smoke boot reports exactly one capacity self-test heap growth skip.'
     }
     $cpus = if ($UseLegacyPic) { 1 } else { $RequestedCpus }
     $rounds = if ($Smoke) { 4 } else { 1 }
@@ -764,38 +777,55 @@ function Assert-MirrorHeapGrowth {
     if ($initial.Count -ne 1 -or [regex]::Matches($Serial, '(?m)^MIRROR_HEAP_READY(?:\s|$)').Count -ne 1 -or
         $shared.Count -ne 1 -or [regex]::Matches($Serial, '(?m)^MIRROR_SHARED_VM_READY(?:\s|$)').Count -ne 1 -or
         $user.Count -ne $userCount -or [regex]::Matches($Serial, '(?m)^MIRROR_USERSPACE_OK(?:\s|$)').Count -ne $userCount -or
-        $shared[0].Index -le $initial[0].Index -or
-        [regex]::Matches($Serial, '(?m)^MIRROR_HEAP_GROWN(?:\s|$)').Count -ne 2) {
-        throw 'Heap validation requires one initial heap, shared-window checks, all userspace completions, and two growth commits.'
+        $shared[0].Index -le $initial[0].Index) {
+        throw 'Heap validation requires one initial heap, shared-window checks, and all userspace completions.'
     }
-    $previous = $shared[0].Index
-    foreach ($phase in @(@{ Name = 'boot'; Size = 2097152 }, @{ Name = 'after_userspace'; Size = 3145728 })) {
-        $pattern = '(?m)^MIRROR_HEAP_GROWN phase={0} size={1} used=(\d+) free=(\d+) max=16777216 added_pages=256\r?$' -f $phase.Name, $phase.Size
-        $records = [regex]::Matches($Serial, $pattern)
-        if ($records.Count -ne 1 -or $records[0].Index -le $previous) {
-            throw "Missing, malformed, duplicate, or out-of-order heap growth phase $($phase.Name)."
-        }
-        $used = [uint64]$records[0].Groups[1].Value
-        $free = [uint64]$records[0].Groups[2].Value
-        if ($used -gt $phase.Size -or $free -ne ($phase.Size - $used)) {
+    # 0059-D4: walk every growth record in order (the boot and after_userspace
+    # commits, plus 0059's phase=auto safe-point records in trace/smoke builds),
+    # recomputing each committed size from the one before. Exactly one boot and
+    # one after_userspace record, in order; at most 13 auto records (16 MiB cap).
+    $grown = [regex]::Matches($Serial, '(?m)^MIRROR_HEAP_GROWN phase=(boot|after_userspace|auto) size=(\d+) used=(\d+) free=(\d+) max=16777216 added_pages=(\d+)\r?$')
+    $phaseIndex = @{}
+    $autoCount = 0
+    $size = 1048576
+    foreach ($record in $grown) {
+        $phase = $record.Groups[1].Value
+        $recordedSize = [uint64]$record.Groups[2].Value
+        $used = [uint64]$record.Groups[3].Value
+        $free = [uint64]$record.Groups[4].Value
+        $added = [uint64]$record.Groups[5].Value
+        if ($phase -eq 'auto') { $autoCount += 1 }
+        elseif ($phaseIndex.ContainsKey($phase)) { throw "Heap growth phase $phase printed twice." }
+        if ($added -ne 256 -or $recordedSize -ne $size + $added * 4096 -or $free -ne $recordedSize - $used) {
             throw 'Heap growth accounting does not match the committed capacity.'
         }
+        if ($phase -ne 'auto') { $phaseIndex[$phase] = $record.Index }
+        $size = $recordedSize
+    }
+    if (-not $phaseIndex.ContainsKey('boot') -or -not $phaseIndex.ContainsKey('after_userspace') -or
+        $phaseIndex['boot'] -ge $phaseIndex['after_userspace'] -or $autoCount -gt 13) {
+        throw 'Heap validation requires the boot and after_userspace commits in order, with at most 13 auto records.'
+    }
+    if ([regex]::Matches($Serial, '(?m)^MIRROR_HEAP_GROWN(?:\s|$)').Count -ne $grown.Count) {
+        throw 'Every heap growth record must be complete.'
+    }
+    foreach ($phaseName in @('boot', 'after_userspace')) {
+        $recordIndex = $phaseIndex[$phaseName]
         # Without an init workload there is nothing to bracket; the phase order
         # above still places both commits after the shared-window checks.
         if ($userCount -gt 0 -and
-            (($phase.Name -eq 'boot' -and $records[0].Index -ge $user[0].Index) -or
-            ($phase.Name -eq 'after_userspace' -and $records[0].Index -le $user[$userCount - 1].Index))) {
+            (($phaseName -eq 'boot' -and $recordIndex -ge $user[0].Index) -or
+            ($phaseName -eq 'after_userspace' -and $recordIndex -le $user[$userCount - 1].Index))) {
             throw 'Heap commits must bracket the native userspace workload.'
         }
         if ($Smoke) {
-            $testPattern = '(?m)^MIRROR_HEAP_GROW_TESTS_OK phase={0} acquisition_rollback=1 mapped_rollback=1 live=1 large=1 guards=1 borrowed_root=1\r?$' -f $phase.Name
+            $testPattern = '(?m)^MIRROR_HEAP_GROW_TESTS_OK phase={0} acquisition_rollback=1 mapped_rollback=1 live=1 large=1 guards=1 borrowed_root=1\r?$' -f $phaseName
             $tests = [regex]::Matches($Serial, $testPattern)
-            if ($tests.Count -ne 1 -or $tests[0].Index -le $previous -or $tests[0].Index -ge $records[0].Index -or
-                ($phase.Name -eq 'after_userspace' -and $tests[0].Index -le $user[$userCount - 1].Index)) {
-                throw "Heap growth regression checks did not precede phase $($phase.Name)."
+            if ($tests.Count -ne 1 -or $tests[0].Index -ge $recordIndex -or
+                ($phaseName -eq 'after_userspace' -and $tests[0].Index -le $user[$userCount - 1].Index)) {
+                throw "Heap growth regression checks did not precede phase $phaseName."
             }
         }
-        $previous = $records[0].Index
     }
     $testCount = [regex]::Matches($Serial, '(?m)^MIRROR_HEAP_GROW_TESTS_OK(?:\s|$)').Count
     $pagingCount = [regex]::Matches($Serial, '(?m)^MIRROR_HEAP_PAGING_OK(?:\s|$)').Count
@@ -809,8 +839,9 @@ function Assert-MirrorHeapGrowth {
             throw 'Heap tests must cover both growth commits and atomic mapping across a page-table boundary.'
         }
         $limit = [regex]::Matches($Serial, '(?m)^MIRROR_HEAP_LIMIT_OK size=16777216 limit_rejected=1 guards=1 reclaimed_allocations=1\r?$')
-        if ($limitCount -ne 1 -or $limit.Count -ne 1 -or $limit[0].Index -le $previous) {
-            throw 'Heap capacity checks must follow both growth commits exactly once.'
+        if ($limitCount -ne 1 -or $limit.Count -ne 1 -or $limit[0].Index -le $phaseIndex['after_userspace'] -or
+            ($skipped.Count -eq 1 -and $skipped[0].Index -ge $limit[0].Index)) {
+            throw 'Heap capacity checks must follow both growth commits and the capacity skip record exactly once.'
         }
         if (-not $UseLegacyPic) {
             $desktopPattern = '(?m)^MIRROR_SMP_IPI_OK phase=after_desktop cpus={0} rounds=4\r?$' -f $cpus

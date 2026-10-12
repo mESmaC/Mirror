@@ -828,7 +828,7 @@ try {
         if ($serial -notmatch "(?m)^$marker(?:\s|$)") { throw "Normal boot missing $marker. See $serialLog." }
     }
     # Trace kernels run no init battery and recognize no fixture (spec 0010).
-    foreach ($marker in @('MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_SCHEDULER_OK', 'MIRROR_IPC_OK', 'MIRROR_USER_SURFACE_OK', 'MIRROR_USER_SURFACE_CLEANUP_OK', 'MIRROR_USER_CLOCK_OK', 'MIRROR_AHCI_READ_OK')) {
+    foreach ($marker in @('MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_SCHEDULER_OK', 'MIRROR_IPC_OK', 'MIRROR_USER_SURFACE_OK', 'MIRROR_USER_SURFACE_CLEANUP_OK', 'MIRROR_USER_CLOCK_OK', 'MIRROR_AHCI_READ_OK', 'MIRROR_HEAP_CHARGE_OK')) {
         if ($serial -match "(?m)^$marker(?:\s|$)") { throw "Trace boot unexpectedly reported $marker. See $serialLog." }
     }
     if ($serial -match '(?m)^MIRROR_FRAMEBUFFER_SKIPPED(?:\s|$)') { throw 'Normal boot skipped framebuffer output.' }
