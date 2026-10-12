@@ -565,9 +565,10 @@ fn run_console(
     devices: &pci::Inventory,
 ) -> ! {
     assert!(!arch::interrupts_enabled());
-    // Discard the bounded queue left by boot. Limit work even if new bytes keep
+    // Discard the bounded backlog left by boot: up to 64 events per device,
+    // each behind one pending loss marker. Limit work even if new bytes keep
     // arriving through the controller's deferred-drain path.
-    for _ in 0..128 {
+    for _ in 0..ps2::MAX_BACKLOG {
         if input_consumer.next_event().is_none() {
             break;
         }

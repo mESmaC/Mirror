@@ -19,7 +19,7 @@ use crate::{arch, ps2};
 const OUTPUT_FULL: u8 = 1;
 const AUXILIARY: u8 = 0x20;
 const RECEIVE_ERROR: u8 = 0xc0;
-const QUEUE_CAPACITY: usize = 64;
+pub(crate) const QUEUE_CAPACITY: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {

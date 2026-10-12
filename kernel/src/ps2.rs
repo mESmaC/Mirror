@@ -26,6 +26,10 @@ const POLL_LIMIT: usize = 100_000;
 const INIT_DRAIN_LIMIT: usize = 256;
 const DRAIN_LIMIT: usize = 32;
 const RESEND_LIMIT: usize = 3;
+/// The most items next_event can return without a new byte: each device's
+/// full ring plus its one pending loss marker, which events queued after that
+/// device's loss follow (spec 0017a-D3). Handoff drains use it as their bound.
+pub(crate) const MAX_BACKLOG: usize = keyboard::QUEUE_CAPACITY + 1 + mouse::QUEUE_CAPACITY + 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ps2Error {

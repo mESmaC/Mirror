@@ -18,10 +18,12 @@ pub struct Session<'a> {
 
 impl<'a> Session<'a> {
     pub fn new(consumer: &'a mut ps2::Consumer) -> Self {
-        // Bound ownership handoff work even if deferred controller polling
-        // produces more events. Do not force decoder break-recovery here: the
-        // first fresh key must remain usable. Lost resets the client's state.
-        for _ in 0..128 {
+        // Discard the backlog left by boot: up to 64 events per device, each
+        // behind one pending loss marker. Bound ownership handoff work even if
+        // deferred controller polling produces more events. Do not force
+        // decoder break-recovery here: the first fresh key must remain usable.
+        // Lost resets the client's state.
+        for _ in 0..ps2::MAX_BACKLOG {
             if consumer.next_event().is_none() {
                 break;
             }
@@ -260,6 +262,41 @@ pub fn self_test() {
                 assert_eq!(words(session.peek().unwrap()), [1, 2, 0, 0, 0, 0, 4, 0]);
                 session.consume();
                 assert_eq!(session.peek(), None);
+            }
+            assert_eq!(consumer.next_event(), None);
+
+            // The worst-case handoff backlog: each device holds one loss
+            // marker plus a full ring of events queued after it (0017a-D3).
+            fn fill_backlog() {
+                crate::keyboard::accept_byte(1, 0); // Keyboard loss
+                crate::keyboard::accept_byte(1, 0xf0);
+                crate::keyboard::accept_byte(1, 0x1c); // Recovery release
+                for _ in 0..crate::keyboard::QUEUE_CAPACITY {
+                    crate::keyboard::accept_byte(1, 0x1c); // a, then repeats
+                }
+                // A corrupt AUX header is a pointer loss. Its two-byte tail is
+                // discarded before the packets that refill the ring.
+                for (status, byte) in [(0x21 | 0xc0, 0x08), (0x21, 0), (0x21, 0)] {
+                    crate::mouse::accept_byte(status, byte);
+                }
+                for _ in 0..crate::mouse::QUEUE_CAPACITY {
+                    for byte in [0x08, 1, 0] {
+                        crate::mouse::accept_byte(0x21, byte);
+                    }
+                }
+            }
+            fill_backlog();
+            let backlog = (0..=ps2::MAX_BACKLOG)
+                .take_while(|_| consumer.next_event().is_some())
+                .count();
+            assert_eq!(backlog, ps2::MAX_BACKLOG);
+            fill_backlog();
+            {
+                let mut session = Session::new(&mut consumer);
+                let initial = session.peek().unwrap();
+                assert_eq!(words(initial), [1, KIND_LOST, 3, 0, 0, 0, 0, 0]);
+                session.consume();
+                assert_eq!(session.peek(), None, "boot backlog survived handoff");
             }
             assert_eq!(consumer.next_event(), None);
             drop(consumer);
