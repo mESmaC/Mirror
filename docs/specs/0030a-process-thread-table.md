@@ -40,7 +40,7 @@ Processes and threads stop being stack locals of three session loops (`run_pair`
 
 Work order (one commit per step, each running its targeted cases, P8; the rewrite takes small steps under the full suite, roadmap-replan.md:398):
 1. MAX_THREADS=16 and MAX_REGIONS=64 with their host tests, the boot-smoke region checks (vm.rs:599-627 and init main.rs:405-420 scale with the constant), the init battery decoupling, and acceptance 2's new 16-thread capacity check — all on today's arrays.
-2. sched.rs tables and one run queue; session loops deleted; policy numbers unchanged. `MIRROR_SCHED_READY` and its test.ps1/run.ps1/capture.ps1 list changes land here.
+2. sched.rs tables and one run queue; session loops deleted; policy numbers unchanged. `MIRROR_SCHED_READY` and its test.ps1/run.ps1/capture.ps1 list changes land here. With `run_desktop` deleted, the agent-demo build retires in this step (RS6, confirmed 2026-10-12): the `-AgentDemo` switches and branches in build.ps1, run.ps1, capture.ps1 and test.ps1, the `agent-demo` cargo feature, userspace/agent and the agent.elf staging, the readme sections, and AGENTS.md's `-AgentDemo` lines all go in this step's commit (the open questions' removal list).
 3. Wait queues replace wake_threads; acceptance 3's FIFO check lands here (FIFO holds only from this step).
 4. Wakeup preemption, MIRROR_PREEMPT_OK, and the input flag with its no-charge reschedule (0030-D2/D3).
 5. Zombie/reap and the table-bounds self-test.
