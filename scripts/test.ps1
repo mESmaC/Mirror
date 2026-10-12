@@ -198,6 +198,13 @@ try {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -NoHpet:$case.NoHpet -Fault $case.Fault -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
             Save-MirrorSmokeLogs "$profile-$($case.Name)"
         }
+        # vmmouse absolute pointing stays optional: without vmport the mouse
+        # stays relative, and a runtime protocol error falls back to relative
+        # PS/2 once (spec 0017c, acceptance test 3).
+        & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -NoVmport -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+        Save-MirrorSmokeLogs "$profile-NoVmport"
+        & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Fault VmmouseError -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+        Save-MirrorSmokeLogs "$profile-VmmouseError"
         # Explicit boot policy must keep the legacy PIC/PIT backend functional,
         # including userspace preemption and PS/2 input. OVMF still needs APIC
         # hardware during firmware startup, so retain the CPU's APIC feature.
@@ -231,6 +238,13 @@ try {
         }
         foreach ($artifact in $applicationArtifacts) {
             Copy-Item -LiteralPath (Join-Path $repositoryRoot "build/$artifact") -Destination (Join-Path $logDirectory "$profile-$artifact") -Force
+        }
+        # The capture above points through the vmmouse. Repeat it with vmport
+        # off, so relative PS/2 pointing stays covered end to end (0017-D18).
+        # Its screenshots reuse the names above; only its logs are distinct.
+        & (Join-Path $PSScriptRoot 'capture.ps1') -NoBuild -RelativePointer -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+        foreach ($artifact in @('serial.log', 'stderr.log')) {
+            Copy-Item -LiteralPath (Join-Path $repositoryRoot "build/relative-boot.$artifact") -Destination (Join-Path $logDirectory "$profile-relative-console.$artifact") -Force
         }
         $imageLabel = if ($AgentDemo) { "$profile agent-demo" } else { $profile }
         Assert-MirrorKernelImage -Flavor Trace -Label $imageLabel

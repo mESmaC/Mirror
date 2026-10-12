@@ -4,6 +4,7 @@ param(
     [switch]$Release,
     [switch]$AgentDemo,
     [switch]$Hygiene,
+    [switch]$RelativePointer,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
@@ -39,7 +40,7 @@ if ($Hygiene -and [System.IO.File]::ReadAllText((Join-Path $espDirectory 'limine
 }
 $varsPath = Join-Path $buildDirectory 'capture.vars.fd'
 Copy-Item -LiteralPath $varsTemplate -Destination $varsPath -Force
-$captureName = if ($Hygiene) { 'hygiene-boot' } else { 'normal-boot' }
+$captureName = if ($Hygiene) { 'hygiene-boot' } elseif ($RelativePointer) { 'relative-boot' } else { 'normal-boot' }
 $serialLog = Join-Path $buildDirectory "$captureName.serial.log"
 $screenshot = Join-Path $buildDirectory 'normal-boot.png'
 $consoleScreenshot = Join-Path $buildDirectory 'normal-console.png'
@@ -152,7 +153,8 @@ function Read-MirrorQmp {
 }
 
 function Invoke-MirrorQmp {
-    param([System.Diagnostics.Process]$Process, [string]$Command, [hashtable]$Arguments = @{})
+    # With -ExpectError the command must fail, and its QMP error is returned.
+    param([System.Diagnostics.Process]$Process, [string]$Command, [hashtable]$Arguments = @{}, [switch]$ExpectError)
     $id = [guid]::NewGuid().ToString('N')
     $request = @{ execute = $Command; arguments = $Arguments; id = $id } | ConvertTo-Json -Compress -Depth 8
     $Process.StandardInput.WriteLine($request)
@@ -164,8 +166,12 @@ function Invoke-MirrorQmp {
         if ($remaining -le 0) { throw 'QMP response timed out.' }
         $response = Read-MirrorQmp $Process $remaining
         if ($response.PSObject.Properties['id'] -and $response.id -eq $id) {
-            if ($response.PSObject.Properties['error']) { throw "QMP $Command failed: $($response.error | ConvertTo-Json -Compress)" }
+            if ($response.PSObject.Properties['error']) {
+                if ($ExpectError) { return $response.error }
+                throw "QMP $Command failed: $($response.error | ConvertTo-Json -Compress)"
+            }
             if (-not $response.PSObject.Properties['return']) { throw 'Malformed QMP response.' }
+            if ($ExpectError) { throw "QMP $Command unexpectedly succeeded." }
             return
         }
     }
@@ -269,6 +275,105 @@ function Send-MirrorPointerButton {
     Invoke-MirrorQmp $Process 'input-send-event' @{ events = @(@{ type = 'btn'; data = @{ button = $Button; down = $Down } }) }
 }
 
+function ConvertTo-MirrorAbsoluteAxis {
+    param([int]$Pixel, [int]$Extent)
+    # QMP abs values span 0..0x7FFF, which QEMU's vmmouse scales to its
+    # 0..0xFFFF device range; the kernel maps that range onto the framebuffer
+    # with px = (x * (W - 1) + 0x7FFF) / 0xFFFF (spec 0017-D14). The nearest
+    # QMP value, round(p * 0x7FFF / (W - 1)), maps back to pixel p exactly.
+    if ($Extent -lt 1 -or $Pixel -lt 0 -or $Pixel -ge $Extent) {
+        throw "Absolute pointer target $Pixel is outside a $Extent-pixel framebuffer axis."
+    }
+    if ($Extent -eq 1) { return 0 }
+    $last = [int64]($Extent - 1)
+    return [int][Math]::Floor((2 * [int64]$Pixel * 0x7FFF + $last) / (2 * $last))
+}
+
+function Send-MirrorPointerPosition {
+    param([System.Diagnostics.Process]$Process, [int]$X, [int]$Y)
+    # One input-send-event carries both abs axes, so the vmmouse queues a
+    # single position for framebuffer pixel (X,Y). Buttons stay separate events.
+    $events = @(
+        @{ type = 'abs'; data = @{ axis = 'x'; value = (ConvertTo-MirrorAbsoluteAxis $X $framebufferSize.Width) } },
+        @{ type = 'abs'; data = @{ axis = 'y'; value = (ConvertTo-MirrorAbsoluteAxis $Y $framebufferSize.Height) } }
+    )
+    Invoke-MirrorQmp $Process 'input-send-event' @{ events = $events }
+    Start-Sleep -Milliseconds 40
+}
+
+function Move-MirrorPointer {
+    param([System.Diagnostics.Process]$Process, [int]$X, [int]$Y, [int]$Dx, [int]$Dy)
+    # Captures place the pointer at framebuffer pixel (X,Y) with one absolute
+    # move and no homing step (spec 0017c, acceptance test 4). -RelativePointer
+    # captures send the relative motion (Dx,Dy) instead (acceptance test 5).
+    if ($RelativePointer) { Send-MirrorPointerMotion $Process $Dx $Dy }
+    else { Send-MirrorPointerPosition $Process $X $Y }
+}
+
+function Move-MirrorDesktopPointer {
+    param([System.Diagnostics.Process]$Process, [hashtable]$Desktop, [int]$X, [int]$Y, [int]$Dx, [int]$Dy)
+    # (X,Y) is surface-local: absolute moves add the desktop's centered origin.
+    Move-MirrorPointer $Process ($Desktop.X + $X) ($Desktop.Y + $Y) $Dx $Dy
+}
+
+function Get-MirrorDesktopRectangle {
+    param([int]$Width = 0, [int]$Height = 0)
+    # The kernel centers the desktop, capped at 1280x800, in the framebuffer
+    # (kernel/src/surface.rs). A shell or desktop READY size must match it.
+    $rectangle = @{ Width = [Math]::Min($framebufferSize.Width, 1280); Height = [Math]::Min($framebufferSize.Height, 800) }
+    if ($Width -ne 0 -and ($Width -ne $rectangle.Width -or $Height -ne $rectangle.Height)) {
+        throw "The ${Width}x$Height surface is not the centered desktop in the $($framebufferSize.Width)x$($framebufferSize.Height) framebuffer."
+    }
+    $rectangle.X = [int][Math]::Floor(($framebufferSize.Width - $rectangle.Width) / 2)
+    $rectangle.Y = [int][Math]::Floor(($framebufferSize.Height - $rectangle.Height) / 2)
+    return $rectangle
+}
+
+function Assert-MirrorAbsoluteRejected {
+    param([System.Diagnostics.Process]$Process)
+    # Spec 0017c, acceptance test 4: QEMU routes abs events only to a handler
+    # that takes them, and the vmmouse registers one only after the guest
+    # requests absolute mode. Before the mouse result, QMP must reject one.
+    if ((Read-MirrorSerial) -match '(?m)^MIRROR_MOUSE_(?:READY|SKIPPED)(?:\s|$)') {
+        throw "The guest reported its mouse before the early abs probe. See $serialLog."
+    }
+    $events = @(
+        @{ type = 'abs'; data = @{ axis = 'x'; value = 0 } },
+        @{ type = 'abs'; data = @{ axis = 'y'; value = 0 } }
+    )
+    $rejection = Invoke-MirrorQmp $Process 'input-send-event' @{ events = $events } -ExpectError
+    if ($rejection.class -cne 'GenericError' -or $rejection.desc -cne 'Input handler not found for event type abs') {
+        throw "QMP rejected the early abs event for an unexpected reason: $($rejection | ConvertTo-Json -Compress)"
+    }
+}
+
+function Assert-MirrorPointerMode {
+    param([string]$Serial)
+    # Spec 0017-D18: q35's default vmport gives the vmmouse, and -RelativePointer
+    # turns vmport off, so the mouse stays relative. Exactly one result, after
+    # the PS/2 mouse's, and no fallback.
+    $expected = if ($RelativePointer) { 'MIRROR_VMMOUSE_SKIPPED reason=no_backdoor' } else { 'MIRROR_VMMOUSE_READY mode=absolute' }
+    $results = [regex]::Matches($Serial, '(?m)^MIRROR_VMMOUSE_(?:READY|SKIPPED|FALLBACK)(?:[ \t][^\r\n]*)?\r?$')
+    $mouse = [regex]::Match($Serial, '(?m)^MIRROR_MOUSE_READY(?:\s|$)')
+    if ($results.Count -ne 1 -or $results[0].Value.TrimEnd("`r") -cne $expected -or
+        -not $mouse.Success -or $results[0].Index -le $mouse.Index) {
+        throw "Captures require '$expected' once, after MIRROR_MOUSE_READY, and no vmmouse fallback. See $serialLog."
+    }
+}
+
+function Wait-MirrorPointerMode {
+    param([System.Diagnostics.Process]$Process)
+    # The vmmouse result prints at boot after the framebuffer and the PS/2
+    # mouse, before any pointer input. Return the framebuffer size that
+    # absolute positions span.
+    Wait-MirrorDesktopMessage $Process '(?m)^MIRROR_VMMOUSE_(?:READY|SKIPPED)[^\r\n]*\r?\n'
+    $serial = Read-MirrorSerial
+    Assert-MirrorPointerMode $serial
+    $framebuffer = [regex]::Matches($serial, '(?m)^MIRROR_FRAMEBUFFER_READY width=([1-9][0-9]*) height=([1-9][0-9]*) ')
+    if ($framebuffer.Count -ne 1) { throw "Captures require exactly one MIRROR_FRAMEBUFFER_READY with the framebuffer size. See $serialLog." }
+    return @{ Width = [int]$framebuffer[0].Groups[1].Value; Height = [int]$framebuffer[0].Groups[2].Value }
+}
+
 function Wait-MirrorPointer {
     param([System.Diagnostics.Process]$Process, [int]$X, [int]$Y, [int]$Buttons, [int]$AfterOffset)
     $deadline = [System.Diagnostics.Stopwatch]::StartNew()
@@ -355,11 +460,15 @@ function Invoke-MirrorHygieneInput {
         [System.Diagnostics.Process]$Process,
         [string]$Target,
         [string]$Text,
+        [int]$PointerX,
+        [int]$PointerY,
         [switch]$Submit
     )
     # Acceptance test 3, step 3 (and its repeat in step 4). A change between
     # stable screens proves the keys and the pointer motion reached the guest;
-    # the serial log must not grow by a single byte meanwhile.
+    # the serial log must not grow by a single byte meanwhile. The pointer,
+    # at framebuffer pixel (PointerX,PointerY), moves 100 px right and 100 px
+    # up: by relative motion, or by one absolute move (spec 0017c).
     $before = Join-Path $buildDirectory "hygiene-$Target-before.png"
     $typed = Join-Path $buildDirectory "hygiene-$Target-typed.png"
     $moved = Join-Path $buildDirectory "hygiene-$Target-pointer.png"
@@ -368,7 +477,7 @@ function Invoke-MirrorHygieneInput {
     Send-MirrorText $Process $Text
     if ($Submit) { Send-MirrorKey $Process 'ret' }
     Wait-MirrorStableScreen $Process $typed -DifferentFrom $before
-    Send-MirrorPointerMotion $Process 100 (-100)
+    Move-MirrorPointer $Process ($PointerX + 100) ($PointerY - 100) 100 (-100)
     Wait-MirrorStableScreen $Process $moved -DifferentFrom $typed
     $grown = (Get-MirrorSerialLength) - $length
     if ($grown -ne 0) {
@@ -446,14 +555,20 @@ function Invoke-MirrorHygieneProbe {
     }
 
     # Step 3: Notes receives the sentinel and pointer motion with empty serial.
-    Invoke-MirrorHygieneInput $Process 'notes' 'zqxjvw'
+    # Default kernels print no shell READY marker, so the desktop origin comes
+    # from the framebuffer size; step 2 left the pointer on the Notes launcher.
+    $desktop = Get-MirrorDesktopRectangle
+    Invoke-MirrorHygieneInput $Process 'notes' 'zqxjvw' ($desktop.X + 64) ($desktop.Y + 776)
 
-    # Step 4: Esc ends the shell session; repeat on the kernel console.
+    # Step 4: Esc ends the shell session; repeat on the kernel console, whose
+    # pointer starts where MIRROR_POINTER_READY reports.
     $offset = (Read-MirrorSerial).Length
     Send-MirrorKey $Process 'esc'
     Wait-MirrorDesktopMessage $Process '(?m)^MIRROR_SHELL_CLEANUP_OK(?:\s|$)' $offset
     Wait-MirrorDesktopMessage $Process '(?m)^MIRROR_CONSOLE_READY(?:\s|$)' $offset
-    Invoke-MirrorHygieneInput $Process 'console' 'echo zqxjvw' -Submit
+    $consolePointer = [regex]::Matches((Read-MirrorSerial).Substring($offset), '(?m)^MIRROR_POINTER_READY x=(\d+) y=(\d+) ')
+    if ($consolePointer.Count -ne 1) { throw "The console must report its pointer once. See $serialLog." }
+    Invoke-MirrorHygieneInput $Process 'console' 'echo zqxjvw' ([int]$consolePointer[0].Groups[1].Value) ([int]$consolePointer[0].Groups[2].Value) -Submit
 }
 
 function Assert-MirrorHygieneLog {
@@ -500,6 +615,8 @@ function Complete-MirrorCapture {
     $serial = Read-MirrorSerial
     if ($Hygiene) { Assert-MirrorHygieneLog $serial }
     else { Assert-MirrorTraceMarker -Serial $serial -Expected $true }
+    Assert-MirrorPointerMode $serial
+    if ($serial -match '(?m)^MIRROR_CONSOLE_INPUT_LOST(?:\s|$)') { throw "The capture lost console input. See $serialLog." }
     Assert-MirrorCaptureSmp -Serial $serial -RequestedCpus $CpuCount
     if ((Get-FileHash -LiteralPath $testDisk -Algorithm SHA256).Hash -ne $testDiskHash) {
         throw 'The read-only block fixture was modified during the capture.'
@@ -511,9 +628,11 @@ function Complete-MirrorCapture {
 }
 
 # Captures use run.ps1's default smoke CPU, so the shell, apps and console run
-# with SMEP and SMAP on (0016-D6).
+# with SMEP and SMAP on (0016-D6). q35 keeps its default vmport, so captures
+# point through the vmmouse; -RelativePointer turns it off (0017-D18).
+$machine = if ($RelativePointer) { 'q35,accel=tcg,vmport=off' } else { 'q35,accel=tcg' }
 $qemuArguments = @(
-    '-machine', 'q35,accel=tcg', '-cpu', 'qemu64,+smep,+smap', '-m', '256', '-smp', "$CpuCount",
+    '-machine', $machine, '-cpu', 'qemu64,+smep,+smap', '-m', '256', '-smp', "$CpuCount",
     '-display', 'none', '-vga', 'std', '-monitor', 'none', '-qmp', 'stdio',
     '-nic', 'none', '-no-reboot', '-no-shutdown',
     '-drive', "if=pflash,unit=0,format=raw,readonly=on,file=$(ConvertTo-QemuOptionValue $codePath)",
@@ -573,11 +692,14 @@ try {
     $greeting = Read-MirrorQmp $process
     if (-not $greeting.PSObject.Properties['QMP']) { throw 'Missing QMP greeting.' }
     Invoke-MirrorQmp $process 'qmp_capabilities'
+    Assert-MirrorAbsoluteRejected $process
     Wait-MirrorKernelFlavor $process
+    $framebufferSize = Wait-MirrorPointerMode $process
+    $pointerMode = if ($RelativePointer) { 'relative' } else { 'absolute' }
     if ($Hygiene) {
         Invoke-MirrorHygieneProbe $process
         Complete-MirrorCapture $process
-        Write-Host "Default kernel hygiene probe passed: decoy fixture probed, no user content or per-input markers on serial (cpus=$CpuCount). Images: $buildDirectory"
+        Write-Host "Default kernel hygiene probe passed: decoy fixture probed, no user content or per-input markers on serial (pointer=$pointerMode, cpus=$CpuCount). Images: $buildDirectory"
         return
     }
     if (-not $AgentDemo) {
@@ -590,20 +712,21 @@ try {
     $desktopHeight = [int]$desktopReady.Groups[2].Value
     $desktopStartX = [int][Math]::Floor($desktopWidth / 2)
     $desktopStartY = [int][Math]::Floor($desktopHeight / 2)
+    $desktop = Get-MirrorDesktopRectangle $desktopWidth $desktopHeight
     Save-MirrorScreenshot $process $desktopScreenshot
     Wait-MirrorDesktopMessage $process '(?m)^MIRROR_AGENT_READY(?:\s|$)'
     $offset = (Read-MirrorSerial).Length
-    Send-MirrorPointerMotion $process (-2 * $desktopWidth) (-2 * $desktopHeight)
+    Move-MirrorDesktopPointer $process $desktop 0 0 (-2 * $desktopWidth) (-2 * $desktopHeight)
     Wait-MirrorDesktopPointer $process 0 0 0 $offset
     Save-MirrorScreenshot $process $desktopAwayScreenshot
     if ((Get-FileHash -LiteralPath $desktopScreenshot).Hash -eq (Get-FileHash -LiteralPath $desktopAwayScreenshot).Hash) {
         throw 'Userspace cursor movement did not change the display.'
     }
     $offset = (Read-MirrorSerial).Length
-    Send-MirrorPointerMotion $process (2 * $desktopWidth) (2 * $desktopHeight)
+    Move-MirrorDesktopPointer $process $desktop ($desktopWidth - 1) ($desktopHeight - 1) (2 * $desktopWidth) (2 * $desktopHeight)
     Wait-MirrorDesktopPointer $process ($desktopWidth - 1) ($desktopHeight - 1) 0 $offset
     $offset = (Read-MirrorSerial).Length
-    Send-MirrorPointerMotion $process ($desktopStartX - $desktopWidth + 1) ($desktopStartY - $desktopHeight + 1)
+    Move-MirrorDesktopPointer $process $desktop $desktopStartX $desktopStartY ($desktopStartX - $desktopWidth + 1) ($desktopStartY - $desktopHeight + 1)
     Wait-MirrorDesktopPointer $process $desktopStartX $desktopStartY 0 $offset
     Save-MirrorScreenshot $process $desktopRestoredScreenshot
     if ((Get-FileHash -LiteralPath $desktopScreenshot).Hash -ne (Get-FileHash -LiteralPath $desktopRestoredScreenshot).Hash) {
@@ -618,7 +741,7 @@ try {
     $desktopClickX = $windowX + 28 + 12 + 2 * 12 + 1
     $desktopClickY = $windowY + 104 + 22
     $offset = (Read-MirrorSerial).Length
-    Send-MirrorPointerMotion $process ($desktopClickX - $desktopStartX) ($desktopClickY - $desktopStartY)
+    Move-MirrorDesktopPointer $process $desktop $desktopClickX $desktopClickY ($desktopClickX - $desktopStartX) ($desktopClickY - $desktopStartY)
     Wait-MirrorDesktopPointer $process $desktopClickX $desktopClickY 0 $offset
     $offset = (Read-MirrorSerial).Length
     Send-MirrorPointerButton $process 'left' $true
@@ -629,7 +752,7 @@ try {
     Send-MirrorKey $process 'x'
     $applyX = $windowX + $windowWidth - 88
     $offset = (Read-MirrorSerial).Length
-    Send-MirrorPointerMotion $process ($applyX - $desktopClickX) 0
+    Move-MirrorDesktopPointer $process $desktop $applyX $desktopClickY ($applyX - $desktopClickX) 0
     Wait-MirrorDesktopPointer $process $applyX $desktopClickY 0 $offset
     $offset = (Read-MirrorSerial).Length
     Send-MirrorPointerButton $process 'left' $true
@@ -639,7 +762,7 @@ try {
     Wait-MirrorDesktopPointer $process $applyX $desktopClickY 0 $offset
     # Compare edited pixels with identical cursor placement in both frames.
     $offset = (Read-MirrorSerial).Length
-    Send-MirrorPointerMotion $process ($desktopStartX - $applyX) ($desktopStartY - $desktopClickY)
+    Move-MirrorDesktopPointer $process $desktop $desktopStartX $desktopStartY ($desktopStartX - $applyX) ($desktopStartY - $desktopClickY)
     Wait-MirrorDesktopPointer $process $desktopStartX $desktopStartY 0 $offset
     Save-MirrorScreenshot $process $desktopInputScreenshot
     if ((Get-FileHash -LiteralPath $desktopScreenshot).Hash -eq (Get-FileHash -LiteralPath $desktopInputScreenshot).Hash) {
@@ -654,7 +777,7 @@ try {
     $agentX = $desktopWidth - 102
     $agentY = $desktopHeight - 29
     $offset = (Read-MirrorSerial).Length
-    Send-MirrorPointerMotion $process ($agentX - $desktopStartX) ($agentY - $desktopStartY)
+    Move-MirrorDesktopPointer $process $desktop $agentX $agentY ($agentX - $desktopStartX) ($agentY - $desktopStartY)
     Wait-MirrorDesktopPointer $process $agentX $agentY 0 $offset
     $offset = (Read-MirrorSerial).Length
     Send-MirrorPointerButton $process 'left' $true
@@ -739,18 +862,22 @@ try {
     $startY = [int]$pointerReady.Groups[2].Value
     $width = [int]$pointerReady.Groups[3].Value
     $height = [int]$pointerReady.Groups[4].Value
+    # The console pointer spans the framebuffer, as absolute positions do.
+    if ($width -ne $framebufferSize.Width -or $height -ne $framebufferSize.Height) {
+        throw "The console pointer spans ${width}x$height, not the $($framebufferSize.Width)x$($framebufferSize.Height) framebuffer."
+    }
     $offset = (Read-MirrorSerial).Length
-    Send-MirrorPointerMotion $process (-2 * $width) (-2 * $height)
+    Move-MirrorPointer $process 0 0 (-2 * $width) (-2 * $height)
     Wait-MirrorPointer $process 0 0 0 $offset
     Save-MirrorScreenshot $process $cursorAwayScreenshot
     if ((Get-FileHash -LiteralPath $consoleScreenshot).Hash -eq (Get-FileHash -LiteralPath $cursorAwayScreenshot).Hash) {
         throw 'Cursor motion did not change the framebuffer.'
     }
     $offset = (Read-MirrorSerial).Length
-    Send-MirrorPointerMotion $process (2 * $width) (2 * $height)
+    Move-MirrorPointer $process ($width - 1) ($height - 1) (2 * $width) (2 * $height)
     Wait-MirrorPointer $process ($width - 1) ($height - 1) 0 $offset
     $offset = (Read-MirrorSerial).Length
-    Send-MirrorPointerMotion $process ($startX - $width + 1) ($startY - $height + 1)
+    Move-MirrorPointer $process $startX $startY ($startX - $width + 1) ($startY - $height + 1)
     Wait-MirrorPointer $process $startX $startY 0 $offset
     Save-MirrorScreenshot $process $cursorRestoredScreenshot
     if ((Get-FileHash -LiteralPath $consoleScreenshot).Hash -ne (Get-FileHash -LiteralPath $cursorRestoredScreenshot).Hash) {
@@ -769,7 +896,7 @@ try {
     $clickY = $margin + [Math]::Max(0, $height - 2 * $margin - $footer) + 3 * $scale
     if ($clickX -ge $width -or $clickY -ge $height) { throw 'Display is too small for the pointer editing probe.' }
     $offset = (Read-MirrorSerial).Length
-    Send-MirrorPointerMotion $process ($clickX - $startX) ($clickY - $startY)
+    Move-MirrorPointer $process $clickX $clickY ($clickX - $startX) ($clickY - $startY)
     Wait-MirrorPointer $process $clickX $clickY 0 $offset
     $offset = (Read-MirrorSerial).Length
     Send-MirrorPointerButton $process 'left' $true
@@ -800,7 +927,7 @@ try {
         throw 'Device catalog pagination did not change the visible fallback console.'
     }
     Complete-MirrorCapture $process
-    Write-Host "Native desktop and fallback console captures passed (agent-demo=$AgentDemo, cpus=$CpuCount). Images: $buildDirectory"
+    Write-Host "Native desktop and fallback console captures passed (agent-demo=$AgentDemo, pointer=$pointerMode, cpus=$CpuCount). Images: $buildDirectory"
 }
 finally {
     if ($started) {

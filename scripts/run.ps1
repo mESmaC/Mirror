@@ -16,13 +16,14 @@ param(
     [switch]$XhciPair,
     [switch]$XhciFullSpeed,
     [switch]$NoKeyboard,
+    [switch]$NoVmport,
     [switch]$NoHpet,
     [switch]$ExtendedCpu,
     [switch]$BaselineCpu,
     [switch]$LegacyPic,
     [switch]$PitTimer,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
-    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation', 'Ps2BatTimeout', 'Ps2StaleScancode')][string]$Fault = 'None',
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation', 'Ps2BatTimeout', 'Ps2StaleScancode', 'VmmouseError')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -248,8 +249,11 @@ if ($Fault -eq 'TimerCalibration' -and ($LegacyPic -or $PitTimer)) {
 if ($Fault -eq 'ClockActivation' -and $NoHpet) {
     throw 'Clock activation fault injection requires HPET hardware.'
 }
-if ($Fault -in @('Ps2BatTimeout', 'Ps2StaleScancode') -and $NoKeyboard) {
+if ($Fault -in @('Ps2BatTimeout', 'Ps2StaleScancode', 'VmmouseError') -and $NoKeyboard) {
     throw "-Fault $Fault requires the i8042 controller, which -NoKeyboard removes."
+}
+if ($Fault -eq 'VmmouseError' -and $NoVmport) {
+    throw '-Fault VmmouseError requires the vmmouse, which -NoVmport removes.'
 }
 # The default CPU model reports SMEP and SMAP, -ExtendedCpu's max model also
 # reports UMIP, and -BaselineCpu's plain qemu64 reports none of them (0016-D6).
@@ -328,6 +332,7 @@ $testMode = switch ($Fault) {
     'ClockActivation' { 'clock-activation' }
     'Ps2BatTimeout' { 'ps2-bat-timeout' }
     'Ps2StaleScancode' { 'ps2-stale-scancode' }
+    'VmmouseError' { 'vmmouse-error' }
     default { $null }
 }
 $kernelArguments = @()
@@ -351,7 +356,10 @@ $stderrLog = Join-Path $buildDirectory 'qemu.stderr.log'
 # build profile, and -ExtendedCpu selects max.
 $cpuModel = if ($ExtendedCpu) { 'max' } elseif ($BaselineCpu) { 'qemu64' } else { 'qemu64,+smep,+smap' }
 $machine = 'q35,accel=tcg'
+# q35 keeps its default vmport, and with it the vmmouse, unless -NoVmport
+# (spec 0017c, D18). -NoKeyboard turns it off with the i8042.
 if ($NoKeyboard) { $machine += ',i8042=off,vmport=off' }
+elseif ($NoVmport) { $machine += ',vmport=off' }
 if ($NoHpet) { $machine += ',hpet=off' }
 $qemuArguments = @(
     '-machine', $machine,
@@ -528,7 +536,7 @@ try {
     $markers += @('MIRROR_SURFACE_TESTS_OK', 'MIRROR_USER_SURFACE_CLEANUP_OK')
     $markers += @('MIRROR_CONTIGUOUS_TESTS_OK', 'MIRROR_DMA_TESTS_OK', 'MIRROR_BLOCK_TESTS_OK')
     $markers += @('MIRROR_KEYBOARD_TESTS_OK', 'MIRROR_CONSOLE_TESTS_OK')
-    $markers += @('MIRROR_PS2_TESTS_OK', 'MIRROR_MOUSE_TESTS_OK', 'MIRROR_POINTER_TESTS_OK')
+    $markers += @('MIRROR_PS2_TESTS_OK', 'MIRROR_MOUSE_TESTS_OK', 'MIRROR_POINTER_TESTS_OK', 'MIRROR_VMMOUSE_TESTS_OK')
     $markers += @('MIRROR_INPUT_TESTS_OK', 'MIRROR_SERVICE_POLICY_TESTS_OK')
     $markers += @('MIRROR_USER_VM_PAGING_OK', 'MIRROR_VM_TESTS_OK', 'MIRROR_USER_VM_OK', 'MIRROR_VM_CLEANUP_OK')
     $markers += @('MIRROR_FPU_READY', 'MIRROR_FPU_TESTS_OK', 'MIRROR_USER_FPU_OK')
@@ -785,6 +793,28 @@ try {
         if ($serial -match '(?m)^MIRROR_(?:KEYBOARD|MOUSE)_SKIPPED(?:\s|$)') {
             throw "Mirror skipped a PS/2 device. See $serialLog."
         }
+    }
+    # vmmouse absolute pointing (spec 0017c): exactly one result, after the
+    # mouse's. q35's default vmport gives READY; without a mouse or a backdoor
+    # the mouse stays relative and says why. Only VmmouseError falls back.
+    $vmmouseExpected = if ($NoKeyboard -or $Fault -eq 'Ps2BatTimeout') { 'MIRROR_VMMOUSE_SKIPPED reason=no_mouse' }
+    elseif ($NoVmport) { 'MIRROR_VMMOUSE_SKIPPED reason=no_backdoor' }
+    else { 'MIRROR_VMMOUSE_READY mode=absolute' }
+    $vmmouseResults = [regex]::Matches($serial, '(?m)^MIRROR_VMMOUSE_(?:READY|SKIPPED)(?:[ \t][^\r\n]*)?\r?$')
+    $mouseResult = [regex]::Match($serial, '(?m)^MIRROR_MOUSE_(?:READY|SKIPPED)(?:\s|$)')
+    if ($vmmouseResults.Count -ne 1 -or $vmmouseResults[0].Value.TrimEnd("`r") -cne $vmmouseExpected -or
+        -not $mouseResult.Success -or $vmmouseResults[0].Index -le $mouseResult.Index) {
+        throw "Mirror must report '$vmmouseExpected' once, after the PS/2 mouse result. See $serialLog."
+    }
+    $vmmouseFallbacks = [regex]::Matches($serial, '(?m)^MIRROR_VMMOUSE_FALLBACK(?:\s|$)')
+    if ($Fault -eq 'VmmouseError') {
+        $statusFallback = [regex]::Matches($serial, '(?m)^MIRROR_VMMOUSE_FALLBACK reason=status\r?$')
+        if ($statusFallback.Count -ne 1 -or $vmmouseFallbacks.Count -ne 1 -or $statusFallback[0].Index -le $vmmouseResults[0].Index) {
+            throw "The vmmouse-error fault must fall back once, with reason=status, after MIRROR_VMMOUSE_READY. See $serialLog."
+        }
+    }
+    elseif ($vmmouseFallbacks.Count -ne 0) {
+        throw "Mirror unexpectedly fell back from the vmmouse. See $serialLog."
     }
     if ($serial -match '(?m)^MIRROR_BLOCK_FAILED(?:\s|$)') {
         throw "Mirror block driver failed. See $serialLog."

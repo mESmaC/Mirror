@@ -23,7 +23,7 @@ function Move-MirrorShellPointer {
     }
     if ($Pointer.X -eq $X -and $Pointer.Y -eq $Y) { return }
     $offset = (Read-MirrorSerial).Length
-    Send-MirrorPointerMotion $Process ($X - $Pointer.X) ($Y - $Pointer.Y)
+    Move-MirrorDesktopPointer $Process $Pointer.Desktop $X $Y ($X - $Pointer.X) ($Y - $Pointer.Y)
     Wait-MirrorShellMessage $Process "pointer $X $Y $($Pointer.Buttons)" $offset
     $Pointer.X = $X
     $Pointer.Y = $Y
@@ -128,6 +128,7 @@ function Invoke-MirrorShellCapture {
         Width = $width
         Height = $height
         Buttons = 0
+        Desktop = Get-MirrorDesktopRectangle $width $height
     }
     Save-MirrorScreenshot $Process $desktopScreenshot
     Move-MirrorShellPointer $Process $pointer 0 0
