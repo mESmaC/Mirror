@@ -51,6 +51,7 @@ Run commands from the repository root in PowerShell.
   - A script change: the cases that execute the changed lines.
   - Docs only: nothing to run.
 - When the spec is complete, run the full `test.ps1` before Cameron merges the branch, plus `test.ps1 -AgentDemo` if you touched agent-demo code.
+- `tools\perf-probe` is a deferred, host-only WIP for spec 0018, not integrated into `test.ps1`. Check it separately with the tools-workspace fmt, clippy and host-test commands above, using `--manifest-path tools\perf-probe\Cargo.toml`. It has 27 synthetic host tests; no VMware or other-OS measurements validate it yet. Other-OS downloads and benchmarking remain deferred until Cameron requests them.
 
 ## Coding conventions
 - Every `unsafe` block has a `// SAFETY:` comment that says why its preconditions hold, and every `unsafe fn` documents its caller contract, normally under `# Safety`. Clippy enforces the comments in every crate: the root `Cargo.toml` denies `unsafe_op_in_unsafe_fn` and `clippy::undocumented_unsafe_blocks` in `[workspace.lints]`, and every member inherits that table; each `tools\` workspace repeats it. Never `allow` or `expect` either lint. The protocol crates, `mirror-acpi`, `mirror-ui-tokens`, `mirror-ext2-layout` and `tools\mirror-image` forbid `unsafe` with `#![forbid(unsafe_code)]`.
