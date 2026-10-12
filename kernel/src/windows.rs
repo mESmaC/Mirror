@@ -118,7 +118,6 @@ pub struct Application {
     events: [[u8; EVENT_SIZE]; QUEUE_SIZE],
     head: usize,
     length: usize,
-    focused: bool,
 }
 
 impl Application {
@@ -154,7 +153,6 @@ impl Application {
             events: [[0; EVENT_SIZE]; QUEUE_SIZE],
             head: 0,
             length: 0,
-            focused: false,
         };
         application.push(reset_event());
         Ok(application)
@@ -272,19 +270,16 @@ impl Application {
         Ok(())
     }
 
+    /// Queue one routed record, or push back with -11 while the queue is full.
+    /// Nothing queued is ever dropped here: the shell keeps a refused record
+    /// and applies the only loss policy, in which a pointer Reset takes no
+    /// capacity (spec 0017a-D3).
     pub fn enqueue(&mut self, event: [u8; EVENT_SIZE]) -> Result<(), i64> {
         if self.state != 1 {
             return Err(-32);
         }
-        if word(&event, 4) == 4 {
-            self.focused = word(&event, 8) != 0;
-        }
         if self.length == QUEUE_SIZE {
-            self.events.fill([0; EVENT_SIZE]);
-            self.head = 0;
-            self.length = 0;
-            self.push(reset_event());
-            self.push(protocol::Event::Focus(self.focused).encode().unwrap());
+            return Err(-11);
         }
         self.push(event);
         Ok(())
@@ -446,27 +441,45 @@ pub fn self_test(frames: &mut FrameAllocator<'_>, direct_map: u64) {
     while application.peek().is_some() {
         application.consume();
     }
-    application
-        .enqueue(protocol::Event::Focus(true).encode().unwrap())
-        .unwrap();
-    let key = protocol::Event::Key {
-        flags: 1,
-        kind: 1,
-        ascii: b'x',
+    let key = |ascii| {
+        protocol::Event::Key {
+            flags: 1,
+            kind: 1,
+            ascii,
+        }
+        .encode()
+        .unwrap()
+    };
+    // A full queue pushes back and keeps every record, Resets included, so a
+    // pointer Reset can never clear the keys queued before it (0017a-D3).
+    for index in 0..QUEUE_SIZE as u8 {
+        let event = if index % 2 == 0 {
+            reset_event()
+        } else {
+            key(b'a' + index / 2)
+        };
+        application.enqueue(event).unwrap();
     }
-    .encode()
-    .unwrap();
-    for _ in 0..QUEUE_SIZE {
-        application.enqueue(key).unwrap();
+    assert_eq!(application.enqueue(reset_event()), Err(-11));
+    assert_eq!(application.enqueue(key(b'z')), Err(-11));
+    for index in 0..QUEUE_SIZE as u8 {
+        let expected = if index % 2 == 0 {
+            reset_event()
+        } else {
+            key(b'a' + index / 2)
+        };
+        assert_eq!(
+            application.peek(),
+            Some(expected),
+            "full queue lost a record"
+        );
+        application.consume();
+        if index == 0 {
+            application.enqueue(key(b'z')).unwrap();
+        }
     }
-    assert_eq!(application.peek(), Some(reset_event()));
-    application.consume();
-    assert_eq!(
-        application.peek(),
-        Some(protocol::Event::Focus(true).encode().unwrap())
-    );
-    application.consume();
-    assert_eq!(application.peek(), Some(key));
+    assert_eq!(application.peek(), Some(key(b'z')));
+    let key = key(b'x');
     let mut invalid = key;
     invalid[16] = 1;
     assert_eq!(validate_event(&invalid, true), Err(-22));
