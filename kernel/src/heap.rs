@@ -55,9 +55,12 @@ pub struct HeapStats {
 struct KernelAllocator {
     locked: AtomicBool,
     heap: UnsafeCell<Heap>,
-    /// The largest failed allocation awaiting growth: (key, packed layout),
-    /// guarded by this allocator's lock. The key is size + align - 1 (0059-D1).
-    shortfall: UnsafeCell<(u64, u64)>,
+    /// The largest failed allocation awaiting growth: (key, packed layout,
+    /// admission), guarded by this allocator's lock. The key is size +
+    /// align - 1; the admission is the capacity still to add at record time
+    /// (0059-D1). The heap never shrinks, so that bound stays valid across
+    /// calls and recoverable interruptions.
+    shortfall: UnsafeCell<(u64, u64, u64)>,
     /// The slab layer's live pages (0059-D2), guarded by the same lock.
     slabs: UnsafeCell<SlabState>,
 }
@@ -73,7 +76,7 @@ impl KernelAllocator {
         Self {
             locked: AtomicBool::new(false),
             heap: UnsafeCell::new(Heap::empty()),
-            shortfall: UnsafeCell::new((0, 0)),
+            shortfall: UnsafeCell::new((0, 0, 0)),
             slabs: UnsafeCell::new(SlabState {
                 pages: [0; SLAB_PAGE_LIMIT],
             }),
@@ -97,15 +100,18 @@ impl KernelAllocator {
     }
 
     /// Record a missed layout for the next safe point (0059-D1), keeping the
-    /// largest pending one by its size + align - 1 key. The caller holds the
-    /// heap lock.
+    /// largest pending one by its size + align - 1 key. Feasibility is stamped
+    /// at record time: the heap never shrinks, so the capacity still to add
+    /// now is the loosest the bound gets, and `ensure` honors it across calls
+    /// and recoverable interruptions. The caller holds the heap lock.
     fn note_shortfall_locked(&self, layout: Layout) {
         let key = layout_key(layout);
         let shortfall = self.shortfall.get();
-        // SAFETY: the caller holds the heap lock, so the cell is owned.
+        // SAFETY: the caller holds the heap lock, so both cells are owned.
         unsafe {
             if key > (*shortfall).0 {
-                *shortfall = (key, pack_layout(layout));
+                let admission = (HEAP_MAX_SIZE - (*self.heap.get()).size()) as u64;
+                *shortfall = (key, pack_layout(layout), admission);
             }
         }
     }
@@ -526,8 +532,8 @@ fn block_fits(heap: &mut Heap, size: usize, align: usize) -> bool {
     }
 }
 
-/// Read the pending shortfall under the lock: (key, packed layout).
-fn pending_shortfall() -> (u64, u64) {
+/// Read the pending shortfall under the lock: (key, packed layout, admission).
+fn pending_shortfall() -> (u64, u64, u64) {
     let _heap = ALLOCATOR.lock();
     // SAFETY: the heap lock is held above, so the cell is exclusively owned.
     unsafe { *ALLOCATOR.shortfall.get() }
@@ -539,7 +545,7 @@ fn pending_shortfall() -> (u64, u64) {
 fn clear_shortfall() {
     let _heap = ALLOCATOR.lock();
     // SAFETY: the heap lock is held above.
-    unsafe { *ALLOCATOR.shortfall.get() = (0, 0) };
+    unsafe { *ALLOCATOR.shortfall.get() = (0, 0, 0) };
 }
 
 // ---- Boot-smoke test hooks (0059's tests 2 and 5) ----
@@ -631,12 +637,6 @@ pub fn ensure(tables: &PageTables, frames: &mut FrameAllocator<'_>, offset: u64)
     }
 
     let mut outcome = Ensure::Unchanged;
-    // A shortfall's feasibility is admitted once per call, against the
-    // capacity still to add at entry: steps committed by this call count
-    // toward satisfying the request, so the bound must not shrink mid-loop
-    // (otherwise a feasible request over half the remaining cap is dropped
-    // after a few steps and can never be served).
-    let admission = (HEAP_MAX_SIZE - stats().size) as u64;
     loop {
         let before = stats();
         let mut needed = false;
@@ -646,23 +646,25 @@ pub fn ensure(tables: &PageTables, frames: &mut FrameAllocator<'_>, offset: u64)
                 needed = true;
             }
             // SAFETY: the heap lock is held above, so the cell is owned.
-            let (key, packed) = unsafe { *ALLOCATOR.shortfall.get() };
+            let (key, packed, admission) = unsafe { *ALLOCATOR.shortfall.get() };
             if key != 0 {
                 if key <= FAILED_SHORTFALL.load(Ordering::Relaxed) {
                     // A repeated shortfall no larger than the failed one does
                     // not re-arm; drop it.
                     // SAFETY: the heap lock is held above.
-                    unsafe { *ALLOCATOR.shortfall.get() = (0, 0) };
+                    unsafe { *ALLOCATOR.shortfall.get() = (0, 0, 0) };
                 } else if key > admission {
-                    // Infeasible below the cap: dropped silently, stay armed.
+                    // Infeasible under its record-time bound: dropped silently,
+                    // stay armed. Steps committed before an interruption keep
+                    // the admission, so this never tightens mid-request.
                     // SAFETY: the heap lock is held above.
-                    unsafe { *ALLOCATOR.shortfall.get() = (0, 0) };
+                    unsafe { *ALLOCATOR.shortfall.get() = (0, 0, 0) };
                 } else {
                     match unpack_layout(packed) {
                         Some(layout) if block_fits(&mut heap, layout.size(), layout.align()) => {
                             // Satisfied by the current free space: no growth.
                             // SAFETY: the heap lock is held above.
-                            unsafe { *ALLOCATOR.shortfall.get() = (0, 0) };
+                            unsafe { *ALLOCATOR.shortfall.get() = (0, 0, 0) };
                         }
                         _ => needed = true,
                     }
@@ -744,7 +746,7 @@ pub fn ensure(tables: &PageTables, frames: &mut FrameAllocator<'_>, offset: u64)
                         Ensure::Deferred
                     };
                 }
-                let (key, _) = pending_shortfall();
+                let (key, _, _) = pending_shortfall();
                 if key != 0 {
                     FAILED_SHORTFALL.fetch_max(key, Ordering::Relaxed);
                 }
@@ -1190,8 +1192,11 @@ pub unsafe fn capacity_self_test(
     unsafe { ALLOCATOR.dealloc(block, request) };
 
     // 0059 test 2, part 2: a feasible request larger than half the cap misses,
-    // is admitted once, and ensure commits as many steps as it needs — the
-    // admission must not shrink with the remaining capacity mid-loop.
+    // is admitted once at record time, and keeps that admission across a
+    // recoverable interruption. Two direct steps commit partial growth (with
+    // the same record ensure would print, so the script's ordered walk still
+    // accounts for every committed step); the resumed ensure must not
+    // re-derive a tighter bound from the grown size, and commits the rest.
     let big =
         Layout::from_size_align(9 * 1024 * 1024 + PAGE_SIZE as usize, PAGE_SIZE as usize).unwrap();
     let before_big = stats().size;
@@ -1199,8 +1204,22 @@ pub unsafe fn capacity_self_test(
     // SAFETY: a valid bounded layout over half the 16 MiB cap.
     let block = unsafe { ALLOCATOR.alloc(big) };
     assert!(block.is_null(), "the big request must miss first");
+    for _ in 0..2 {
+        // SAFETY: the next uncommitted tail is owned and absent, and every
+        // batch completes its shootdowns before permanent capacity is exposed.
+        let grown =
+            unsafe { grow(tables, frames, offset, MAX_GROW_PAGES) }.expect("partial growth");
+        crate::serial::println!(
+            "MIRROR_HEAP_GROWN phase=auto size={} used={} free={} max={} added_pages={}",
+            grown.size,
+            grown.used,
+            grown.free,
+            HEAP_MAX_SIZE,
+            MAX_GROW_PAGES
+        );
+    }
     assert_eq!(ensure(tables, frames, offset), Ensure::Grew);
-    // SAFETY: admitted at entry, so enough steps were committed to serve it.
+    // SAFETY: the record-time admission survived the interruption.
     let block = unsafe { ALLOCATOR.alloc(big) };
     assert!(!block.is_null(), "a feasible big request must be served");
     let step = MAX_GROW_PAGES * PAGE_SIZE as usize;
