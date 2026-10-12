@@ -8,7 +8,7 @@ use crate::{
     paging::{PagingError, UserAddressSpace, UserPermissions},
 };
 
-use mirror_vm_protocol::{ARENA_END, ARENA_START, COMMITTED_LIMIT, MAX_REGIONS, RESERVED_LIMIT};
+use mirror_vm_protocol::{ARENA_END, ARENA_START, MAX_REGIONS, RESERVED_LIMIT};
 const RESIDENT_BITMAP_WORDS: usize = (RESERVED_LIMIT / PAGE_SIZE / 64) as usize;
 const USER_END: u64 = 1 << 47;
 const READ: u64 = 1;
@@ -144,12 +144,18 @@ pub struct Stats {
     pub reserved_bytes: u64,
     pub committed_bytes: u64,
     pub regions: u64,
+    /// 0054-D2: the limits this process's class set at creation.
+    pub reserved_limit: u64,
+    pub committed_limit: u64,
 }
 
 pub struct Vm {
     regions: Regions,
     reserved: u64,
     committed: u64,
+    /// 0054-D2: this process's limits, set from its memory class at creation.
+    reserved_limit: u64,
+    committed_limit: u64,
     // Deterministic physical-allocation failure exercises the same rollback
     // path without temporarily exhausting the machine's entire frame pool.
     #[cfg(feature = "boot-smoke")]
@@ -157,11 +163,13 @@ pub struct Vm {
 }
 
 impl Vm {
-    pub const fn new() -> Self {
+    pub const fn new(reserved_limit: u64, committed_limit: u64) -> Self {
         Self {
             regions: Regions::new(),
             reserved: 0,
             committed: 0,
+            reserved_limit,
+            committed_limit,
             #[cfg(feature = "boot-smoke")]
             allocation_budget: None,
         }
@@ -172,6 +180,8 @@ impl Vm {
             reserved_bytes: self.reserved,
             committed_bytes: self.committed,
             regions: self.regions.count as u64,
+            reserved_limit: self.reserved_limit,
+            committed_limit: self.committed_limit,
         }
     }
 
@@ -188,7 +198,7 @@ impl Vm {
             return Err(EINVAL);
         }
         let reserved = self.reserved.checked_add(length).ok_or(ENOMEM)?;
-        if reserved > RESERVED_LIMIT {
+        if reserved > self.reserved_limit {
             return Err(ENOMEM);
         }
         let start = if hint == 0 {
@@ -408,7 +418,7 @@ impl Vm {
                 count += 1;
             }
         }
-        if self.committed + count * PAGE_SIZE > COMMITTED_LIMIT {
+        if self.committed + count * PAGE_SIZE > self.committed_limit {
             return Err(ENOMEM);
         }
         for (index, page) in (first..end).step_by(PAGE_SIZE as usize).enumerate() {
@@ -537,7 +547,8 @@ fn paging_error(error: PagingError) -> i64 {
 
 #[cfg(feature = "boot-smoke")]
 fn ledger_self_test() {
-    let mut vm = Vm::new();
+    use mirror_vm_protocol::COMMITTED_LIMIT;
+    let mut vm = Vm::new(RESERVED_LIMIT, COMMITTED_LIMIT);
     let base = vm.reserve(0, 3 * PAGE_SIZE, READ_WRITE).unwrap();
     assert_eq!(base, ARENA_START);
     assert_eq!(vm.stats().committed_bytes, 0);
@@ -589,14 +600,14 @@ fn ledger_self_test() {
     assert!(!vm.permits_fault(base - 1, 4));
     assert!(!vm.permits_fault(base + 3 * PAGE_SIZE, 4));
 
-    let mut quota = Vm::new();
+    let mut quota = Vm::new(RESERVED_LIMIT, COMMITTED_LIMIT);
     quota.reserve(0, RESERVED_LIMIT, READ).unwrap();
     let original = quota.stats();
     assert_eq!(quota.reserve(0, PAGE_SIZE, READ), Err(ENOMEM));
     assert_eq!(quota.stats(), original);
     assert_eq!(quota.reserve(0, ARENA_END, READ), Err(EINVAL));
 
-    let mut full = Vm::new();
+    let mut full = Vm::new(RESERVED_LIMIT, COMMITTED_LIMIT);
     for index in 0..MAX_REGIONS {
         full.reserve(
             base + index as u64 * 4 * PAGE_SIZE,
@@ -634,6 +645,7 @@ pub fn self_test(
     frames: &mut FrameAllocator<'_>,
     direct_map: u64,
 ) {
+    use mirror_vm_protocol::COMMITTED_LIMIT;
     ledger_self_test();
     let baseline = frames.stats().unwrap().allocated_frames;
     // SAFETY: run_init invokes this with the kernel root active, IF=0, and no
@@ -641,7 +653,7 @@ pub fn self_test(
     // use the same unique allocator and borrow the live kernel HHDM throughout.
     unsafe {
         let mut space = UserAddressSpace::new(kernel, frames).unwrap();
-        let mut vm = Vm::new();
+        let mut vm = Vm::new(RESERVED_LIMIT, COMMITTED_LIMIT);
         let base = vm.reserve(0, 4 * PAGE_SIZE, READ_WRITE).unwrap();
         let unmapped_frames = frames.stats().unwrap().allocated_frames;
         assert_eq!(
@@ -787,7 +799,7 @@ pub fn self_test(
             .unwrap();
 
         let mut sibling = UserAddressSpace::new(kernel, frames).unwrap();
-        let mut sibling_vm = Vm::new();
+        let mut sibling_vm = Vm::new(RESERVED_LIMIT, COMMITTED_LIMIT);
         sibling_vm.reserve(base, 2 * PAGE_SIZE, READ_WRITE).unwrap();
         sibling_vm
             .materialize(
@@ -816,7 +828,7 @@ pub fn self_test(
         // leaves, preserving hidden data and reclaiming their sparse tables.
         let before_sparse = frames.stats().unwrap().allocated_frames;
         let mut sparse_space = UserAddressSpace::new(kernel, frames).unwrap();
-        let mut sparse_vm = Vm::new();
+        let mut sparse_vm = Vm::new(RESERVED_LIMIT, COMMITTED_LIMIT);
         let sparse = sparse_vm.reserve(0, RESERVED_LIMIT, READ_WRITE).unwrap();
         let last = sparse + RESERVED_LIMIT - PAGE_SIZE;
         for (address, value) in [(sparse, 0x41), (last, 0x52)] {
@@ -841,7 +853,10 @@ pub fn self_test(
         sparse_vm
             .release(&mut sparse_space, frames, sparse, RESERVED_LIMIT)
             .unwrap();
-        assert_eq!(sparse_vm.stats(), Vm::new().stats());
+        assert_eq!(
+            sparse_vm.stats(),
+            Vm::new(RESERVED_LIMIT, COMMITTED_LIMIT).stats()
+        );
         assert_eq!(sparse_space.owned_page_count(), 0);
         assert_eq!(sparse_space.owned_table_count(), 1);
         sparse_space.destroy(frames).unwrap();

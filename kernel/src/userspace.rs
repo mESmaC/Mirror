@@ -198,6 +198,33 @@ struct Access {
     windows: bool,
 }
 
+/// A process's memory class (0054-D2, S18): its VM limits are set from this at
+/// creation. Every class keeps today's values until the reserve floor and OOM
+/// order land (0054-D4/D5); the kill ranking is theirs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemoryClass {
+    /// The compositor/shell and system services; may draw the reserve.
+    Protected,
+    /// Ordinary applications.
+    Normal,
+    /// Agent tasks (0022, Phase 2).
+    #[allow(dead_code)] // constructed when 0022's agents arrive
+    Agent,
+    /// Background work; the OomOrder scenario's victim.
+    #[allow(dead_code)] // constructed by 0054-D5's scenario
+    Background,
+    /// Init's probes.
+    #[cfg_attr(not(feature = "boot-smoke"), allow(dead_code))] // init runs in smoke only
+    Test,
+}
+
+impl MemoryClass {
+    /// (reserved, committed) limits in bytes. Today's values for every class.
+    fn limits(self) -> (u64, u64) {
+        (vm_abi::RESERVED_LIMIT, vm_abi::COMMITTED_LIMIT)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MemoryRequest {
     Operation,
@@ -654,8 +681,16 @@ fn table_bounds_self_test(
 
     // Case 1: both tables full.
     for slot in &mut slots {
-        *slot = load_process(kernel, frames, bytes, image, direct_map, 0)
-            .expect("table-bounds process");
+        *slot = load_process(
+            kernel,
+            frames,
+            bytes,
+            image,
+            direct_map,
+            0,
+            MemoryClass::Test,
+        )
+        .expect("table-bounds process");
         // SAFETY: A fresh slot that nothing else references.
         let process = unsafe { sched::process(*slot) };
         for _ in 1..sched::THREAD_SLOTS / sched::PROCESS_SLOTS {
@@ -667,7 +702,15 @@ fn table_bounds_self_test(
         "the tables did not fill"
     );
     let full = allocated(frames);
-    let refused = load_process(kernel, frames, bytes, image, direct_map, 0);
+    let refused = load_process(
+        kernel,
+        frames,
+        bytes,
+        image,
+        direct_map,
+        0,
+        MemoryClass::Test,
+    );
     assert_eq!(
         refused.map_err(|error| error.errno()),
         Err(-11),
@@ -692,7 +735,15 @@ fn table_bounds_self_test(
         sched::has_room(0, sched::THREAD_SLOTS) && !sched::has_room(1, 0),
         "zombies kept thread entries or gave up process slots"
     );
-    let refused = load_process(kernel, frames, bytes, image, direct_map, 0);
+    let refused = load_process(
+        kernel,
+        frames,
+        bytes,
+        image,
+        direct_map,
+        0,
+        MemoryClass::Test,
+    );
     assert_eq!(
         refused.map_err(|error| error.errno()),
         Err(-11),
@@ -712,8 +763,16 @@ fn table_bounds_self_test(
     // Case 2: only the thread table full.
     let count = sched::THREAD_SLOTS / thread_abi::MAX_THREADS;
     for slot in &mut slots[..count] {
-        *slot = load_process(kernel, frames, bytes, image, direct_map, 0)
-            .expect("table-bounds process");
+        *slot = load_process(
+            kernel,
+            frames,
+            bytes,
+            image,
+            direct_map,
+            0,
+            MemoryClass::Test,
+        )
+        .expect("table-bounds process");
         // SAFETY: A fresh slot that nothing else references.
         let process = unsafe { sched::process(*slot) };
         for _ in 1..thread_abi::MAX_THREADS {
@@ -731,7 +790,15 @@ fn table_bounds_self_test(
         "only the thread table should be full"
     );
     let full = allocated(frames);
-    let refused = load_process(kernel, frames, bytes, image, direct_map, 0);
+    let refused = load_process(
+        kernel,
+        frames,
+        bytes,
+        image,
+        direct_map,
+        0,
+        MemoryClass::Test,
+    );
     assert_eq!(
         refused.map_err(|error| error.errno()),
         Err(-11),
@@ -782,8 +849,9 @@ fn create_process(
     image: &elf::Image,
     direct_map: u64,
     argument: u64,
+    class: MemoryClass,
 ) -> Result<usize, CreateError> {
-    let slot = load_process(kernel, frames, bytes, image, direct_map, argument)?;
+    let slot = load_process(kernel, frames, bytes, image, direct_map, argument, class)?;
     // SAFETY: The slot was just filled, and nothing else references it.
     let process = unsafe { sched::process(slot) };
     serial::println!(
@@ -806,6 +874,7 @@ fn load_process(
     image: &elf::Image,
     direct_map: u64,
     argument: u64,
+    class: MemoryClass,
 ) -> Result<usize, CreateError> {
     if !sched::has_room(1, 1) {
         return Err(CreateError::TableFull);
@@ -828,7 +897,7 @@ fn load_process(
     let slot = sched::insert_process(Process {
         pid,
         space,
-        vm: vm::Vm::new(),
+        vm: vm::Vm::new(class.limits().0, class.limits().1),
         direct_map,
         access: Access::default(),
         #[cfg(feature = "boot-smoke")]
@@ -969,9 +1038,25 @@ fn run_pair(
         .expect("surface session");
     let before = frames.stats().expect("recycling required").allocated_frames;
     let heap_before = heap::stats().size;
-    let first = create_process(kernel, frames, bytes, image, direct_map, scenario)
-        .expect("load first native process");
-    let second = match create_process(kernel, frames, bytes, image, direct_map, 1 << 8) {
+    let first = create_process(
+        kernel,
+        frames,
+        bytes,
+        image,
+        direct_map,
+        scenario,
+        MemoryClass::Test,
+    )
+    .expect("load first native process");
+    let second = match create_process(
+        kernel,
+        frames,
+        bytes,
+        image,
+        direct_map,
+        1 << 8,
+        MemoryClass::Test,
+    ) {
         Ok(second) => second,
         Err(error) => {
             // SAFETY: The first process has never run and nothing references
@@ -1674,6 +1759,7 @@ impl ShellRuntime<'_> {
             &self.image,
             self.direct_map,
             kind,
+            MemoryClass::Normal,
         )
         .map_err(|error| error.errno())?;
         // SAFETY: A fresh slot, distinct from the shell's, that nothing else
@@ -2266,6 +2352,7 @@ pub fn run_shell(
         &desktop_image,
         direct_map,
         2 + u64::from(smoke),
+        MemoryClass::Protected,
     )
     .expect("load native shell");
     let runtime = ShellRuntime {
@@ -3620,8 +3707,9 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                         reserved_bytes: stats.reserved_bytes,
                         committed_bytes: stats.committed_bytes,
                         regions: stats.regions,
-                        reserved_limit: vm_abi::RESERVED_LIMIT,
-                        committed_limit: vm_abi::COMMITTED_LIMIT,
+                        // 0054-D2: the process's own class limits.
+                        reserved_limit: stats.reserved_limit,
+                        committed_limit: stats.committed_limit,
                     }
                     .encode();
                     // SAFETY: The suspended process owns the complete checked

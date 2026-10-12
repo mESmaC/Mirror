@@ -14,7 +14,11 @@ pub const PROT_READ_WRITE: u64 = 3;
 pub const ARENA_START: u64 = 0x1_0000_0000;
 pub const ARENA_END: u64 = 0x10_0000_0000;
 pub const MAX_REGIONS: usize = 64;
+/// The reserved-space limit every memory class reports in Phase 1 (0054-D2).
+/// Per-process limits carry this value from creation until the reserve floor
+/// and OOM order land (0054-D4/D5).
 pub const RESERVED_LIMIT: u64 = 256 * 1024 * 1024;
+/// The committed-space limit every memory class reports in Phase 1 (0054-D2).
 pub const COMMITTED_LIMIT: u64 = 32 * 1024 * 1024;
 pub const STATS_SIZE: usize = 48;
 
