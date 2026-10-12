@@ -14,7 +14,7 @@ use core::{
     marker::PhantomData,
     ops::{Deref, DerefMut},
     ptr::NonNull,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
 };
 
 use linked_list_allocator::Heap;
@@ -55,6 +55,9 @@ pub struct HeapStats {
 struct KernelAllocator {
     locked: AtomicBool,
     heap: UnsafeCell<Heap>,
+    /// The largest failed allocation awaiting growth: (key, packed layout),
+    /// guarded by this allocator's lock. The key is size + align - 1 (0059-D1).
+    shortfall: UnsafeCell<(u64, u64)>,
 }
 
 // SAFETY: Every access to the heap is protected by the acquire/release lock.
@@ -68,6 +71,7 @@ impl KernelAllocator {
         Self {
             locked: AtomicBool::new(false),
             heap: UnsafeCell::new(Heap::empty()),
+            shortfall: UnsafeCell::new((0, 0)),
         }
     }
 
@@ -134,9 +138,23 @@ unsafe impl GlobalAlloc for KernelAllocator {
         if layout.size() > HEAP_MAX_SIZE || layout.align() > HEAP_MAX_SIZE {
             return core::ptr::null_mut();
         }
-        self.lock()
-            .allocate_first_fit(layout)
-            .map_or(core::ptr::null_mut(), NonNull::as_ptr)
+        let mut heap = self.lock();
+        match heap.allocate_first_fit(layout) {
+            Ok(pointer) => pointer.as_ptr(),
+            Err(()) => {
+                // 0059-D1: record the miss for the next safe point, keeping the
+                // largest pending layout by its size + align - 1 key.
+                let key = layout_key(layout);
+                let shortfall = self.shortfall.get();
+                // SAFETY: the heap lock is held above, so this cell is owned.
+                unsafe {
+                    if key > (*shortfall).0 {
+                        *shortfall = (key, pack_layout(layout));
+                    }
+                }
+                core::ptr::null_mut()
+            }
+        }
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
@@ -389,6 +407,290 @@ unsafe fn recycle_frames(frames: &mut FrameAllocator<'_>, physical: &[u64]) {
         // SAFETY: This batch owns each frame once, with no surviving mappings
         // except its dormant HHDM alias, references, DMA, or table use.
         unsafe { frames.deallocate(frame) }.expect("recycle uncommitted heap frame");
+    }
+}
+
+// ---- Demand-driven growth at safe points (0059-D1) ----
+//
+// `alloc` never grows: it cannot reach the frame allocator, the kernel tables
+// or the HHDM offset under its lock, and `grow`'s contract (BSP, IF=0, kernel
+// root, exclusive frames, no IRQ-needed lock) is met only at safe points.
+// So a failed allocation records its layout here and the next safe point's
+// `ensure` grows for the mark or the shortfall.
+
+/// The low-water mark: the largest free block the heap guarantees (0059-D1).
+const LOW_WATER: usize = 256 * 1024;
+
+/// Pack a layout as (size << 8) | align_log2. Both are bounded by
+/// HEAP_MAX_SIZE (16 MiB), so the pack fits a u64.
+fn pack_layout(layout: Layout) -> u64 {
+    ((layout.size() as u64) << 8) | layout.align().trailing_zeros() as u64
+}
+
+fn unpack_layout(packed: u64) -> Option<Layout> {
+    let size = (packed >> 8) as usize;
+    let align = 1usize << (packed & 0xff);
+    if size == 0 || size > HEAP_MAX_SIZE || align > HEAP_MAX_SIZE {
+        return None;
+    }
+    Layout::from_size_align(size, align).ok()
+}
+
+/// The feasibility key (0059-D1): size + align - 1.
+fn layout_key(layout: Layout) -> u64 {
+    layout.size() as u64 + layout.align() as u64 - 1
+}
+
+/// The largest shortfall key whose growth already failed; a repeated shortfall
+/// no larger than it never re-arms (0059-D1). Cleared when the frame back-off
+/// re-arms.
+static FAILED_SHORTFALL: AtomicU64 = AtomicU64::new(0);
+
+// Back-off modes (0059-D1's failure policy).
+const BACKOFF_ARMED: u8 = 0;
+/// LimitExceeded, the transport or a bug-class failure: never re-arm.
+const BACKOFF_NEVER: u8 = 1;
+/// OutOfFrames: re-arm only when allocated_frames drops below the failure's.
+const BACKOFF_WAIT_FRAMES: u8 = 2;
+static BACKOFF_MODE: AtomicU8 = AtomicU8::new(BACKOFF_ARMED);
+/// The post-rollback allocated_frames at the last OutOfFrames failure.
+static BACKOFF_FRAMES: AtomicUsize = AtomicUsize::new(0);
+
+/// Test 5's injection (boot-smoke only), read and consumed by ensure: 0 off,
+/// 1 = cancel before commit, N >= 2 = fail after N - 2 frames.
+#[cfg(feature = "boot-smoke")]
+static ENSURE_INJECT: AtomicU64 = AtomicU64::new(0);
+/// Counts each growth attempted under the injection, so a skipped attempt
+/// fails the test.
+#[cfg(feature = "boot-smoke")]
+static ENSURE_INJECTED: AtomicU64 = AtomicU64::new(0);
+
+/// The result of one safe-point ensure call (0059-D1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ensure {
+    /// Nothing needed growth.
+    Unchanged,
+    /// The heap grew at least one step.
+    Grew,
+    /// Growth is still needed but the heap is at HEAP_MAX_SIZE: the caller's
+    /// boot-smoke test prints the one accepted SKIPPED record (0059-D4).
+    AtCap,
+    /// The back-off declined (a real failure earlier, or no transport).
+    Deferred,
+}
+
+/// Whether a free block can serve a layout of `size`/`align`, probed under the
+/// lock (the crate's hole list is private, so this probe is how the mark and a
+/// shortfall's fit are checked, 0059-D1). It allocates and immediately
+/// releases, changing nothing it does not restore.
+fn block_fits(heap: &mut Heap, size: usize, align: usize) -> bool {
+    let Ok(layout) = Layout::from_size_align(size, align) else {
+        return false;
+    };
+    match heap.allocate_first_fit(layout) {
+        Ok(pointer) => {
+            // SAFETY: the probe's own fresh allocation, released at once with
+            // its exact layout; the crate merges the padding holes back.
+            unsafe { heap.deallocate(pointer, layout) };
+            true
+        }
+        Err(()) => false,
+    }
+}
+
+/// Read the pending shortfall under the lock: (key, packed layout).
+fn pending_shortfall() -> (u64, u64) {
+    let _heap = ALLOCATOR.lock();
+    // SAFETY: the heap lock is held above, so the cell is exclusively owned.
+    unsafe { *ALLOCATOR.shortfall.get() }
+}
+
+/// Clear the pending shortfall under the lock (satisfied, infeasible, or a
+/// battery's deliberate failure, whose records the tests clear).
+#[cfg(feature = "boot-smoke")]
+fn clear_shortfall() {
+    let _heap = ALLOCATOR.lock();
+    // SAFETY: the heap lock is held above.
+    unsafe { *ALLOCATOR.shortfall.get() = (0, 0) };
+}
+
+/// Grow the heap on demand at a safe point (0059-D1), while the largest free
+/// block is below the mark or a feasible recorded shortfall still misses.
+///
+/// The caller runs on the BSP with IF=0, the kernel root active, the frame
+/// allocator exclusively borrowed, no IRQ-needed lock held and no syscall
+/// handler frame live — the contract `grow` already requires. Failures print
+/// nothing; test 2's one accepted record is printed by `capacity_self_test`.
+pub fn ensure(tables: &PageTables, frames: &mut FrameAllocator<'_>, offset: u64) -> Ensure {
+    match BACKOFF_MODE.load(Ordering::Relaxed) {
+        BACKOFF_NEVER => return Ensure::Deferred,
+        BACKOFF_WAIT_FRAMES => {
+            let failed = BACKOFF_FRAMES.load(Ordering::Relaxed);
+            let now = frames
+                .stats()
+                .map(|stats| stats.allocated_frames)
+                .unwrap_or(failed);
+            if now >= failed {
+                return Ensure::Deferred;
+            }
+            // Frames were freed below the failure's level: re-arm.
+            BACKOFF_MODE.store(BACKOFF_ARMED, Ordering::Relaxed);
+            FAILED_SHORTFALL.store(0, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    // The transport preflight runs before any frame is acquired (0059-D1): a
+    // boot whose shootdown transport is unavailable never grows at runtime.
+    // The returned guard is dropped at once; map_heap_pages re-checks it.
+    if crate::smp::prepare_kernel_update().is_err() {
+        BACKOFF_MODE.store(BACKOFF_NEVER, Ordering::Relaxed);
+        return Ensure::Deferred;
+    }
+
+    let mut outcome = Ensure::Unchanged;
+    loop {
+        let before = stats();
+        let mut needed = false;
+        {
+            let mut heap = ALLOCATOR.lock();
+            if !block_fits(&mut heap, LOW_WATER, PAGE_SIZE as usize) {
+                needed = true;
+            }
+            // SAFETY: the heap lock is held above, so the cell is owned.
+            let (key, packed) = unsafe { *ALLOCATOR.shortfall.get() };
+            if key != 0 {
+                if key <= FAILED_SHORTFALL.load(Ordering::Relaxed) {
+                    // A repeated shortfall no larger than the failed one does
+                    // not re-arm; drop it.
+                    // SAFETY: the heap lock is held above.
+                    unsafe { *ALLOCATOR.shortfall.get() = (0, 0) };
+                } else if key > (HEAP_MAX_SIZE - before.size) as u64 {
+                    // Infeasible below the cap: dropped silently, stay armed.
+                    // SAFETY: the heap lock is held above.
+                    unsafe { *ALLOCATOR.shortfall.get() = (0, 0) };
+                } else {
+                    match unpack_layout(packed) {
+                        Some(layout) if block_fits(&mut heap, layout.size(), layout.align()) => {
+                            // Satisfied by the current free space: no growth.
+                            // SAFETY: the heap lock is held above.
+                            unsafe { *ALLOCATOR.shortfall.get() = (0, 0) };
+                        }
+                        _ => needed = true,
+                    }
+                }
+            }
+        }
+        if !needed {
+            return outcome;
+        }
+        if before.size == HEAP_MAX_SIZE {
+            // LimitExceeded: at the cap with growth still needed. Never re-arm.
+            BACKOFF_MODE.store(BACKOFF_NEVER, Ordering::Relaxed);
+            return Ensure::AtCap;
+        }
+        let pages = MAX_GROW_PAGES.min((HEAP_MAX_SIZE - before.size) / PAGE_SIZE as usize);
+        // The frame preflight runs before every growth, so a growth completes
+        // or never starts (0059-D1).
+        let free_frames = frames
+            .stats()
+            .map(|stats| stats.recycled_frames + stats.never_allocated_frames);
+        if free_frames.is_some_and(|free| free < pages) {
+            BACKOFF_FRAMES.store(
+                frames
+                    .stats()
+                    .map(|stats| stats.allocated_frames)
+                    .unwrap_or(0),
+                Ordering::Relaxed,
+            );
+            BACKOFF_MODE.store(BACKOFF_WAIT_FRAMES, Ordering::Relaxed);
+            return if outcome == Ensure::Grew {
+                outcome
+            } else {
+                Ensure::Deferred
+            };
+        }
+
+        #[cfg(feature = "boot-smoke")]
+        let (mode, injected) = match ENSURE_INJECT.swap(0, Ordering::Relaxed) {
+            0 => (GrowthMode::Normal, false),
+            1 => {
+                ENSURE_INJECTED.fetch_add(1, Ordering::Relaxed);
+                (GrowthMode::CancelBeforeCommit, true)
+            }
+            count => {
+                ENSURE_INJECTED.fetch_add(1, Ordering::Relaxed);
+                (GrowthMode::FailFramesAfter((count - 2) as usize), true)
+            }
+        };
+        #[cfg(not(feature = "boot-smoke"))]
+        let (mode, injected) = (GrowthMode::Normal, false);
+
+        // SAFETY: the caller established the safe-point contract (BSP, IF=0,
+        // kernel root, exclusive frames, no IRQ-needed lock, no syscall frame).
+        let result = unsafe { grow_inner(tables, frames, offset, pages, mode) };
+        match result {
+            Ok(grown) => {
+                outcome = Ensure::Grew;
+                #[cfg(feature = "test-trace")]
+                // A phase=auto record, from its own format string (0059-D4);
+                // default kernels grow silently.
+                crate::serial::println!(
+                    "MIRROR_HEAP_GROWN phase=auto size={} used={} free={} max={} added_pages={}",
+                    grown.size,
+                    grown.used,
+                    grown.free,
+                    HEAP_MAX_SIZE,
+                    pages
+                );
+                #[cfg(not(feature = "test-trace"))]
+                let _ = grown;
+            }
+            Err(error) => {
+                if injected {
+                    // Injected failures neither print nor arm the back-off;
+                    // the attempt still stops this safe point (0059-D1).
+                    return if outcome == Ensure::Grew {
+                        outcome
+                    } else {
+                        Ensure::Deferred
+                    };
+                }
+                let (key, _) = pending_shortfall();
+                if key != 0 {
+                    FAILED_SHORTFALL.fetch_max(key, Ordering::Relaxed);
+                }
+                match error {
+                    HeapError::LimitExceeded => {
+                        BACKOFF_MODE.store(BACKOFF_NEVER, Ordering::Relaxed);
+                        return Ensure::AtCap;
+                    }
+                    HeapError::OutOfFrames => {
+                        BACKOFF_FRAMES.store(
+                            frames
+                                .stats()
+                                .map(|stats| stats.allocated_frames)
+                                .unwrap_or(0),
+                            Ordering::Relaxed,
+                        );
+                        BACKOFF_MODE.store(BACKOFF_WAIT_FRAMES, Ordering::Relaxed);
+                        return if outcome == Ensure::Grew {
+                            outcome
+                        } else {
+                            Ensure::Deferred
+                        };
+                    }
+                    // The transport and the injection/bug classes never re-arm.
+                    _ => {
+                        BACKOFF_MODE.store(BACKOFF_NEVER, Ordering::Relaxed);
+                        return if outcome == Ensure::Grew {
+                            outcome
+                        } else {
+                            Ensure::Deferred
+                        };
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -782,6 +1084,15 @@ pub fn self_test() {
     }
     assert_eq!(stats(), baseline, "heap smoke test leaked allocations");
     assert_eq!(arch::interrupts_enabled(), interrupts_before);
+    // The deliberate failures above recorded shortfalls (0059-D1); assert the
+    // recording worked, then clear it so no safe point grows for a battery
+    // artifact.
+    assert_ne!(
+        pending_shortfall().0,
+        0,
+        "the battery recorded no shortfall"
+    );
+    clear_shortfall();
     crate::serial::println!(
         "MIRROR_HEAP_OK size={} free={}",
         baseline.size,

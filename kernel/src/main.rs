@@ -367,6 +367,8 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
     // below run in every flavor.
     #[cfg(feature = "boot-smoke")]
     {
+        // 0059-D1: a session's seeding is a heap safe point.
+        heap::ensure(&tables, &mut frames, boot.direct_map_offset);
         let scenario = if let boot::SmokeMode::User(value) = boot::smoke_mode() {
             value
         } else {
@@ -400,6 +402,8 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
     serial::println!("MIRROR_BOOT_OK");
     let mut input_consumer = ps2::Consumer::claim().expect("exclusive input consumer");
     if let Some(display) = display.as_mut().filter(|_| keyboard_ready || mouse_ready) {
+        // 0059-D1: a session's seeding is a heap safe point.
+        heap::ensure(&tables, &mut frames, boot.direct_map_offset);
         if cfg!(feature = "agent-demo") {
             userspace::run_desktop(
                 &tables,

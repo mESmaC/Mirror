@@ -8,7 +8,7 @@ use crate::{
     arch,
     capability::{self, CapError, Capability, HandleTable, Object},
     context::Context,
-    elf, framebuffer, input,
+    elf, framebuffer, heap, input,
     interrupts::{self, TrapFrame},
     ipc::{Ipc, IpcError, MESSAGE_SIZE},
     memory::{FrameAllocator, PAGE_SIZE},
@@ -423,6 +423,8 @@ pub fn run_init(
     );
     // Relaunch from the same ELF after teardown. Fresh BSS and successful entry
     // exercise frame reuse and continuation recovery after both exit and fault.
+    // 0059-D1: a session's seeding is a heap safe point.
+    heap::ensure(kernel, frames, direct_map);
     run_pair(kernel, frames, bytes, &image, direct_map, 0, display);
 }
 
@@ -701,6 +703,9 @@ fn run_pair(
     let mut idle_ticks = 0;
     while processes.iter().any(|process| !process.finished()) {
         assert!(!arch::interrupts_enabled());
+        // 0059-D1: the loop top is a heap safe point (kernel root active, no
+        // syscall frame live, no scheduler structure half-updated).
+        heap::ensure(kernel, frames, direct_map);
         release_finished_handles(&mut processes, &mut ipc);
         let now = timer::ticks();
         for process in &mut processes {
@@ -1259,6 +1264,8 @@ pub fn run_desktop(
         let mut cursor = 0;
         while !processes[0].finished() {
             assert!(!arch::interrupts_enabled());
+            // 0059-D1: the loop top is a heap safe point.
+            heap::ensure(kernel, frames, direct_map);
             // Endpoint closure is visible before checking a peer's pending
             // receive. A client may exit while the desktop remains interactive.
             release_finished_handles(&mut processes, &mut ipc);
@@ -2036,6 +2043,8 @@ pub fn run_shell(
     let mut cursor = 0;
     while !desktop.finished() {
         assert!(ACTIVE_WINDOWS.load(Ordering::SeqCst).is_null());
+        // 0059-D1: the loop top is a heap safe point.
+        heap::ensure(kernel, frames, direct_map);
         runtime.reclaim_finished(frames, &mut ipc);
         let now = timer::ticks();
         wake_threads(&mut desktop, &mut ipc, Some(&mut input), None, now);
