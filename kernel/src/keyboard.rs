@@ -307,7 +307,9 @@ struct State {
     queue: [Option<(u64, KeyEvent)>; QUEUE_CAPACITY],
     head: usize,
     len: usize,
-    overflow: bool,
+    /// Sequence of the first keyboard loss since the consumer last took this
+    /// device's loss marker (spec 0017a-D3). Every queued event is newer.
+    lost: Option<u64>,
 }
 
 impl State {
@@ -318,15 +320,24 @@ impl State {
             queue: [None; QUEUE_CAPACITY],
             head: 0,
             len: 0,
-            overflow: false,
+            lost: None,
         }
     }
 
-    fn lose_input(&mut self) {
+    fn clear_queue(&mut self) {
         self.queue.fill(None);
         self.head = 0;
         self.len = 0;
-        self.overflow = true;
+    }
+
+    /// A keyboard fault or ring overflow drops only this device's queue and
+    /// key state. Its marker takes the next shared sequence unless an
+    /// unacknowledged loss already holds one; mouse events are untouched.
+    fn lose_input(&mut self) {
+        self.clear_queue();
+        if self.lost.is_none() {
+            self.lost = Some(ps2::next_sequence());
+        }
         self.decoder.lose_input();
     }
 
@@ -356,7 +367,7 @@ impl State {
 
     fn pop(&mut self) -> Option<KeyEvent> {
         // The console must observe loss before it can consume subsequent input.
-        if self.overflow || self.len == 0 {
+        if self.lost.is_some() || self.len == 0 {
             return None;
         }
         let event = self.queue[self.head].take().map(|(_, event)| event);
@@ -365,19 +376,28 @@ impl State {
         event
     }
 
+    /// The pending loss marker sorts ahead of the queue head: every queued
+    /// event was published after the loss that cleared the queue.
     fn peek_sequence(&self) -> Option<u64> {
-        if self.overflow || self.len == 0 {
+        if self.lost.is_some() {
+            self.lost
+        } else if self.len == 0 {
             None
         } else {
             self.queue[self.head].map(|(sequence, _)| sequence)
         }
     }
 
+    fn take_lost(&mut self) -> bool {
+        self.lost.take().is_some()
+    }
+
     fn discard_input(&mut self) {
-        self.lose_input();
+        self.clear_queue();
+        self.decoder.lose_input();
         self.decoder.extended = false;
         self.decoder.released = false;
-        self.overflow = false;
+        self.lost = None;
     }
 }
 
@@ -431,16 +451,18 @@ pub(crate) fn peek_sequence() -> Option<u64> {
     with_state(|state| state.peek_sequence())
 }
 
-/// A shared loss barrier invalidates both input streams. Preserve an opaque
-/// Pause tail, but discard prefixes/held keys and require a new release boundary.
+/// Controller handoff only (ps2 stop_routing): drop queued events and any
+/// pending loss. Preserve an opaque Pause tail, but discard prefixes/held keys
+/// and require a new release boundary.
 pub(crate) fn discard_input() {
     with_state(State::discard_input);
 }
 
-/// Report and acknowledge queue overflow or damaged input. The consumer must
-/// discard its unfinished input line. pop_event withholds events until this ack.
-pub(crate) fn take_overflow() -> bool {
-    with_state(|state| core::mem::take(&mut state.overflow))
+/// Report and acknowledge queue overflow or damaged keyboard input. The
+/// consumer must discard its unfinished input line; pointer state is
+/// unaffected. pop_event withholds events until this ack.
+pub(crate) fn take_lost() -> bool {
+    with_state(State::take_lost)
 }
 
 /// Delivered IRQ1 handlers, including empty or command-ACK deliveries; this is
@@ -480,7 +502,7 @@ pub fn self_test() {
     let original_if = arch::interrupts_enabled();
     assert!(pop_event().is_none());
     assert_eq!(arch::interrupts_enabled(), original_if);
-    assert!(!take_overflow());
+    assert!(!take_lost());
     assert_eq!(arch::interrupts_enabled(), original_if);
 
     let mut state = State::new();
@@ -549,7 +571,7 @@ pub fn self_test() {
     state.accept(OUTPUT_FULL | AUXILIARY, 0x12);
     state.accept(OUTPUT_FULL | AUXILIARY | RECEIVE_ERROR, 0x14);
     assert!(state.pop().is_none());
-    assert!(!state.overflow);
+    assert!(state.lost.is_none());
 
     // Wrap the queue several times, then prove overflow removes all stale
     // events and modifiers and gates new input on an observed release boundary.
@@ -562,13 +584,13 @@ pub fn self_test() {
     for _ in 0..QUEUE_CAPACITY {
         feed(&mut state, &[0x1c]);
     }
-    assert!(state.overflow && state.len == 0);
+    assert!(state.lost.is_some() && state.len == 0);
     assert_eq!(state.decoder.modifiers(), Modifiers::default());
     feed(&mut state, &[0x12, 0x1c]);
     assert_eq!(state.len, 0);
     feed(&mut state, &[0xf0, 0x12, 0x1c]);
     assert!(state.pop().is_none());
-    state.overflow = false;
+    state.lost = None;
     assert_eq!(event(&mut state).ascii(), Some(b'a'));
 
     // Corruption halfway through Pause still consumes its opaque tail; no fake
@@ -577,33 +599,55 @@ pub fn self_test() {
     state.accept(OUTPUT_FULL | RECEIVE_ERROR, 0x77);
     feed(&mut state, &[0xe1, 0xf0, 0x14, 0xf0, 0x77, 0x12, 0x1c]);
     assert_eq!(state.decoder.modifiers(), Modifiers::default());
-    assert!(state.overflow && state.len == 0);
+    assert!(state.lost.is_some() && state.len == 0);
     feed(&mut state, &[0xf0, 0x1c, 0x1c]);
-    state.overflow = false;
+    state.lost = None;
     assert_eq!(event(&mut state).ascii(), Some(b'a'));
     for response in [0x00, 0xff, 0xaa, 0xfa, 0xfc, 0xfd, 0xfe] {
         feed(&mut state, &[response, 0x12, 0x1c]);
-        assert!(state.overflow && state.len == 0);
+        assert!(state.lost.is_some() && state.len == 0);
         assert_eq!(state.decoder.modifiers(), Modifiers::default());
         feed(&mut state, &[0xf0, 0x1c]);
-        state.overflow = false;
+        state.lost = None;
     }
 
-    // A mouse loss barrier may interrupt any keyboard prefix. It clears old
-    // modifiers/queued text and withholds makes until an ordinary release.
+    // A loss marker sorts ahead of the queue head with its own sequence. A
+    // second loss before the consumer takes it keeps the first sequence, and
+    // text queued after recovery is delivered behind the marker (0017a-D3).
+    state = State::new();
+    feed(&mut state, &[0x1c]);
+    state.accept(OUTPUT_FULL | RECEIVE_ERROR, 0x00);
+    let first = state.peek_sequence().expect("keyboard loss marker");
+    feed(&mut state, &[0xf0, 0x1c, 0x1c]);
+    assert_eq!(state.len, 1);
+    feed(&mut state, &[0xff]);
+    assert_eq!((state.peek_sequence(), state.len), (Some(first), 0));
+    feed(&mut state, &[0xf0, 0x1c, 0x1c]);
+    let after = state.queue[state.head].map(|(sequence, _)| sequence);
+    assert!(after.is_some_and(|sequence| (first.wrapping_sub(sequence) as i64) < 0));
+    assert!(state.pop().is_none());
+    assert!(state.take_lost());
+    assert!(!state.take_lost());
+    assert_eq!(state.peek_sequence(), after);
+    assert_eq!(event(&mut state).ascii(), Some(b'a'));
+    assert!(state.peek_sequence().is_none());
+
+    // Controller handoff (ps2 stop_routing) may interrupt any keyboard
+    // prefix. It clears old modifiers/queued text and any pending loss, and
+    // withholds makes until an ordinary release.
     state = State::new();
     feed(&mut state, &[0x12, 0x1c, 0xe0, 0xf0]);
     assert!(state.peek_sequence().is_some());
     state.discard_input();
     assert!(state.peek_sequence().is_none());
-    assert!(!state.overflow);
+    assert!(state.lost.is_none());
     assert_eq!(state.decoder.modifiers(), Modifiers::default());
     feed(&mut state, &[0x14, 0x1c]);
     assert!(state.pop().is_none());
     feed(&mut state, &[0xf0, 0x1c, 0x1c]);
     assert_eq!(event(&mut state).ascii(), Some(b'a'));
 
-    // Preserve the complete remaining Pause tail through a shared barrier:
+    // Preserve the complete remaining Pause tail through controller handoff:
     // its embedded break must not prematurely release the recovery gate.
     feed(&mut state, &[0xe1, 0x14]);
     assert_eq!(state.decoder.pause_remaining, 6);

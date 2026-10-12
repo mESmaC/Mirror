@@ -617,7 +617,7 @@ fn run_console(
         // but only this loop owns console state and the framebuffer writer.
         for _ in 0..32 {
             // One controller consumer preserves keyboard/mouse event order and
-            // places a loss barrier before any input after a discarded queue.
+            // places each device's loss marker before that device's later input.
             let Some(event) = input_consumer.next_event() else {
                 full_batch = false;
                 break;
@@ -626,12 +626,23 @@ fn run_console(
             // the console/display are never borrowed or accessed by an IRQ.
             unsafe { arch::restore_interrupts(true) };
             match event {
-                ps2::InputEvent::Lost => {
-                    console.input_lost();
-                    pointer.input_lost();
-                    dirty = true;
-                    redraw_content = true;
-                    serial::println!("MIRROR_CONSOLE_INPUT_LOST");
+                // Each loss resets only its own device's state (spec 0017a-D3):
+                // the unsent line survives a pointer loss, and click arming
+                // survives a keyboard loss.
+                ps2::InputEvent::Lost {
+                    keyboard,
+                    pointer: pointer_lost,
+                } => {
+                    if keyboard {
+                        console.input_lost();
+                        dirty = true;
+                        redraw_content = true;
+                        serial::println!("MIRROR_CONSOLE_INPUT_LOST device=keyboard");
+                    }
+                    if pointer_lost {
+                        pointer.input_lost();
+                        serial::println!("MIRROR_CONSOLE_INPUT_LOST device=pointer");
+                    }
                 }
                 ps2::InputEvent::Key(event) => {
                     if let Some(action) = console.process(event) {

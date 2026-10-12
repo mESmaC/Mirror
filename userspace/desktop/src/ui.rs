@@ -182,12 +182,22 @@ impl Ui {
 
     pub fn process(&mut self, event: Event) -> u8 {
         match event {
-            Event::Lost => {
-                self.dispatch_human(Operation::ClearDraft);
-                self.buttons = 0;
-                self.clicks_armed = false;
-                self.notice = true;
-                EDIT | NOTICE | POINTER
+            // Loss is per device (spec 0017a-D3): only a keyboard loss can
+            // have dropped typed text, so only it clears the draft and shows
+            // the notice. A pointer loss disarms clicks until a release.
+            Event::Lost { keyboard, pointer } => {
+                let mut change = 0;
+                if keyboard {
+                    self.dispatch_human(Operation::ClearDraft);
+                    self.notice = true;
+                    change |= EDIT | NOTICE;
+                }
+                if pointer {
+                    self.buttons = 0;
+                    self.clicks_armed = false;
+                    change |= POINTER;
+                }
+                change
             }
             Event::Key { flags, kind, ascii } => {
                 if flags & 1 == 0 || flags & (8 | 16) != 0 {
@@ -594,9 +604,17 @@ pub fn self_test() {
             == 0,
         94,
     );
-    ui.process(Event::Lost);
+    // A pointer-only loss keeps the draft and disarms clicks; a keyboard
+    // loss then clears the draft (spec 0017a, acceptance test 4).
+    ui.process(Event::Lost {
+        keyboard: false,
+        pointer: true,
+    });
     require(
-        ui.editor.draft().is_empty() && !ui.clicks_armed && ui.submitted() == b"abxcd",
+        ui.editor.draft() == b"abxcd"
+            && !ui.notice
+            && !ui.clicks_armed
+            && ui.submitted() == b"abxcd",
         95,
     );
     require(
@@ -607,6 +625,18 @@ pub fn self_test() {
         }) & SUBMIT
             == 0,
         96,
+    );
+    ui.process(Event::Lost {
+        keyboard: true,
+        pointer: false,
+    });
+    require(
+        ui.editor.draft().is_empty()
+            && ui.notice
+            && ui.buttons == 1
+            && !ui.clicks_armed
+            && ui.submitted() == b"abxcd",
+        111,
     );
     ui.process(key(4, 0));
     ui.process(key(4, 0));

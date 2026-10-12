@@ -158,43 +158,55 @@ impl Drop for Consumer {
 pub enum InputEvent {
     Key(keyboard::KeyEvent),
     Mouse(mouse::MouseEvent),
-    Lost,
+    /// One device's loss marker (spec 0017a-D3). next_event sets exactly one
+    /// flag; only a session's initial record names both devices.
+    Lost {
+        keyboard: bool,
+        pointer: bool,
+    },
 }
 
-/// A device stamps only a completed, queued event. This atomic has no controller
-/// borrow, so it is safe from either decoder callback under IF exclusion.
+/// A device stamps only a completed, queued or merged event, or its first
+/// unacknowledged loss. This atomic has no controller borrow, so it is safe
+/// from either decoder callback under IF exclusion.
 pub(crate) fn next_sequence() -> u64 {
     NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
 }
 
 fn keyboard_first(keyboard: u64, mouse: u64) -> bool {
-    // At most 128 events can be queued. No two live sequence numbers can differ
-    // by half the u64 range, including across the counter's natural wrap.
+    // Each device holds at most 64 events and one loss marker. A full mouse
+    // ring can keep an old head while merged packets take new sequences, but
+    // every allocation needs a received byte, so live sequence numbers stay
+    // far closer than half the u64 range, including across the natural wrap.
     (keyboard.wrapping_sub(mouse) as i64) < 0
 }
 
-/// Drain once, then consume the oldest keyboard/mouse event under one IF guard.
-/// Loss is a shared ordering barrier: acknowledge both flags and discard both
-/// queues before delivering any later event. Device pop functions perform no I/O.
+/// Drain once, then consume the oldest keyboard/mouse item under one IF guard.
+/// Each device reports a pending loss marker ahead of its queue head, so both
+/// heads, markers included, merge by sequence. A loss never discards the other
+/// device's queued events (spec 0017a-D3). Device functions perform no I/O.
 fn next_event() -> Option<InputEvent> {
     let enabled = arch::save_and_disable_interrupts();
     // poll_pending ends its controller borrow before any device queue is read.
     poll_pending();
-    let keyboard_lost = keyboard::take_overflow();
-    let mouse_lost = mouse::take_overflow();
-    let result = if keyboard_lost || mouse_lost {
-        keyboard::discard_input();
-        mouse::discard_input();
-        Some(InputEvent::Lost)
-    } else {
-        match (keyboard::peek_sequence(), mouse::peek_sequence()) {
-            (Some(key), Some(mouse)) if keyboard_first(key, mouse) => {
-                keyboard::pop_event().map(InputEvent::Key)
-            }
-            (Some(_), Some(_)) | (None, Some(_)) => mouse::pop_event().map(InputEvent::Mouse),
-            (Some(_), None) => keyboard::pop_event().map(InputEvent::Key),
-            (None, None) => None,
-        }
+    let keyboard_next = match (keyboard::peek_sequence(), mouse::peek_sequence()) {
+        (Some(key), Some(mouse)) => Some(keyboard_first(key, mouse)),
+        (Some(_), None) => Some(true),
+        (None, Some(_)) => Some(false),
+        (None, None) => None,
+    };
+    let result = match keyboard_next {
+        Some(true) if keyboard::take_lost() => Some(InputEvent::Lost {
+            keyboard: true,
+            pointer: false,
+        }),
+        Some(true) => keyboard::pop_event().map(InputEvent::Key),
+        Some(false) if mouse::take_lost() => Some(InputEvent::Lost {
+            keyboard: false,
+            pointer: true,
+        }),
+        Some(false) => mouse::pop_event().map(InputEvent::Mouse),
+        None => None,
     };
     // SAFETY: Controller and both device borrows ended; initialized handlers
     // see consistent queues if the caller previously enabled interrupts.
@@ -564,23 +576,48 @@ fn dispatch_self_test() {
         }
     }
 
-    fn expect_key(ascii: u8) {
+    fn expect_key_with(ascii: u8, modifiers: keyboard::Modifiers) -> keyboard::KeyEvent {
         let Some(InputEvent::Key(event)) = next_event() else {
             panic!("expected merged keyboard input");
         };
         assert_eq!(event.ascii(), Some(ascii));
-        assert_eq!(event.modifiers, keyboard::Modifiers::default());
+        assert_eq!(event.modifiers, modifiers);
+        assert!(!arch::interrupts_enabled());
+        event
+    }
+
+    fn expect_key(ascii: u8) {
+        let event = expect_key_with(ascii, keyboard::Modifiers::default());
+        assert!(event.pressed && !event.repeat);
+    }
+
+    fn expect_release() {
+        let Some(InputEvent::Key(event)) = next_event() else {
+            panic!("expected merged keyboard release");
+        };
+        assert!(!event.pressed);
+        assert!(!arch::interrupts_enabled());
+    }
+
+    fn expect_pointer(dx: i16, buttons: u8) {
+        assert_eq!(
+            next_event(),
+            Some(InputEvent::Mouse(mouse::MouseEvent { dx, dy: 0, buttons }))
+        );
         assert!(!arch::interrupts_enabled());
     }
 
     fn expect_mouse(dx: i16) {
+        expect_pointer(dx, 0);
+    }
+
+    fn expect_lost(keyboard: bool) {
         assert_eq!(
             next_event(),
-            Some(InputEvent::Mouse(mouse::MouseEvent {
-                dx,
-                dy: 0,
-                buttons: 0
-            }))
+            Some(InputEvent::Lost {
+                keyboard,
+                pointer: !keyboard
+            })
         );
         assert!(!arch::interrupts_enabled());
     }
@@ -614,47 +651,126 @@ fn dispatch_self_test() {
             expect_mouse(7);
             assert_eq!(next_event(), None);
 
-            // Loss from either or both sources invalidates even the other
-            // source's already-queued events. Acknowledge exactly one barrier,
-            // then require fresh keyboard recovery and fresh mouse input.
-            for (key_loss, mouse_loss) in [(true, false), (false, true), (true, true)] {
-                feed(&router, Source::Keyboard, &[0x12, 0x21]);
-                feed(&router, Source::Mouse, &[0x09, 4, 0]);
-                if key_loss {
-                    router.route(OUTPUT_FULL | RECEIVE_ERROR, 0x00);
-                    // Recovery can complete before the loss is consumed. This
-                    // newly queued text must still be discarded by the barrier.
-                    feed(&router, Source::Keyboard, &[0xf0, 0x1c, 0x1c]);
-                }
-                if mouse_loss {
-                    router.route(OUTPUT_FULL | AUXILIARY | RECEIVE_ERROR, 0x08);
-                    // Consume the corrupt packet's tail, then queue another
-                    // valid packet behind the pending loss notification.
-                    feed(&router, Source::Mouse, &[0x09, 0x09, 0x08, 5, 0]);
-                }
-                assert_eq!(next_event(), Some(InputEvent::Lost));
-                assert_eq!(next_event(), None);
-                assert!(!keyboard::take_overflow() && !mouse::take_overflow());
-                assert!(!arch::interrupts_enabled());
+            // Mouse-only losses (spec 0017a-D3) never change keyboard state:
+            // held Shift, Caps Lock and an already queued key all survive,
+            // and the pointer marker follows that key by sequence.
+            feed(
+                &router,
+                Source::Keyboard,
+                &[0xf0, 0x1c, 0xf0, 0x32, 0x12, 0x58, 0xf0, 0x58],
+            );
+            for _ in 0..5 {
+                assert!(matches!(next_event(), Some(InputEvent::Key(_))));
+            }
+            assert_eq!(next_event(), None);
+            let held = keyboard::Modifiers {
+                shift: true,
+                caps_lock: true,
+                ..keyboard::Modifiers::default()
+            };
+            for case in 0..3 {
                 feed(&router, Source::Keyboard, &[0x1c]);
-                assert_eq!(next_event(), None); // Makes alone cannot recover.
-                feed(&router, Source::Keyboard, &[0xf0, 0x1c, 0x1c]);
-                feed(&router, Source::Mouse, &[0x08, 2, 0]);
-                expect_key(b'a'); // Stale Shift must not survive global loss.
-                expect_mouse(2);
+                match case {
+                    // An AUX RECEIVE_ERROR byte in a packet's header position.
+                    0 => router.route(OUTPUT_FULL | AUXILIARY | RECEIVE_ERROR, 0x08),
+                    // A motion-overflow packet with the left button held.
+                    1 => feed(&router, Source::Mouse, &[0x48 | mouse::LEFT, 0xff, 0]),
+                    // A button change on a full ring.
+                    _ => {
+                        for _ in 0..mouse::QUEUE_CAPACITY {
+                            feed(&router, Source::Mouse, &[0x08, 1, 0]);
+                        }
+                        feed(&router, Source::Mouse, &[0x08 | mouse::LEFT, 1, 0]);
+                    }
+                }
+                let event = expect_key_with(b'a', held);
+                assert!(event.pressed && !event.repeat);
+                expect_lost(false);
+                if case == 1 {
+                    // The overflow packet's zero-motion button snapshot.
+                    expect_pointer(0, mouse::LEFT);
+                }
                 assert_eq!(next_event(), None);
+                if case == 0 {
+                    // The corrupt header's two remaining positions are
+                    // discarded as framing, not decoded as a click.
+                    feed(&router, Source::Mouse, &[0x09, 0x09]);
+                    assert_eq!(next_event(), None);
+                }
+                // The next make is delivered from its first byte, with no
+                // keyboard recovery gate and both modifiers intact.
+                feed(&router, Source::Keyboard, &[0x1c]);
+                let event = expect_key_with(b'a', held);
+                assert!(event.pressed && event.repeat);
+                feed(&router, Source::Keyboard, &[0xf0, 0x1c]);
+                expect_release();
+                assert_eq!(next_event(), None);
+                assert!(!keyboard::take_lost() && !mouse::take_lost());
             }
 
+            // A keyboard fault between two mouse packets drops neither: its
+            // marker sorts between them. Keyboard recovery still withholds
+            // makes until a complete release, and Shift and Caps Lock reset.
+            feed(&router, Source::Mouse, &[0x08, 3, 0]);
+            router.route(OUTPUT_FULL | RECEIVE_ERROR, 0x00);
+            feed(&router, Source::Mouse, &[0x08, 4, 0]);
+            expect_mouse(3);
+            expect_lost(true);
+            expect_mouse(4);
+            assert_eq!(next_event(), None);
+            feed(&router, Source::Keyboard, &[0x1c]);
+            assert_eq!(next_event(), None); // Makes alone cannot recover.
+            feed(&router, Source::Keyboard, &[0xf0, 0x1c, 0x1c]);
+            expect_key(b'a');
+            assert_eq!(next_event(), None);
+
             // A keyboard fault can cut a mouse packet after its header. The
-            // global barrier must discard its remaining two header-looking
-            // payload bytes instead of manufacturing a click from stale data.
+            // mouse decoder is untouched, so the packet completes and is
+            // delivered after the keyboard marker.
             feed(&router, Source::Mouse, &[0x09]);
             router.route(OUTPUT_FULL | RECEIVE_ERROR, 0x00);
-            assert_eq!(next_event(), Some(InputEvent::Lost));
-            feed(&router, Source::Mouse, &[0x09, 0x09]);
+            feed(&router, Source::Mouse, &[5, 0]);
+            expect_lost(true);
+            expect_pointer(5, mouse::LEFT);
             assert_eq!(next_event(), None);
-            feed(&router, Source::Mouse, &[0x08, 1, 0]);
-            expect_mouse(1);
+
+            // Both devices lost: two markers, in loss-sequence order. Input
+            // that each device queues after its own loss, here including text
+            // after keyboard recovery completes, follows its marker.
+            for keyboard_loss_first in [true, false] {
+                for keyboard_turn in [keyboard_loss_first, !keyboard_loss_first] {
+                    if keyboard_turn {
+                        router.route(OUTPUT_FULL | RECEIVE_ERROR, 0x00);
+                    } else {
+                        router.route(OUTPUT_FULL | AUXILIARY | RECEIVE_ERROR, 0x08);
+                        feed(&router, Source::Mouse, &[0x09, 0x09]);
+                    }
+                }
+                feed(&router, Source::Keyboard, &[0xf0, 0x1c, 0x1c]);
+                feed(&router, Source::Mouse, &[0x08, 2, 0]);
+                expect_lost(keyboard_loss_first);
+                expect_lost(!keyboard_loss_first);
+                expect_key(b'a');
+                expect_mouse(2);
+                assert_eq!(next_event(), None);
+                assert!(!keyboard::take_lost() && !mouse::take_lost());
+            }
+
+            // A starved full mouse ring merges same-button motion into its
+            // newest event, which takes the newest packet's sequence (spec
+            // 0017a-D6): a key published between two merged packets is
+            // delivered before the merged event, and no motion is lost.
+            for _ in 0..mouse::QUEUE_CAPACITY {
+                feed(&router, Source::Mouse, &[0x08, 1, 0]);
+            }
+            feed(&router, Source::Mouse, &[0x08, 2, 0]);
+            feed(&router, Source::Keyboard, &[0xf0, 0x1c]);
+            feed(&router, Source::Mouse, &[0x08, 3, 0]);
+            for _ in 0..mouse::QUEUE_CAPACITY - 1 {
+                expect_mouse(1);
+            }
+            expect_release();
+            expect_mouse(6);
             assert_eq!(next_event(), None);
 
             // Fatal controller handoff revokes even a previously activated

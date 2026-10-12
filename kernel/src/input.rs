@@ -28,7 +28,11 @@ impl<'a> Session<'a> {
         }
         Self {
             consumer,
-            pending: Some(encode(ps2::InputEvent::Lost)),
+            // The initial record alone names both devices (spec 0017a-D4).
+            pending: Some(encode(ps2::InputEvent::Lost {
+                keyboard: true,
+                pointer: true,
+            })),
         }
     }
 
@@ -54,6 +58,8 @@ impl<'a> Session<'a> {
 fn encode(event: ps2::InputEvent) -> [u8; EVENT_SIZE] {
     // Eight LE u32s: version, kind, flags, key kind, unshifted character,
     // printable ASCII (zero if none), signed dx, signed dy. Unused words are zero.
+    // A loss record's flags are a nonzero device mask: bit 0 keyboard, bit 1
+    // pointer (spec 0017a-D4).
     let mut words = [0u32; 8];
     words[0] = 1;
     match event {
@@ -94,7 +100,11 @@ fn encode(event: ps2::InputEvent) -> [u8; EVENT_SIZE] {
             words[6] = i32::from(event.dx) as u32;
             words[7] = i32::from(event.dy) as u32;
         }
-        ps2::InputEvent::Lost => words[1] = KIND_LOST,
+        ps2::InputEvent::Lost { keyboard, pointer } => {
+            assert!(keyboard || pointer, "loss record without a device");
+            words[1] = KIND_LOST;
+            words[2] = u32::from(keyboard) | u32::from(pointer) << 1;
+        }
     }
     let mut record = [0u8; EVENT_SIZE];
     for (destination, word) in record.as_chunks_mut::<4>().0.iter_mut().zip(words) {
@@ -121,10 +131,13 @@ pub fn self_test() {
             modifiers: Modifiers::default(),
         }
     }
-    assert_eq!(
-        words(encode(ps2::InputEvent::Lost)),
-        [1, 3, 0, 0, 0, 0, 0, 0]
-    );
+    // Keyboard, pointer and initial loss records carry their device mask.
+    for (keyboard, pointer, mask) in [(true, false, 1), (false, true, 2), (true, true, 3)] {
+        assert_eq!(
+            words(encode(ps2::InputEvent::Lost { keyboard, pointer })),
+            [1, 3, mask, 0, 0, 0, 0, 0]
+        );
+    }
     for (index, key_kind) in [
         Key::Character(b'a'),
         Key::Enter,
@@ -193,7 +206,7 @@ pub fn self_test() {
             {
                 let mut session = Session::new(&mut consumer);
                 let initial = session.peek().unwrap();
-                assert_eq!(words(initial)[1], KIND_LOST);
+                assert_eq!(words(initial), [1, KIND_LOST, 3, 0, 0, 0, 0, 0]);
                 assert_eq!(session.peek(), Some(initial));
                 session.consume();
                 assert_eq!(session.peek(), None);
@@ -219,11 +232,11 @@ pub fn self_test() {
 
                 crate::keyboard::accept_byte(1, 0x21); // c staged before loss
                 let retained = session.peek().unwrap();
-                crate::keyboard::accept_byte(1, 0); // Corrupt stream -> shared barrier
+                crate::keyboard::accept_byte(1, 0); // Corrupt stream -> keyboard loss
                 assert_eq!(session.peek(), Some(retained));
                 session.consume();
                 let loss = session.peek().unwrap();
-                assert_eq!(words(loss), [1, 3, 0, 0, 0, 0, 0, 0]);
+                assert_eq!(words(loss), [1, 3, 1, 0, 0, 0, 0, 0]);
                 assert_eq!(session.peek(), Some(loss));
                 session.consume();
                 assert_eq!(session.peek(), None);
@@ -232,6 +245,21 @@ pub fn self_test() {
                 crate::keyboard::accept_byte(1, 0x23); // Fresh d
                 assert_eq!(words(session.peek().unwrap())[5], 100);
                 session.consume();
+
+                // A pointer loss is its own record and keeps the key that
+                // was queued before it (spec 0017a-D3).
+                crate::keyboard::accept_byte(1, 0x24); // e queued before loss
+                crate::mouse::accept_byte(0x21 | 0xc0, 0x08); // Corrupt AUX header
+                for byte in [0x09, 0x09, 0x08, 4, 0] {
+                    crate::mouse::accept_byte(0x21, byte);
+                }
+                assert_eq!(words(session.peek().unwrap())[5], 101);
+                session.consume();
+                assert_eq!(words(session.peek().unwrap()), [1, 3, 2, 0, 0, 0, 0, 0]);
+                session.consume();
+                assert_eq!(words(session.peek().unwrap()), [1, 2, 0, 0, 0, 0, 4, 0]);
+                session.consume();
+                assert_eq!(session.peek(), None);
             }
             assert_eq!(consumer.next_event(), None);
             drop(consumer);

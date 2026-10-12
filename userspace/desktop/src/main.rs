@@ -85,11 +85,13 @@ fn boot_handle(index: u64) -> u64 {
     result as u64
 }
 
+// Lost names the devices whose input was lost; only the initial record of an
+// input session names both (spec 0017a-D4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Event {
     Key { flags: u32, kind: u32, ascii: u8 },
     Mouse { dx: i32, dy: i32, buttons: u8 },
-    Lost,
+    Lost { keyboard: bool, pointer: bool },
 }
 
 fn decode_event(bytes: &[u8; 32]) -> Event {
@@ -126,8 +128,16 @@ fn decode_event(bytes: &[u8; 32]) -> Event {
             }
         }
         3 => {
-            require(words[2..] == [0; 6], 14);
-            Event::Lost
+            // Device mask (spec 0017a-D4): bit 0 keyboard, bit 1 pointer,
+            // nonzero, every other bit and payload word zero.
+            require(
+                words[2] != 0 && words[2] & !3 == 0 && words[3..] == [0; 5],
+                14,
+            );
+            Event::Lost {
+                keyboard: words[2] & 1 != 0,
+                pointer: words[2] & 2 != 0,
+            }
         }
         _ => exit(15),
     }
@@ -172,7 +182,14 @@ fn check_input(console: u64, surface: u64, input: u64) {
     // Invalid destinations and rights must not consume the session's first
     // staged event. A valid copy now receives its exact loss/baseline barrier.
     require(syscall(SYS_INPUT_POLL, input, pointer, 32) == 32, 38);
-    require(decode_event(&buffer) == Event::Lost, 39);
+    require(
+        decode_event(&buffer)
+            == Event::Lost {
+                keyboard: true,
+                pointer: true,
+            },
+        39,
+    );
 }
 
 fn surface_dimensions(surface: u64) -> (usize, usize) {

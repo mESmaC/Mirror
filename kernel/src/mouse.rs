@@ -9,10 +9,12 @@
 //! https://github.com/qemu/qemu/blob/v10.1.0/hw/input/ps2.c
 //! No source code is copied. The header carries the ninth motion/sign bits;
 //! PS/2 positive Y is upward, so decoded events invert Y for screen coordinates.
+//! The 500 ms framing-recovery gap matches linux `psmouse-base.c`, which uses
+//! HZ/2 (spec 0017a-D7); no source code is copied.
 
 use core::cell::UnsafeCell;
 
-use crate::{arch, ps2};
+use crate::{arch, ps2, timer};
 
 pub const LEFT: u8 = 1;
 pub const RIGHT: u8 = 2;
@@ -23,7 +25,10 @@ const AUXILIARY: u8 = 0x20;
 const RECEIVE_ERROR: u8 = 0xc0;
 const HEADER_SYNC: u8 = 0x08;
 const MOTION_OVERFLOW: u8 = 0xc0;
-const QUEUE_CAPACITY: usize = 64;
+pub(crate) const QUEUE_CAPACITY: usize = 64;
+/// 500 ms at the 100 Hz timer. A partial packet whose previous byte is older
+/// than this is dropped, and the next byte becomes a candidate header (D7).
+const RESYNC_TICKS: u64 = 50;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MouseEvent {
@@ -49,6 +54,8 @@ struct Decoder {
     bytes: [u8; 3],
     length: u8,
     discard: u8,
+    /// Timer tick of the previous byte, consulted only mid-packet.
+    last: u64,
 }
 
 impl Decoder {
@@ -57,10 +64,25 @@ impl Decoder {
             bytes: [0; 3],
             length: 0,
             discard: 0,
+            last: 0,
         }
     }
 
-    fn feed(&mut self, byte: u8) -> Option<Packet> {
+    /// Framing recovery (spec 0017a-D7). A partial packet, including the
+    /// remaining tail of a corrupt one, whose previous byte arrived more than
+    /// 500 ms before `now` is dropped silently. The byte arriving at `now`
+    /// then starts afresh and must still pass the header-bit-3 check.
+    fn expire(&mut self, now: u64) {
+        if (self.length != 0 || self.discard != 0) && now.wrapping_sub(self.last) > RESYNC_TICKS {
+            self.length = 0;
+            self.discard = 0;
+            self.bytes = [0; 3];
+        }
+        self.last = now;
+    }
+
+    fn feed(&mut self, byte: u8, now: u64) -> Option<Packet> {
+        self.expire(now);
         if self.discard != 0 {
             self.discard -= 1;
             return None;
@@ -92,7 +114,8 @@ impl Decoder {
         })
     }
 
-    fn corrupt_byte(&mut self) {
+    fn corrupt_byte(&mut self, now: u64) {
+        self.expire(now);
         // The controller consumed this corrupt byte. Discard the remaining
         // positions of its known three-byte packet, then seek a new header.
         // Repeated corrupt bytes still advance this bounded recovery count.
@@ -106,8 +129,9 @@ impl Decoder {
     }
 
     fn discard_partial(&mut self) {
-        // A global input barrier can run between bytes of a packet. Drop its
-        // remaining tail as transport framing, not as new input/header bytes.
+        // Controller handoff (ps2 stop_routing) can run between bytes of a
+        // packet. Drop its remaining tail as transport framing, not as new
+        // input/header bytes.
         if self.length != 0 {
             self.discard = 3 - self.length;
         }
@@ -122,7 +146,9 @@ struct State {
     queue: [Option<QueuedEvent>; QUEUE_CAPACITY],
     head: usize,
     length: usize,
-    overflow: bool,
+    /// Sequence of the first pointer loss since the consumer last took this
+    /// device's loss marker (spec 0017a-D3). Every queued event is newer.
+    lost: Option<u64>,
 }
 
 impl State {
@@ -133,7 +159,7 @@ impl State {
             queue: [None; QUEUE_CAPACITY],
             head: 0,
             length: 0,
-            overflow: false,
+            lost: None,
         }
     }
 
@@ -142,35 +168,58 @@ impl State {
         self.active = true;
     }
 
-    fn lose_input(&mut self) {
+    fn clear_queue(&mut self) {
         self.queue.fill(None);
         self.head = 0;
         self.length = 0;
-        self.overflow = true;
+    }
+
+    /// A pointer loss drops only this device's queue. Its marker takes the
+    /// next shared sequence unless an unacknowledged loss already holds one,
+    /// so it orders against keyboard events without discarding any of them.
+    fn lose_input(&mut self, next_sequence: impl FnOnce() -> u64) {
+        self.clear_queue();
+        if self.lost.is_none() {
+            self.lost = Some(next_sequence());
+        }
         // This decoder keeps no previous button levels or click history.
         // The consumer must reset its own history upon acknowledging loss.
     }
 
-    fn accept(&mut self, status: u8, byte: u8, next_sequence: impl FnOnce() -> u64) {
+    fn accept(&mut self, status: u8, byte: u8, now: u64, mut next_sequence: impl FnMut() -> u64) {
         if !self.active || status & (OUTPUT_FULL | AUXILIARY) != (OUTPUT_FULL | AUXILIARY) {
             return;
         }
         if status & RECEIVE_ERROR != 0 {
-            self.decoder.corrupt_byte();
-            self.lose_input();
+            self.decoder.corrupt_byte(now);
+            self.lose_input(&mut next_sequence);
             return;
         }
-        let Some(packet) = self.decoder.feed(byte) else {
+        let Some(packet) = self.decoder.feed(byte, now) else {
             return;
         };
         if packet.overflow {
             // Signal lost motion before publishing its zero-motion button
             // snapshot. The consumer disarms click edges until release.
-            self.lose_input();
+            self.lose_input(&mut next_sequence);
         } else if self.length == QUEUE_CAPACITY {
-            // Decoder is at a complete packet boundary. Drop the whole queue
-            // and this packet; the next complete packet supplies fresh levels.
-            self.lose_input();
+            // Starvation (spec 0017a-D6): add same-button motion into the
+            // newest queued event, which takes this packet's sequence and so
+            // still sorts after every key published before this packet. A
+            // button change or an i16 overflow is a pointer loss; the decoder
+            // is at a packet boundary, so the next packet supplies fresh levels.
+            let newest = (self.head + QUEUE_CAPACITY - 1) % QUEUE_CAPACITY;
+            if let Some(queued) = &mut self.queue[newest]
+                && queued.event.buttons == packet.event.buttons
+                && let Some(dx) = queued.event.dx.checked_add(packet.event.dx)
+                && let Some(dy) = queued.event.dy.checked_add(packet.event.dy)
+            {
+                queued.event.dx = dx;
+                queued.event.dy = dy;
+                queued.sequence = next_sequence();
+            } else {
+                self.lose_input(&mut next_sequence);
+            }
             return;
         }
         let tail = (self.head + self.length) % QUEUE_CAPACITY;
@@ -182,7 +231,8 @@ impl State {
     }
 
     fn pop(&mut self) -> Option<MouseEvent> {
-        if self.overflow || self.length == 0 {
+        // The consumer must take the loss marker before any later event.
+        if self.lost.is_some() || self.length == 0 {
             return None;
         }
         let event = self.queue[self.head].take();
@@ -191,22 +241,25 @@ impl State {
         event.map(|queued| queued.event)
     }
 
+    /// The pending loss marker sorts ahead of the queue head: every queued
+    /// event was published after the loss that cleared the queue.
     fn peek_sequence(&self) -> Option<u64> {
-        if self.overflow || self.length == 0 {
+        if self.lost.is_some() {
+            return self.lost;
+        }
+        if self.length == 0 {
             return None;
         }
         self.queue[self.head].map(|queued| queued.sequence)
     }
 
-    fn take_overflow(&mut self) -> bool {
-        core::mem::take(&mut self.overflow)
+    fn take_lost(&mut self) -> bool {
+        self.lost.take().is_some()
     }
 
     fn discard_input(&mut self) {
-        self.queue.fill(None);
-        self.head = 0;
-        self.length = 0;
-        self.overflow = false;
+        self.clear_queue();
+        self.lost = None;
         self.decoder.discard_partial();
     }
 }
@@ -237,9 +290,11 @@ pub(crate) fn activate() {
 
 /// Accept one controller-routed byte with IF clear. This function never polls
 /// the controller, allocates, prints, enables interrupts, or retains a borrow.
+/// The delivered timer tick count dates the byte for framing recovery (D7).
 pub(crate) fn accept_byte(status: u8, byte: u8) {
+    let now = timer::ticks();
     // SAFETY: The sole controller owner calls with IF clear on the boot CPU.
-    unsafe { &mut *STATE.0.get() }.accept(status, byte, ps2::next_sequence);
+    unsafe { &mut *STATE.0.get() }.accept(status, byte, now, ps2::next_sequence);
 }
 
 /// Internal ordered-dispatch consumer. Preserves IF and never polls hardware;
@@ -248,20 +303,21 @@ pub(crate) fn pop_event() -> Option<MouseEvent> {
     with_state(State::pop)
 }
 
-/// Inspect the oldest publication sequence for the controller's ordered merge.
+/// Inspect the oldest publication sequence for the controller's ordered merge:
+/// a pending loss marker first, then the queue head.
 pub(crate) fn peek_sequence() -> Option<u64> {
     with_state(|state| state.peek_sequence())
 }
 
-/// Acknowledge lost input, preserving IF. The shared dispatcher then discards
-/// both queues and returns a global loss event before any subsequent input.
-pub(crate) fn take_overflow() -> bool {
-    with_state(State::take_overflow)
+/// Acknowledge a pending pointer loss, preserving IF. The shared dispatcher
+/// returns its marker in sequence order; keyboard events are never discarded.
+pub(crate) fn take_lost() -> bool {
+    with_state(State::take_lost)
 }
 
-/// Global loss barrier: clear queued events and the loss flag, preserving only
-/// a bounded partial-packet tail discard so stale payload cannot become a header.
-/// The pointer consumer clears button history and waits for a released snapshot.
+/// Controller handoff only (ps2 stop_routing): clear queued events and any
+/// pending loss, preserving a bounded partial-packet tail discard so stale
+/// payload cannot become a header.
 pub(crate) fn discard_input() {
     with_state(State::discard_input);
 }
@@ -297,7 +353,17 @@ pub fn self_test() {
     }
     fn feed(state: &mut State, bytes: &[u8]) {
         for &byte in bytes {
-            state.accept(STATUS, byte, || 0);
+            state.accept(STATUS, byte, 0, || 0);
+        }
+    }
+    /// Publish through an explicit shared counter, as ps2::next_sequence does.
+    fn feed_sequenced(state: &mut State, bytes: &[u8], sequence: &mut u64) {
+        for &byte in bytes {
+            state.accept(STATUS, byte, 0, || {
+                let current = *sequence;
+                *sequence = sequence.wrapping_add(1);
+                current
+            });
         }
     }
     fn event(state: &mut State) -> MouseEvent {
@@ -312,9 +378,9 @@ pub fn self_test() {
     assert_eq!(peek_sequence(), None);
     assert_eq!(arch::interrupts_enabled(), original_if);
     discard_input();
-    assert!(!take_overflow());
+    assert!(!take_lost());
     assert_eq!(arch::interrupts_enabled(), original_if);
-    assert!(!take_overflow());
+    assert!(!take_lost());
     assert_eq!(arch::interrupts_enabled(), original_if);
     assert_eq!(irq_count(), 0);
 
@@ -390,8 +456,8 @@ pub fn self_test() {
             &[HEADER_SYNC | overflow | LEFT | MIDDLE, 255, 255],
         );
         assert!(queue.pop().is_none());
-        assert!(queue.take_overflow());
-        assert!(!queue.take_overflow());
+        assert!(queue.take_lost());
+        assert!(!queue.take_lost());
         assert_eq!(
             event(&mut queue),
             MouseEvent {
@@ -403,14 +469,32 @@ pub fn self_test() {
         assert!(queue.pop().is_none());
     }
 
+    // The loss marker takes a shared sequence of its own, after the dropped
+    // event and before the snapshot. A second loss before the consumer takes
+    // the marker keeps the first loss's sequence and allocates no other.
+    let mut marked = state();
+    let mut sequence = 10;
+    feed_sequenced(&mut marked, &[0x08, 1, 1], &mut sequence);
+    feed_sequenced(&mut marked, &[0x48 | LEFT, 255, 0], &mut sequence);
+    assert_eq!(sequence, 13);
+    assert_eq!(marked.peek_sequence(), Some(11));
+    marked.accept(STATUS | RECEIVE_ERROR, 0x08, 0, || {
+        panic!("second loss sequence")
+    });
+    feed(&mut marked, &[0x09, 0x09]);
+    assert_eq!(marked.peek_sequence(), Some(11));
+    assert!(marked.pop().is_none());
+    assert!(marked.take_lost());
+    assert_eq!(marked.peek_sequence(), None);
+
     // Wrong-origin bytes and inactive input must not alter a partial packet.
     let mut inactive = State::new();
     feed(&mut inactive, &[0x09, 5, 6]);
     assert!(inactive.pop().is_none());
     feed(&mut queue, &[0x08]);
-    queue.accept(OUTPUT_FULL, 0xff, || 0);
-    queue.accept(OUTPUT_FULL | RECEIVE_ERROR, 0xff, || 0);
-    queue.accept(AUXILIARY, 0xff, || 0);
+    queue.accept(OUTPUT_FULL, 0xff, 0, || 0);
+    queue.accept(OUTPUT_FULL | RECEIVE_ERROR, 0xff, 0, || 0);
+    queue.accept(AUXILIARY, 0xff, 0, || 0);
     feed(&mut queue, &[2, 3]);
     assert_eq!(
         event(&mut queue),
@@ -420,7 +504,7 @@ pub fn self_test() {
             buttons: 0
         }
     );
-    assert!(!queue.take_overflow());
+    assert!(!queue.take_lost());
 
     // Every corrupt position discards the known remainder of its packet;
     // header-looking tail bytes must not invent a new button press.
@@ -429,10 +513,10 @@ pub fn self_test() {
             let mut damaged = state();
             let packet = [0x0f, 0x0f, 0x0f];
             feed(&mut damaged, &packet[..position]);
-            damaged.accept(STATUS | error, packet[position], || 0);
+            damaged.accept(STATUS | error, packet[position], 0, || 0);
             feed(&mut damaged, &packet[position + 1..]);
             assert!(damaged.pop().is_none());
-            assert!(damaged.take_overflow());
+            assert!(damaged.take_lost());
             assert_eq!(damaged.decoder.length, 0);
             assert_eq!(damaged.decoder.discard, 0);
             feed(&mut damaged, &[0x08, 4, 0]);
@@ -446,10 +530,10 @@ pub fn self_test() {
             );
         }
     }
-    queue.accept(STATUS | RECEIVE_ERROR, 0x0f, || 0);
-    queue.accept(STATUS | RECEIVE_ERROR, 0x0f, || 0);
-    queue.accept(STATUS | RECEIVE_ERROR, 0x0f, || 0);
-    assert!(queue.take_overflow());
+    queue.accept(STATUS | RECEIVE_ERROR, 0x0f, 0, || 0);
+    queue.accept(STATUS | RECEIVE_ERROR, 0x0f, 0, || 0);
+    queue.accept(STATUS | RECEIVE_ERROR, 0x0f, 0, || 0);
+    assert!(queue.take_lost());
     feed(&mut queue, &[0x08, 0, 0]);
     assert_eq!(event(&mut queue).buttons, 0);
 
@@ -470,13 +554,17 @@ pub fn self_test() {
         assert!(queue.pop().is_none());
     }
 
-    for _ in 0..=QUEUE_CAPACITY {
+    // A button change on a full ring is a pointer loss (spec 0017a-D6): the
+    // ring and that packet are dropped, and the next packet supplies levels.
+    for _ in 0..QUEUE_CAPACITY {
         feed(&mut queue, &[HEADER_SYNC | LEFT, 1, 0]);
     }
-    assert!(queue.overflow && queue.length == 0);
+    assert!(queue.lost.is_none() && queue.length == QUEUE_CAPACITY);
+    feed(&mut queue, &[HEADER_SYNC, 1, 0]);
+    assert!(queue.lost.is_some() && queue.length == 0);
     feed(&mut queue, &[HEADER_SYNC | LEFT, 0, 0]);
     assert!(queue.pop().is_none());
-    assert!(queue.take_overflow());
+    assert!(queue.take_lost());
     // Button levels are supplied without interpreting a fresh click. Pointer
     // tests cover suppressing this held press until the following release.
     assert_eq!(event(&mut queue).buttons, LEFT);
@@ -485,17 +573,119 @@ pub fn self_test() {
     assert_eq!(event(&mut queue).buttons, LEFT);
     assert!(queue.pop().is_none());
 
+    // Starvation without a consumer: 64 + 1000 same-button packets lose
+    // nothing. The newest queued event absorbs the excess motion.
+    let mut starved = state();
+    for _ in 0..QUEUE_CAPACITY + 1000 {
+        feed(&mut starved, &[HEADER_SYNC, 1, 0]);
+    }
+    assert!(starved.lost.is_none() && starved.length == QUEUE_CAPACITY);
+    let (mut count, mut total) = (0, 0_i32);
+    while let Some(motion) = starved.pop() {
+        assert_eq!((motion.dy, motion.buttons), (0, 0));
+        count += 1;
+        total += i32::from(motion.dx);
+    }
+    assert_eq!((count, total), (QUEUE_CAPACITY, 1064));
+    assert!(!starved.take_lost());
+
+    // The merged event takes the newest packet's sequence, so a sequence
+    // allocated between two merged packets (a key) sorts before it, here
+    // across the u64 wrap.
+    let mut merged = state();
+    let mut sequence = u64::MAX - QUEUE_CAPACITY as u64;
+    for _ in 0..QUEUE_CAPACITY {
+        feed_sequenced(&mut merged, &[HEADER_SYNC, 1, 0], &mut sequence);
+    }
+    feed_sequenced(&mut merged, &[HEADER_SYNC, 2, 0], &mut sequence);
+    let key = sequence;
+    sequence = sequence.wrapping_add(1);
+    feed_sequenced(&mut merged, &[HEADER_SYNC, 3, 0], &mut sequence);
+    let newest = sequence.wrapping_sub(1);
+    assert_eq!((key, newest), (0, 1));
+    assert!(merged.lost.is_none() && merged.length == QUEUE_CAPACITY);
+    for _ in 0..QUEUE_CAPACITY - 1 {
+        assert_eq!(event(&mut merged).dx, 1);
+    }
+    assert_eq!(merged.peek_sequence(), Some(newest));
+    assert!((key.wrapping_sub(newest) as i64) < 0);
+    assert_eq!(
+        event(&mut merged),
+        MouseEvent {
+            dx: 6,
+            dy: 0,
+            buttons: 0
+        }
+    );
+    assert!(merged.pop().is_none());
+
+    // Checked i16 sums: reaching i16::MIN exactly still merges, and one more
+    // packet beyond either bound is a pointer loss that drops the ring.
+    // Header 0x18 is dx -256; header 0x28 with payload 0 is dy +256.
+    for (header, merges, sum) in [(0x18, 127, i16::MIN), (0x28, 126, 127 * 256)] {
+        let mut saturated = state();
+        for _ in 0..QUEUE_CAPACITY + merges {
+            feed(&mut saturated, &[header, 0, 0]);
+        }
+        assert!(saturated.lost.is_none() && saturated.length == QUEUE_CAPACITY);
+        let newest = saturated.queue[QUEUE_CAPACITY - 1].map(|queued| queued.event);
+        let motion = newest.expect("newest saturated event");
+        assert_eq!(if header == 0x18 { motion.dx } else { motion.dy }, sum);
+        feed(&mut saturated, &[header, 0, 0]);
+        assert!(saturated.lost.is_some() && saturated.length == 0);
+        assert!(saturated.pop().is_none());
+        assert!(saturated.take_lost());
+        assert!(saturated.pop().is_none());
+    }
+
+    // Framing recovery (spec 0017a-D7): header 0x09, then a gap of more
+    // than 50 ticks drops it silently and 08 05 00 decodes on its own. A gap
+    // of 50 ticks or less completes the stale packet 09 08 05 instead, and
+    // the trailing 00 fails the header-bit-3 check.
+    let stale = MouseEvent {
+        dx: 8,
+        dy: -5,
+        buttons: LEFT,
+    };
+    let fresh = MouseEvent {
+        dx: 5,
+        dy: 0,
+        buttons: 0,
+    };
+    for (advance, expected) in [(51, fresh), (49, stale), (50, stale)] {
+        let mut framing = state();
+        let start = 1000;
+        framing.accept(STATUS, 0x09, start, || 0);
+        for byte in [0x08, 5, 0] {
+            framing.accept(STATUS, byte, start + advance, || 0);
+        }
+        assert_eq!(event(&mut framing), expected);
+        assert!(framing.pop().is_none());
+        assert!(!framing.take_lost());
+        assert_eq!(framing.decoder.length, 0);
+    }
+    // A corrupt packet's pending tail expires the same way: after the gap the
+    // next byte is a candidate header rather than discarded payload.
+    for (advance, expected) in [(51, Some(fresh)), (49, None)] {
+        let mut framing = state();
+        framing.accept(STATUS | RECEIVE_ERROR, 0x09, 1000, || 0);
+        assert!(framing.take_lost());
+        for byte in [0x08, 5, 0] {
+            framing.accept(STATUS, byte, 1000 + advance, || 0);
+        }
+        assert_eq!(framing.pop(), expected);
+        assert!(framing.pop().is_none());
+    }
+
     // Publication sequences are allocated only for completed, accepted events;
     // peek and pop retain ordering even across the global u64 sequence wrap.
     let mut ordered = state();
     let mut sequence = u64::MAX - 1;
-    for byte in [0x08, 1, 0, 0x08, 2, 0, 0x08, 3, 0] {
-        ordered.accept(STATUS, byte, || {
-            let current = sequence;
-            sequence = sequence.wrapping_add(1);
-            current
-        });
-    }
+    feed_sequenced(
+        &mut ordered,
+        &[0x08, 1, 0, 0x08, 2, 0, 0x08, 3, 0],
+        &mut sequence,
+    );
     assert_eq!(sequence, 1);
     for (expected_sequence, expected_dx) in [(u64::MAX - 1, 1), (u64::MAX, 2), (0, 3)] {
         assert_eq!(ordered.peek_sequence(), Some(expected_sequence));
@@ -503,22 +693,23 @@ pub fn self_test() {
     }
     assert_eq!(ordered.peek_sequence(), None);
 
-    // A cross-device loss barrier drops complete queued events and partial
-    // bytes, but preserves just enough framing to discard a header-looking tail.
+    // Controller handoff (ps2 stop_routing) drops complete queued events,
+    // any pending loss and partial bytes, but preserves just enough framing
+    // to discard a header-looking tail.
     for prefix in 1..3 {
-        let mut barrier = state();
-        feed(&mut barrier, &[0x09, 1, 1]);
-        feed(&mut barrier, &[0x0f, 0x0f][..prefix]);
-        barrier.overflow = true;
-        barrier.discard_input();
-        assert!(!barrier.take_overflow());
-        assert!(barrier.active);
-        assert_eq!(barrier.peek_sequence(), None);
-        feed(&mut barrier, &[0x0f, 0x0f][..3 - prefix]);
-        assert!(barrier.pop().is_none());
-        feed(&mut barrier, &[0x08, 7, 0]);
+        let mut handoff = state();
+        feed(&mut handoff, &[0x09, 1, 1]);
+        feed(&mut handoff, &[0x0f, 0x0f][..prefix]);
+        handoff.lost = Some(0);
+        handoff.discard_input();
+        assert!(!handoff.take_lost());
+        assert!(handoff.active);
+        assert_eq!(handoff.peek_sequence(), None);
+        feed(&mut handoff, &[0x0f, 0x0f][..3 - prefix]);
+        assert!(handoff.pop().is_none());
+        feed(&mut handoff, &[0x08, 7, 0]);
         assert_eq!(
-            event(&mut barrier),
+            event(&mut handoff),
             MouseEvent {
                 dx: 7,
                 dy: 0,
@@ -526,12 +717,12 @@ pub fn self_test() {
             }
         );
     }
-    let mut barrier = state();
-    barrier.accept(STATUS | RECEIVE_ERROR, 0x0f, || 0);
-    barrier.discard_input();
-    assert!(!barrier.take_overflow());
-    feed(&mut barrier, &[0x0f, 0x0f, 0x08, 8, 0]);
-    assert_eq!(event(&mut barrier).dx, 8);
+    let mut handoff = state();
+    handoff.accept(STATUS | RECEIVE_ERROR, 0x0f, 0, || 0);
+    handoff.discard_input();
+    assert!(!handoff.take_lost());
+    feed(&mut handoff, &[0x0f, 0x0f, 0x08, 8, 0]);
+    assert_eq!(event(&mut handoff).dx, 8);
 
     crate::serial::println!("MIRROR_MOUSE_TESTS_OK");
 }

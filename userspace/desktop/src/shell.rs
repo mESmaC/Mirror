@@ -429,16 +429,20 @@ impl Shell {
 
     fn process(&mut self, event: HardwareEvent) -> bool {
         match event {
-            HardwareEvent::Lost => {
-                self.capture = Capture::None;
-                self.buttons = 0;
-                self.clicks_armed = false;
-                for slot in 0..protocol::MAX_APPS {
-                    if let Some(window) = &mut self.windows[slot] {
-                        window.pending = Pending::new();
+            // Loss is per device (spec 0017a-D3). A pointer loss cancels the
+            // shell's held interaction and resets each app's pointer state;
+            // events already queued for apps, keys included, keep their
+            // order. A keyboard loss sends apps nothing: every key record
+            // carries its full modifier snapshot, and app Reset and Focus
+            // clear only pointer and focus state.
+            HardwareEvent::Lost { pointer, .. } => {
+                if pointer {
+                    self.capture = Capture::None;
+                    self.buttons = 0;
+                    self.clicks_armed = false;
+                    for slot in 0..protocol::MAX_APPS {
+                        self.enqueue(slot, Event::Reset);
                     }
-                    self.enqueue(slot, Event::Reset);
-                    self.enqueue(slot, Event::Focus(self.focused == Some(slot)));
                 }
             }
             HardwareEvent::Key { flags, kind, ascii } => {
@@ -1310,8 +1314,24 @@ fn policy_checks() {
             ascii: b'x',
         },
     );
-    shell.process(HardwareEvent::Lost);
-    require(shell.windows[0].unwrap().pending.length == 2, 168);
+    // A pointer-only loss keeps the key already queued for the focused app
+    // and follows it with a pointer Reset (spec 0017a, acceptance test 4).
+    shell.process(HardwareEvent::Lost {
+        keyboard: false,
+        pointer: true,
+    });
+    let pending = shell.windows[0].unwrap().pending;
+    require(
+        pending.length == 2
+            && pending.events[0]
+                == Some(Event::Key {
+                    flags: 1,
+                    kind: 1,
+                    ascii: b'x',
+                })
+            && pending.events[1] == Some(Event::Reset),
+        168,
+    );
     shell.process(HardwareEvent::Mouse {
         dx: 1,
         dy: 0,
@@ -1353,6 +1373,19 @@ fn policy_checks() {
                     buttons: 1,
                 }),
         170,
+    );
+    // A keyboard-only loss sends apps nothing and keeps the pointer's held
+    // client capture, buttons and click arming.
+    shell.process(HardwareEvent::Lost {
+        keyboard: true,
+        pointer: false,
+    });
+    require(
+        shell.windows[0].unwrap().pending.length == 4
+            && matches!(shell.capture, Capture::Client(0))
+            && shell.buttons == 1
+            && shell.clicks_armed,
+        173,
     );
 }
 
