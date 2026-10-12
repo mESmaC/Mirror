@@ -2,6 +2,8 @@
 //! IRQ/syscall handlers return to the scheduler before another process resumes.
 //! User buffers are checked and copied through the direct map before use.
 
+#[cfg(feature = "boot-smoke")]
+use core::sync::atomic::AtomicBool;
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::{
@@ -62,6 +64,10 @@ static ACTIVE_INPUT: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 static ACTIVE_WINDOWS: AtomicPtr<windows::Session> = AtomicPtr::new(core::ptr::null_mut());
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
+/// Arms acceptance test 4's charge leak probe for the next run_pair drain
+/// (0059; boot-smoke only, one-shot).
+#[cfg(feature = "boot-smoke")]
+static CHARGE_PROBE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Outcome {
@@ -444,7 +450,6 @@ pub fn run_init(
         direct_map,
         scenario,
         display.as_deref_mut(),
-        false,
     );
     // Relaunch from the same ELF after teardown. Fresh BSS and successful entry
     // exercise frame reuse and continuation recovery after both exit and fault.
@@ -454,17 +459,12 @@ pub fn run_init(
     // its first loop top, so its next loop-top ensure grows mid-session.
     #[cfg(feature = "boot-smoke")]
     heap::arm_hold_across_session();
-    // When no desktop session follows, this pair's drain is the boot's last.
-    run_pair(
-        kernel,
-        frames,
-        bytes,
-        &image,
-        direct_map,
-        0,
-        display,
-        !desktop_follows,
-    );
+    // 0059 acceptance test 4: when no desktop session follows, this pair's
+    // drain is the boot's last, so it runs the charge leak probe.
+    if !desktop_follows {
+        CHARGE_PROBE.store(true, Ordering::Relaxed);
+    }
+    run_pair(kernel, frames, bytes, &image, direct_map, 0, display);
 }
 
 #[cfg(feature = "boot-smoke")]
@@ -656,7 +656,6 @@ fn run_pair(
     direct_map: u64,
     scenario: u64,
     display: Option<&mut framebuffer::Driver<'_>>,
-    charge_probe: bool,
 ) {
     // The framebuffer borrow belongs to this whole session, never to a user
     // mapping or handle. Only syscall handlers may reborrow it during resume.
@@ -855,8 +854,9 @@ fn run_pair(
     serial::println!("MIRROR_VM_CLEANUP_OK allocated={}", before);
     // 0059 acceptance test 4: once per boot, the last session's drain leaks
     // one charge, requires the reap check to report it, repairs it, and only
-    // then prints the marker.
-    if charge_probe {
+    // then prints the marker. Armed before the relaunch pair when no desktop
+    // session follows, making this drain the boot's last.
+    if CHARGE_PROBE.swap(false, Ordering::Relaxed) {
         let process = &mut processes[0];
         process.surface_frames = 1;
         assert!(!process.charges_zero(), "reap check missed a leaked charge");
