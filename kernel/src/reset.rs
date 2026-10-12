@@ -246,7 +246,7 @@ pub fn restart(cause: Cause) -> ! {
     #[cfg(not(feature = "boot-smoke"))]
     let first = Method::Fadt;
     let mut hardware = Hardware {
-        stopwatch: Stopwatch::start(),
+        stopwatch: Stopwatch::start_restart(),
         pulse: None,
         #[cfg(feature = "boot-smoke")]
         suppressed,

@@ -279,8 +279,22 @@ const NANOS_PER_SECOND: u128 = 1_000_000_000;
 /// the PIT's 10 ms period; a wrap missed while the VM is descheduled can only
 /// lengthen a wait. BSP only, after init, with IF clear.
 pub(crate) enum Stopwatch {
-    Hpet { origin_ns: u64 },
-    Pit { last: u16, ticks: u64 },
+    Hpet {
+        origin_ns: u64,
+    },
+    /// The restart path's HPET clock (spec 0058a, D7): forward deltas between
+    /// samples are summed and a sample below the last one adds nothing, so a
+    /// counter that a reset write sent back to zero lengthens the wait by at
+    /// most one sample instead of panicking. A stopped counter stalls it, and
+    /// RESET_POLL_LIMIT then ends the wait.
+    RestartHpet {
+        last_ns: u64,
+        elapsed_ns: u64,
+    },
+    Pit {
+        last: u16,
+        ticks: u64,
+    },
 }
 
 impl Stopwatch {
@@ -289,16 +303,32 @@ impl Stopwatch {
             Some(now) => Self::Hpet {
                 origin_ns: now.monotonic_ns,
             },
-            None => Self::Pit {
-                last: pit_counter(),
-                ticks: 0,
+            None => Self::pit(),
+        }
+    }
+
+    /// The stopwatch for `reset::restart`, which must reach its next method
+    /// whatever a reset write did to the HPET.
+    pub(crate) fn start_restart() -> Self {
+        match crate::clock::restart_counter_ns() {
+            Some(now_ns) => Self::RestartHpet {
+                last_ns: now_ns,
+                elapsed_ns: 0,
             },
+            None => Self::pit(),
+        }
+    }
+
+    fn pit() -> Self {
+        Self::Pit {
+            last: pit_counter(),
+            ticks: 0,
         }
     }
 
     pub(crate) fn name(&self) -> &'static str {
         match self {
-            Self::Hpet { .. } => "hpet",
+            Self::Hpet { .. } | Self::RestartHpet { .. } => "hpet",
             Self::Pit { .. } => "pit",
         }
     }
@@ -309,6 +339,15 @@ impl Stopwatch {
                 .expect("published HPET clock")
                 .monotonic_ns
                 .saturating_sub(*origin_ns),
+            Self::RestartHpet {
+                last_ns,
+                elapsed_ns,
+            } => {
+                let now_ns = crate::clock::restart_counter_ns().expect("published HPET clock");
+                *elapsed_ns = restart_elapsed(*last_ns, *elapsed_ns, now_ns);
+                *last_ns = now_ns;
+                *elapsed_ns
+            }
             Self::Pit { last, ticks } => {
                 let current = pit_counter();
                 *ticks = ticks.saturating_add(u64::from(pit_elapsed(*last, current)));
@@ -318,6 +357,12 @@ impl Stopwatch {
             }
         }
     }
+}
+
+/// One `RestartHpet` sample: time since the last sample adds, and a counter
+/// below the last sample only becomes the new base.
+fn restart_elapsed(last_ns: u64, elapsed_ns: u64, now_ns: u64) -> u64 {
+    elapsed_ns.saturating_add(now_ns.saturating_sub(last_ns))
 }
 
 /// The restart path's backstop for its waits (spec 0058a, D7): the 8042
@@ -463,6 +508,14 @@ fn policy_self_test() {
     assert_eq!(pit_elapsed(divisor, 1), PIT_DIVISOR - 1);
     assert_eq!(pit_elapsed(7_777, 7_777), 0);
     assert_eq!(pit_elapsed(divisor, divisor), 0);
+    // The restart stopwatch (spec 0058a, D7): forward time adds, a counter
+    // sent back to zero adds nothing and counts on from there, and a stopped
+    // counter stalls, leaving the end to RESET_POLL_LIMIT.
+    assert_eq!(restart_elapsed(100, 0, 600), 500);
+    assert_eq!(restart_elapsed(600, 500, 40), 500);
+    assert_eq!(restart_elapsed(40, 500, 140), 600);
+    assert_eq!(restart_elapsed(140, 600, 140), 600);
+    assert_eq!(restart_elapsed(0, u64::MAX - 1, u64::MAX), u64::MAX);
     serial::println!("MIRROR_TIMER_POLICY_OK");
 }
 
