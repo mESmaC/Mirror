@@ -1,7 +1,7 @@
 # 0054a: Frame allocator v2 — refcounts, per-process limits
 
-Status: draft (revised after claude's reviews of 8762d0e and 95eafa1; the reserve and OOM-order half moves to a follow-up spec, pending Cameron's C8/RD24 answer — open question 8)
-Depends on: 0030a (the process table and its per-entry state, 0030-D1). Ordered fifth in Phase 1 (roadmap-replan.md:124), before 0051. The reserve and OOM decisions wait on RD6 (proposed, due before Phase 1) and live in the follow-up spec.
+Status: draft (revised after claude's reviews of 8762d0e and 95eafa1; the reserve and OOM-order half moves to a follow-up spec, pending Cameron's C8/RD24 answer — open question 4)
+Depends on: 0030a (the process table and its per-entry state, 0030-D1). Ordered fifth in Phase 1 (roadmap-replan.md:124), before 0051. RD6 (confirmed 2026-10-12) places the S18 reserve and OOM order in 0054a, so this split proposes amending RD6 and S18 until Cameron decides C8 (open question 4); they live in the follow-up spec.
 Ledger: S18 (partially — the reserve and the OOM order are the follow-up spec's; class-based limits start its class model), S6 as amended 2026-10-11 (a vm-protocol limit change; no syscall). Related: I6 (multi-GB per-process memory), S4, RD6.
 
 Line references are at origin/main 838c3b6.
@@ -14,7 +14,7 @@ The frame allocator gains per-frame reference counts, so sharing (0025's shared 
 - Pressure notifications and cache-shrink requests (0054b, Phase 11; S18's engine/indexer behavior waits for it).
 - Userspace on APs and the allocator's locking (0051): allocation stays BSP-only with IF=0 (memory.rs:210-215, :313-314). 0051 inherits the obligations the follow-up spec adds to.
 - Grant-carried per-agent limits (0022, Phase 2; S18's "grants can carry per-agent memory limits"); limits here come from the class only, and 0022's grants raise them later — that is the path to I6's multi-GB.
-- Charged kernel frames (heapv2-D3's page tables and surfaces, 0050's stacks) count toward neither limits nor (in the follow-up spec) victim choice in Phase 1 unless Cameron decides otherwise (open question 7).
+- Charged kernel frames (0059-D3's page tables and surfaces, 0050's stacks) count toward neither limits nor (in the follow-up spec) victim choice in Phase 1 unless Cameron decides otherwise (open question 7).
 - A free list or faster scans: the 2-bit bitmap and its scans stay (memory.rs:55-86).
 - The vm-protocol ARENA bounds and MAX_REGIONS (64, after 0030a).
 
@@ -54,4 +54,4 @@ No new crates.
 1. The class limit table (C3). Recommended: fixed Phase 1 defaults — normal, agent and background equal (1 GiB reserved, 512 MiB committed); protected limited only by the arena and free memory; the test class keeps 256/32 MiB; 0022's grants raise limits later. Main alternative: scale normal's limits with usable RAM now.
 2. Refcount width (C4). Recommended: u16 (adopted in D1). Alternative: u8.
 3. Do charged kernel frames (page tables, surfaces, 0050's stacks) or image and stack pages count toward limits or victim choice in Phase 1 (C7)? Heap v2 and 0050 both defer this here. Recommended: limits count only the VM ledger; the follow-up spec's victim choice counts all of a process's frames.
-4. The split itself (C8): this draft takes it — allocator, classes, limits and the 256 MiB case stay here; the reserve floor, victim order and OomOrder move to the follow-up spec, whose number Cameron assigns (RD24; 0054b is taken by pressure notifications, roadmap-replan.md:383). Both keep 0054-Dn IDs (rule 1). Alternative: one spec, built in five commits.
+4. The split itself (C8): this draft takes it — allocator, classes, limits and the 256 MiB case stay here; the reserve floor, victim order and OomOrder move to the follow-up spec, whose number Cameron assigns (RD24; 0054b is taken by pressure notifications, roadmap-replan.md:383). Both keep 0054-Dn IDs (rule 1). Because RD6 (confirmed 2026-10-12) places the reserve and OOM order in 0054a, the split proposes amending RD6 and S18 until Cameron decides. Alternative: one spec, built in five commits.
