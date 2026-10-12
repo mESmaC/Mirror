@@ -13,7 +13,7 @@ Processes and threads stop being stack locals of three session loops (`run_pair`
 - Userspace on the APs, per-CPU data, per-thread kernel stacks and the per-CPU SYSCALL entry (0051, 0050). The single RSP0 trap stack (stacks.rs:119) and the single ACTIVE-process statics (:56-64), with interrupts-disabled scheduling, stay as they are.
 - Priority classes and work-conserving scheduling (0052, S4). The throttle survives here, so its dead time does too: an eligible-again stall of up to 680 ms is unchanged until 0052.
 - Kernel heap v2 and frame allocator v2 (Phase 1 items 4-5). The tables are fixed-capacity .bss statics, so they need neither.
-- Spawn, wait, kill and exit status (0030, Phase 3), suspend/resume (S6e) and the principal field (RD2, proposed, due before Phase 1). Processes are created only by kernel session seeding and the shell's launch call (:1417, :2046-2052). 0030's Phase 3 draft continues this spec's 0030-Dn numbering (split rule 1).
+- Spawn, wait, kill and exit status (0030, Phase 3), suspend/resume (S6e) and the principal field (RD2, confirmed 2026-10-12). Processes are created only by kernel session seeding and the shell's launch call (:1417, :2046-2052). 0030's Phase 3 draft continues this spec's 0030-Dn numbering (split rule 1).
 - The vm-protocol capacity limits RESERVED_LIMIT/COMMITTED_LIMIT (0054a); MAX_REGIONS rises here (0030-D4). The 2 MiB image limit stays for the ELF loader v2 (Phase 3).
 
 ## Decisions
