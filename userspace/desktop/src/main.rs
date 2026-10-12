@@ -86,15 +86,19 @@ fn boot_handle(index: u64) -> u64 {
 }
 
 // Lost names the devices whose input was lost; only the initial record of an
-// input session names both (spec 0017a-D4).
+// input session names both (spec 0017a-D4). Position places the pointer at
+// surface-local pixels (spec 0017-D17).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Event {
     Key { flags: u32, kind: u32, ascii: u8 },
     Mouse { dx: i32, dy: i32, buttons: u8 },
+    Position { x: usize, y: usize, buttons: u8 },
     Lost { keyboard: bool, pointer: bool },
 }
 
-fn decode_event(bytes: &[u8; 32]) -> Event {
+/// `surface` is the input surface's width and height: a position outside it
+/// is rejected.
+fn decode_event(bytes: &[u8; 32], surface: (usize, usize)) -> Event {
     let mut words = [0u32; 8];
     for (word, bytes) in words.iter_mut().zip(bytes.as_chunks::<4>().0) {
         *word = u32::from_le_bytes(*bytes);
@@ -139,21 +143,33 @@ fn decode_event(bytes: &[u8; 32]) -> Event {
                 pointer: words[2] & 2 != 0,
             }
         }
+        4 => {
+            // Pointer position (spec 0017-D17): button levels, then unsigned
+            // surface-local x and y inside the surface.
+            require(words[2] & !7 == 0 && words[3..6] == [0; 3], 16);
+            let (x, y) = (words[6] as usize, words[7] as usize);
+            require(x < surface.0 && y < surface.1, 18);
+            Event::Position {
+                x,
+                y,
+                buttons: words[2] as u8,
+            }
+        }
         _ => exit(15),
     }
 }
 
-fn next_input(number: u64, input: u64) -> Result<Event, i64> {
+fn next_input(number: u64, input: u64, surface: (usize, usize)) -> Result<Event, i64> {
     let mut bytes = [0u8; 32];
     let result = syscall(number, input, bytes.as_mut_ptr() as u64, 32);
     if result == 32 {
-        Ok(decode_event(&bytes))
+        Ok(decode_event(&bytes, surface))
     } else {
         Err(result)
     }
 }
 
-fn check_input(console: u64, surface: u64, input: u64) {
+fn check_input(console: u64, surface: u64, input: u64, dimensions: (usize, usize)) {
     let mut buffer = [0xa5u8; 32];
     let pointer = buffer.as_mut_ptr() as u64;
     require(syscall(SYS_BOOT_HANDLE, 1, 0, 0) > 0, 20);
@@ -183,7 +199,7 @@ fn check_input(console: u64, surface: u64, input: u64) {
     // staged event. A valid copy now receives its exact loss/baseline barrier.
     require(syscall(SYS_INPUT_POLL, input, pointer, 32) == 32, 38);
     require(
-        decode_event(&buffer)
+        decode_event(&buffer, dimensions)
             == Event::Lost {
                 keyboard: true,
                 pointer: true,
@@ -336,8 +352,8 @@ extern "C" fn desktop_main(mode: u64) -> ! {
     let surface = boot_handle(3);
     let input = boot_handle(4);
     let mut service = service::Service::new(boot_handle(1), boot_handle(2));
-    check_input(console, surface, input);
     let (width, height) = surface_dimensions(surface);
+    check_input(console, surface, input, (width, height));
     if mode == 1 {
         smoke(console, surface, input, &mut service);
     }
@@ -357,7 +373,7 @@ extern "C" fn desktop_main(mode: u64) -> ! {
         // Bound each source independently; a busy agent must leave human input
         // responsive, and waiting for input alone would starve IPC requests.
         for _ in 0..16 {
-            match next_input(SYS_INPUT_POLL, input) {
+            match next_input(SYS_INPUT_POLL, input, (width, height)) {
                 Ok(event) => changes |= ui.process(event),
                 Err(EAGAIN) => break,
                 Err(_) => exit(56),

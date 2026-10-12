@@ -15,7 +15,7 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::{arch, clock, keyboard, mouse, serial, timer};
+use crate::{arch, clock, keyboard, mouse, serial, timer, vmmouse};
 
 const DATA: u16 = 0x60;
 const STATUS_COMMAND: u16 = 0x64;
@@ -294,6 +294,8 @@ impl Drop for Consumer {
 pub enum InputEvent {
     Key(keyboard::KeyEvent),
     Mouse(mouse::MouseEvent),
+    /// A vmmouse absolute position in device units (spec 0017-D14).
+    Position(mouse::PositionEvent),
     /// One device's loss marker (spec 0017a-D3). next_event sets exactly one
     /// flag; only a session's initial record names both devices.
     Lost {
@@ -312,8 +314,9 @@ pub(crate) fn next_sequence() -> u64 {
 fn keyboard_first(keyboard: u64, mouse: u64) -> bool {
     // Each device holds at most 64 events and one loss marker. A full mouse
     // ring can keep an old head while merged packets take new sequences, but
-    // every allocation needs a received byte, so live sequence numbers stay
-    // far closer than half the u64 range, including across the natural wrap.
+    // every allocation needs a received byte or a drained vmmouse packet, so
+    // live sequence numbers stay far closer than half the u64 range,
+    // including across the natural wrap.
     (keyboard.wrapping_sub(mouse) as i64) < 0
 }
 
@@ -341,12 +344,18 @@ fn next_event() -> Option<InputEvent> {
             keyboard: false,
             pointer: true,
         }),
-        Some(false) => mouse::pop_event().map(InputEvent::Mouse),
+        Some(false) => mouse::pop_event().map(|event| match event {
+            mouse::Event::Relative(motion) => InputEvent::Mouse(motion),
+            mouse::Event::Absolute(position) => InputEvent::Position(position),
+        }),
         None => None,
     };
     // SAFETY: Controller and both device borrows ended; initialized handlers
     // see consistent queues if the caller previously enabled interrupts.
     unsafe { arch::restore_interrupts(enabled) };
+    // The IRQ side only records a vmmouse runtime fallback; print it once here
+    // (spec 0017-D16).
+    vmmouse::report_fallback();
     result
 }
 
@@ -781,12 +790,17 @@ pub(crate) fn handle_irq(vector: u8) {
 /// Continue at most 32 deferred bytes, preserving IF. Call before borrowing any
 /// keyboard/mouse state: the drain may call both device decoders synchronously.
 /// The periodic PIT must keep waking main even when no input event is queued.
+/// A vmmouse drain that stopped at its 64-packet bound also continues here,
+/// independently of the controller's pending drain (spec 0017-D13).
 pub fn poll_pending() {
     with_state(|state| {
         if state.pending_drain {
             drain_controller(state);
         }
     });
+    if vmmouse::pending() {
+        mouse::drain_vmmouse();
+    }
 }
 
 /// Delivered handlers, possibly empty or raised by an initialization ACK.

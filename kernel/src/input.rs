@@ -4,20 +4,71 @@
 //! record is copied by value and committed only after successful user copyout;
 //! failed requests cannot consume it or reorder later device events.
 
-use crate::{keyboard::Key, ps2};
+use crate::framebuffer::SurfaceRegion;
+use crate::{keyboard::Key, mouse, ps2};
 
 pub const EVENT_SIZE: usize = 32;
 pub const KIND_KEY: u32 = 1;
 pub const KIND_MOUSE: u32 = 2;
 pub const KIND_LOST: u32 = 3;
+pub const KIND_POSITION: u32 = 4;
+const BUTTONS: u8 = mouse::LEFT | mouse::RIGHT | mouse::MIDDLE;
+
+/// Where kind 4 positions land (spec 0017-D14, D17): absolute device units
+/// span the framebuffer, and records carry pixels local to the desktop
+/// rectangle inside it, clamped to that rectangle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Placement {
+    last_x: usize,
+    last_y: usize,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+impl Placement {
+    /// Fails closed unless the desktop lies inside the framebuffer and its
+    /// local coordinates fit the record's u32 words.
+    fn new(framebuffer: (usize, usize), desktop: SurfaceRegion) -> Self {
+        let (x, y) = desktop.origin();
+        let (width, height) = desktop.dimensions();
+        assert!(
+            width != 0
+                && height != 0
+                && u32::try_from(width).is_ok()
+                && u32::try_from(height).is_ok()
+                && x.checked_add(width).is_some_and(|end| end <= framebuffer.0)
+                && y.checked_add(height)
+                    .is_some_and(|end| end <= framebuffer.1),
+            "desktop outside the framebuffer"
+        );
+        Self {
+            last_x: framebuffer.0 - 1,
+            last_y: framebuffer.1 - 1,
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+}
 
 pub struct Session<'a> {
     consumer: &'a mut ps2::Consumer,
+    placement: Placement,
     pending: Option<[u8; EVENT_SIZE]>,
 }
 
 impl<'a> Session<'a> {
-    pub fn new(consumer: &'a mut ps2::Consumer) -> Self {
+    /// `framebuffer` is the framebuffer's width and height and `desktop` the
+    /// surface rectangle inside it, from `surface::Session::desktop`.
+    pub fn new(
+        consumer: &'a mut ps2::Consumer,
+        framebuffer: (usize, usize),
+        desktop: SurfaceRegion,
+    ) -> Self {
+        let placement = Placement::new(framebuffer, desktop);
         // Discard the backlog left by boot: up to 64 events per device, each
         // behind one pending loss marker. Bound ownership handoff work even if
         // deferred controller polling produces more events. Do not force
@@ -30,11 +81,15 @@ impl<'a> Session<'a> {
         }
         Self {
             consumer,
+            placement,
             // The initial record alone names both devices (spec 0017a-D4).
-            pending: Some(encode(ps2::InputEvent::Lost {
-                keyboard: true,
-                pointer: true,
-            })),
+            pending: Some(encode(
+                ps2::InputEvent::Lost {
+                    keyboard: true,
+                    pointer: true,
+                },
+                placement,
+            )),
         }
     }
 
@@ -42,7 +97,11 @@ impl<'a> Session<'a> {
     /// from the controller and every retry observes these exact same bytes.
     pub fn peek(&mut self) -> Option<[u8; EVENT_SIZE]> {
         if self.pending.is_none() {
-            self.pending = self.consumer.next_event().map(encode);
+            let placement = self.placement;
+            self.pending = self
+                .consumer
+                .next_event()
+                .map(|event| encode(event, placement));
         }
         self.pending
     }
@@ -57,11 +116,12 @@ impl<'a> Session<'a> {
     }
 }
 
-fn encode(event: ps2::InputEvent) -> [u8; EVENT_SIZE] {
+fn encode(event: ps2::InputEvent, placement: Placement) -> [u8; EVENT_SIZE] {
     // Eight LE u32s: version, kind, flags, key kind, unshifted character,
     // printable ASCII (zero if none), signed dx, signed dy. Unused words are zero.
     // A loss record's flags are a nonzero device mask: bit 0 keyboard, bit 1
-    // pointer (spec 0017a-D4).
+    // pointer (spec 0017a-D4). A position record (spec 0017-D17) carries
+    // button levels and unsigned surface-local x and y in the last two words.
     let mut words = [0u32; 8];
     words[0] = 1;
     match event {
@@ -96,11 +156,21 @@ fn encode(event: ps2::InputEvent) -> [u8; EVENT_SIZE] {
         }
         ps2::InputEvent::Mouse(event) => {
             words[1] = KIND_MOUSE;
-            words[2] = u32::from(
-                event.buttons & (crate::mouse::LEFT | crate::mouse::RIGHT | crate::mouse::MIDDLE),
-            );
+            words[2] = u32::from(event.buttons & BUTTONS);
             words[6] = i32::from(event.dx) as u32;
             words[7] = i32::from(event.dy) as u32;
+        }
+        ps2::InputEvent::Position(event) => {
+            // Device units to framebuffer pixels, then to the desktop's
+            // centered origin; positions in the border clamp to its edge.
+            let local = |value, last, origin: usize, extent: usize| {
+                let pixel: usize = mouse::to_pixel(value, last);
+                pixel.saturating_sub(origin).min(extent - 1) as u32
+            };
+            words[1] = KIND_POSITION;
+            words[2] = u32::from(event.buttons & BUTTONS);
+            words[6] = local(event.x, placement.last_x, placement.x, placement.width);
+            words[7] = local(event.y, placement.last_y, placement.y, placement.height);
         }
         ps2::InputEvent::Lost { keyboard, pointer } => {
             assert!(keyboard || pointer, "loss record without a device");
@@ -133,6 +203,22 @@ pub fn self_test() {
             modifiers: Modifiers::default(),
         }
     }
+    /// A 1280x800 desktop centered in a framebuffer, as surface::Session
+    /// grants it.
+    fn desktop(width: usize, height: usize) -> SurfaceRegion {
+        let info = crate::framebuffer::Info {
+            width,
+            height,
+            pitch: width * 4,
+            bpp: 32,
+            byte_len: width * 4 * height,
+        };
+        SurfaceRegion::new(info, (width - 1280) / 2, (height - 800) / 2, 1280, 800)
+            .expect("test desktop")
+    }
+    const FRAMEBUFFER: (usize, usize) = (1920, 1080);
+    let placement = Placement::new(FRAMEBUFFER, desktop(FRAMEBUFFER.0, FRAMEBUFFER.1));
+    let encode = |event| self::encode(event, placement);
     // Keyboard, pointer and initial loss records carry their device mask.
     for (keyboard, pointer, mask) in [(true, false, 1), (false, true, 2), (true, true, 3)] {
         assert_eq!(
@@ -193,6 +279,64 @@ pub fn self_test() {
     assert_eq!(words(motion), [1, 2, 7, 0, 0, 0, (-256i32) as u32, 256]);
     assert_eq!(&motion[24..28], &[0, 0xff, 0xff, 0xff]);
 
+    // Position records (spec 0017-D17): with the 1280x800 desktop centered in
+    // 1920x1080 (origin 320,140), device unit 0 is local (0, 0) and 0xFFFF is
+    // (1279, 799); framebuffer pixels in the border clamp to the edge.
+    let position = |x, y, buttons| {
+        words(encode(ps2::InputEvent::Position(mouse::PositionEvent {
+            x,
+            y,
+            buttons,
+        })))
+    };
+    assert_eq!(position(0, 0, 0), [1, 4, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(
+        position(0xffff, 0xffff, 0xff),
+        [1, 4, 7, 0, 0, 0, 1279, 799]
+    );
+    for buttons in [mouse::LEFT, mouse::RIGHT, mouse::MIDDLE] {
+        assert_eq!(position(0, 0, buttons)[2], u32::from(buttons));
+    }
+    // The device unit that maps to framebuffer pixel `pixel` of `extent`.
+    let unit = |pixel: u64, extent: u64| {
+        u16::try_from((2 * pixel * 0xffff + extent - 1) / (2 * (extent - 1))).expect("unit")
+    };
+    for (pixel, local) in [
+        (0, 0),
+        (319, 0),
+        (320, 0),
+        (321, 1),
+        (960, 640),
+        (1599, 1279),
+        (1600, 1279),
+        (1919, 1279),
+    ] {
+        assert_eq!(position(unit(pixel, 1920), 0, 0)[6..], [local, 0]);
+    }
+    for (pixel, local) in [
+        (0, 0),
+        (139, 0),
+        (140, 0),
+        (141, 1),
+        (540, 400),
+        (939, 799),
+        (940, 799),
+        (1079, 799),
+    ] {
+        assert_eq!(position(0, unit(pixel, 1080), 0)[6..], [0, local]);
+    }
+    // A framebuffer the desktop fills has no border to subtract.
+    let filled = Placement::new((1280, 800), desktop(1280, 800));
+    let corner = self::encode(
+        ps2::InputEvent::Position(mouse::PositionEvent {
+            x: 0xffff,
+            y: 0xffff,
+            buttons: 0,
+        }),
+        filled,
+    );
+    assert_eq!(words(corner), [1, 4, 0, 0, 0, 0, 1279, 799]);
+
     // Fixtures activate only software decoders. Controller state is still
     // uninitialized with no pending drain, so these paths perform no port I/O.
     crate::keyboard::with_test_input(|| {
@@ -206,7 +350,7 @@ pub fn self_test() {
             crate::keyboard::accept_byte(1, 0xf0);
             crate::keyboard::accept_byte(1, 0x1c);
             {
-                let mut session = Session::new(&mut consumer);
+                let mut session = Session::new(&mut consumer, FRAMEBUFFER, desktop(1920, 1080));
                 let initial = session.peek().unwrap();
                 assert_eq!(words(initial), [1, KIND_LOST, 3, 0, 0, 0, 0, 0]);
                 assert_eq!(session.peek(), Some(initial));
@@ -262,6 +406,24 @@ pub fn self_test() {
                 assert_eq!(words(session.peek().unwrap()), [1, 2, 0, 0, 0, 0, 4, 0]);
                 session.consume();
                 assert_eq!(session.peek(), None);
+
+                // A drained position reaches the session in order with keys,
+                // as a kind 4 record in surface-local pixels (spec 0017-D17).
+                crate::keyboard::accept_byte(1, 0x2b); // f
+                mouse::publish_test_event(mouse::Event::Absolute(mouse::PositionEvent {
+                    x: 0xffff,
+                    y: 0,
+                    buttons: mouse::LEFT,
+                }));
+                crate::keyboard::accept_byte(1, 0xf0);
+                crate::keyboard::accept_byte(1, 0x2b);
+                assert_eq!(words(session.peek().unwrap())[5], 102);
+                session.consume();
+                assert_eq!(words(session.peek().unwrap()), [1, 4, 1, 0, 0, 0, 1279, 0]);
+                session.consume();
+                assert_eq!(words(session.peek().unwrap()), [1, 1, 0, 1, 102, 0, 0, 0]);
+                session.consume();
+                assert_eq!(session.peek(), None);
             }
             assert_eq!(consumer.next_event(), None);
 
@@ -292,7 +454,7 @@ pub fn self_test() {
             assert_eq!(backlog, ps2::MAX_BACKLOG);
             fill_backlog();
             {
-                let mut session = Session::new(&mut consumer);
+                let mut session = Session::new(&mut consumer, FRAMEBUFFER, desktop(1920, 1080));
                 let initial = session.peek().unwrap();
                 assert_eq!(words(initial), [1, KIND_LOST, 3, 0, 0, 0, 0, 0]);
                 session.consume();

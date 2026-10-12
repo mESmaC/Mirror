@@ -11,10 +11,14 @@
 //! PS/2 positive Y is upward, so decoded events invert Y for screen coordinates.
 //! The 500 ms framing-recovery gap matches linux `psmouse-base.c`, which uses
 //! HZ/2 (spec 0017a-D7); no source code is copied.
+//!
+//! While the VMware vmmouse is active (spec 0017c), this decoder keeps PS/2
+//! framing but a completed packet is only a doorbell for a vmmouse drain, and
+//! the ring also carries absolute positions (0017-D13, D15).
 
 use core::cell::UnsafeCell;
 
-use crate::{arch, ps2, timer};
+use crate::{arch, ps2, timer, vmmouse};
 
 pub const LEFT: u8 = 1;
 pub const RIGHT: u8 = 2;
@@ -39,6 +43,63 @@ pub struct MouseEvent {
     pub buttons: u8,
 }
 
+/// A vmmouse absolute position in device units (spec 0017-D14): 0..=0xFFFF
+/// spans the framebuffer. Consumers convert at use with `to_pixel`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PositionEvent {
+    pub x: u16,
+    pub y: u16,
+    /// Current button levels, not edges; LEFT | RIGHT | MIDDLE only.
+    pub buttons: u8,
+}
+
+/// One entry of the shared mouse ring: relative motion, from PS/2 or a
+/// relative vmmouse packet, or an absolute vmmouse position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    Relative(MouseEvent),
+    Absolute(PositionEvent),
+}
+
+impl Event {
+    /// Fold a newer event into this newest queued one on a full ring: same-
+    /// button relative motion adds with checked i16 sums (spec 0017a-D6), and
+    /// a same-button absolute position replaces this one (0017-D15). A button
+    /// change, a relative/absolute switch or an overflow refuses.
+    fn absorb(&mut self, newer: Event) -> bool {
+        match (self, newer) {
+            (Self::Relative(queued), Self::Relative(motion))
+                if queued.buttons == motion.buttons =>
+            {
+                let (Some(dx), Some(dy)) = (
+                    queued.dx.checked_add(motion.dx),
+                    queued.dy.checked_add(motion.dy),
+                ) else {
+                    return false;
+                };
+                queued.dx = dx;
+                queued.dy = dy;
+                true
+            }
+            (Self::Absolute(queued), Self::Absolute(position))
+                if queued.buttons == position.buttons =>
+            {
+                *queued = position;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Convert a device unit to a pixel index in `0..=last` (spec 0017-D14):
+/// `(value * last + 0x7FFF) / 0xFFFF`, so 0 and 0xFFFF are the first and last
+/// pixel. `last` is the extent minus one; the result never exceeds it.
+pub fn to_pixel(value: u16, last: usize) -> usize {
+    let scaled = (u128::from(value) * last as u128 + 0x7fff) / 0xffff;
+    usize::try_from(scaled).expect("pixel within the extent")
+}
+
 struct Packet {
     event: MouseEvent,
     overflow: bool,
@@ -47,7 +108,7 @@ struct Packet {
 #[derive(Clone, Copy)]
 struct QueuedEvent {
     sequence: u64,
-    event: MouseEvent,
+    event: Event,
 }
 
 struct Decoder {
@@ -142,6 +203,10 @@ impl Decoder {
 
 struct State {
     active: bool,
+    /// vmmouse doorbell mode (spec 0017-D13). Only `vmmouse::init` sets it,
+    /// after its probe and enable pass; a runtime fallback clears it until the
+    /// next boot (0017-D16).
+    doorbell: bool,
     decoder: Decoder,
     queue: [Option<QueuedEvent>; QUEUE_CAPACITY],
     head: usize,
@@ -155,6 +220,7 @@ impl State {
     const fn new() -> Self {
         Self {
             active: false,
+            doorbell: false,
             decoder: Decoder::new(),
             queue: [None; QUEUE_CAPACITY],
             head: 0,
@@ -186,51 +252,87 @@ impl State {
         // The consumer must reset its own history upon acknowledging loss.
     }
 
-    fn accept(&mut self, status: u8, byte: u8, now: u64, mut next_sequence: impl FnMut() -> u64) {
+    /// Decode one AUX byte. Returns true when it rang the vmmouse doorbell: in
+    /// doorbell mode a completed packet, a motion-overflow packet or a receive
+    /// error queues nothing and is no pointer loss, and the caller then runs
+    /// one drain (spec 0017-D13). Framing (0017a-D7) is the same in both modes.
+    fn accept(
+        &mut self,
+        status: u8,
+        byte: u8,
+        now: u64,
+        mut next_sequence: impl FnMut() -> u64,
+    ) -> bool {
         if !self.active || status & (OUTPUT_FULL | AUXILIARY) != (OUTPUT_FULL | AUXILIARY) {
-            return;
+            return false;
         }
         if status & RECEIVE_ERROR != 0 {
             self.decoder.corrupt_byte(now);
-            self.lose_input(&mut next_sequence);
-            return;
+            if !self.doorbell {
+                self.lose_input(&mut next_sequence);
+            }
+            return self.doorbell;
         }
         let Some(packet) = self.decoder.feed(byte, now) else {
-            return;
+            return false;
         };
+        if self.doorbell {
+            // The packet's motion and buttons are discarded: the vmmouse
+            // queue carries the input this packet announces.
+            return true;
+        }
         if packet.overflow {
             // Signal lost motion before publishing its zero-motion button
             // snapshot. The consumer disarms click edges until release.
             self.lose_input(&mut next_sequence);
-        } else if self.length == QUEUE_CAPACITY {
-            // Starvation (spec 0017a-D6): add same-button motion into the
-            // newest queued event, which takes this packet's sequence and so
-            // still sorts after every key published before this packet. A
-            // button change or an i16 overflow is a pointer loss; the decoder
-            // is at a packet boundary, so the next packet supplies fresh levels.
+        }
+        self.publish(Event::Relative(packet.event), &mut next_sequence);
+        false
+    }
+
+    /// Queue one completed event under the next shared sequence. On a full
+    /// ring (spec 0017a-D6, 0017-D15) the newest queued event absorbs it and
+    /// takes its sequence, so it still sorts after every key published before
+    /// it; when it cannot, that is a pointer loss, and the next event supplies
+    /// fresh levels.
+    fn publish(&mut self, event: Event, next_sequence: &mut impl FnMut() -> u64) {
+        if self.length == QUEUE_CAPACITY {
             let newest = (self.head + QUEUE_CAPACITY - 1) % QUEUE_CAPACITY;
             if let Some(queued) = &mut self.queue[newest]
-                && queued.event.buttons == packet.event.buttons
-                && let Some(dx) = queued.event.dx.checked_add(packet.event.dx)
-                && let Some(dy) = queued.event.dy.checked_add(packet.event.dy)
+                && queued.event.absorb(event)
             {
-                queued.event.dx = dx;
-                queued.event.dy = dy;
                 queued.sequence = next_sequence();
             } else {
-                self.lose_input(&mut next_sequence);
+                self.lose_input(next_sequence);
             }
             return;
         }
         let tail = (self.head + self.length) % QUEUE_CAPACITY;
         self.queue[tail] = Some(QueuedEvent {
             sequence: next_sequence(),
-            event: packet.event,
+            event,
         });
         self.length += 1;
     }
 
-    fn pop(&mut self) -> Option<MouseEvent> {
+    /// One vmmouse drain into this ring (spec 0017-D13). A protocol error has
+    /// already disabled the device; it ends doorbell mode for good and is a
+    /// pointer loss (0017-D16).
+    fn drain(
+        &mut self,
+        backdoor: &mut impl vmmouse::Backdoor,
+        mut next_sequence: impl FnMut() -> u64,
+    ) -> vmmouse::Drain {
+        debug_assert!(self.active && self.doorbell);
+        let result = vmmouse::drain(backdoor, |event| self.publish(event, &mut next_sequence));
+        if let vmmouse::Drain::Failed(_) = result {
+            self.doorbell = false;
+            self.lose_input(&mut next_sequence);
+        }
+        result
+    }
+
+    fn pop(&mut self) -> Option<Event> {
         // The consumer must take the loss marker before any later event.
         if self.lost.is_some() || self.length == 0 {
             return None;
@@ -291,15 +393,50 @@ pub(crate) fn activate() {
 /// Accept one controller-routed byte with IF clear. This function never polls
 /// the controller, allocates, prints, enables interrupts, or retains a borrow.
 /// The delivered timer tick count dates the byte for framing recovery (D7).
+/// A rung doorbell drains the vmmouse here (spec 0017-D13).
 pub(crate) fn accept_byte(status: u8, byte: u8) {
     let now = timer::ticks();
     // SAFETY: The sole controller owner calls with IF clear on the boot CPU.
-    unsafe { &mut *STATE.0.get() }.accept(status, byte, now, ps2::next_sequence);
+    let state = unsafe { &mut *STATE.0.get() };
+    if state.accept(status, byte, now, ps2::next_sequence) {
+        drain_device(state);
+    }
+}
+
+/// One drain on the real backdoor with IF clear, recording its outcome. It
+/// never prints; ps2::next_event reports a fallback.
+fn drain_device(state: &mut State) {
+    if !state.doorbell {
+        return;
+    }
+    let mut port = {
+        // SAFETY: Doorbell mode is set only by vmmouse::init after GETVERSION
+        // found the backdoor on a hypervisor, and every caller holds this
+        // state with IF clear on the BSP, at CPL0.
+        unsafe { vmmouse::Port::new() }
+    };
+    vmmouse::record(state.drain(&mut port, ps2::next_sequence));
+}
+
+/// Continue a vmmouse drain that stopped at its 64-packet bound (called by
+/// ps2::poll_pending), or run the VmmouseError fault's one drain. Preserves
+/// IF; does nothing outside doorbell mode.
+pub(crate) fn drain_vmmouse() {
+    with_state(drain_device);
+}
+
+/// Called only by vmmouse::init with IF clear, after a successful enable and
+/// before IRQ12 is unmasked: completed PS/2 packets become doorbells.
+pub(crate) fn enter_doorbell() {
+    with_state(|state| {
+        assert!(state.active, "vmmouse without an active PS/2 mouse");
+        state.doorbell = true;
+    });
 }
 
 /// Internal ordered-dispatch consumer. Preserves IF and never polls hardware;
 /// ps2::next_event performs the shared drain before borrowing either queue.
-pub(crate) fn pop_event() -> Option<MouseEvent> {
+pub(crate) fn pop_event() -> Option<Event> {
     with_state(State::pop)
 }
 
@@ -330,6 +467,17 @@ pub fn irq_count() -> u64 {
     ps2::mouse_irq_count()
 }
 
+/// Publish one event into the real ring as a drain would, under the shared
+/// sequence. Input-session tests only, inside `with_test_input`.
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn publish_test_event(event: Event) {
+    with_state(|state| {
+        assert!(state.active && !state.doorbell);
+        let mut sequence = ps2::next_sequence;
+        state.publish(event, &mut sequence);
+    });
+}
+
 /// Exercise the real merged consumer before controller initialization. No
 /// device-state borrow spans the callback, which may use all consumer paths.
 #[cfg(feature = "boot-smoke")]
@@ -340,6 +488,15 @@ pub(crate) fn with_test_input(operation: impl FnOnce()) {
     operation();
     assert!(!arch::interrupts_enabled());
     with_state(|state| *state = State::new());
+}
+
+/// A queued relative event's motion; an absolute position is a test failure.
+#[cfg(feature = "boot-smoke")]
+fn relative(event: Option<Event>) -> Option<MouseEvent> {
+    event.map(|event| match event {
+        Event::Relative(motion) => motion,
+        Event::Absolute(_) => panic!("unexpected absolute mouse event"),
+    })
 }
 
 #[cfg(feature = "boot-smoke")]
@@ -367,7 +524,7 @@ pub fn self_test() {
         }
     }
     fn event(state: &mut State) -> MouseEvent {
-        state.pop().expect("missing mouse test event")
+        relative(state.pop()).expect("missing mouse test event")
     }
 
     // Boot invokes this before controller init. These internal empty-queue
@@ -581,7 +738,7 @@ pub fn self_test() {
     }
     assert!(starved.lost.is_none() && starved.length == QUEUE_CAPACITY);
     let (mut count, mut total) = (0, 0_i32);
-    while let Some(motion) = starved.pop() {
+    while let Some(motion) = relative(starved.pop()) {
         assert_eq!((motion.dy, motion.buttons), (0, 0));
         count += 1;
         total += i32::from(motion.dx);
@@ -628,7 +785,7 @@ pub fn self_test() {
             feed(&mut saturated, &[header, 0, 0]);
         }
         assert!(saturated.lost.is_none() && saturated.length == QUEUE_CAPACITY);
-        let newest = saturated.queue[QUEUE_CAPACITY - 1].map(|queued| queued.event);
+        let newest = relative(saturated.queue[QUEUE_CAPACITY - 1].map(|queued| queued.event));
         let motion = newest.expect("newest saturated event");
         assert_eq!(if header == 0x18 { motion.dx } else { motion.dy }, sum);
         feed(&mut saturated, &[header, 0, 0]);
@@ -673,7 +830,7 @@ pub fn self_test() {
         for byte in [0x08, 5, 0] {
             framing.accept(STATUS, byte, 1000 + advance, || 0);
         }
-        assert_eq!(framing.pop(), expected);
+        assert_eq!(relative(framing.pop()), expected);
         assert!(framing.pop().is_none());
     }
 
@@ -725,4 +882,180 @@ pub fn self_test() {
     assert_eq!(event(&mut handoff).dx, 8);
 
     crate::serial::println!("MIRROR_MOUSE_TESTS_OK");
+}
+
+/// Doorbell mode, absolute events in the shared ring and the runtime fallback
+/// (spec 0017c acceptance test 1), on private decoder states fed by fake
+/// vmmouse queues. Called by vmmouse::self_test; performs no port I/O.
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn doorbell_self_test() {
+    const STATUS: u8 = OUTPUT_FULL | AUXILIARY;
+
+    fn doorbell() -> State {
+        let mut state = State::new();
+        state.activate();
+        state.doorbell = true;
+        state
+    }
+    fn counter(sequence: &mut u64) -> impl FnMut() -> u64 + '_ {
+        move || {
+            let current = *sequence;
+            *sequence = current.wrapping_add(1);
+            current
+        }
+    }
+    /// Drain until the fake queue is empty; returns the number of drains.
+    fn drain_all(state: &mut State, device: &mut vmmouse::Stream, sequence: &mut u64) -> usize {
+        for drains in 1..=64 {
+            match state.drain(device, counter(sequence)) {
+                vmmouse::Drain::More => {}
+                vmmouse::Drain::Done => return drains,
+                vmmouse::Drain::Failed(reason) => panic!("unexpected vmmouse fallback {reason:?}"),
+            }
+        }
+        panic!("vmmouse drains did not empty the queue");
+    }
+    fn position(state: &mut State) -> PositionEvent {
+        match state.pop() {
+            Some(Event::Absolute(position)) => position,
+            other => panic!("expected an absolute mouse event, got {other:?}"),
+        }
+    }
+    fn at(index: u16, buttons: u8) -> PositionEvent {
+        PositionEvent {
+            x: index,
+            y: index * 2,
+            buttons,
+        }
+    }
+
+    // A complete PS/2 packet, one with motion overflow included, queues
+    // nothing, allocates no sequence and rings once, on its last byte.
+    let mut state = doorbell();
+    for packet in [[0x09, 5, 5], [0x48 | LEFT, 255, 0], [0x08, 0, 0]] {
+        let rung = packet.map(|byte| state.accept(STATUS, byte, 0, || panic!("doorbell sequence")));
+        assert_eq!(rung, [false, false, true]);
+    }
+    assert!(state.pop().is_none() && state.lost.is_none() && state.length == 0);
+    // A receive error rings and is no pointer loss. Framing still discards
+    // the rest of its packet, so the header-looking tail does not ring.
+    assert!(state.accept(STATUS | RECEIVE_ERROR, 0x09, 0, || panic!("loss sequence")));
+    assert!(!state.accept(STATUS, 0x09, 0, || panic!("tail sequence")));
+    assert!(!state.accept(STATUS, 0x09, 0, || panic!("tail sequence")));
+    assert!(state.lost.is_none() && state.peek_sequence().is_none());
+    // Wrong-origin bytes never ring.
+    assert!(!state.accept(OUTPUT_FULL, 0x08, 0, || 0));
+    let mut sequence = 0;
+    let mut device = vmmouse::Stream::new(0, 0, false);
+    assert_eq!(drain_all(&mut state, &mut device, &mut sequence), 1);
+    assert!(state.pop().is_none() && sequence == 0);
+
+    // Drained positions keep device units and take shared sequences in order;
+    // relative packets carry dx = x, dy = -y.
+    let mut device = vmmouse::Stream::new(3, LEFT, false);
+    assert_eq!(drain_all(&mut state, &mut device, &mut sequence), 1);
+    let mut device = vmmouse::Stream::new(2, RIGHT, true);
+    assert_eq!(drain_all(&mut state, &mut device, &mut sequence), 1);
+    for index in 0..3 {
+        assert_eq!(state.peek_sequence(), Some(u64::from(index)));
+        assert_eq!(position(&mut state), at(index, LEFT));
+    }
+    for dx in 0..2 {
+        assert_eq!(
+            relative(state.pop()),
+            Some(MouseEvent {
+                dx,
+                dy: -2 * dx,
+                buttons: RIGHT
+            })
+        );
+    }
+    assert!(state.pop().is_none() && !state.take_lost());
+
+    // 64 + 1000 same-button absolute events with no consumer lose nothing:
+    // sixteen drains stop at the 64-packet bound, the seventeenth empties the
+    // queue, and the newest position replaces the newest queued one and takes
+    // its sequence (0017-D15).
+    let mut starved = doorbell();
+    let mut sequence = 0;
+    let total = QUEUE_CAPACITY as u16 + 1000;
+    let mut device = vmmouse::Stream::new(u32::from(total), MIDDLE, false);
+    assert_eq!(drain_all(&mut starved, &mut device, &mut sequence), 17);
+    assert_eq!((device.remaining, device.drains), (0, 17));
+    assert!(starved.lost.is_none() && starved.length == QUEUE_CAPACITY);
+    assert_eq!(sequence, u64::from(total));
+    for index in 0..QUEUE_CAPACITY as u16 - 1 {
+        assert_eq!(position(&mut starved), at(index, MIDDLE));
+    }
+    assert_eq!(starved.peek_sequence(), Some(u64::from(total) - 1));
+    assert_eq!(position(&mut starved), at(total - 1, MIDDLE));
+    assert!(starved.pop().is_none() && !starved.take_lost());
+
+    // On a full ring a button change, or a relative/absolute switch, is a
+    // pointer loss; same-button relative motion still merges (0017a-D6).
+    for (full_relative, buttons, next_relative, lost) in [
+        (false, LEFT, false, true),
+        (false, MIDDLE, true, true),
+        (true, MIDDLE, false, true),
+        (true, LEFT, true, true),
+        (true, MIDDLE, true, false),
+    ] {
+        let mut full = doorbell();
+        let mut sequence = 0;
+        let capacity = QUEUE_CAPACITY as u32;
+        let mut device = vmmouse::Stream::new(capacity, MIDDLE, full_relative);
+        drain_all(&mut full, &mut device, &mut sequence);
+        assert!(full.length == QUEUE_CAPACITY && full.lost.is_none());
+        let mut device = vmmouse::Stream::new(1, buttons, next_relative);
+        drain_all(&mut full, &mut device, &mut sequence);
+        assert_eq!(full.lost, lost.then_some(QUEUE_CAPACITY as u64));
+        assert_eq!(full.length, if lost { 0 } else { QUEUE_CAPACITY });
+        if lost {
+            assert!(full.pop().is_none());
+            assert!(full.take_lost());
+            // The next event supplies fresh levels.
+            let mut device = vmmouse::Stream::new(1, LEFT, false);
+            drain_all(&mut full, &mut device, &mut sequence);
+            assert_eq!(position(&mut full), at(0, LEFT));
+            assert!(full.pop().is_none());
+        }
+    }
+
+    // A runtime error (0017-D16), a STATUS error or a queue length of 6,
+    // disables the device, drops the ring for a pointer loss and leaves
+    // doorbell mode for good: PS/2 packets decode as relative motion again.
+    for (stray, error, reason) in [
+        (0, true, vmmouse::Fallback::Status),
+        (2, false, vmmouse::Fallback::QueueLength),
+    ] {
+        let mut failed = doorbell();
+        let mut sequence = 0;
+        let mut device = vmmouse::Stream::new(2, LEFT, false);
+        drain_all(&mut failed, &mut device, &mut sequence);
+        let mut device = vmmouse::Stream::new(1, LEFT, false);
+        device.stray = stray;
+        device.error = error;
+        assert_eq!(
+            failed.drain(&mut device, counter(&mut sequence)),
+            vmmouse::Drain::Failed(reason)
+        );
+        assert!(device.disabled && device.remaining == 1);
+        assert!(!failed.doorbell && failed.length == 0);
+        assert_eq!(failed.peek_sequence(), Some(2));
+        assert!(failed.pop().is_none() && failed.take_lost());
+        for byte in [0x08 | LEFT, 4, 0] {
+            assert!(!failed.accept(STATUS, byte, 0, counter(&mut sequence)));
+        }
+        assert_eq!(
+            relative(failed.pop()),
+            Some(MouseEvent {
+                dx: 4,
+                dy: 0,
+                buttons: LEFT
+            })
+        );
+        // A receive error is a pointer loss again, and rings nothing.
+        assert!(!failed.accept(STATUS | RECEIVE_ERROR, 0, 0, || 9));
+        assert_eq!(failed.lost, Some(9));
+    }
 }

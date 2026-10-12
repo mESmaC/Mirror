@@ -84,6 +84,11 @@ impl SurfaceRegion {
     pub fn dimensions(self) -> (usize, usize) {
         (self.width, self.height)
     }
+
+    /// The rectangle's top-left framebuffer pixel.
+    pub fn origin(self) -> (usize, usize) {
+        (self.x, self.y)
+    }
 }
 
 #[derive(Clone, Copy)]

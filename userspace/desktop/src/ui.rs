@@ -263,50 +263,55 @@ impl Ui {
                 }
             }
             Event::Mouse { dx, dy, buttons } => {
-                let old = self.pointer();
-                self.pointer_x = self
+                let x = self.pointer_x.saturating_add_signed(dx as isize);
+                let y = self.pointer_y.saturating_add_signed(dy as isize);
+                self.pointer_to(x, y, buttons)
+            }
+            // An absolute position (spec 0017-D17) sets the pointer directly
+            // and keeps click arming.
+            Event::Position { x, y, buttons } => self.pointer_to(x, y, buttons),
+        }
+    }
+
+    /// Move the pointer to (x, y), clamped to the surface, and apply the
+    /// button levels with click arming.
+    fn pointer_to(&mut self, x: usize, y: usize, buttons: u8) -> u8 {
+        let old = self.pointer();
+        self.pointer_x = x.min(self.width - 1);
+        self.pointer_y = y.min(self.height - 1);
+        let left_pressed = self.clicks_armed && self.buttons & 1 == 0 && buttons & 1 != 0;
+        if buttons == 0 {
+            self.clicks_armed = true;
+        }
+        self.buttons = buttons;
+        let mut change = if old != self.pointer() { POINTER } else { 0 };
+        if left_pressed {
+            if self.layout.field.contains(self.pointer_x, self.pointer_y) {
+                let cell = self
                     .pointer_x
-                    .saturating_add_signed(dx as isize)
-                    .min(self.width - 1);
-                self.pointer_y = self
-                    .pointer_y
-                    .saturating_add_signed(dy as isize)
-                    .min(self.height - 1);
-                let left_pressed = self.clicks_armed && self.buttons & 1 == 0 && buttons & 1 != 0;
-                if buttons == 0 {
-                    self.clicks_armed = true;
-                }
-                self.buttons = buttons;
-                let mut change = if old != self.pointer() { POINTER } else { 0 };
-                if left_pressed {
-                    if self.layout.field.contains(self.pointer_x, self.pointer_y) {
-                        let cell = self
-                            .pointer_x
-                            .saturating_sub(self.layout.text_x)
-                            .saturating_add(CELL / 2)
-                            / CELL;
-                        let caret = (self.input_start() + cell.min(self.layout.visible))
-                            .min(self.editor.draft().len());
-                        change |= self.dispatch_human(Operation::SetCaret(caret));
-                        self.input_focused = true;
-                        self.agent_focused = false;
-                        self.keyboard_focus = false;
-                        change |= EDIT | AGENT;
-                    } else if self.layout.button.contains(self.pointer_x, self.pointer_y) {
-                        self.input_focused = false;
-                        self.agent_focused = false;
-                        self.keyboard_focus = false;
-                        change |= EDIT | AGENT | self.submit();
-                    } else if self.layout.agent.contains(self.pointer_x, self.pointer_y) {
-                        self.input_focused = false;
-                        self.agent_focused = true;
-                        self.keyboard_focus = false;
-                        change |= EDIT | AGENT | self.run_agent();
-                    }
-                }
-                change
+                    .saturating_sub(self.layout.text_x)
+                    .saturating_add(CELL / 2)
+                    / CELL;
+                let caret = (self.input_start() + cell.min(self.layout.visible))
+                    .min(self.editor.draft().len());
+                change |= self.dispatch_human(Operation::SetCaret(caret));
+                self.input_focused = true;
+                self.agent_focused = false;
+                self.keyboard_focus = false;
+                change |= EDIT | AGENT;
+            } else if self.layout.button.contains(self.pointer_x, self.pointer_y) {
+                self.input_focused = false;
+                self.agent_focused = false;
+                self.keyboard_focus = false;
+                change |= EDIT | AGENT | self.submit();
+            } else if self.layout.agent.contains(self.pointer_x, self.pointer_y) {
+                self.input_focused = false;
+                self.agent_focused = true;
+                self.keyboard_focus = false;
+                change |= EDIT | AGENT | self.run_agent();
             }
         }
+        change
     }
 
     pub fn paint_initial(&self, renderer: &mut Renderer) {
@@ -677,6 +682,32 @@ pub fn self_test() {
         buttons: 0,
     });
     require(ui.pointer() == (1279, 0, 0), 101);
+    // Absolute positions (spec 0017-D17) set the pointer directly and keep
+    // click arming: after a pointer loss a held button is no click.
+    require(
+        ui.process(Event::Position {
+            x: 0,
+            y: 799,
+            buttons: 0,
+        }) == POINTER
+            && ui.pointer() == (0, 799, 0),
+        112,
+    );
+    ui.process(Event::Lost {
+        keyboard: false,
+        pointer: true,
+    });
+    let apply = ui.layout.button;
+    let (x, y) = (apply.x + apply.width / 2, apply.y + apply.height / 2);
+    require(
+        ui.process(Event::Position { x, y, buttons: 1 }) & SUBMIT == 0 && !ui.clicks_armed,
+        113,
+    );
+    ui.process(Event::Position { x, y, buttons: 0 });
+    require(
+        ui.process(Event::Position { x, y, buttons: 1 }) & SUBMIT != 0 && ui.pointer() == (x, y, 1),
+        114,
+    );
     require(ui.process(key(5, 0)) == EXIT, 102);
 
     // Real keyboard policy and typed IPC converge on the same semantic state.

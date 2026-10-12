@@ -1,10 +1,11 @@
 //! Main-context pointer state, independent of framebuffer ownership or IRQs.
 //!
-//! Motion is clamped to the current surface. Clicks are left-button edges, not
-//! held-button repeats; initialization and input loss require a release before
-//! accepting clicks so a missing earlier packet cannot create a phantom press.
+//! Motion is clamped to the current surface, and absolute vmmouse positions
+//! map onto it (spec 0017-D14). Clicks are left-button edges, not held-button
+//! repeats; initialization and input loss require a release before accepting
+//! clicks so a missing earlier packet cannot create a phantom press.
 
-use crate::mouse::{LEFT, MIDDLE, MouseEvent, RIGHT};
+use crate::mouse::{self, LEFT, MIDDLE, MouseEvent, RIGHT};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Update {
@@ -49,7 +50,21 @@ impl Pointer {
             .y
             .saturating_add_signed(isize::from(event.dy))
             .min(self.max_y);
-        let buttons = event.buttons & (LEFT | RIGHT | MIDDLE);
+        self.update(previous, event.buttons)
+    }
+
+    /// Move to an absolute vmmouse position in device units: 0 and 0xFFFF are
+    /// the first and last framebuffer pixel (spec 0017-D14).
+    pub fn place(&mut self, x: u16, y: u16, buttons: u8) -> Update {
+        let previous = self.position();
+        self.x = mouse::to_pixel(x, self.max_x);
+        self.y = mouse::to_pixel(y, self.max_y);
+        self.update(previous, buttons)
+    }
+
+    /// Click arming shared by relative and absolute input.
+    fn update(&mut self, previous: (usize, usize), buttons: u8) -> Update {
+        let buttons = buttons & (LEFT | RIGHT | MIDDLE);
         let left_pressed = self.clicks_armed && self.buttons & LEFT == 0 && buttons & LEFT != 0;
         if buttons == 0 {
             self.clicks_armed = true;
@@ -124,5 +139,38 @@ pub fn self_test() {
     enormous.y = 1;
     enormous.apply(event(i16::MAX, i16::MIN, 0));
     assert_eq!(enormous.position(), (usize::MAX - 1, 0));
+    enormous.place(0xffff, 0, 0);
+    assert_eq!(enormous.position(), (usize::MAX - 1, 0));
+
+    // Absolute positions (spec 0017-D14) reach the first and last framebuffer
+    // pixel exactly, with no homing, and share the release-before-click rule.
+    for (width, height) in [(1280, 800), (1920, 1080)] {
+        let mut absolute = Pointer::new(width, height);
+        assert_eq!(
+            absolute.place(0, 0, LEFT),
+            Update {
+                moved: true,
+                left_pressed: false
+            }
+        );
+        assert_eq!(absolute.position(), (0, 0));
+        assert!(!absolute.place(0, 0, 0).moved);
+        assert!(absolute.place(0xffff, 0xffff, LEFT).left_pressed);
+        assert_eq!(absolute.position(), (width - 1, height - 1));
+        assert!(!absolute.place(0x8000, 0x8000, LEFT).left_pressed);
+        assert_eq!(absolute.position(), (width / 2, height / 2));
+        absolute.input_lost();
+        assert!(!absolute.place(0, 0, LEFT).left_pressed);
+        assert!(!absolute.place(0, 0, LEFT | RIGHT).left_pressed);
+        assert!(!absolute.place(0, 0, 0).left_pressed);
+        assert!(absolute.place(1, 1, LEFT).left_pressed);
+        // Relative and absolute input share one button history.
+        assert!(!absolute.apply(event(0, 0, LEFT)).left_pressed);
+        assert!(!absolute.apply(event(0, 0, 0)).left_pressed);
+        assert!(absolute.place(0, 0, LEFT).left_pressed);
+    }
+    let mut tiny = Pointer::new(1, 1);
+    tiny.place(0xffff, 0xffff, 0);
+    assert_eq!(tiny.position(), (0, 0));
     crate::serial::println!("MIRROR_POINTER_TESTS_OK");
 }

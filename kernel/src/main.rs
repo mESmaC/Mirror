@@ -39,6 +39,7 @@ mod timer;
 mod usb;
 mod userspace;
 mod vm;
+mod vmmouse;
 mod windows;
 mod xhci;
 
@@ -254,6 +255,7 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
         drivers::self_test();
         keyboard::self_test();
         mouse::self_test();
+        vmmouse::self_test();
         ps2::self_test();
         input::self_test();
         pointer::self_test();
@@ -337,6 +339,9 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
             false
         }
     };
+    // Absolute pointing (spec 0017c) after the mouse result prints and before
+    // IRQ12 is unmasked; it reports reason=no_mouse when the mouse failed.
+    vmmouse::init(mouse_ready);
     if mouse_ready {
         timer::enable_mouse_irq();
     }
@@ -458,6 +463,7 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
             | boot::SmokeMode::ClockActivation
             | boot::SmokeMode::Ps2BatTimeout
             | boot::SmokeMode::Ps2StaleScancode
+            | boot::SmokeMode::VmmouseError
             | boot::SmokeMode::SmpTlbTimeout => {
                 interrupts::arm_expected_page_fault(paging::TEST_ADDRESS)
             }
@@ -628,7 +634,7 @@ fn run_console(
             // SAFETY: IRQ handlers only update independent timer/input state;
             // the console/display are never borrowed or accessed by an IRQ.
             unsafe { arch::restore_interrupts(true) };
-            match event {
+            let pointer_update = match event {
                 // Each loss resets only its own device's state (spec 0017a-D3):
                 // the unsent line survives a pointer loss, and click arming
                 // survives a keyboard loss.
@@ -646,6 +652,7 @@ fn run_console(
                         pointer.input_lost();
                         serial::println!("MIRROR_CONSOLE_INPUT_LOST device=pointer");
                     }
+                    None
                 }
                 ps2::InputEvent::Key(event) => {
                     if let Some(action) = console.process(event) {
@@ -654,23 +661,32 @@ fn run_console(
                         action.log();
                         dirty = true;
                     }
+                    None
                 }
-                ps2::InputEvent::Mouse(event) => {
-                    let update = pointer.apply(event);
-                    pointer_changed |= update.moved;
+                ps2::InputEvent::Mouse(motion) => Some((pointer.apply(motion), motion.buttons)),
+                // A vmmouse position places the pointer on the framebuffer
+                // (spec 0017-D14) and shares click arming with motion.
+                ps2::InputEvent::Position(position) => Some((
+                    pointer.place(position.x, position.y, position.buttons),
+                    position.buttons,
+                )),
+            };
+            if let Some((update, buttons)) = pointer_update {
+                pointer_changed |= update.moved;
+                #[cfg(feature = "test-trace")]
+                {
+                    pointer_buttons = Some(buttons);
+                }
+                #[cfg(not(feature = "test-trace"))]
+                let _ = buttons;
+                let (x, y) = pointer.position();
+                if update.left_pressed
+                    && let Some(display) = display
+                    && let Some(caret) = display.console_caret_at(&console, x, y)
+                {
+                    dirty |= console.place_cursor(caret);
                     #[cfg(feature = "test-trace")]
-                    {
-                        pointer_buttons = Some(event.buttons);
-                    }
-                    let (x, y) = pointer.position();
-                    if update.left_pressed
-                        && let Some(display) = display
-                        && let Some(caret) = display.console_caret_at(&console, x, y)
-                    {
-                        dirty |= console.place_cursor(caret);
-                        #[cfg(feature = "test-trace")]
-                        serial::println!("MIRROR_POINTER_CLICK x={} y={} caret={}", x, y, caret);
-                    }
+                    serial::println!("MIRROR_POINTER_CLICK x={} y={} caret={}", x, y, caret);
                 }
             }
             arch::disable_interrupts();

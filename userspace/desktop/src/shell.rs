@@ -509,128 +509,131 @@ impl Shell {
                 }
             }
             HardwareEvent::Mouse { dx, dy, buttons } => {
-                let old = (self.pointer_x, self.pointer_y, self.buttons);
-                self.pointer_x = self
-                    .pointer_x
-                    .saturating_add_signed(dx as isize)
-                    .min(self.width - 1);
-                self.pointer_y = self
-                    .pointer_y
-                    .saturating_add_signed(dy as isize)
-                    .min(self.height - 1);
-                self.pointer_changed |= old != (self.pointer_x, self.pointer_y, buttons);
-                let pressed = self.clicks_armed && self.buttons & 1 == 0 && buttons & 1 != 0;
+                let x = self.pointer_x.saturating_add_signed(dx as isize);
+                let y = self.pointer_y.saturating_add_signed(dy as isize);
+                self.pointer(x, y, buttons);
+            }
+            // An absolute position (spec 0017-D17) sets the pointer directly
+            // and keeps click arming.
+            HardwareEvent::Position { x, y, buttons } => self.pointer(x, y, buttons),
+        }
+        false
+    }
+
+    /// Move the pointer to (x, y), clamped to the screen, and apply the button
+    /// levels: click arming, capture, the taskbar, window chrome and routing.
+    fn pointer(&mut self, x: usize, y: usize, buttons: u8) {
+        let old = (self.pointer_x, self.pointer_y, self.buttons);
+        self.pointer_x = x.min(self.width - 1);
+        self.pointer_y = y.min(self.height - 1);
+        self.pointer_changed |= old != (self.pointer_x, self.pointer_y, buttons);
+        let pressed = self.clicks_armed && self.buttons & 1 == 0 && buttons & 1 != 0;
+        if buttons == 0 {
+            self.clicks_armed = true;
+        }
+        self.buttons = buttons;
+        // Loss resets app button state too. Do not turn a still-held
+        // hardware button into a fresh application click after Reset.
+        if !self.clicks_armed && buttons != 0 {
+            return;
+        }
+        match self.capture {
+            Capture::Drag { slot, x, y } => {
+                if buttons & 1 != 0 {
+                    let mut window = self.windows[slot].unwrap();
+                    let next_x = self
+                        .pointer_x
+                        .saturating_sub(x)
+                        .min(self.width - OUTER_WIDTH - 8);
+                    let next_y = self
+                        .pointer_y
+                        .saturating_sub(y)
+                        .clamp(40, self.height - TASKBAR_HEIGHT - OUTER_HEIGHT - 8);
+                    if (next_x, next_y) != (window.x, window.y) {
+                        self.invalidate(window.damage());
+                        window.x = next_x;
+                        window.y = next_y;
+                        self.windows[slot] = Some(window);
+                        self.invalidate(window.damage());
+                        self.log(b"move", &[slot as u64, next_x as u64, next_y as u64]);
+                    }
+                } else {
+                    self.capture = Capture::None;
+                }
+                return;
+            }
+            Capture::Client(slot) => {
+                self.route_pointer(slot, buttons);
                 if buttons == 0 {
-                    self.clicks_armed = true;
+                    self.capture = Capture::None;
                 }
-                self.buttons = buttons;
-                // Loss resets app button state too. Do not turn a still-held
-                // hardware button into a fresh application click after Reset.
-                if !self.clicks_armed && buttons != 0 {
-                    return false;
+                return;
+            }
+            Capture::None => {}
+        }
+        if pressed && self.taskbar().contains(self.pointer_x, self.pointer_y) {
+            for kind in [protocol::NOTES, protocol::COUNTER] {
+                if self.launcher(kind).contains(self.pointer_x, self.pointer_y) {
+                    self.launch(kind);
+                    return;
                 }
-                match self.capture {
-                    Capture::Drag { slot, x, y } => {
-                        if buttons & 1 != 0 {
-                            let mut window = self.windows[slot].unwrap();
-                            let next_x = self
-                                .pointer_x
-                                .saturating_sub(x)
-                                .min(self.width - OUTER_WIDTH - 8);
-                            let next_y = self
-                                .pointer_y
-                                .saturating_sub(y)
-                                .clamp(40, self.height - TASKBAR_HEIGHT - OUTER_HEIGHT - 8);
-                            if (next_x, next_y) != (window.x, window.y) {
-                                self.invalidate(window.damage());
-                                window.x = next_x;
-                                window.y = next_y;
-                                self.windows[slot] = Some(window);
-                                self.invalidate(window.damage());
-                                self.log(b"move", &[slot as u64, next_x as u64, next_y as u64]);
-                            }
-                        } else {
-                            self.capture = Capture::None;
-                        }
-                        return false;
-                    }
-                    Capture::Client(slot) => {
-                        self.route_pointer(slot, buttons);
-                        if buttons == 0 {
-                            self.capture = Capture::None;
-                        }
-                        return false;
-                    }
-                    Capture::None => {}
-                }
-                if pressed && self.taskbar().contains(self.pointer_x, self.pointer_y) {
-                    for kind in [protocol::NOTES, protocol::COUNTER] {
-                        if self.launcher(kind).contains(self.pointer_x, self.pointer_y) {
-                            self.launch(kind);
-                            return false;
-                        }
-                    }
-                    for slot in 0..protocol::MAX_APPS {
-                        if self.windows[slot].is_some()
-                            && self
-                                .task_button(slot)
-                                .contains(self.pointer_x, self.pointer_y)
-                        {
-                            self.restore(slot);
-                            return false;
-                        }
-                    }
-                }
-                // The toast sits above the windows: pointer events inside it
-                // reach no window (0029-D8).
-                if self.launch_failed.is_some()
-                    && self.toast().contains(self.pointer_x, self.pointer_y)
+            }
+            for slot in 0..protocol::MAX_APPS {
+                if self.windows[slot].is_some()
+                    && self
+                        .task_button(slot)
+                        .contains(self.pointer_x, self.pointer_y)
                 {
-                    return false;
-                }
-                if let Some(slot) = self.hit(self.pointer_x, self.pointer_y) {
-                    let window = self.windows[slot].unwrap();
-                    if pressed {
-                        self.focus(Some(slot));
-                        if window
-                            .close_button()
-                            .contains(self.pointer_x, self.pointer_y)
-                        {
-                            self.close(slot);
-                        } else if window
-                            .minimize_button()
-                            .contains(self.pointer_x, self.pointer_y)
-                        {
-                            self.minimize(slot);
-                        } else if self.pointer_y < window.y + 29 {
-                            self.capture = Capture::Drag {
-                                slot,
-                                x: self.pointer_x - window.x,
-                                y: self.pointer_y - window.y,
-                            };
-                        } else if window.stopped()
-                            && window
-                                .relaunch_button()
-                                .contains(self.pointer_x, self.pointer_y)
-                        {
-                            self.relaunch(slot);
-                        } else {
-                            self.capture = Capture::Client(slot);
-                            // This press followed an observed hardware release.
-                            // Establish that baseline after the focus event, so
-                            // the app can safely rearm without inventing edges.
-                            self.route_pointer(slot, 0);
-                            self.route_pointer(slot, buttons);
-                        }
-                    } else if window.content().contains(self.pointer_x, self.pointer_y) {
-                        self.route_pointer(slot, buttons);
-                    }
-                } else if pressed {
-                    self.focus(None);
+                    self.restore(slot);
+                    return;
                 }
             }
         }
-        false
+        // The toast sits above the windows: pointer events inside it
+        // reach no window (0029-D8).
+        if self.launch_failed.is_some() && self.toast().contains(self.pointer_x, self.pointer_y) {
+            return;
+        }
+        if let Some(slot) = self.hit(self.pointer_x, self.pointer_y) {
+            let window = self.windows[slot].unwrap();
+            if pressed {
+                self.focus(Some(slot));
+                if window
+                    .close_button()
+                    .contains(self.pointer_x, self.pointer_y)
+                {
+                    self.close(slot);
+                } else if window
+                    .minimize_button()
+                    .contains(self.pointer_x, self.pointer_y)
+                {
+                    self.minimize(slot);
+                } else if self.pointer_y < window.y + 29 {
+                    self.capture = Capture::Drag {
+                        slot,
+                        x: self.pointer_x - window.x,
+                        y: self.pointer_y - window.y,
+                    };
+                } else if window.stopped()
+                    && window
+                        .relaunch_button()
+                        .contains(self.pointer_x, self.pointer_y)
+                {
+                    self.relaunch(slot);
+                } else {
+                    self.capture = Capture::Client(slot);
+                    // This press followed an observed hardware release.
+                    // Establish that baseline after the focus event, so
+                    // the app can safely rearm without inventing edges.
+                    self.route_pointer(slot, 0);
+                    self.route_pointer(slot, buttons);
+                }
+            } else if window.content().contains(self.pointer_x, self.pointer_y) {
+                self.route_pointer(slot, buttons);
+            }
+        } else if pressed {
+            self.focus(None);
+        }
     }
 
     fn flush_events(&mut self) {
@@ -1072,7 +1075,7 @@ pub fn run(smoke: bool) -> ! {
     write(console, b"Mirror shell: ready\n");
     loop {
         for _ in 0..16 {
-            match next_input(SYS_INPUT_POLL, input) {
+            match next_input(SYS_INPUT_POLL, input, (width, height)) {
                 Ok(event) => {
                     if shell.process(event) {
                         exit(0);
@@ -1471,6 +1474,70 @@ fn policy_checks() {
             && shell.buttons == 1
             && shell.clicks_armed,
         173,
+    );
+    // An absolute position record (spec 0017-D17) decodes inside the surface,
+    // sets the pointer directly and keeps click arming: after a pointer loss
+    // a held button routes nothing until a release.
+    let mut record = [0u8; 32];
+    for (bytes, word) in record
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip([1u32, 4, 1, 0, 0, 0, 1279, 799])
+    {
+        bytes.copy_from_slice(&word.to_le_bytes());
+    }
+    require(
+        crate::decode_event(&record, (1280, 800))
+            == HardwareEvent::Position {
+                x: 1279,
+                y: 799,
+                buttons: 1,
+            },
+        179,
+    );
+    shell.process(HardwareEvent::Lost {
+        keyboard: false,
+        pointer: true,
+    });
+    let queued = shell.windows[0].unwrap().pending.length;
+    shell.process(HardwareEvent::Position {
+        x: 120,
+        y: 210,
+        buttons: 1,
+    });
+    require(
+        (shell.pointer_x, shell.pointer_y) == (120, 210)
+            && !shell.clicks_armed
+            && matches!(shell.capture, Capture::None)
+            && shell.windows[0].unwrap().pending.length == queued,
+        180,
+    );
+    for buttons in [0, 1] {
+        shell.process(HardwareEvent::Position {
+            x: 120,
+            y: 210,
+            buttons,
+        });
+    }
+    let pending = shell.windows[0].unwrap().pending;
+    require(
+        shell.clicks_armed
+            && matches!(shell.capture, Capture::Client(0))
+            && pending.length == queued + 2
+            && pending.events[queued]
+                == Some(Event::Pointer {
+                    x: 39,
+                    y: 81,
+                    buttons: 0,
+                })
+            && pending.events[queued + 1]
+                == Some(Event::Pointer {
+                    x: 39,
+                    y: 81,
+                    buttons: 1,
+                }),
+        181,
     );
     // Pointer losses never cost a queued key or an earlier click (codex's
     // 0017a reviews): the Reset is a marker that takes no capacity.

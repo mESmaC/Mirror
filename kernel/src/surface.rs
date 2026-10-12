@@ -114,6 +114,14 @@ impl<'borrow, 'fb> Session<'borrow, 'fb> {
     pub fn totals(&self) -> (u64, u64) {
         (self.tiles, self.pixels)
     }
+
+    /// The framebuffer's width and height, and this surface's rectangle in it,
+    /// in framebuffer pixels. Input sessions place absolute positions with
+    /// them (spec 0017-D14).
+    pub fn placement(&self) -> ((usize, usize), SurfaceRegion) {
+        let info = self.driver.info();
+        ((info.width, info.height), self.region)
+    }
 }
 
 #[cfg(feature = "boot-smoke")]

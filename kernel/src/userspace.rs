@@ -1222,7 +1222,8 @@ pub fn run_desktop(
         let mut processes = [desktop, agent];
         let mut ipc = Ipc::new();
         let mut surface = surface::Session::desktop(display).expect("desktop surface");
-        let mut input = input::Session::new(consumer);
+        let (framebuffer, region) = surface.placement();
+        let mut input = input::Session::new(consumer, framebuffer, region);
         for (index, process) in processes.iter_mut().enumerate() {
             // Channel 0 carries requests to the desktop; channel 1 carries
             // replies/jobs to the agent. Handles never cross process tables.
@@ -2026,7 +2027,8 @@ pub fn run_shell(
     }
     let mut ipc = Ipc::new();
     let mut surface = surface::Session::desktop(display).expect("shell scanout");
-    let mut input = input::Session::new(consumer);
+    let (framebuffer, region) = surface.placement();
+    let mut input = input::Session::new(consumer, framebuffer, region);
     let stack_top = stacks::bsp_rsp0_top();
     // SAFETY: IF=0, no active users; the guarded RSP0 stack stays mapped in
     // every root's shared upper half.
