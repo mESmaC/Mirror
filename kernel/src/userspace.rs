@@ -33,9 +33,9 @@ const SURFACE_DENIED_CHECKS: &[u8] = b"Mirror init: surface denied\n";
 #[cfg(feature = "boot-smoke")]
 const PROCESS_COUNT: usize = 2;
 const QUANTUM_TICKS: u64 = 2;
-// Finite init probes include register/preemption loops and 21 thread creations.
-// Leave headroom for the complete debug workload, including IRQs delivered on
-// syscall return. This finite lifetime allowance is shared by all its threads;
+// Finite init probes include register/preemption loops and 20 thread creations,
+// plus 15 more in role 0's capacity check (spec 0030a). Leave headroom for the
+// complete debug workload, including IRQs delivered on syscall return. This finite lifetime allowance is shared by all its threads;
 // it does not change the independent recurring budgets of ordinary services.
 const USER_TICK_BUDGET: u64 = 128;
 const MAX_SLEEP_TICKS: u64 = 1000;
@@ -240,6 +240,10 @@ struct Process<'kernel> {
     thread_checks: bool,
     #[cfg(feature = "boot-smoke")]
     threads_created: u64,
+    #[cfg(feature = "boot-smoke")]
+    threads_peak: usize,
+    #[cfg(feature = "boot-smoke")]
+    capacity_checks: bool,
     #[cfg(feature = "boot-smoke")]
     threads_joined: u64,
     #[cfg(feature = "boot-smoke")]
@@ -465,23 +469,35 @@ fn test_load_rollback(
     serial::println!("MIRROR_USER_LOAD_ROLLBACK_OK");
 }
 
-fn create_process<'kernel>(
+/// Build a process in the caller's empty `slot`. A process holds
+/// MAX_THREADS thread contexts, so returning it by value would copy it through
+/// several temporaries per frame in a debug build and overflow the 256 KiB
+/// scheduler stack (spec 0030a). On failure the slot stays empty and every
+/// frame the load took is released.
+fn create_process<'kernel, 'slot>(
+    slot: &'slot mut Option<Process<'kernel>>,
     kernel: &'kernel PageTables,
     frames: &mut FrameAllocator<'_>,
     bytes: &[u8],
     image: &elf::Image,
     direct_map: u64,
     argument: u64,
-) -> Result<Process<'kernel>, PagingError> {
+) -> Result<&'slot mut Process<'kernel>, PagingError> {
+    assert!(slot.is_none(), "process slot occupied");
     // SAFETY: The BSP is alone with IF=0, kernel root active, and the shared
     // upper mappings and unique allocator remain live throughout this run.
-    let space = unsafe { UserAddressSpace::new(kernel, frames) }?;
+    let mut space = unsafe { UserAddressSpace::new(kernel, frames) }?;
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     assert!(
         (1..=i64::MAX as u64).contains(&pid),
         "process IDs exhausted"
     );
-    let mut process = Process {
+    if let Err(error) = load(&mut space, frames, bytes, image, direct_map) {
+        // SAFETY: This root has never been active; mapped frames belong to it.
+        unsafe { space.destroy(frames) }.expect("failed-load cleanup");
+        return Err(error);
+    }
+    *slot = Some(Process {
         pid,
         space,
         vm: vm::Vm::new(),
@@ -492,15 +508,17 @@ fn create_process<'kernel>(
         demand_faults: 0,
         #[cfg(feature = "boot-smoke")]
         copy_faults: 0,
-        threads: core::array::from_fn(|index| {
-            (index == 0).then(|| Thread::new(image.entry, STACK_TOP - 8, argument))
-        }),
+        threads: [const { None }; thread_abi::MAX_THREADS],
         current_thread: 0,
         next_thread: 0,
         #[cfg(feature = "boot-smoke")]
         thread_checks: false,
         #[cfg(feature = "boot-smoke")]
         threads_created: 1,
+        #[cfg(feature = "boot-smoke")]
+        threads_peak: 1,
+        #[cfg(feature = "boot-smoke")]
+        capacity_checks: false,
         #[cfg(feature = "boot-smoke")]
         threads_joined: 0,
         #[cfg(feature = "boot-smoke")]
@@ -588,12 +606,9 @@ fn create_process<'kernel>(
         input_lost: 0,
         input_waits: 0,
         input_timeouts: 0,
-    };
-    if let Err(error) = load(&mut process.space, frames, bytes, image, direct_map) {
-        // SAFETY: This root has never been active; mapped frames belong to it.
-        unsafe { process.space.destroy(frames) }.expect("failed-load cleanup");
-        return Err(error);
-    }
+    });
+    let process = slot.as_mut().expect("process slot just filled");
+    process.threads[0] = Some(Thread::new(image.entry, STACK_TOP - 8, argument));
     serial::println!(
         "Native process: pid={} entry={:#x} root={:#x} pages={} tables={}",
         pid,
@@ -622,17 +637,34 @@ fn run_pair(
         .transpose()
         .expect("surface session");
     let before = frames.stats().expect("recycling required").allocated_frames;
-    let mut first = create_process(kernel, frames, bytes, image, direct_map, scenario)
-        .expect("load first native process");
-    let second = match create_process(kernel, frames, bytes, image, direct_map, 1 << 8) {
-        Ok(process) => process,
-        Err(error) => {
-            // SAFETY: Neither process has been activated; the failed creation
-            // cleaned its own tree and this first process has no live users.
-            unsafe { first.space.destroy(frames) }.expect("peer-load cleanup");
-            assert_eq!(frames.stats().unwrap().allocated_frames, before);
-            panic!("could not load peer: {error:?}");
-        }
+    let mut slots = [None, None];
+    create_process(
+        &mut slots[0],
+        kernel,
+        frames,
+        bytes,
+        image,
+        direct_map,
+        scenario,
+    )
+    .expect("load first native process");
+    if let Err(error) = create_process(
+        &mut slots[1],
+        kernel,
+        frames,
+        bytes,
+        image,
+        direct_map,
+        1 << 8,
+    ) {
+        // SAFETY: Neither process has been activated; the failed creation
+        // cleaned its own tree and this first process has no live users.
+        unsafe { slots[0].as_mut().unwrap().space.destroy(frames) }.expect("peer-load cleanup");
+        assert_eq!(frames.stats().unwrap().allocated_frames, before);
+        panic!("could not load peer: {error:?}");
+    }
+    let [Some(first), Some(second)] = slots else {
+        unreachable!("both processes were created");
     };
     let mut processes = [first, second];
     let mut ipc = Ipc::new();
@@ -831,6 +863,17 @@ fn run_pair(
     serial::println!("MIRROR_USER_SURFACE_CLEANUP_OK handles_reclaimed=1");
     validate_process(&processes[0], scenario);
     validate_process(&processes[1], 0);
+    // Spec 0030a, acceptance 2: only role 0 fills its thread table, and the
+    // kernel saw it hold every slot at once; role 1 keeps the 3-worker battery.
+    assert!(
+        processes[0].capacity_checks
+            && processes[0].threads_peak == thread_abi::MAX_THREADS
+            && !processes[1].capacity_checks
+            && processes[1].threads_peak < thread_abi::MAX_THREADS,
+        "thread capacity checks did not complete: peaks {} and {}",
+        processes[0].threads_peak,
+        processes[1].threads_peak
+    );
     assert_eq!(
         processes
             .iter()
@@ -1190,7 +1233,9 @@ pub fn run_desktop(
         // Validate both immutable modules before acquiring either address space.
         let desktop_image = elf::parse(programs[0]).expect("invalid native desktop ELF");
         let agent_image = elf::parse(programs[1]).expect("invalid native agent ELF");
-        let mut desktop = create_process(
+        let mut slots = [None, None];
+        create_process(
+            &mut slots[0],
             kernel,
             frames,
             programs[0],
@@ -1199,7 +1244,8 @@ pub fn run_desktop(
             u64::from(smoke),
         )
         .expect("load native desktop");
-        let mut agent = match create_process(
+        if let Err(error) = create_process(
+            &mut slots[1],
             kernel,
             frames,
             programs[1],
@@ -1207,19 +1253,20 @@ pub fn run_desktop(
             direct_map,
             u64::from(smoke),
         ) {
-            Ok(process) => process,
-            Err(error) => {
-                // SAFETY: Neither root has been active. Failed creation released
-                // its own mappings; the desktop owns all remaining user pages.
-                unsafe { desktop.space.destroy(frames) }.expect("agent-load cleanup");
-                assert_eq!(frames.stats().unwrap().allocated_frames, before);
-                panic!("could not load native agent: {error:?}");
-            }
+            // SAFETY: Neither root has been active. Failed creation released
+            // its own mappings; the desktop owns all remaining user pages.
+            unsafe { slots[0].as_mut().unwrap().space.destroy(frames) }
+                .expect("agent-load cleanup");
+            assert_eq!(frames.stats().unwrap().allocated_frames, before);
+            panic!("could not load native agent: {error:?}");
+        }
+        let [Some(desktop), Some(agent)] = slots else {
+            unreachable!("both processes were created");
         };
-        let now = timer::ticks();
-        desktop.policy = CpuPolicy::Desktop(ServicePolicy::new(now));
-        agent.policy = CpuPolicy::Agent(ServicePolicy::new(now));
         let mut processes = [desktop, agent];
+        let now = timer::ticks();
+        processes[0].policy = CpuPolicy::Desktop(ServicePolicy::new(now));
+        processes[1].policy = CpuPolicy::Agent(ServicePolicy::new(now));
         let mut ipc = Ipc::new();
         let mut surface = surface::Session::desktop(display).expect("desktop surface");
         let (framebuffer, region) = surface.placement();
@@ -1429,7 +1476,8 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
             .ok_or(-11)?;
         assert!(self.children[index].is_none());
         let before = frames.stats().unwrap().allocated_frames;
-        let mut child = create_process(
+        let child = create_process(
+            &mut self.children[index],
             self.kernel,
             frames,
             self.bytes,
@@ -1470,6 +1518,7 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
                 // SAFETY: The child has never run, and failed resource creation
                 // released all offscreen pages before this address-space teardown.
                 unsafe { child.space.destroy(frames) }.expect("application-load rollback");
+                self.children[index] = None;
                 assert_eq!(frames.stats().unwrap().allocated_frames, before);
                 return Err(error);
             }
@@ -1479,7 +1528,6 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
             desktop.space.root_physical_address()
         );
         child.policy = CpuPolicy::Application(ServicePolicy::new(timer::ticks()));
-        self.children[index] = Some(child);
         self.windows.applications[index] = Some(application);
         self.windows.launches += 1;
         serial::println!("MIRROR_APP_STARTED pid={} kind={}", pid, kind);
@@ -1898,6 +1946,8 @@ fn create_thread(process: &mut Process<'_>, frame: &TrapFrame) -> Result<u64, i6
     #[cfg(feature = "boot-smoke")]
     {
         process.threads_created += 1;
+        let live = process.threads.iter().flatten().count();
+        process.threads_peak = process.threads_peak.max(live);
     }
     Ok(tid)
 }
@@ -1967,7 +2017,9 @@ pub fn run_shell(
     let before = frames.stats().unwrap().allocated_frames;
     let desktop_image = elf::parse(programs[0]).expect("invalid shell ELF");
     let image = elf::parse(programs[1]).expect("invalid application ELF");
-    let mut desktop = create_process(
+    let mut shell = None;
+    let desktop = create_process(
+        &mut shell,
         kernel,
         frames,
         programs[0],
@@ -2016,7 +2068,7 @@ pub fn run_shell(
                 Err(error) => panic!("rollback test handle failure: {error:?}"),
             }
         }
-        assert_eq!(runtime.launch(frames, &mut desktop, 0), Err(-24));
+        assert_eq!(runtime.launch(frames, desktop, 0), Err(-24));
         assert_eq!(frames.stats().unwrap().allocated_frames, baseline);
         assert!(runtime.children.iter().all(Option::is_none));
         assert!(runtime.windows.applications.iter().all(Option::is_none));
@@ -2038,7 +2090,7 @@ pub fn run_shell(
         assert!(ACTIVE_WINDOWS.load(Ordering::SeqCst).is_null());
         runtime.reclaim_finished(frames, &mut ipc);
         let now = timer::ticks();
-        wake_threads(&mut desktop, &mut ipc, Some(&mut input), None, now);
+        wake_threads(desktop, &mut ipc, Some(&mut input), None, now);
         for index in 0..desktop.threads.len() {
             if desktop.threads[index].is_none() {
                 continue;
@@ -2047,14 +2099,14 @@ pub fn run_shell(
             match desktop.thread().state {
                 State::Launching(kind) => {
                     let result = runtime
-                        .launch(frames, &mut desktop, kind)
+                        .launch(frames, desktop, kind)
                         .unwrap_or_else(|error| error as u64);
                     desktop.thread_mut().context.frame.rax = result;
                     desktop.thread_mut().state = State::Ready;
                 }
                 State::Closing(pid) => {
                     let result = runtime
-                        .close(frames, &mut desktop, &mut ipc, pid, Outcome::Terminated)
+                        .close(frames, desktop, &mut ipc, pid, Outcome::Terminated)
                         .map_or_else(|error| error as u64, |()| 0);
                     desktop.thread_mut().context.frame.rax = result;
                     desktop.thread_mut().state = State::Ready;
@@ -2069,7 +2121,7 @@ pub fn run_shell(
         for offset in 0..=windows::APP_COUNT {
             let index = (cursor + offset) % (windows::APP_COUNT + 1);
             let ready = if index == 0 {
-                service_eligible(&mut desktop, now)
+                service_eligible(desktop, now)
             } else {
                 runtime.children[index - 1]
                     .as_mut()
@@ -2086,7 +2138,7 @@ pub fn run_shell(
                 resume_process(
                     kernel,
                     frames,
-                    &mut desktop,
+                    desktop,
                     &mut ipc,
                     Some(&mut surface),
                     Some(&mut input),
@@ -2117,10 +2169,10 @@ pub fn run_shell(
         .map(|application| application.as_ref().map(|application| application.pid));
     for pid in pids.into_iter().flatten() {
         runtime
-            .close(frames, &mut desktop, &mut ipc, pid, Outcome::SessionEnded)
+            .close(frames, desktop, &mut ipc, pid, Outcome::SessionEnded)
             .expect("shell child cancellation");
     }
-    release_finished_handles(core::slice::from_mut(&mut desktop), &mut ipc);
+    release_finished_handles(core::slice::from_mut(&mut *desktop), &mut ipc);
     assert!(desktop.handles.is_empty() && ipc.is_drained());
     assert!(
         ACTIVE.load(Ordering::SeqCst).is_null() && ACTIVE_WINDOWS.load(Ordering::SeqCst).is_null()
@@ -2635,6 +2687,7 @@ fn match_init_oracles(process: &mut Process<'_>, message: &[u8]) {
     process.clock_checks |= message == b"Mirror init: clock checks passed\n";
     process.clock_unavailable |= message == b"Mirror init: clock unavailable\n";
     process.thread_checks |= message == b"Mirror init: thread checks passed\n";
+    process.capacity_checks |= message == b"Mirror init: thread capacity checks passed\n";
     process.sync_checks |= message == b"Mirror init: synchronization checks passed\n";
     if message == b"Mirror init: FPU preemption begin\n" {
         process.fpu_preemption_start = Some(process.preemptions);

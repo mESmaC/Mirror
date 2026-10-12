@@ -23,6 +23,10 @@ const WAIT: u32 = 0;
 const GATED_WAIT: u32 = 1;
 const MUTEX: u32 = 2;
 const INCREMENTS: u64 = 8;
+/// The battery's worker count. It is local, not the ABI limit, so raising
+/// MAX_THREADS leaves the battery's semantics and indexing unchanged (spec
+/// 0030a, 0030-D4). Wake counts of MAX_THREADS still mean "every waiter".
+const WORKERS: usize = 3;
 
 struct Task {
     address: AtomicU64,
@@ -46,7 +50,7 @@ impl Task {
     }
 }
 
-static TASKS: [Task; MAX_THREADS - 1] = [const { Task::new() }; MAX_THREADS - 1];
+static TASKS: [Task; WORKERS] = [const { Task::new() }; WORKERS];
 static WORDS: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
 static GATE: AtomicU32 = AtomicU32::new(0);
 static COUNTER: Mutex<u64> = Mutex::new(0);
@@ -74,7 +78,7 @@ fn yield_now() {
 fn settle() {
     // A worker publishes stage 1 immediately before entering WAIT. Several
     // complete round-robin passes also cover preemption between those actions.
-    for _ in 0..MAX_THREADS {
+    for _ in 0..=WORKERS {
         yield_now();
     }
 }

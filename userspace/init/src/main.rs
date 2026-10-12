@@ -1128,6 +1128,11 @@ extern "C" fn init_main(launch: u64) -> ! {
     tls::finish(console, pid as u64);
     clock::check(console);
     threads::check(console, pid as u64);
+    if role == 0 {
+        // Both roles run the battery at once, so only one fills its thread
+        // table: a pair session then peaks at 16 + 4 live threads.
+        threads::check_capacity(console);
+    }
     sync::check(console);
 
     // SAFETY: Both statics are live in this process's private address space, and

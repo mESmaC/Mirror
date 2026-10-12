@@ -643,6 +643,11 @@ try {
     if (@([regex]::Matches($serial, '(?m)^MIRROR_USER_SYNC_OK(?:\s|$)')).Count -ne 4) {
         throw 'Both native process runs must validate address waits, wakeups, and synchronization cleanup.'
     }
+    # Only the primary process fills its sixteen thread slots (spec 0030a,
+    # acceptance 2); the kernel asserts that it held them all at once.
+    if (@([regex]::Matches($serial, '(?m)^user: Mirror init: thread capacity checks passed\\n\r?$')).Count -ne 2) {
+        throw 'The primary native process must complete its thread capacity check before and after teardown/relaunch.'
+    }
     if ($serial -notmatch '(?m)^MIRROR_TLS_READY[^\r\n]* fsgsbase=0(?:\s|$)') {
         throw 'Mirror must keep direct user FS/GS base instructions disabled.'
     }

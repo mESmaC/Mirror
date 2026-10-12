@@ -7,7 +7,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use mirror_thread_protocol::{
     MAX_THREADS, SYS_THREAD_CREATE, SYS_THREAD_EXIT, SYS_THREAD_ID, SYS_THREAD_JOIN, SYS_TLS_GET,
-    THREAD_START_SIZE, TLS_BASES_SIZE, ThreadStart, USER_ADDRESS_END,
+    SYS_WAIT_U32, SYS_WAKE_U32, THREAD_START_SIZE, TLS_BASES_SIZE, ThreadStart, USER_ADDRESS_END,
+    WAIT_FOREVER,
 };
 
 use crate::{
@@ -35,6 +36,15 @@ const BURN: u64 = 5;
 const MAIN_EXIT: u64 = 18;
 const PROCESS_EXIT: u64 = 19;
 const FAULT: u64 = 20;
+/// The lifecycle battery's worker count. It is local, not the ABI limit, so
+/// raising MAX_THREADS leaves the battery's semantics and indexing unchanged
+/// (spec 0030a, 0030-D4).
+const WORKERS: usize = 3;
+/// The capacity check fills the process: the main thread plus 15 workers.
+const CAPACITY_WORKERS: usize = MAX_THREADS - 1;
+const CAPACITY_STACK_PAGES: u64 = 4;
+const CAPACITY_STACKS: u64 = 0x1_0a00_0000;
+const CAPACITY_VALUE: u64 = 0x5eed_0030_a000_0000;
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
@@ -76,7 +86,7 @@ impl Task {
     }
 }
 
-static TASKS: [Task; MAX_THREADS - 1] = [const { Task::new() }; MAX_THREADS - 1];
+static TASKS: [Task; WORKERS] = [const { Task::new() }; WORKERS];
 static TLS_WORDS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 static PROCESS: AtomicU64 = AtomicU64::new(0);
 static MAIN: AtomicU64 = AtomicU64::new(0);
@@ -85,6 +95,9 @@ static SHARED_HANDLE: AtomicU64 = AtomicU64::new(0);
 static GATE: AtomicU64 = AtomicU64::new(0);
 static COMPLETED: AtomicU64 = AtomicU64::new(0);
 static PARK_WORD: AtomicU32 = AtomicU32::new(0);
+static CAPACITY_GATE: AtomicU32 = AtomicU32::new(0);
+static CAPACITY_STARTED: AtomicU64 = AtomicU64::new(0);
+static CAPACITY_DONE: AtomicU64 = AtomicU64::new(0);
 
 unsafe extern "C" {
     fn mirror_thread_entry();
@@ -444,26 +457,16 @@ pub(super) fn check(console: u64, pid: u64) {
     let second = launch(1, BASIC);
     let third = launch(2, BASIC);
     require(first != second && first != third && second != third, 551);
-    // Do not mutate an active Task merely to provoke the capacity error.
-    let overflow = ThreadStart {
-        entry: mirror_thread_entry as *const () as u64,
-        stack: load(&TASKS[0].stack),
-        argument: (&raw const TASKS) as u64,
-        fs: 0,
-        gs: 0,
-    };
-    require(create(overflow) == EAGAIN, 552);
     store(&GATE, 1);
     for task in &TASKS {
         await_value(&task.progress, 2);
     }
     // Progress is published immediately before THREAD_EXIT. Give every ready
-    // sibling a final turn so this capacity check covers retained exit records.
-    for _ in 0..MAX_THREADS {
+    // sibling a final turn so the joins below consume retained exit records.
+    // The thread-limit checks moved to check_capacity (spec 0030a).
+    for _ in 0..=WORKERS {
         yield_now();
     }
-    // Exited but unjoined threads continue to occupy their bounded slots.
-    require(create(overflow) == EAGAIN, 570);
     for (index, tid) in [first, second, third].into_iter().enumerate() {
         require(join(tid) == (0, EXIT_VALUE ^ index as u64), 553);
         require(join(tid).0 == ESRCH, 554);
@@ -519,6 +522,102 @@ pub(super) fn check(console: u64, pid: u64) {
     write(console, b"Mirror init: thread checks passed\n");
 }
 
+extern "C" fn capacity_worker(index: u64) -> ! {
+    // The raw entry contract: the argument arrives in RDI, with no TLS bases.
+    require(index < CAPACITY_WORKERS as u64, 575);
+    CAPACITY_STARTED.fetch_add(1, Ordering::AcqRel);
+    // Counted immediately before the wait; the creator settles afterwards.
+    let result = syscall(SYS_WAIT_U32, CAPACITY_GATE.as_ptr() as u64, 0, WAIT_FOREVER);
+    // Zero is an explicit wake; EAGAIN means the gate opened before the wait.
+    require(result == 0 || result == EAGAIN, 576);
+    require(CAPACITY_GATE.load(Ordering::Acquire) == 1, 577);
+    CAPACITY_DONE.fetch_add(1, Ordering::AcqRel);
+    thread_exit(CAPACITY_VALUE ^ index)
+}
+
+fn capacity_start(index: usize) -> ThreadStart {
+    let top = CAPACITY_STACKS + (index as u64 + 1) * CAPACITY_STACK_PAGES * PAGE_SIZE;
+    ThreadStart {
+        entry: capacity_worker as *const () as u64,
+        stack: top - 8,
+        argument: index as u64,
+        fs: 0,
+        gs: 0,
+    }
+}
+
+/// Acceptance 2 of spec 0030a, run in role 0 only: one process runs
+/// MAX_THREADS threads, the next create returns EAGAIN whether its siblings
+/// are live or exited and unjoined, and WAKE_U32 accepts a count of
+/// MAX_THREADS but not one more. The worker stacks share one guardless RW
+/// reservation, released before the synchronization checks run.
+pub(super) fn check_capacity(console: u64) {
+    const _: () = assert!(MAX_THREADS == 16);
+    let baseline = vm_stats();
+    let pages = CAPACITY_WORKERS as u64 * CAPACITY_STACK_PAGES;
+    vm_reserve(CAPACITY_STACKS, pages, PROT_READ_WRITE);
+    require(vm_stats().regions == baseline.regions + 1, 578);
+    CAPACITY_GATE.store(0, Ordering::Release);
+    CAPACITY_STARTED.store(0, Ordering::Release);
+    CAPACITY_DONE.store(0, Ordering::Release);
+    let mut tids = [0_u64; CAPACITY_WORKERS];
+    for (index, tid) in tids.iter_mut().enumerate() {
+        let created = create(capacity_start(index));
+        require(created > 0 && created as u64 != load(&MAIN), 579);
+        *tid = created as u64;
+    }
+    for (index, tid) in tids.iter().enumerate() {
+        require(!tids[..index].contains(tid), 580);
+    }
+    // A valid descriptor, so only the thread limit can reject it.
+    let overflow = capacity_start(0);
+    require(create(overflow) == EAGAIN, 581);
+    for _ in 0..4096 {
+        if load(&CAPACITY_STARTED) == CAPACITY_WORKERS as u64 {
+            break;
+        }
+        yield_now();
+    }
+    require(load(&CAPACITY_STARTED) == CAPACITY_WORKERS as u64, 582);
+    // A worker counts itself just before WAIT. A further yield per sibling
+    // covers preemption between the two.
+    for _ in 0..MAX_THREADS {
+        yield_now();
+    }
+    require(load(&CAPACITY_DONE) == 0, 583);
+    let gate = CAPACITY_GATE.as_ptr() as u64;
+    require(
+        syscall(SYS_WAKE_U32, gate, MAX_THREADS as u64 + 1, 0) == EINVAL,
+        584,
+    );
+    CAPACITY_GATE.store(1, Ordering::Release);
+    require(
+        syscall(SYS_WAKE_U32, gate, MAX_THREADS as u64, 0) == CAPACITY_WORKERS as i64,
+        585,
+    );
+    for _ in 0..4096 {
+        if load(&CAPACITY_DONE) == CAPACITY_WORKERS as u64 {
+            break;
+        }
+        yield_now();
+    }
+    require(load(&CAPACITY_DONE) == CAPACITY_WORKERS as u64, 586);
+    // Completion is counted immediately before THREAD_EXIT. Give every ready
+    // sibling a final turn so the next check covers retained exit records.
+    for _ in 0..MAX_THREADS {
+        yield_now();
+    }
+    // Exited but unjoined threads continue to occupy their bounded slots.
+    require(create(overflow) == EAGAIN, 587);
+    for (index, tid) in tids.into_iter().enumerate() {
+        require(join(tid) == (0, CAPACITY_VALUE ^ index as u64), 588);
+        require(join(tid).0 == ESRCH, 589);
+    }
+    vm_release(CAPACITY_STACKS, pages);
+    require(vm_stats() == baseline, 590);
+    write(console, b"Mirror init: thread capacity checks passed\n");
+}
+
 pub(super) fn scenario(scenario: u64) -> ! {
     allocate_stacks();
     store(&GATE, 0);
@@ -532,7 +631,7 @@ pub(super) fn scenario(scenario: u64) -> ! {
             let worker = launch(0, scenario);
             launch(1, PARK);
             await_value(&TASKS[1].progress, 1);
-            for _ in 0..MAX_THREADS {
+            for _ in 0..=WORKERS {
                 yield_now();
             }
             store(&GATE, 1);

@@ -20,7 +20,7 @@ pub const SYS_WAIT_U32: u64 = 33;
 pub const SYS_WAKE_U32: u64 = 34;
 pub const TLS_BASES_SIZE: usize = 16;
 pub const THREAD_START_SIZE: usize = 40;
-pub const MAX_THREADS: usize = 4;
+pub const MAX_THREADS: usize = 16;
 pub const USER_ADDRESS_END: u64 = 1 << 47;
 pub const WAIT_WORD_SIZE: u64 = 4;
 pub const MAX_WAIT_TICKS: u64 = 1000;
@@ -137,6 +137,16 @@ impl TlsBases {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thread_limit_is_sixteen_and_bounds_the_wake_count() {
+        // ABI (spec 0030a, 0030-D4): sixteen threads per process, counting the
+        // initial thread and exited threads awaiting join.
+        assert_eq!(MAX_THREADS, 16);
+        assert!(wake_arguments_valid(4096, 16, 0));
+        assert!(!wake_arguments_valid(4096, 17, 0));
+        assert!(!wake_arguments_valid(4096, u64::MAX, 0));
+    }
 
     #[test]
     fn wait_and_wake_validate_full_width_inputs_and_boundaries() {
