@@ -60,6 +60,8 @@ struct Recycling {
     bitmap: *mut u8,
     /// 0054-D1: the per-frame u16 refcount array, in its own reserved span.
     refcounts: *mut u16,
+    /// 0054-D4: the reserve floor in frames, fixed when recycling starts.
+    reserve_floor: usize,
     #[cfg(feature = "boot-smoke")]
     physical: u64,
     #[cfg(feature = "boot-smoke")]
@@ -350,6 +352,7 @@ impl<'a> FrameAllocator<'a> {
                 never_allocated_frames: total_frames - allocated_frames - metadata_frames,
             },
             recycled_hint: total_frames,
+            reserve_floor: reserve_floor(total_frames),
         };
         // Bump allocation visits the compact usable-frame index in order, even
         // when memory-map entries are not sorted by physical address.
@@ -499,6 +502,30 @@ impl<'a> FrameAllocator<'a> {
         self.recycling.as_ref().map(|recycling| recycling.stats)
     }
 
+    /// 0054-D4: the reserve floor in frames, fixed when recycling started.
+    pub fn reserve_floor(&self) -> usize {
+        self.recycling
+            .as_ref()
+            .map(|recycling| recycling.reserve_floor)
+            .unwrap_or(0)
+    }
+
+    /// 0054-D4: preflight one operation's worst-case frame count against the
+    /// reserve floor, so no partial operation straddles it. The kernel and
+    /// protected classes may draw the floor; any other operation may not start
+    /// if it would end below it. Before recycling starts there is no floor.
+    pub fn preflight_reserve(&self, pages: usize, may_draw_reserve: bool) -> bool {
+        let Some(recycling) = self.recycling.as_ref() else {
+            return true;
+        };
+        let free = recycling.stats.recycled_frames + recycling.stats.never_allocated_frames;
+        if may_draw_reserve {
+            free >= pages
+        } else {
+            free >= pages + recycling.reserve_floor
+        }
+    }
+
     fn index_of(&self, frame: u64) -> Option<usize> {
         let mut index = 0;
         for entry in self.entries {
@@ -534,6 +561,12 @@ fn usable_bounds(entry: &Entry) -> Option<(u64, u64)> {
     // Physical page zero is never allocated, regardless of the firmware map.
     let base = align_up(entry.base)?.max(PAGE_SIZE);
     (base < end).then_some((base, end))
+}
+
+/// 0054-D4: the reserve floor in frames — the smaller of 16 MiB and one
+/// sixteenth of the usable frames.
+fn reserve_floor(total_frames: usize) -> usize {
+    (total_frames / 16).min(4096)
 }
 
 fn align_up(value: u64) -> Option<u64> {
@@ -689,6 +722,7 @@ fn self_test_contiguous() {
             never_allocated_frames: 11,
         },
         recycled_hint: 2,
+        reserve_floor: 1,
     };
     let initial = [
         METADATA,
@@ -890,6 +924,24 @@ pub fn self_test_recycling(frames: &mut FrameAllocator<'_>) {
             Err(RecyclingError::AlreadyEnabled)
         );
     }
+    assert_eq!(frames.stats(), Some(before));
+
+    // 0054 acceptance 3: the floor, fixed at enable_recycling, refuses a
+    // non-protected operation that would end below it, while the kernel's own
+    // allocation still succeeds; the frame counts are restored exactly.
+    let floor = frames.reserve_floor();
+    assert_eq!(floor, 4096.min(before.total_frames / 16));
+    let free = before.recycled_frames + before.never_allocated_frames;
+    assert!(frames.preflight_reserve(free - floor, false));
+    assert!(!frames.preflight_reserve(free - floor + 1, false));
+    assert!(frames.preflight_reserve(free - floor + 1, true));
+    let kernel_frame = frames.allocate().expect("kernel frame beside the floor");
+    // SAFETY: the test owns this frame outright, with no alias or DMA.
+    unsafe {
+        frames
+            .deallocate(kernel_frame)
+            .expect("release kernel frame")
+    };
     assert_eq!(frames.stats(), Some(before));
 
     let first = frames.allocate().expect("first recycling test frame");

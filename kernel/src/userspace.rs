@@ -223,6 +223,11 @@ impl MemoryClass {
     fn limits(self) -> (u64, u64) {
         (vm_abi::RESERVED_LIMIT, vm_abi::COMMITTED_LIMIT)
     }
+
+    /// 0054-D4: only the protected class may draw the reserve floor.
+    fn may_draw_reserve(self) -> bool {
+        matches!(self, MemoryClass::Protected)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -879,6 +884,13 @@ fn load_process(
     if !sched::has_room(1, 1) {
         return Err(CreateError::TableFull);
     }
+    // 0054-D4: one preflight per operation against the reserve floor, on the
+    // child's class, before the create's own allocations start. The worst case
+    // is the image pages, the 16-page stack, and their page-table pages.
+    let image_pages = (bytes.len() as u64).div_ceil(PAGE_SIZE);
+    if !frames.preflight_reserve((image_pages + 32) as usize, class.may_draw_reserve()) {
+        return Err(CreateError::Paging(PagingError::OutOfFrames));
+    }
     // SAFETY: The BSP is alone with IF=0, kernel root active, and the shared
     // upper mappings and unique allocator remain live throughout this run.
     // The kernel tables live in continue_boot's frame, which never returns.
@@ -897,7 +909,7 @@ fn load_process(
     let slot = sched::insert_process(Process {
         pid,
         space,
-        vm: vm::Vm::new(class.limits().0, class.limits().1),
+        vm: vm::Vm::new(class.limits().0, class.limits().1, class.may_draw_reserve()),
         direct_map,
         access: Access::default(),
         #[cfg(feature = "boot-smoke")]
@@ -1774,6 +1786,14 @@ impl ShellRuntime<'_> {
             ] {
                 child.boot_handles[slot] =
                     child.handles.insert(object, rights).map_err(cap_error)?;
+            }
+            // 0054-D4: the launch's pixels preflight against the reserve floor
+            // on the child's (normal) class, before the allocation starts.
+            if !frames.preflight_reserve(
+                windows::SURFACE_PAGES,
+                MemoryClass::Normal.may_draw_reserve(),
+            ) {
+                return Err(-12);
             }
             // SAFETY: The kernel root is active on the sole BSP with IF=0.
             // The unique allocator and persistent HHDM own all acquired pages.

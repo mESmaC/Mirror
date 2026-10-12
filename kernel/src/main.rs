@@ -194,6 +194,9 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
         // 0054-D3: the refcount array's exact bytes (two per frame, own span).
         frame_stats.total_frames * 2,
     );
+    // 0054-D4: the reserve floor, fixed when recycling started and identical
+    // in every flavor.
+    serial::println!("MIRROR_MEM_RESERVE frames={}", frames.reserve_floor());
     let discovered = acpi::discover(&boot, &mut tables, &mut frames);
     reset::init(discovered.reset);
     let topology = discovered.topology;

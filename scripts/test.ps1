@@ -40,11 +40,11 @@ function Assert-MirrorKernelImage {
         # kernels test the policy, skip methods or suppress writes (0058a).
         # 0059: the auto-phase growth records are test-trace-gated, and the
         # capacity skip record and charge summary exist only in boot-smoke.
-        $required = @('MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=') + $resetRequired
+        $required = @('MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=', 'MIRROR_MEM_RESERVE frames=') + $resetRequired
         $forbidden = @('MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_TRACE_ON', 'MIRROR_CONSOLE_COMMAND operation=', 'MIRROR_POINTER_UPDATED', 'MIRROR_POINTER_CLICK', 'MIRROR_SHELL_FRAME', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'Mirror shell: ready', 'MIRROR_USERSPACE_OK', 'Mirror init: VM checks passed', 'fixture data mismatch', 'unexpected budget exhaustion', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROWN phase=auto', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK') + $resetForbidden
     }
     else {
-        $required = @('MIRROR_TRACE_ON', 'MIRROR_SHELL_FRAME', 'MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=', 'MIRROR_HEAP_GROWN phase=auto') + $resetRequired
+        $required = @('MIRROR_TRACE_ON', 'MIRROR_SHELL_FRAME', 'MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=', 'MIRROR_HEAP_GROWN phase=auto', 'MIRROR_MEM_RESERVE frames=') + $resetRequired
         $forbidden = @('MIRROR_USERSPACE_OK', 'fixture data mismatch', 'MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK') + $resetForbidden
     }
     foreach ($text in $required) {

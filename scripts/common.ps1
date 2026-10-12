@@ -993,6 +993,18 @@ function Assert-MirrorFramePool {
         $free -ne $total - $allocated - $metadata) {
         throw 'Frame pool accounting does not match the bitmap and refcount spans.'
     }
+    # 0054-D6: the reserve floor follows the pool record once per boot, in
+    # every flavor, recomputed from the pool's total by the sizing rule.
+    $reserve = [regex]::Matches($Serial, '(?m)^MIRROR_MEM_RESERVE frames=([0-9]+)\r?$')
+    if ($reserve.Count -ne 1 -or [regex]::Matches($Serial, '(?m)^MIRROR_MEM_RESERVE(?:\s|$)').Count -ne 1 -or
+        $reserve[0].Index -le $records[0].Index) {
+        throw 'Mirror must report its memory reserve exactly once, after the frame pool.'
+    }
+    $floor = [uint64][math]::Floor($total / 16)
+    if ($floor -gt 4096) { $floor = 4096 }
+    if ([uint64]$reserve[0].Groups[1].Value -ne $floor) {
+        throw 'The memory reserve does not match the floor sizing rule.'
+    }
 }
 
 function ConvertTo-QemuOptionValue {
