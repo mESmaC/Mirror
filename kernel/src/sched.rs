@@ -24,8 +24,10 @@
 //! completed input while a thread waits for it. The interrupted thread then
 //! returns to the scheduler still ready, keeping the rest of its quantum.
 //! Each completion pass appends the threads it wakes to the run queue, and
-//! the next dispatch takes the first eligible one, or else the interrupted
-//! thread, which rejoins the queue behind them (0030-D3).
+//! the next dispatch takes the first eligible one. The interrupted thread
+//! rejoins at the head of the queue, so it resumes right after that woken
+//! thread, or first when none is eligible, ahead of every entry queued before
+//! it ran (0030-D3).
 //!
 //! Only the BSP touches any of this, with IF=0: the scheduler between user
 //! entries, and the running thread's synchronous syscall and CPL3 IRQ handlers
@@ -690,11 +692,33 @@ pub(super) fn enqueue(slot: u16) {
     append(slot, false);
 }
 
-/// Append a thread that the current completion pass readied: a woken one,
-/// or an interrupted one that a wake displaced. Until the next pass these
-/// dispatch before older entries (0030-D3).
+/// Append a thread that the current completion pass woke. Until the next
+/// pass these dispatch before older entries (0030-D3).
 pub(super) fn enqueue_woken(slot: u16) {
     append(slot, true);
+}
+
+/// Put an interrupted thread that a wake displaced with quantum left back at
+/// the head of the run queue (0030-D3). The current pass's woken threads
+/// still dispatch first, by their precedence, and the displaced thread then
+/// resumes its turn ahead of every older entry. At the tail it would fall
+/// behind the threads queued before it ran once the next pass began, which
+/// reordered a woken set whenever a deadline displaced one of its threads
+/// before that thread's first instruction.
+fn requeue_displaced(slot: u16) {
+    let index = usize::from(slot);
+    RUN_QUEUE.with(|queue| {
+        assert!(!queue.queued[index], "thread queued twice");
+        if queue.length == 0 {
+            queue.tail = slot;
+        } else {
+            queue.next[index] = queue.head;
+        }
+        queue.head = slot;
+        queue.queued[index] = true;
+        queue.woken_in[index] = 0;
+        queue.length += 1;
+    });
 }
 
 fn append(slot: u16, woken: bool) {
@@ -1005,7 +1029,7 @@ pub(super) struct Stats {
 struct Returned {
     slot: u16,
     /// A wake displaced it with quantum left (0030-D3), so it dispatches
-    /// before older entries, behind the threads that pass wakes.
+    /// before older entries, behind the first eligible thread that pass wakes.
     displaced: bool,
 }
 
@@ -1069,11 +1093,13 @@ pub(super) fn run(
         let now = timer::ticks();
         begin_pass();
         complete_waits(session, now);
-        // Queue the returned thread behind the threads this pass woke, before
-        // a shell close can finish its process and take it off the queue.
+        // Queue the returned thread before a shell close can finish its
+        // process and take it off the queue: a displaced one at the head,
+        // behind this pass's woken threads by their precedence, any other at
+        // the tail.
         if let Some(thread) = returned.take() {
             if thread.displaced {
-                enqueue_woken(thread.slot);
+                requeue_displaced(thread.slot);
             } else {
                 enqueue(thread.slot);
             }

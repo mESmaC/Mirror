@@ -4320,7 +4320,8 @@ fn suspend(frame: &mut TrapFrame, state: State) {
 
 /// Return the running thread to the scheduler still ready, so the threads
 /// that an event woke dispatch first. It keeps the rest of its quantum and
-/// then rejoins the run queue behind them (0030-D3).
+/// rejoins the run queue at its head, so it resumes after the first eligible
+/// woken thread, ahead of the threads queued before it ran (0030-D3).
 fn displace(frame: &mut TrapFrame) {
     park_current(frame, State::Ready, true);
 }
