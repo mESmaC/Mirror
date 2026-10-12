@@ -374,6 +374,10 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
         } else {
             0
         };
+        // 0059 acceptance test 4: the charge leak probe belongs to the boot's
+        // last session drain — the relaunch pair's when no desktop session
+        // follows.
+        let desktop_follows = display.is_some() && (keyboard_ready || mouse_ready);
         userspace::run_init(
             &tables,
             &mut frames,
@@ -381,6 +385,7 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
             boot.direct_map_offset,
             scenario,
             display.as_mut(),
+            desktop_follows,
         );
         // Init's register probe entered with AC set; while SMAP is active,
         // every entry must have run with AC clear (spec 0016b).

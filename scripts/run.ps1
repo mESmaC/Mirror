@@ -724,6 +724,14 @@ try {
             throw 'The busy app stopped before the peer edit completed.'
         }
     }
+    # 0059-D4: one charge summary per session drain — both init pairs plus the
+    # shell/desktop drain, or just the pairs when the desktop is skipped.
+    $chargeExpected = if ($NoKeyboard -or $NoDisplayDevice) { 2 } else { 3 }
+    $chargeRecords = [regex]::Matches($serial, '(?m)^MIRROR_HEAP_CHARGE_OK tables_peak=([0-9]+) surfaces_peak=([0-9]+)\r?$')
+    if ($chargeRecords.Count -ne $chargeExpected -or
+        [regex]::Matches($serial, '(?m)^MIRROR_HEAP_CHARGE_OK(?:\s|$)').Count -ne $chargeExpected) {
+        throw "Mirror must report exactly $chargeExpected complete heap charge summaries. See $serialLog."
+    }
     # PS/2 init waits are bounded by elapsed time, on HPET when its clock is
     # published and on PIT channel 0 otherwise, and init skips the controller
     # self-test (spec 0017b). One record follows init in every case, timeouts

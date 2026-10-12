@@ -631,6 +631,12 @@ pub fn ensure(tables: &PageTables, frames: &mut FrameAllocator<'_>, offset: u64)
     }
 
     let mut outcome = Ensure::Unchanged;
+    // A shortfall's feasibility is admitted once per call, against the
+    // capacity still to add at entry: steps committed by this call count
+    // toward satisfying the request, so the bound must not shrink mid-loop
+    // (otherwise a feasible request over half the remaining cap is dropped
+    // after a few steps and can never be served).
+    let admission = (HEAP_MAX_SIZE - stats().size) as u64;
     loop {
         let before = stats();
         let mut needed = false;
@@ -647,7 +653,7 @@ pub fn ensure(tables: &PageTables, frames: &mut FrameAllocator<'_>, offset: u64)
                     // not re-arm; drop it.
                     // SAFETY: the heap lock is held above.
                     unsafe { *ALLOCATOR.shortfall.get() = (0, 0) };
-                } else if key > (HEAP_MAX_SIZE - before.size) as u64 {
+                } else if key > admission {
                     // Infeasible below the cap: dropped silently, stay armed.
                     // SAFETY: the heap lock is held above.
                     unsafe { *ALLOCATOR.shortfall.get() = (0, 0) };
@@ -1182,6 +1188,34 @@ pub unsafe fn capacity_self_test(
     );
     // SAFETY: free the block once with its exact layout.
     unsafe { ALLOCATOR.dealloc(block, request) };
+
+    // 0059 test 2, part 2: a feasible request larger than half the cap misses,
+    // is admitted once, and ensure commits as many steps as it needs — the
+    // admission must not shrink with the remaining capacity mid-loop.
+    let big =
+        Layout::from_size_align(9 * 1024 * 1024 + PAGE_SIZE as usize, PAGE_SIZE as usize).unwrap();
+    let before_big = stats().size;
+    let frames_before_big = frames.stats().unwrap().allocated_frames;
+    // SAFETY: a valid bounded layout over half the 16 MiB cap.
+    let block = unsafe { ALLOCATOR.alloc(big) };
+    assert!(block.is_null(), "the big request must miss first");
+    assert_eq!(ensure(tables, frames, offset), Ensure::Grew);
+    // SAFETY: admitted at entry, so enough steps were committed to serve it.
+    let block = unsafe { ALLOCATOR.alloc(big) };
+    assert!(!block.is_null(), "a feasible big request must be served");
+    let step = MAX_GROW_PAGES * PAGE_SIZE as usize;
+    let steps = (big.size() - before_big).div_ceil(step);
+    assert!(
+        steps >= 2,
+        "the big request must need several committed steps"
+    );
+    assert_eq!(stats().size, before_big + steps * step);
+    assert_eq!(
+        frames.stats().unwrap().allocated_frames,
+        frames_before_big + steps * MAX_GROW_PAGES
+    );
+    // SAFETY: free the block once with its exact layout.
+    unsafe { ALLOCATOR.dealloc(block, big) };
 
     // 0059 test 5: with the largest block held below the mark, the injected
     // FailFramesAfter and CancelBeforeCommit modes reach ensure through the

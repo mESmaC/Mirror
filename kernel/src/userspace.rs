@@ -295,8 +295,8 @@ struct Process<'kernel> {
     boot_handles: [u64; 6],
     handles_closed: bool,
     /// The surface pixel frames charged to this process (0059-D3; the shell
-    /// carries its apps' surfaces). Boot-smoke only: the zero-at-reap check.
-    #[cfg(feature = "boot-smoke")]
+    /// carries its apps' surfaces). Maintained in every flavor so 0054a can
+    /// consume the counters; boot-smoke only: the zero-at-reap check.
     surface_frames: u64,
     #[cfg(feature = "boot-smoke")]
     ipc_checks: bool,
@@ -379,6 +379,13 @@ impl Process<'_> {
         );
     }
 
+    /// The reporting form of the reap check, for acceptance test 4's
+    /// leak-repair probe (boot-smoke).
+    #[cfg(feature = "boot-smoke")]
+    fn charges_zero(&self) -> bool {
+        self.surface_frames == 0 && self.space.owned_table_count() == 0
+    }
+
     fn ready(&self) -> bool {
         !self.finished()
             && self
@@ -414,6 +421,7 @@ pub fn run_init(
     direct_map: u64,
     scenario: u64,
     mut display: Option<&mut framebuffer::Driver<'_>>,
+    desktop_follows: bool,
 ) {
     assert!(!arch::interrupts_enabled());
     let image = elf::parse(bytes).expect("invalid native init ELF");
@@ -436,6 +444,7 @@ pub fn run_init(
         direct_map,
         scenario,
         display.as_deref_mut(),
+        false,
     );
     // Relaunch from the same ELF after teardown. Fresh BSS and successful entry
     // exercise frame reuse and continuation recovery after both exit and fault.
@@ -445,7 +454,17 @@ pub fn run_init(
     // its first loop top, so its next loop-top ensure grows mid-session.
     #[cfg(feature = "boot-smoke")]
     heap::arm_hold_across_session();
-    run_pair(kernel, frames, bytes, &image, direct_map, 0, display);
+    // When no desktop session follows, this pair's drain is the boot's last.
+    run_pair(
+        kernel,
+        frames,
+        bytes,
+        &image,
+        direct_map,
+        0,
+        display,
+        !desktop_follows,
+    );
 }
 
 #[cfg(feature = "boot-smoke")]
@@ -577,7 +596,6 @@ fn create_process<'kernel>(
         handles: HandleTable::new(),
         boot_handles: [0; 6],
         handles_closed: false,
-        #[cfg(feature = "boot-smoke")]
         surface_frames: 0,
         #[cfg(feature = "boot-smoke")]
         ipc_checks: false,
@@ -638,6 +656,7 @@ fn run_pair(
     direct_map: u64,
     scenario: u64,
     display: Option<&mut framebuffer::Driver<'_>>,
+    charge_probe: bool,
 ) {
     // The framebuffer borrow belongs to this whole session, never to a user
     // mapping or handle. Only syscall handlers may reborrow it during resume.
@@ -834,6 +853,16 @@ fn run_pair(
     );
     serial::println!("MIRROR_USER_CLEANUP_OK allocated={}", before);
     serial::println!("MIRROR_VM_CLEANUP_OK allocated={}", before);
+    // 0059 acceptance test 4: once per boot, the last session's drain leaks
+    // one charge, requires the reap check to report it, repairs it, and only
+    // then prints the marker.
+    if charge_probe {
+        let process = &mut processes[0];
+        process.surface_frames = 1;
+        assert!(!process.charges_zero(), "reap check missed a leaked charge");
+        process.surface_frames = 0;
+        assert!(process.charges_zero(), "a repaired charge must pass");
+    }
     #[cfg(feature = "boot-smoke")]
     serial::println!(
         "MIRROR_HEAP_CHARGE_OK tables_peak={} surfaces_peak=0",
@@ -1408,6 +1437,17 @@ pub fn run_desktop(
             before + (heap::stats().size - heap_before) / PAGE_SIZE as usize,
             "desktop/agent frame leak"
         );
+        // 0059 acceptance test 4: the last session's drain leaks one charge,
+        // requires the reap check to report it, repairs it, and only then
+        // prints the marker.
+        #[cfg(feature = "boot-smoke")]
+        {
+            let process = &mut processes[0];
+            process.surface_frames = 1;
+            assert!(!process.charges_zero(), "reap check missed a leaked charge");
+            process.surface_frames = 0;
+            assert!(process.charges_zero(), "a repaired charge must pass");
+        }
         #[cfg(feature = "boot-smoke")]
         serial::println!(
             "MIRROR_HEAP_CHARGE_OK tables_peak={} surfaces_peak=0",
@@ -1529,20 +1569,14 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
             let mut application =
                 unsafe { windows::Application::new(pid, kind as u32, frames, self.direct_map) }?;
             // 0059-D3: the shell carries the app's surface frames.
-            #[cfg(feature = "boot-smoke")]
-            {
-                desktop.surface_frames += windows::SURFACE_PAGES as u64;
-            }
+            desktop.surface_frames += windows::SURFACE_PAGES as u64;
             match desktop
                 .handles
                 .insert(Object::Application(pid), capability::WRITE)
             {
                 Ok(handle) => Ok((application, handle)),
                 Err(error) => {
-                    #[cfg(feature = "boot-smoke")]
-                    {
-                        desktop.surface_frames -= windows::SURFACE_PAGES as u64;
-                    }
+                    desktop.surface_frames -= windows::SURFACE_PAGES as u64;
                     // SAFETY: No application resource or handle was published.
                     unsafe { application.destroy(frames) };
                     Err(cap_error(error))
@@ -1654,10 +1688,7 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
         let mut application = self.windows.applications[index].take().unwrap();
         let before = frames.stats().unwrap().allocated_frames;
         // 0059-D3: the shell's surface charge is released with the destroy.
-        #[cfg(feature = "boot-smoke")]
-        {
-            desktop.surface_frames -= windows::SURFACE_PAGES as u64;
-        }
+        desktop.surface_frames -= windows::SURFACE_PAGES as u64;
         // SAFETY: No child or handler can access the removed resource, whose
         // pages have never been mapped into either application address space.
         unsafe { application.destroy(frames) };
@@ -2250,6 +2281,16 @@ pub fn run_shell(
         before + (heap::stats().size - heap_before) / PAGE_SIZE as usize,
         "shell frame leak"
     );
+    // 0059 acceptance test 4: the last session's drain leaks one charge,
+    // requires the reap check to report it, repairs it, and only then prints
+    // the marker.
+    #[cfg(feature = "boot-smoke")]
+    {
+        desktop.surface_frames = 1;
+        assert!(!desktop.charges_zero(), "reap check missed a leaked charge");
+        desktop.surface_frames = 0;
+        assert!(desktop.charges_zero(), "a repaired charge must pass");
+    }
     #[cfg(feature = "boot-smoke")]
     serial::println!(
         "MIRROR_HEAP_CHARGE_OK tables_peak={} surfaces_peak={}",
