@@ -7,6 +7,9 @@
 
 use limine::memory_map::{Entry, EntryType};
 
+#[cfg(feature = "boot-smoke")]
+use core::sync::atomic::{AtomicI64, Ordering};
+
 pub const PAGE_SIZE: u64 = 4096;
 pub const MAX_DMA_PAGES: usize = 4;
 pub const DMA32_LIMIT: u64 = 1 << 32;
@@ -15,6 +18,24 @@ const NEVER_ALLOCATED: u8 = 0;
 const ALLOCATED: u8 = 1;
 const RECYCLED: u8 = 2;
 const METADATA: u8 = 3;
+
+/// 0054-D5's OomOrder scenario: a kernel-wide budget of net allocations
+/// (allocate minus deallocate), armed only in that scenario; negative means
+/// disarmed.
+#[cfg(feature = "boot-smoke")]
+static FRAME_BUDGET: AtomicI64 = AtomicI64::new(-1);
+
+/// Arm the scenario's frame budget (boot-smoke only).
+#[cfg(feature = "boot-smoke")]
+pub fn arm_frame_budget(frames: i64) {
+    FRAME_BUDGET.store(frames, Ordering::Relaxed);
+}
+
+/// Lift it before the session's drain (boot-smoke only).
+#[cfg(feature = "boot-smoke")]
+pub fn lift_frame_budget() {
+    FRAME_BUDGET.store(-1, Ordering::Relaxed);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameStats {
@@ -130,6 +151,17 @@ impl<'a> FrameAllocator<'a> {
     }
 
     pub fn allocate(&mut self) -> Option<u64> {
+        #[cfg(feature = "boot-smoke")]
+        {
+            // 0054-D5's OomOrder budget caps net allocations while armed.
+            let budget = FRAME_BUDGET.load(Ordering::Relaxed);
+            if budget == 0 {
+                return None;
+            }
+            if budget > 0 {
+                FRAME_BUDGET.store(budget - 1, Ordering::Relaxed);
+            }
+        }
         if let Some(recycling) = &mut self.recycling
             && recycling.stats.recycled_frames != 0
         {
@@ -411,6 +443,11 @@ impl<'a> FrameAllocator<'a> {
                 recycling.recycled_hint = recycling.recycled_hint.min(index);
                 recycling.stats.allocated_frames -= 1;
                 recycling.stats.recycled_frames += 1;
+                // 0054-D5: a real recycle restores the armed scenario budget.
+                #[cfg(feature = "boot-smoke")]
+                if FRAME_BUDGET.load(Ordering::Relaxed) >= 0 {
+                    FRAME_BUDGET.fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(())
             }
             _ => unreachable!("two-bit frame state"),
@@ -495,6 +532,11 @@ impl<'a> FrameAllocator<'a> {
         }
         recycling.stats.allocated_frames -= pages;
         recycling.stats.recycled_frames += pages;
+        // 0054-D5: a real recycle restores the armed scenario budget.
+        #[cfg(feature = "boot-smoke")]
+        if FRAME_BUDGET.load(Ordering::Relaxed) >= 0 {
+            FRAME_BUDGET.fetch_add(pages as i64, Ordering::Relaxed);
+        }
         Ok(())
     }
 

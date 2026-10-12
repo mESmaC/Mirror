@@ -114,7 +114,7 @@ try {
         # with SMEP and SMAP on (0016-D6).
         # UserSimd remains a strict manual #XM probe: current QEMU TCG does not
         # deliver that unmasked SSE arithmetic exception (QEMU issue 215).
-        foreach ($fault in @('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall')) {
+        foreach ($fault in @('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'OomOrder')) {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Release:$release -Fault $fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
             Save-MirrorSmokeLogs "$profile-$fault"
         }

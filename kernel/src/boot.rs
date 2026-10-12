@@ -171,6 +171,9 @@ pub enum SmokeMode {
     /// Restart through `reset::restart(test)` after every self-test, in place
     /// of the expected page fault (spec 0058a, D11).
     Reset(ResetTest),
+    /// The 0054-D5 scenario: a normal requester and a background victim
+    /// replace the relaunch pair, and the armed frame budget drives a kill.
+    OomOrder,
     User(u64),
 }
 
@@ -246,6 +249,7 @@ pub fn smoke_mode() -> SmokeMode {
         b"mirror.test=reset-from-cf9" => SmokeMode::Reset(ResetTest::Cf9),
         b"mirror.test=reset-from-triple-fault" => SmokeMode::Reset(ResetTest::TripleFault),
         b"mirror.test=reset-suppressed" => SmokeMode::Reset(ResetTest::Suppressed),
+        b"mirror.test=oom-order" => SmokeMode::OomOrder,
         _ => panic!("unknown smoke-test command line"),
     };
     assert!(tokens.next().is_none(), "multiple smoke-test arguments");

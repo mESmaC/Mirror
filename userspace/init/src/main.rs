@@ -1110,11 +1110,46 @@ fn check_preempted_arithmetic(pid: i64) {
     require(completed, 57);
 }
 
+/// 0054-D5's OomOrder requester: reserve a region and commit its pages one at
+/// a time; the kernel kills the background victim when the frame budget runs
+/// out, and every commit still succeeds.
+fn oom_requester() -> ! {
+    let console = syscall(SYS_BOOT_HANDLE, 0, 0, 0);
+    require(console > 0, 60);
+    let base = syscall(SYS_VM_RESERVE, 0, 64 * PAGE_SIZE, PROT_READ_WRITE);
+    require(base >= ARENA_START as i64, 62);
+    for page in 0..16u64 {
+        // SAFETY: the reservation owns this page; the write faults it in.
+        unsafe { ((base as u64 + page * PAGE_SIZE) as *mut u8).write_volatile(1) };
+    }
+    write(console as u64, b"Mirror init: oom requester done\n");
+    exit(0);
+}
+
+/// 0054-D5's OomOrder victim: idle on its receive channel until the kernel
+/// kills it for the requester.
+fn oom_victim() -> ! {
+    let channel = syscall(SYS_BOOT_HANDLE, 2, 0, 0);
+    require(channel > 0, 61);
+    let mut bytes = [0u8; 64];
+    loop {
+        syscall(SYS_RECV_WAIT, channel as u64, bytes.as_mut_ptr() as u64, 64);
+    }
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn init_main(launch: u64) -> ! {
     let probe = launch & 0xff;
     let role = launch >> 8;
-    require(role <= 1 && probe <= 22 && (role == 0 || probe == 0), 33);
+    // 0054-D5: roles 2 and 3 are the OomOrder scenario's requester and victim;
+    // the probe bound is unchanged.
+    require(role <= 3 && probe <= 22 && (role == 0 || probe == 0), 33);
+    if role == 2 {
+        oom_requester();
+    }
+    if role == 3 {
+        oom_victim();
+    }
     fpu::check_initial();
     tls::check_initial();
     let code_segment: u16;

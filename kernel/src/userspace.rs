@@ -13,13 +13,13 @@ use core::sync::atomic::AtomicBool;
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use crate::{
-    arch,
+    arch, boot,
     capability::{self, CapError, Capability, HandleTable, Object},
     context::Context,
     elf, framebuffer, heap, input,
     interrupts::{self, TrapFrame},
     ipc::{Ipc, IpcError, MESSAGE_SIZE},
-    memory::{FrameAllocator, PAGE_SIZE},
+    memory::{self, FrameAllocator, PAGE_SIZE},
     paging::{PageTables, PagingError, UserAddressSpace, UserPermissions},
     ps2, serial, surface, timer, vm, windows,
 };
@@ -626,16 +626,26 @@ pub fn run_init(
     // exercise frame reuse and continuation recovery after both exit and fault.
     // 0059-D1: a session's seeding is a heap safe point.
     heap::ensure(kernel, frames, direct_map);
-    // 0059 test 2's second step: the relaunch pair holds the heap near-full at
-    // its first loop top, so its next loop-top ensure grows mid-session.
-    #[cfg(feature = "boot-smoke")]
-    heap::arm_hold_across_session();
-    // 0059 acceptance test 4: when no desktop session follows, this pair's
-    // drain is the boot's last, so it runs the charge leak probe.
+    // 0054-D5's scenario replaces the relaunch pair with its requester/victim
+    // pair.
+    let oom_order = matches!(boot::smoke_mode(), boot::SmokeMode::OomOrder);
+    if !oom_order {
+        // 0059 test 2's second step: the relaunch pair holds the heap
+        // near-full at its first loop top, so its next loop-top ensure grows
+        // mid-session.
+        #[cfg(feature = "boot-smoke")]
+        heap::arm_hold_across_session();
+    }
+    // 0059 acceptance test 4: when no desktop session follows, the last
+    // pair's drain is the boot's last, so it runs the charge leak probe.
     if !desktop_follows {
         CHARGE_PROBE.store(true, Ordering::Relaxed);
     }
-    run_pair(kernel, frames, bytes, &image, direct_map, 0, display);
+    if oom_order {
+        run_oom_pair(kernel, frames, bytes, &image, direct_map);
+    } else {
+        run_pair(kernel, frames, bytes, &image, direct_map, 0, display);
+    }
 }
 
 #[cfg(feature = "boot-smoke")]
@@ -1247,6 +1257,140 @@ fn run_pair(
     // one charge, requires the reap check to report it, repairs it, and only
     // then prints the marker. Armed before the relaunch pair when no desktop
     // session follows, making this drain the boot's last.
+    if CHARGE_PROBE.swap(false, Ordering::Relaxed) {
+        let zombie = &mut zombies[0];
+        zombie.surface_frames = 1;
+        assert!(!zombie.charges_zero(), "reap check missed a leaked charge");
+        zombie.surface_frames = 0;
+        assert!(zombie.charges_zero(), "a repaired charge must pass");
+    }
+    serial::println!(
+        "MIRROR_HEAP_CHARGE_OK tables_peak={} surfaces_peak=0",
+        tables_peak
+    );
+}
+
+/// The OomOrder scenario (0054-D5, acceptance 2): a normal requester and a
+/// background victim replace the relaunch pair. The armed kernel-wide frame
+/// budget shrinks only this scenario: the requester's commits exhaust it, the
+/// victim dies OutOfMemory, and the retry succeeds. The budget lifts before
+/// the drain.
+#[cfg(feature = "boot-smoke")]
+fn run_oom_pair(
+    kernel: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    bytes: &[u8],
+    image: &elf::Image,
+    direct_map: u64,
+) {
+    let before = frames.stats().expect("recycling required").allocated_frames;
+    let heap_before = heap::stats().size;
+    let requester = create_process(
+        kernel,
+        frames,
+        bytes,
+        image,
+        direct_map,
+        2 << 8,
+        MemoryClass::Normal,
+    )
+    .expect("load OOM requester");
+    let victim = create_process(
+        kernel,
+        frames,
+        bytes,
+        image,
+        direct_map,
+        3 << 8,
+        MemoryClass::Background,
+    )
+    .expect("load OOM victim");
+    let tables_peak: usize = [requester, victim]
+        .into_iter()
+        .map(|slot| {
+            // SAFETY: Seeding holds one process reference at a time.
+            unsafe { sched::process(slot) }.space.owned_table_count()
+        })
+        .sum();
+    // The victim blocks on its receive channel forever, so it stays a live
+    // candidate until the requester's frame pressure kills it.
+    let mut ipc = Ipc::new();
+    for (index, slot) in [requester, victim].into_iter().enumerate() {
+        // SAFETY: Seeding holds one process reference at a time.
+        let process = unsafe { sched::process(slot) };
+        let grants = [
+            (Object::Console, capability::WRITE),
+            (Object::Channel(1 - index), capability::SEND),
+            (Object::Channel(index), capability::RECEIVE),
+        ];
+        for (slot, (object, rights)) in grants.into_iter().enumerate() {
+            let handle = process
+                .handles
+                .insert(object, rights)
+                .expect("bootstrap capability");
+            ipc.grant(Capability { object, rights });
+            process.boot_handles[slot] = handle;
+        }
+    }
+    // The budget caps only this scenario's net allocations; it lifts before
+    // the drain below.
+    memory::arm_frame_budget(8);
+    let mut session = sched::Session {
+        ipc,
+        surface: None,
+        input: None,
+        runtime: None,
+        end: sched::End::Pair {
+            first: requester,
+            second: victim,
+            scenario: 0,
+        },
+    };
+    sched::run(&mut session, kernel, frames, direct_map);
+    memory::lift_frame_budget();
+    assert!(session.ipc.is_drained(), "IPC endpoints leaked");
+    {
+        // SAFETY: Two distinct occupied slots, and no other reference.
+        let pair = unsafe { [sched::process(requester), sched::process(victim)] };
+        assert_eq!(
+            pair[0].outcome,
+            Some(Outcome::Exit(0)),
+            "the requester must finish after the kill: {:?}",
+            pair[0].outcome
+        );
+        assert_eq!(
+            pair[1].outcome,
+            Some(Outcome::OutOfMemory),
+            "the victim must die OutOfMemory"
+        );
+        assert!(
+            pair[1].space_destroyed,
+            "the victim's space moved at the kill"
+        );
+    }
+    // SAFETY: Validation's borrows have ended, ACTIVE is clear, and nothing
+    // references either entry; reap checks that each finished.
+    let mut zombies = unsafe { [sched::reap(requester), sched::reap(victim)] };
+    sched::assert_drained();
+    for zombie in &mut zombies {
+        // 0054-D5: an OOM victim's space was destroyed at kill time.
+        if !zombie.space_destroyed {
+            // SAFETY: All contexts are finished, ACTIVE is clear, the kernel
+            // root is active, and no handler retains a reference into the tree.
+            unsafe { zombie.space.destroy(frames) }.expect("release user address space");
+        }
+        zombie.check_charges_zero();
+    }
+    assert_eq!(
+        frames.stats().unwrap().allocated_frames,
+        // 0050-D2's shared rule, heap term: heap pages committed this session
+        // are not a leak.
+        before + (heap::stats().size - heap_before) / PAGE_SIZE as usize,
+        "user frame leak"
+    );
+    serial::println!("MIRROR_USER_CLEANUP_OK allocated={}", before);
+    serial::println!("MIRROR_VM_CLEANUP_OK allocated={}", before);
+    // 0059 acceptance test 4: the leak probe runs at the boot's last drain.
     if CHARGE_PROBE.swap(false, Ordering::Relaxed) {
         let zombie = &mut zombies[0];
         zombie.surface_frames = 1;

@@ -22,7 +22,7 @@ param(
     [switch]$LegacyPic,
     [switch]$PitTimer,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
-    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation', 'Ps2BatTimeout', 'Ps2StaleScancode', 'VmmouseError', 'Reset', 'ResetFromKbc', 'ResetFromCf9', 'ResetFromTripleFault', 'ResetSuppressed')][string]$Fault = 'None',
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation', 'Ps2BatTimeout', 'Ps2StaleScancode', 'VmmouseError', 'Reset', 'ResetFromKbc', 'ResetFromCf9', 'ResetFromTripleFault', 'ResetSuppressed', 'OomOrder')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -337,6 +337,7 @@ $testMode = switch ($Fault) {
     'ResetFromCf9' { 'reset-from-cf9' }
     'ResetFromTripleFault' { 'reset-from-triple-fault' }
     'ResetSuppressed' { 'reset-suppressed' }
+    'OomOrder' { 'oom-order' }
     default { $null }
 }
 $kernelArguments = @()
@@ -529,6 +530,11 @@ try {
         throw "Mirror reported a panic. See $serialLog."
     }
     $fatalKernelFault = $Fault -in @('PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap')
+    # 0054-D5: the OomOrder scenario runs one battery pair plus its requester
+    # and victim instead of the relaunch pair, so init's per-process and
+    # per-pair counts halve.
+    $initRuns = if ($Fault -eq 'OomOrder') { 2 } else { 4 }
+    $pairRuns = if ($Fault -eq 'OomOrder') { 1 } else { 2 }
     # A reset case restarts after every self-test, and -no-reboot turns the
     # guest reset into a QEMU exit with code 0 (spec 0058a, D11).
     $resetCase = $Fault -like 'Reset*'
@@ -589,7 +595,7 @@ try {
         }
     }
     Assert-MirrorTimer -Serial $serial -Smoke $true -UseLegacyPic ([bool]$LegacyPic) -ForcePit ([bool]$PitTimer) -FaultMode $Fault
-    Assert-MirrorClock -Serial $serial -Smoke $true -WithoutHpet ([bool]$NoHpet) -FaultMode $Fault
+    Assert-MirrorClock -Serial $serial -Smoke $true -WithoutHpet ([bool]$NoHpet) -FaultMode $Fault -InitRuns $initRuns
     Assert-MirrorSmpMarkers -Serial $serial -RequestedCpus $CpuCount -UseLegacyPic ([bool]$LegacyPic) -FaultMode $Fault
     # Every online CPU reports its guarded stacks; -LegacyPic keeps the APs
     # offline, so only the BSP reports (spec 0016a).
@@ -609,15 +615,15 @@ try {
     $entryAcLines = [regex]::Matches($serial, '(?m)^MIRROR_ENTRY_AC_OK(?:\s|$)').Count
     if ($smapActive) {
         $userspaceRuns = [regex]::Matches($serial, '(?m)^MIRROR_USERSPACE_OK(?:\s|$)')
-        if ($entryAc.Count -ne 1 -or $entryAcLines -ne 1 -or [uint64]$entryAc[0].Groups[1].Value -lt 4 -or
-            $userspaceRuns.Count -ne 4 -or $entryAc[0].Index -le $userspaceRuns[3].Index) {
+        if ($entryAc.Count -ne 1 -or $entryAcLines -ne 1 -or [uint64]$entryAc[0].Groups[1].Value -lt $initRuns -or
+            $userspaceRuns.Count -ne $initRuns -or $entryAc[0].Index -le $userspaceRuns[$initRuns - 1].Index) {
             throw 'With SMAP active, Mirror must report once, after the four init process runs, that at least four entries from CPL3 with AC set ran the kernel with AC clear.'
         }
     }
     elseif ($entryAcLines -ne 0) {
         throw 'Mirror reported the SMAP entry check on a CPU without SMAP.'
     }
-    Assert-MirrorHeapGrowth -Serial $serial -RequestedCpus $CpuCount -Smoke $true -UseLegacyPic ([bool]$LegacyPic)
+    Assert-MirrorHeapGrowth -Serial $serial -RequestedCpus $CpuCount -Smoke $true -UseLegacyPic ([bool]$LegacyPic) -InitRuns $initRuns
     Assert-MirrorFramePool -Serial $serial
     Assert-MirrorDriverCatalog -Serial $serial -Smoke $true -LegacyDisk ($DeviceProfile -eq 'LegacyVirtio' -and -not $NoTestDisk) -XhciAttached ([bool]$Xhci)
     if ($CrowdedPci) {
@@ -652,28 +658,29 @@ try {
     Assert-MirrorTraceMarker -Serial $serial -Expected $true
     Assert-MirrorSchedReady -Serial $serial
     $markers += 'MIRROR_USER_SYNC_OK'
-    if (@([regex]::Matches($serial, '(?m)^user: Mirror init: synchronization checks passed\\n\r?$')).Count -ne 4) {
+    if (@([regex]::Matches($serial, '(?m)^user: Mirror init: synchronization checks passed\\n\r?$')).Count -ne $initRuns) {
         throw 'Both native processes must complete their synchronization checks before and after teardown/relaunch.'
     }
-    if (@([regex]::Matches($serial, '(?m)^MIRROR_USER_SYNC_OK(?:\s|$)')).Count -ne 4) {
+    if (@([regex]::Matches($serial, '(?m)^MIRROR_USER_SYNC_OK(?:\s|$)')).Count -ne $initRuns) {
         throw 'Both native process runs must validate address waits, wakeups, and synchronization cleanup.'
     }
     # Only the primary process fills its sixteen thread slots (spec 0030a,
     # acceptance 2); the kernel asserts that it held them all at once.
-    if (@([regex]::Matches($serial, '(?m)^user: Mirror init: thread capacity checks passed\\n\r?$')).Count -ne 2) {
+    if (@([regex]::Matches($serial, '(?m)^user: Mirror init: thread capacity checks passed\\n\r?$')).Count -ne $pairRuns) {
         throw 'The primary native process must complete its thread capacity check before and after teardown/relaunch.'
     }
     # The primary alone then checks FIFO wake order (spec 0030a, acceptance
     # 3); the kernel asserts that its peer did not.
-    if (@([regex]::Matches($serial, '(?m)^user: Mirror init: wait queue checks passed\\n\r?$')).Count -ne 2) {
+    if (@([regex]::Matches($serial, '(?m)^user: Mirror init: wait queue checks passed\\n\r?$')).Count -ne $pairRuns) {
         throw 'The primary native process must complete its wait queue check before and after teardown/relaunch.'
     }
     # Wakeup preemption (spec 0030a, acceptance 4): each pair's primary times
     # a sleeper's and a receiver's dispatch, each at most one tick late. The
-    # fatal kernel faults run after both pairs, so every case reports twice.
+    # fatal kernel faults run after both pairs, so every case reports twice
+    # (once for the OomOrder scenario's single battery pair).
     $preemptLines = @([regex]::Matches($serial, '(?m)^MIRROR_PREEMPT_OK(?:\s|$)')).Count
     $preemptValid = @([regex]::Matches($serial, '(?m)^MIRROR_PREEMPT_OK wake_lateness=[01] ipc_lateness=[01]\r?$')).Count
-    if ($preemptLines -ne 2 -or $preemptValid -ne 2) {
+    if ($preemptLines -ne $pairRuns -or $preemptValid -ne $pairRuns) {
         throw "Both native process runs must report MIRROR_PREEMPT_OK with wake_lateness and ipc_lateness of at most one tick. See $serialLog."
     }
     # Table bounds (spec 0030a, acceptance 5): before the first session, the
@@ -693,18 +700,18 @@ try {
     if ($ExtendedCpu -and $serial -notmatch '(?m)^MIRROR_TLS_READY[^\r\n]* cpuid_fsgsbase=1(?:\s|$)') {
         throw 'The extended CPU regression requires guest-visible FSGSBASE support.'
     }
-    if (@([regex]::Matches($serial, '(?m)^user: Mirror init: TLS checks passed\\n\r?$')).Count -ne 4) {
+    if (@([regex]::Matches($serial, '(?m)^user: Mirror init: TLS checks passed\\n\r?$')).Count -ne $initRuns) {
         throw 'Both native processes must complete their TLS checks before and after teardown/relaunch.'
     }
-    if (@([regex]::Matches($serial, '(?m)^MIRROR_USER_TLS_OK(?:\s|$)')).Count -ne 4) {
+    if (@([regex]::Matches($serial, '(?m)^MIRROR_USER_TLS_OK(?:\s|$)')).Count -ne $initRuns) {
         throw 'Both native process runs must validate independent FS/GS context state.'
     }
     if (-not $fatalKernelFault) {
         $markers += 'MIRROR_USER_THREADS_OK'
-        if (@([regex]::Matches($serial, '(?m)^user: Mirror init: thread checks passed\\n\r?$')).Count -ne 4) {
+        if (@([regex]::Matches($serial, '(?m)^user: Mirror init: thread checks passed\\n\r?$')).Count -ne $initRuns) {
             throw 'Both native processes must complete their thread checks before and after teardown/relaunch.'
         }
-        if (@([regex]::Matches($serial, '(?m)^MIRROR_USER_THREADS_OK(?:\s|$)')).Count -ne 4) {
+        if (@([regex]::Matches($serial, '(?m)^MIRROR_USER_THREADS_OK(?:\s|$)')).Count -ne $initRuns) {
             throw 'Both native process runs must validate shared resources and independent thread contexts.'
         }
     }
@@ -714,13 +721,13 @@ try {
     if ($ExtendedCpu -and $serial -notmatch '(?m)^MIRROR_FPU_READY .*cpuid_avx=1(?:\s|$)') {
         throw 'The extended CPU regression requires guest-visible AVX support.'
     }
-    if (@([regex]::Matches($serial, '(?m)^user: Mirror init: FPU checks passed\\n\r?$')).Count -ne 4) {
+    if (@([regex]::Matches($serial, '(?m)^user: Mirror init: FPU checks passed\\n\r?$')).Count -ne $initRuns) {
         throw 'Both native processes must complete their FPU checks before and after teardown/relaunch.'
     }
-    if (@([regex]::Matches($serial, '(?m)^MIRROR_USER_FPU_OK(?:\s|$)')).Count -ne 4) {
+    if (@([regex]::Matches($serial, '(?m)^MIRROR_USER_FPU_OK(?:\s|$)')).Count -ne $initRuns) {
         throw 'Both native process runs must validate independent floating-point and SIMD state.'
     }
-    if (@([regex]::Matches($serial, '(?m)^user: Mirror init: VM checks passed\\n\r?$')).Count -ne 4) {
+    if (@([regex]::Matches($serial, '(?m)^user: Mirror init: VM checks passed\\n\r?$')).Count -ne $initRuns) {
         throw 'Both native processes must complete their VM checks before and after teardown/relaunch.'
     }
     if (@([regex]::Matches($serial, '(?m)^MIRROR_VM_CLEANUP_OK(?:\s|$)')).Count -ne 2) {
@@ -906,7 +913,7 @@ try {
             throw "Mirror did not use its display device. See $serialLog."
         }
     }
-    if (@([regex]::Matches($serial, '(?m)^MIRROR_USER_SURFACE_CLEANUP_OK handles_reclaimed=1\r?$')).Count -ne 2) {
+    if (@([regex]::Matches($serial, '(?m)^MIRROR_USER_SURFACE_CLEANUP_OK handles_reclaimed=1\r?$')).Count -ne $pairRuns) {
         throw "Both native process runs must reclaim their surface handles. See $serialLog."
     }
     $scenario = switch ($Fault) {
@@ -1008,6 +1015,20 @@ try {
     }
     if ($Fault -ne 'IpcTimeout' -and $serial -match '(?m)^MIRROR_IPC_TIMEOUT_OK(?:\s|$)') {
         throw "Mirror unexpectedly reported the IPC timeout scenario. See $serialLog."
+    }
+    # 0054-D5/D6: the OomOrder scenario kills exactly one background victim,
+    # before the requester's completion line; every other scenario kills none.
+    $oomKills = [regex]::Matches($serial, '(?m)^MIRROR_OOM_KILL class=background pid=([0-9]+)\r?$')
+    $requesterDone = [regex]::Matches($serial, '(?m)^user: Mirror init: oom requester done\\n\r?$')
+    if ($Fault -eq 'OomOrder') {
+        if ($oomKills.Count -ne 1 -or
+            [regex]::Matches($serial, '(?m)^MIRROR_OOM_KILL(?:\s|$)').Count -ne 1 -or
+            $requesterDone.Count -ne 1 -or $requesterDone[0].Index -le $oomKills[0].Index) {
+            throw "The OomOrder scenario must kill exactly one background victim before the requester completes. See $serialLog."
+        }
+    }
+    elseif ($oomKills.Count -ne 0 -or $requesterDone.Count -ne 0) {
+        throw "Mirror unexpectedly ran OOM victim selection. See $serialLog."
     }
     $threadScenarios = @{
         ThreadLastExit = 'MIRROR_THREAD_LAST_EXIT_OK'

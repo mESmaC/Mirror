@@ -554,7 +554,8 @@ function Assert-MirrorClock {
         [Parameter(Mandatory = $true)][string]$Serial,
         [bool]$Smoke,
         [bool]$WithoutHpet,
-        [string]$FaultMode = 'None'
+        [string]$FaultMode = 'None',
+        [int]$InitRuns = 4
     )
 
     $injected = $FaultMode -eq 'ClockActivation'
@@ -564,7 +565,7 @@ function Assert-MirrorClock {
     $available = -not $WithoutHpet -and -not $injected
     # Smoke runs both init processes twice. Trace and default kernels run no
     # init program (spec 0010-D3), so they report no user clock checks.
-    $userCount = if ($Smoke) { 4 } else { 0 }
+    $userCount = if ($Smoke) { $InitRuns } else { 0 }
     $expected = @{
         MIRROR_ACPI_HPET_READY = [int](-not $WithoutHpet)
         MIRROR_ACPI_HPET_SKIPPED = [int]$WithoutHpet
@@ -856,7 +857,8 @@ function Assert-MirrorHeapGrowth {
         [Parameter(Mandatory = $true)][string]$Serial,
         [Parameter(Mandatory = $true)][int]$RequestedCpus,
         [bool]$Smoke,
-        [bool]$UseLegacyPic
+        [bool]$UseLegacyPic,
+        [int]$InitRuns = 4
     )
 
     # 0059-D1/D4: the boot and after_userspace growths must succeed in every
@@ -879,7 +881,7 @@ function Assert-MirrorHeapGrowth {
     $rounds = if ($Smoke) { 4 } else { 1 }
     # Each run_pair reports both processes; smoke repeats the workload once.
     # Trace and default kernels run no init program (spec 0010-D3).
-    $userCount = if ($Smoke) { 4 } else { 0 }
+    $userCount = if ($Smoke) { $InitRuns } else { 0 }
     $initial = [regex]::Matches($Serial, '(?m)^MIRROR_HEAP_READY size=1048576 free=1048576\r?$')
     $sharedPattern = '(?m)^MIRROR_SHARED_VM_READY pages=512 cpus={0} rounds={1} reclaimed=3 borrowed_root=1\r?$' -f $cpus, $rounds
     $shared = [regex]::Matches($Serial, $sharedPattern)
