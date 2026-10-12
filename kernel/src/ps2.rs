@@ -4,6 +4,7 @@
 //! drain. Device decoders own separate state and never call this module while
 //! borrowed. Initialization runs with both PIC input IRQs masked and IF clear;
 //! runtime commands, hotplug, ACPI discovery and output-port/A20 writes are absent.
+//! Every initialization wait is bounded by elapsed time (spec 0017b-D5).
 //!
 //! Protocol references (no implementation copied):
 //! https://github.com/qemu/qemu/blob/v10.1.0/hw/input/pckbd.c
@@ -14,7 +15,7 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::{arch, keyboard, mouse};
+use crate::{arch, clock, keyboard, mouse, serial, timer};
 
 const DATA: u16 = 0x60;
 const STATUS_COMMAND: u16 = 0x64;
@@ -22,7 +23,12 @@ const OUTPUT_FULL: u8 = 1;
 const INPUT_FULL: u8 = 2;
 const AUXILIARY: u8 = 0x20;
 const RECEIVE_ERROR: u8 = 0xc0;
-const POLL_LIMIT: usize = 100_000;
+/// A backstop only: elapsed-time deadlines end every init wait. At 50 ns per
+/// status read it cannot fire before the longest budget, the 4 s BAT wait.
+const POLL_LIMIT: usize = 80_000_000;
+const _: () = assert!(POLL_LIMIT as u64 * 50 >= Wait::Bat.budget_ms() * NANOS_PER_MS);
+const NANOS_PER_MS: u64 = 1_000_000;
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
 const INIT_DRAIN_LIMIT: usize = 256;
 const DRAIN_LIMIT: usize = 32;
 const RESEND_LIMIT: usize = 3;
@@ -40,7 +46,6 @@ pub enum Ps2Error {
     OutputTimeout,
     OutputStuck,
     ControllerData,
-    ControllerTest,
     KeyboardPortTest,
     MousePortTest,
     Configuration,
@@ -81,6 +86,133 @@ impl Source {
         }
     }
 }
+
+/// Elapsed time since initialization began (spec 0017b-D5). Init runs with IF
+/// clear, so delivered ticks never advance: use the HPET clock when it is
+/// published, else poll PIT channel 0 and sum its deltas. Every wait samples
+/// once per status read, far more often than the PIT's 10 ms period; a wrap
+/// missed while the VM is descheduled can only lengthen a wait.
+enum InitClock {
+    Hpet { origin_ns: u64 },
+    Pit { last: u16, ticks: u64 },
+}
+
+impl InitClock {
+    fn start() -> Self {
+        match clock::snapshot() {
+            Some(now) => Self::Hpet {
+                origin_ns: now.monotonic_ns,
+            },
+            None => Self::Pit {
+                last: timer::pit_counter(),
+                ticks: 0,
+            },
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Hpet { .. } => "hpet",
+            Self::Pit { .. } => "pit",
+        }
+    }
+
+    fn elapsed_ns(&mut self) -> u64 {
+        match self {
+            Self::Hpet { origin_ns } => clock::snapshot()
+                .expect("published HPET clock")
+                .monotonic_ns
+                .saturating_sub(*origin_ns),
+            Self::Pit { last, ticks } => {
+                let current = timer::pit_counter();
+                *ticks = ticks.saturating_add(u64::from(timer::pit_elapsed(*last, current)));
+                *last = current;
+                let nanoseconds =
+                    u128::from(*ticks) * NANOS_PER_SECOND / u128::from(timer::PIT_INPUT_HZ);
+                u64::try_from(nanoseconds).unwrap_or(u64::MAX)
+            }
+        }
+    }
+}
+
+/// One kind of bounded init wait, with its Linux budget (spec 0017b-D5): the
+/// i8042 controller's IBF/OBF timeout, and libps2's ACK, reset ACK, response
+/// and reset BAT waits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wait {
+    Controller,
+    Ack,
+    ResetAck,
+    Response,
+    Bat,
+}
+
+impl Wait {
+    const fn budget_ms(self) -> u64 {
+        match self {
+            Self::Controller => 500,
+            Self::Ack => 200,
+            Self::ResetAck => 1000,
+            Self::Response => 500,
+            Self::Bat => 4000,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Controller => "controller",
+            Self::Ack | Self::ResetAck => "ack",
+            Self::Response => "response",
+            Self::Bat => "bat",
+        }
+    }
+}
+
+/// The start of one wait on the init clock. Each poll samples the clock before
+/// its status read, so the read that follows an expired sample still accepts
+/// a reply that arrived in time.
+#[derive(Clone, Copy)]
+struct Deadline {
+    wait: Wait,
+    start_ns: u64,
+}
+
+impl Deadline {
+    fn start(clock: &mut InitClock, wait: Wait) -> Self {
+        Self {
+            wait,
+            start_ns: clock.elapsed_ns(),
+        }
+    }
+
+    fn waited_ns(self, clock: &mut InitClock) -> u64 {
+        clock.elapsed_ns().saturating_sub(self.start_ns)
+    }
+
+    fn expired(self, clock: &mut InitClock) -> bool {
+        self.waited_ns(clock) >= self.wait.budget_ms() * NANOS_PER_MS
+    }
+
+    /// Report this wait's own duration before the device's SKIPPED line. It is
+    /// a content-free device marker, so every build flavor prints it.
+    fn timed_out(self, clock: &mut InitClock, error: Ps2Error) -> Ps2Error {
+        serial::println!(
+            "MIRROR_PS2_TIMEOUT wait={} elapsed_ms={} clock={}",
+            self.wait.name(),
+            self.waited_ns(clock) / NANOS_PER_MS,
+            clock.name()
+        );
+        error
+    }
+}
+
+/// Smoke fault Ps2StaleScancode (spec 0017b): armed once 0xAE enables the
+/// keyboard port, so the next keyboard-source read returns a buffered make
+/// code before any real controller data.
+#[cfg(feature = "boot-smoke")]
+static STALE_SCANCODE: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "boot-smoke")]
+const STALE_MAKE: u8 = 0x1c;
 
 struct State {
     attempted: bool,
@@ -239,22 +371,31 @@ pub fn init() -> InitResult {
             return InitResult::failed(Ps2Error::AlreadyInitialized);
         }
         state.attempted = true;
+        let mut clock = InitClock::start();
         let mut quiet_config = None;
-        match initialize(state, &mut quiet_config) {
+        let result = match initialize(state, &mut clock, &mut quiet_config) {
             Ok(result) => result,
             Err(error) => {
                 // A final mouse-enable failure can reveal a broken controller
                 // after keyboard activation. Revoke both routes/queues before
                 // best-effort quieting; neither PIC input IRQ may be unmasked.
                 state.stop_routing();
-                let _ = command(0xad);
-                let _ = command(0xa7);
+                let _ = command(&mut clock, 0xad);
+                let _ = command(&mut clock, 0xa7);
                 if let Some(quiet) = quiet_config {
-                    let _ = write_config(quiet);
+                    let _ = write_config(&mut clock, quiet);
                 }
                 InitResult::failed(error)
             }
-        }
+        };
+        // A content-free lifecycle marker in every build flavor (spec 0017b).
+        // Init no longer runs the controller self-test (0017b-D8).
+        serial::println!(
+            "MIRROR_PS2_INIT elapsed_ms={} clock={} selftest=0",
+            clock.elapsed_ns() / NANOS_PER_MS,
+            clock.name()
+        );
+        result
     })
 }
 
@@ -266,53 +407,50 @@ fn configuration(original: u8, keyboard: bool, mouse: bool, irqs: bool) -> u8 {
         | if mouse { u8::from(irqs) << 1 } else { 0x20 }
 }
 
-fn initialize(state: &mut State, quiet_config: &mut Option<u8>) -> Result<InitResult, Ps2Error> {
-    command(0xad)?;
-    command(0xa7)?;
+fn initialize(
+    state: &mut State,
+    clock: &mut InitClock,
+    quiet_config: &mut Option<u8>,
+) -> Result<InitResult, Ps2Error> {
+    command(clock, 0xad)?;
+    command(clock, 0xa7)?;
     drain_initial_output()?;
-    let quiet = configuration(read_config(state)?, false, false, false);
+    let quiet = configuration(read_config(state, clock)?, false, false, false);
     *quiet_config = Some(quiet);
-    write_config(quiet)?;
-    command(0xaa)?;
-    if read_response(state, Source::Keyboard)? != 0x55 {
-        return Err(Ps2Error::ControllerTest);
-    }
-    // Self-test may reset configuration. Reapply all routing policy first.
-    command(0xad)?;
-    command(0xa7)?;
-    write_config(quiet)?;
-    drain_initial_output()?;
+    write_config(clock, quiet)?;
+    // No controller self-test (0xaa, spec 0017b-D8): it can only abort init or
+    // reset the configuration. The port tests below still run.
 
-    let mut keyboard = prepare_keyboard(state, quiet);
+    let mut keyboard = prepare_keyboard(state, clock, quiet);
     if keyboard.is_err() {
-        command(0xad)?;
-        write_config(quiet)?;
+        command(clock, 0xad)?;
+        write_config(clock, quiet)?;
     }
-    let mut mouse = prepare_mouse(state, quiet, keyboard.is_ok());
+    let mut mouse = prepare_mouse(state, clock, quiet, keyboard.is_ok());
     if mouse.is_err() {
-        command(0xa7)?;
+        command(clock, 0xa7)?;
     }
     let mut active = configuration(quiet, keyboard.is_ok(), mouse.is_ok(), true);
-    write_config(active)?;
-    verify_config(state, active)?;
+    write_config(clock, active)?;
+    verify_config(state, clock, active)?;
 
     // No config reads after keyboard scanning begins: controller replies have
     // the same source tag as scan bytes. Mouse commands can still distinguish
     // and deliver every intervening keyboard byte to its now-active decoder.
     if keyboard.is_ok() {
-        keyboard = device_command(state, Source::Keyboard, 0xf4);
+        keyboard = device_command(state, clock, Source::Keyboard, 0xf4);
         if keyboard.is_ok() {
             keyboard::activate();
             state.keyboard_ready = true;
         } else {
-            command(0xad)?;
+            command(clock, 0xad)?;
             active = configuration(quiet, false, mouse.is_ok(), true);
-            write_config(active)?;
-            verify_config(state, active)?;
+            write_config(clock, active)?;
+            verify_config(state, clock, active)?;
         }
     }
     if mouse.is_ok() {
-        mouse = device_command(state, Source::Mouse, 0xf4);
+        mouse = device_command(state, clock, Source::Mouse, 0xf4);
         if mouse.is_ok() {
             mouse::activate();
             state.mouse_ready = true;
@@ -320,8 +458,11 @@ fn initialize(state: &mut State, quiet_config: &mut Option<u8>) -> Result<InitRe
             // Preserve the working keyboard even when the mouse does not ACK.
             // If quieting fails, revoke the whole controller: live AUX data
             // with IRQ12 masked could occupy OBF and prevent future IRQ1 input.
-            command(0xa7)?;
-            write_config(configuration(active, state.keyboard_ready, false, true))?;
+            command(clock, 0xa7)?;
+            write_config(
+                clock,
+                configuration(active, state.keyboard_ready, false, true),
+            )?;
         }
     }
     // Drain even if an enable ACK consumed the IRQ's edge. Future IRQs and PIT
@@ -330,48 +471,60 @@ fn initialize(state: &mut State, quiet_config: &mut Option<u8>) -> Result<InitRe
     Ok(InitResult { keyboard, mouse })
 }
 
-fn prepare_keyboard(state: &State, quiet: u8) -> Result<(), Ps2Error> {
-    command(0xab)?;
-    if read_response(state, Source::Keyboard)? != 0 {
+fn prepare_keyboard(state: &State, clock: &mut InitClock, quiet: u8) -> Result<(), Ps2Error> {
+    command(clock, 0xab)?;
+    if read_reply(state, clock, Source::Keyboard, Wait::Controller)? != 0 {
         return Err(Ps2Error::KeyboardPortTest);
     }
-    command(0xae)?;
+    command(clock, 0xae)?;
+    #[cfg(feature = "boot-smoke")]
+    if matches!(
+        crate::boot::smoke_mode(),
+        crate::boot::SmokeMode::Ps2StaleScancode
+    ) {
+        STALE_SCANCODE.store(true, Ordering::Relaxed);
+    }
     let config = configuration(quiet, true, false, false);
-    write_config(config)?;
-    verify_config(state, config)?;
-    device_command(state, Source::Keyboard, 0xf5)?;
-    device_command(state, Source::Keyboard, 0xf0)?;
-    device_command(state, Source::Keyboard, 0x02)?;
-    device_command(state, Source::Keyboard, 0xf0)?;
-    device_command(state, Source::Keyboard, 0x00)?;
-    if read_response(state, Source::Keyboard)? != 2 {
+    write_config(clock, config)?;
+    verify_config(state, clock, config)?;
+    device_command(state, clock, Source::Keyboard, 0xf5)?;
+    device_command(state, clock, Source::Keyboard, 0xf0)?;
+    device_command(state, clock, Source::Keyboard, 0x02)?;
+    device_command(state, clock, Source::Keyboard, 0xf0)?;
+    device_command(state, clock, Source::Keyboard, 0x00)?;
+    if read_reply(state, clock, Source::Keyboard, Wait::Response)? != 2 {
         return Err(Ps2Error::WrongScanSet);
     }
     Ok(())
 }
 
-fn prepare_mouse(state: &State, quiet: u8, keyboard: bool) -> Result<(), Ps2Error> {
-    command(0xa9)?;
-    if read_response(state, Source::Keyboard)? != 0 {
+fn prepare_mouse(
+    state: &State,
+    clock: &mut InitClock,
+    quiet: u8,
+    keyboard: bool,
+) -> Result<(), Ps2Error> {
+    command(clock, 0xa9)?;
+    if read_reply(state, clock, Source::Keyboard, Wait::Controller)? != 0 {
         return Err(Ps2Error::MousePortTest);
     }
-    command(0xa8)?;
+    command(clock, 0xa8)?;
     let config = configuration(quiet, keyboard, true, false);
-    write_config(config)?;
-    verify_config(state, config)?;
-    device_command(state, Source::Mouse, 0xf5)?;
+    write_config(clock, config)?;
+    verify_config(state, clock, config)?;
+    device_command(state, clock, Source::Mouse, 0xf5)?;
     // Defaults alone do not undo IntelliMouse mode. Reset establishes ID 0 and
     // disables reporting; then verify both BAT and the standard three-byte ID.
-    device_command(state, Source::Mouse, 0xff)?;
-    if read_response(state, Source::Mouse)? != 0xaa {
+    send_device(state, clock, Source::Mouse, 0xff, Wait::ResetAck)?;
+    if read_bat(state, clock)? != 0xaa {
         return Err(Ps2Error::MouseSelfTest);
     }
-    if read_response(state, Source::Mouse)? != 0 {
+    if read_reply(state, clock, Source::Mouse, Wait::Response)? != 0 {
         return Err(Ps2Error::UnsupportedMouse);
     }
-    device_command(state, Source::Mouse, 0xf6)?;
-    device_command(state, Source::Mouse, 0xf2)?;
-    if read_response(state, Source::Mouse)? != 0 {
+    device_command(state, clock, Source::Mouse, 0xf6)?;
+    device_command(state, clock, Source::Mouse, 0xf2)?;
+    if read_reply(state, clock, Source::Mouse, Wait::Response)? != 0 {
         return Err(Ps2Error::UnsupportedMouse);
     }
     Ok(())
@@ -387,8 +540,10 @@ fn data() -> u8 {
     unsafe { arch::in8(DATA) }
 }
 
-fn wait_input_empty() -> Result<(), Ps2Error> {
+fn wait_input_empty(clock: &mut InitClock) -> Result<(), Ps2Error> {
+    let deadline = Deadline::start(clock, Wait::Controller);
     for _ in 0..POLL_LIMIT {
+        let expired = deadline.expired(clock);
         let current = status();
         if current == 0xff {
             return Err(Ps2Error::ControllerMissing);
@@ -396,20 +551,23 @@ fn wait_input_empty() -> Result<(), Ps2Error> {
         if current & INPUT_FULL == 0 {
             return Ok(());
         }
+        if expired {
+            break;
+        }
         core::hint::spin_loop();
     }
-    Err(Ps2Error::InputTimeout)
+    Err(deadline.timed_out(clock, Ps2Error::InputTimeout))
 }
 
-fn command(value: u8) -> Result<(), Ps2Error> {
-    wait_input_empty()?;
+fn command(clock: &mut InitClock, value: u8) -> Result<(), Ps2Error> {
+    wait_input_empty(clock)?;
     // SAFETY: Exclusively owned command port and an empty input buffer.
     unsafe { arch::out8(STATUS_COMMAND, value) };
     Ok(())
 }
 
-fn write_data(value: u8) -> Result<(), Ps2Error> {
-    wait_input_empty()?;
+fn write_data(clock: &mut InitClock, value: u8) -> Result<(), Ps2Error> {
+    wait_input_empty(clock)?;
     // SAFETY: Exclusively owned data port and an empty input buffer.
     unsafe { arch::out8(DATA, value) };
     Ok(())
@@ -438,8 +596,21 @@ fn classify_response(expected: Source, status: u8, byte: u8) -> Result<Response,
     Ok(Response::Byte(byte))
 }
 
-fn read_response(state: &State, expected: Source) -> Result<u8, Ps2Error> {
+/// Wait for one byte from `expected` until `deadline`, which several reads
+/// can share. Bytes from the other source go to its decoder, if active.
+fn read_response(
+    state: &State,
+    clock: &mut InitClock,
+    expected: Source,
+    deadline: Deadline,
+) -> Result<u8, Ps2Error> {
+    #[cfg(feature = "boot-smoke")]
+    if expected == Source::Keyboard && STALE_SCANCODE.swap(false, Ordering::Relaxed) {
+        serial::println!("MIRROR_PS2_INJECTED stale=1");
+        return Ok(STALE_MAKE);
+    }
     for _ in 0..POLL_LIMIT {
+        let expired = deadline.expired(clock);
         let current = status();
         // Do not touch the data port for an absent controller or empty buffer.
         let byte = if current != 0xff && current & OUTPUT_FULL != 0 {
@@ -452,8 +623,44 @@ fn read_response(state: &State, expected: Source) -> Result<u8, Ps2Error> {
             Response::OtherSource => state.route(current, byte),
             Response::Waiting => core::hint::spin_loop(),
         }
+        if expired {
+            break;
+        }
     }
-    Err(Ps2Error::OutputTimeout)
+    Err(deadline.timed_out(clock, Ps2Error::OutputTimeout))
+}
+
+/// One reply with its own deadline.
+fn read_reply(
+    state: &State,
+    clock: &mut InitClock,
+    expected: Source,
+    wait: Wait,
+) -> Result<u8, Ps2Error> {
+    let deadline = Deadline::start(clock, wait);
+    read_response(state, clock, expected, deadline)
+}
+
+/// The mouse's reset result. Smoke fault Ps2BatTimeout (spec 0017b) reads and
+/// drops every mouse byte during this wait only, so it ends at its deadline.
+fn read_bat(state: &State, clock: &mut InitClock) -> Result<u8, Ps2Error> {
+    let deadline = Deadline::start(clock, Wait::Bat);
+    #[cfg(feature = "boot-smoke")]
+    if matches!(
+        crate::boot::smoke_mode(),
+        crate::boot::SmokeMode::Ps2BatTimeout
+    ) {
+        // Every dropped byte shares the one BAT deadline; the explicit check
+        // also ends a byte stream that never lets a single read time out.
+        for _ in 0..POLL_LIMIT {
+            if deadline.expired(clock) {
+                break;
+            }
+            read_response(state, clock, Source::Mouse, deadline)?;
+        }
+        return Err(deadline.timed_out(clock, Ps2Error::OutputTimeout));
+    }
+    read_response(state, clock, Source::Mouse, deadline)
 }
 
 fn drain_initial_output() -> Result<(), Ps2Error> {
@@ -474,34 +681,51 @@ fn drain_initial_output() -> Result<(), Ps2Error> {
     }
 }
 
-fn read_config(state: &State) -> Result<u8, Ps2Error> {
-    command(0x20)?;
-    read_response(state, Source::Keyboard)
+fn read_config(state: &State, clock: &mut InitClock) -> Result<u8, Ps2Error> {
+    command(clock, 0x20)?;
+    read_reply(state, clock, Source::Keyboard, Wait::Controller)
 }
 
-fn write_config(config: u8) -> Result<(), Ps2Error> {
-    command(0x60)?;
-    write_data(config)
+fn write_config(clock: &mut InitClock, config: u8) -> Result<(), Ps2Error> {
+    command(clock, 0x60)?;
+    write_data(clock, config)
 }
 
-fn verify_config(state: &State, expected: u8) -> Result<(), Ps2Error> {
-    if read_config(state)? & 0x73 != expected & 0x73 {
+fn verify_config(state: &State, clock: &mut InitClock, expected: u8) -> Result<(), Ps2Error> {
+    if read_config(state, clock)? & 0x73 != expected & 0x73 {
         return Err(Ps2Error::Configuration);
     }
     Ok(())
 }
 
-fn device_command(state: &State, target: Source, value: u8) -> Result<(), Ps2Error> {
+fn device_command(
+    state: &State,
+    clock: &mut InitClock,
+    target: Source,
+    value: u8,
+) -> Result<(), Ps2Error> {
+    send_device(state, clock, target, value, Wait::Ack)
+}
+
+fn send_device(
+    state: &State,
+    clock: &mut InitClock,
+    target: Source,
+    value: u8,
+    ack: Wait,
+) -> Result<(), Ps2Error> {
     for _ in 0..=RESEND_LIMIT {
         if target == Source::Mouse {
-            command(0xd4)?;
+            command(clock, 0xd4)?;
         }
-        write_data(value)?;
+        write_data(clock, value)?;
         // A final packet/scan byte may race disable. Match ACK only from the
         // addressed device, discarding at most 32 stale bytes from that device.
+        // Each attempt has one ACK deadline, which those discards share.
+        let deadline = Deadline::start(clock, ack);
         let mut resend = false;
         for _ in 0..DRAIN_LIMIT {
-            match read_response(state, target)? {
+            match read_response(state, clock, target, deadline)? {
                 0xfa => return Ok(()),
                 0xfe => {
                     resend = true;

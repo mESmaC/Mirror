@@ -22,7 +22,7 @@ param(
     [switch]$LegacyPic,
     [switch]$PitTimer,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
-    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation')][string]$Fault = 'None',
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation', 'Ps2BatTimeout', 'Ps2StaleScancode')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -248,6 +248,9 @@ if ($Fault -eq 'TimerCalibration' -and ($LegacyPic -or $PitTimer)) {
 if ($Fault -eq 'ClockActivation' -and $NoHpet) {
     throw 'Clock activation fault injection requires HPET hardware.'
 }
+if ($Fault -in @('Ps2BatTimeout', 'Ps2StaleScancode') -and $NoKeyboard) {
+    throw "-Fault $Fault requires the i8042 controller, which -NoKeyboard removes."
+}
 # The default CPU model reports SMEP and SMAP, -ExtendedCpu's max model also
 # reports UMIP, and -BaselineCpu's plain qemu64 reports none of them (0016-D6).
 # Without them the kernel probes panic and SGDT succeeds (spec 0016b).
@@ -323,6 +326,8 @@ $testMode = switch ($Fault) {
     'SmpTlbTimeout' { 'smp-tlb-timeout' }
     'TimerCalibration' { 'timer-calibration' }
     'ClockActivation' { 'clock-activation' }
+    'Ps2BatTimeout' { 'ps2-bat-timeout' }
+    'Ps2StaleScancode' { 'ps2-stale-scancode' }
     default { $null }
 }
 $kernelArguments = @()
@@ -711,10 +716,68 @@ try {
             throw 'The busy app stopped before the peer edit completed.'
         }
     }
+    # PS/2 init waits are bounded by elapsed time, on HPET when its clock is
+    # published and on PIT channel 0 otherwise, and init skips the controller
+    # self-test (spec 0017b). One record follows init in every case, timeouts
+    # and the injected scancode precede it, and it precedes both device lines.
+    $ps2Clock = if ($NoHpet -or $Fault -eq 'ClockActivation') { 'pit' } else { 'hpet' }
+    $ps2Init = [regex]::Matches($serial, ('(?m)^MIRROR_PS2_INIT elapsed_ms=([0-9]+) clock={0} selftest=0\r?$' -f $ps2Clock))
+    $ps2Devices = [regex]::Matches($serial, '(?m)^MIRROR_(?:KEYBOARD|MOUSE)_(?:READY|SKIPPED)(?:\s|$)')
+    if ($ps2Init.Count -ne 1 -or [regex]::Matches($serial, '(?m)^MIRROR_PS2_INIT(?:\s|$)').Count -ne 1 -or
+        $ps2Devices.Count -ne 2 -or $ps2Devices[0].Index -le $ps2Init[0].Index) {
+        throw "PS/2 init must report once, on the $ps2Clock clock and without the controller self-test, before one keyboard and one mouse result. See $serialLog."
+    }
+    $ps2Elapsed = [uint64]$ps2Init[0].Groups[1].Value
+    $ps2Timeouts = [regex]::Matches($serial, '(?m)^MIRROR_PS2_TIMEOUT(?:\s|$)')
+    $ps2Injected = [regex]::Matches($serial, '(?m)^MIRROR_PS2_INJECTED(?:\s|$)')
+    if ($Fault -eq 'Ps2StaleScancode') {
+        $stale = [regex]::Matches($serial, '(?m)^MIRROR_PS2_INJECTED stale=1\r?$')
+        if ($stale.Count -ne 1 -or $ps2Injected.Count -ne 1 -or $stale[0].Index -ge $ps2Init[0].Index) {
+            throw "The stale-scancode fault must inject one keyboard byte during PS/2 init. See $serialLog."
+        }
+    }
+    elseif ($ps2Injected.Count -ne 0) {
+        throw "Mirror unexpectedly injected a PS/2 scancode. See $serialLog."
+    }
+    if ($Fault -eq 'Ps2BatTimeout') {
+        # Only the mouse's 4000 ms BAT wait expires; the rest of init keeps
+        # the same 250 ms bound as every other boot.
+        $bat = [regex]::Matches($serial, ('(?m)^MIRROR_PS2_TIMEOUT wait=bat elapsed_ms=([0-9]+) clock={0}\r?$' -f $ps2Clock))
+        if ($bat.Count -ne 1 -or $ps2Timeouts.Count -ne 1 -or $bat[0].Index -ge $ps2Init[0].Index) {
+            throw "The BAT-timeout fault must expire exactly one PS/2 wait, the mouse BAT, on the $ps2Clock clock during init. See $serialLog."
+        }
+        $batElapsed = [uint64]$bat[0].Groups[1].Value
+        if ($batElapsed -lt 4000 -or $batElapsed -gt 4500) {
+            throw "The PS/2 BAT wait must expire after 4000 to 4500 ms; it took $batElapsed ms. See $serialLog."
+        }
+        if ($ps2Elapsed -lt $batElapsed -or $ps2Elapsed -ge $batElapsed + 250) {
+            throw "PS/2 init must take its BAT wait plus less than 250 ms; it took $ps2Elapsed ms. See $serialLog."
+        }
+    }
+    else {
+        if ($ps2Timeouts.Count -ne 0) {
+            throw "A PS/2 init wait timed out. See $serialLog."
+        }
+        if ($ps2Elapsed -ge 250) {
+            throw "PS/2 init must finish within 250 ms; it took $ps2Elapsed ms. See $serialLog."
+        }
+    }
     if ($NoKeyboard) {
         $markers += @('MIRROR_KEYBOARD_SKIPPED', 'MIRROR_MOUSE_SKIPPED')
         if ($serial -match '(?m)^MIRROR_(?:KEYBOARD|MOUSE)_READY(?:\s|$)') {
             throw "Mirror unexpectedly initialized the absent PS/2 controller. See $serialLog."
+        }
+    }
+    elseif ($Fault -eq 'Ps2BatTimeout') {
+        # This fault alone expects MOUSE_SKIPPED instead of MOUSE_READY, after
+        # its timeout record; the keyboard still comes up.
+        $mouseSkipped = [regex]::Matches($serial, '(?m)^MIRROR_MOUSE_SKIPPED reason=OutputTimeout\r?$')
+        if ($mouseSkipped.Count -ne 1 -or $mouseSkipped[0].Index -le $bat[0].Index) {
+            throw "The BAT-timeout fault must skip the mouse with reason=OutputTimeout after its timeout record. See $serialLog."
+        }
+        $markers += 'MIRROR_KEYBOARD_READY'
+        if ($serial -match '(?m)^MIRROR_(?:KEYBOARD_SKIPPED|MOUSE_READY)(?:\s|$)') {
+            throw "The BAT-timeout fault must keep the keyboard and skip only the mouse. See $serialLog."
         }
     }
     else {

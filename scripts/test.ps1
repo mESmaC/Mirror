@@ -31,13 +31,14 @@ function Assert-MirrorKernelImage {
         # MIRROR_PERF_ strings (spec 0019) are allowed under 0010-D4's exception.
         # Every flavor reports its guarded stacks, CPU protections and
         # speculative-execution exposure; only smoke kernels probe the NMI and
-        # #MC IST stacks (specs 0016a, 0016b).
-        $required = @('MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN')
-        $forbidden = @('MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_TRACE_ON', 'MIRROR_CONSOLE_COMMAND operation=', 'MIRROR_POINTER_UPDATED', 'MIRROR_POINTER_CLICK', 'MIRROR_SHELL_FRAME', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'Mirror shell: ready', 'MIRROR_USERSPACE_OK', 'Mirror init: VM checks passed', 'fixture data mismatch', 'unexpected budget exhaustion')
+        # #MC IST stacks (specs 0016a, 0016b). Every flavor reports PS/2 init
+        # and its timeouts; only smoke kernels inject PS/2 faults (spec 0017b).
+        $required = @('MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=')
+        $forbidden = @('MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_TRACE_ON', 'MIRROR_CONSOLE_COMMAND operation=', 'MIRROR_POINTER_UPDATED', 'MIRROR_POINTER_CLICK', 'MIRROR_SHELL_FRAME', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'Mirror shell: ready', 'MIRROR_USERSPACE_OK', 'Mirror init: VM checks passed', 'fixture data mismatch', 'unexpected budget exhaustion', 'MIRROR_PS2_INJECTED')
     }
     else {
-        $required = @('MIRROR_TRACE_ON', 'MIRROR_SHELL_FRAME', 'MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN')
-        $forbidden = @('MIRROR_USERSPACE_OK', 'fixture data mismatch', 'MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK')
+        $required = @('MIRROR_TRACE_ON', 'MIRROR_SHELL_FRAME', 'MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=')
+        $forbidden = @('MIRROR_USERSPACE_OK', 'fixture data mismatch', 'MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_PS2_INJECTED')
     }
     foreach ($text in $required) {
         if ($image.IndexOf($text, [StringComparison]::Ordinal) -lt 0) {
@@ -186,6 +187,17 @@ try {
         Save-MirrorSmokeLogs "$profile-NoHpet-LegacyPic"
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Fault ClockActivation -CpuCount 4 -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
         Save-MirrorSmokeLogs "$profile-ClockActivation-CpuCount4"
+        # PS/2 init waits are bounded by elapsed time: a mouse that never
+        # completes BAT costs its 4 s budget on either clock, HPET or the PIT,
+        # and a scancode buffered at boot no longer disables the keyboard
+        # (spec 0017b, acceptance tests 3 and 4).
+        foreach ($case in @(
+                @{ Name = 'Ps2BatTimeout'; Fault = 'Ps2BatTimeout'; NoHpet = $false },
+                @{ Name = 'Ps2BatTimeout-NoHpet'; Fault = 'Ps2BatTimeout'; NoHpet = $true },
+                @{ Name = 'Ps2StaleScancode'; Fault = 'Ps2StaleScancode'; NoHpet = $false })) {
+            & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -NoHpet:$case.NoHpet -Fault $case.Fault -Release:$release -AgentDemo:$AgentDemo -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+            Save-MirrorSmokeLogs "$profile-$($case.Name)"
+        }
         # Explicit boot policy must keep the legacy PIC/PIT backend functional,
         # including userspace preemption and PS/2 input. OVMF still needs APIC
         # hardware during firmware startup, so retain the CPU's APIC feature.

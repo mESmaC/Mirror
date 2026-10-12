@@ -169,6 +169,8 @@ pub enum SmokeMode {
     SmpTlbTimeout,
     TimerCalibration,
     ClockActivation,
+    Ps2BatTimeout,
+    Ps2StaleScancode,
     User(u64),
 }
 
@@ -224,6 +226,8 @@ pub fn smoke_mode() -> SmokeMode {
         b"mirror.test=smp-tlb-timeout" => SmokeMode::SmpTlbTimeout,
         b"mirror.test=timer-calibration" => SmokeMode::TimerCalibration,
         b"mirror.test=clock-activation" => SmokeMode::ClockActivation,
+        b"mirror.test=ps2-bat-timeout" => SmokeMode::Ps2BatTimeout,
+        b"mirror.test=ps2-stale-scancode" => SmokeMode::Ps2StaleScancode,
         _ => panic!("unknown smoke-test command line"),
     };
     assert!(tokens.next().is_none(), "multiple smoke-test arguments");

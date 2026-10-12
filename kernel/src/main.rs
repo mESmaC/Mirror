@@ -456,6 +456,8 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
             | boot::SmokeMode::SmpUnmap
             | boot::SmokeMode::TimerCalibration
             | boot::SmokeMode::ClockActivation
+            | boot::SmokeMode::Ps2BatTimeout
+            | boot::SmokeMode::Ps2StaleScancode
             | boot::SmokeMode::SmpTlbTimeout => {
                 interrupts::arm_expected_page_fault(paging::TEST_ADDRESS)
             }

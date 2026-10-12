@@ -34,7 +34,8 @@ const MASTER_VECTOR: u8 = 32;
 const SLAVE_VECTOR: u8 = 40;
 const PIC_EOI: u8 = 0x20;
 const PIC_READ_ISR: u8 = 0x0b;
-const PIT_INPUT_HZ: u32 = 1_193_182;
+const PIT_LATCH_ZERO: u8 = 0x00;
+pub(crate) const PIT_INPUT_HZ: u32 = 1_193_182;
 const TARGET_HZ: u32 = 100;
 const PIT_DIVISOR: u32 = (PIT_INPUT_HZ + TARGET_HZ / 2) / TARGET_HZ;
 const REFERENCE_COUNT: u16 = 23864; // Approximately 20 ms at 1,193,182 Hz.
@@ -241,6 +242,35 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
+/// Latch and read PIT channel 0's current count. init programs that channel in
+/// mode 2 with PIT_DIVISOR whichever tick source it selects, so the count runs
+/// from PIT_DIVISOR down to 1 about every 10 ms even while IF is clear and no
+/// tick is delivered (spec 0017b-D5). Call on the BSP with IF clear.
+pub fn pit_counter() -> u16 {
+    assert!(INITIALIZED.load(Ordering::SeqCst), "timer not initialized");
+    assert!(!arch::interrupts_enabled(), "PIT read requires IF clear");
+    assert!(!crate::smp::is_secondary(), "PIT read requires the BSP");
+    // SAFETY: init finished programming channel 0 for low/high byte access, and
+    // nothing reprograms it later. The BSP owns the PIT ports and IF is clear,
+    // so no other latch or read can split this latch-low-high sequence.
+    unsafe {
+        arch::out8(PIT_COMMAND, PIT_LATCH_ZERO);
+        let low = arch::in8(PIT_CHANNEL_ZERO);
+        let high = arch::in8(PIT_CHANNEL_ZERO);
+        u16::from_le_bytes([low, high])
+    }
+}
+
+/// PIT input ticks from one channel 0 sample to a later one, assuming at most
+/// one wrap: `(previous - current) mod PIT_DIVISOR`. A count of PIT_DIVISOR is
+/// the reload of the period that ends at 1, so it equals 0 here. Missing a
+/// whole wrap can only make the result smaller, never larger.
+pub fn pit_elapsed(previous: u16, current: u16) -> u32 {
+    // Both counts are below 2^16, so the difference fits i32 exactly and the
+    // Euclidean remainder lies in 0..PIT_DIVISOR.
+    (i32::from(previous) - i32::from(current)).rem_euclid(PIT_DIVISOR as i32) as u32
+}
+
 /// Unmask IRQ1 after the keyboard driver has initialized its controller and
 /// queue. The BSP owns both interrupt controllers; preserve all other routes.
 pub fn enable_keyboard_irq() {
@@ -365,6 +395,16 @@ fn policy_self_test() {
     // A 20 ms reference and 62.5 MHz divided LAPIC yield about625k per10ms.
     let count = calibrated_count([1_249_999, 1_250_000, 1_250_001]).unwrap();
     assert!((624_000..=626_000).contains(&count));
+    // PS/2 init sums these channel 0 deltas (spec 0017b-D5): no wrap, one
+    // wrap, equal samples, and the divisor boundary, where the reload count
+    // PIT_DIVISOR follows 1 by one input tick.
+    let divisor = PIT_DIVISOR as u16;
+    assert_eq!(pit_elapsed(5_000, 1_000), 4_000);
+    assert_eq!(pit_elapsed(100, divisor - 50), 150);
+    assert_eq!(pit_elapsed(1, divisor), 1);
+    assert_eq!(pit_elapsed(divisor, 1), PIT_DIVISOR - 1);
+    assert_eq!(pit_elapsed(7_777, 7_777), 0);
+    assert_eq!(pit_elapsed(divisor, divisor), 0);
     serial::println!("MIRROR_TIMER_POLICY_OK");
 }
 
