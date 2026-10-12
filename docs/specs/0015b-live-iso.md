@@ -44,10 +44,10 @@ Limine scans the El Torito image first, which has no config, and then the whole 
 - `build.ps1`: after 0015a's disk step, writes `mirror.iso` and verifies it together with the image.
 - `run.ps1`, new `-Iso` switch:
   - Attach `build/mirror.iso` instead of the disk image: `-drive if=none,id=mirror-iso,media=cdrom,format=raw,readonly=on,...` with `-device ide-cd,drive=mirror-iso,bus=ide.2,bootindex=0` on q35's built-in AHCI controller. `ide.2` leaves `ide.0` free for the AHCI fixture. No SMBIOS config is passed.
-  - `-Iso` requires `-DeviceProfile LegacyVirtio`. With no modern virtio-blk boot disk, the legacy fixture is the only device that satisfies the smoke assert (`kernel/src/main.rs:260-263`). 0014 already rejects `LegacyVirtio` with `-NoTestDisk`.
+  - `-Iso` requires `-DeviceProfile LegacyVirtio`. With no modern virtio-blk boot disk, the legacy fixture is the only device that satisfies the smoke assert (`kernel/src/main.rs:262-265`). 0014 already rejects `LegacyVirtio` with `-NoTestDisk`.
   - `-Iso` rejects any `-Fault` other than `None`, plus `-LegacyPic` and `-PitTimer`, because those need a kernel command line.
-  - The kernel skips ATAPI ports (`ahci.rs:238-245`), so AHCI reports `MIRROR_AHCI_SKIPPED reason=no_disk` (`main.rs:929`).
-- `common.ps1`: `Assert-MirrorDriverCatalog` gets a parameter for the expected number of modern VirtIO devices, which today is fixed at 1 (`common.ps1:115-127`). `run.ps1:552` passes 0 for `-Iso` and 1 otherwise. `run.ps1:708-710` is unchanged, because the legacy fixture satisfies it.
+  - The kernel skips ATAPI ports (`ahci.rs:238-245`), so AHCI reports `MIRROR_AHCI_SKIPPED reason=no_disk` (`main.rs:959`).
+- `common.ps1`: `Assert-MirrorDriverCatalog` gets a parameter for the expected number of modern VirtIO devices, which today is fixed at 1 (`common.ps1:115-127`). `run.ps1:595` passes 0 for `-Iso` and 1 otherwise. `run.ps1:751-753` is unchanged, because the legacy fixture satisfies it.
 - `test.ps1`: adds one `-Iso` smoke case per build profile under `LegacyVirtio`, two boots in all. 0014's computed boot count includes them.
 - `package.ps1` (0015a): also copies `mirror.iso` to `build/dist/`.
 - `docs/vm-settings.md` (0015-D11): add the ISO steps. Remove the disk (delete the `sata0:0` lines, or set `sata0:0.present = "FALSE"`) and attach `build/dist/mirror.iso` on a SATA CD-ROM: `sata0:1.present = "TRUE"`, `sata0:1.deviceType = "cdrom-image"`, `sata0:1.fileName = "<abs>\build\dist\mirror.iso"`. Keep every other reference setting.
@@ -88,4 +88,4 @@ As in 0015a, firmware must start Limine from the El Torito image, and Limine mus
 ## Open questions
 
 1. Follow-up spec, after M5: once the system needs a root filesystem, the live ISO needs one too, for example an ext2 image loaded into a RAM disk as a Limine module. This spec does not decide how. README.md lists it under the unscheduled follow-ups.
-2. 0062 (Phase 6) retires `LegacyVirtio` (0014-D5) before this spec lands in Phase 11, so there is no `-Iso` case for it to rehome. The re-draft chooses the `-Iso` case's profile; under `V1`, the smoke assert at `kernel/src/main.rs:260-263` must accept a boot with no VirtIO block device.
+2. 0062 (Phase 6) retires `LegacyVirtio` (0014-D5) before this spec lands in Phase 11, so there is no `-Iso` case for it to rehome. The re-draft chooses the `-Iso` case's profile; under `V1`, the smoke assert at `kernel/src/main.rs:262-265` must accept a boot with no VirtIO block device.

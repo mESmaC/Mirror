@@ -1,6 +1,13 @@
 # 0016b: CPU controls and vulnerability reporting
 
-Status: confirmed (2026-10-09)
+Status: done (2026-10-11, branch `claude/0016b-cpu-controls`: items 1-5 in ac1fcec, 6c17e08, c0ae731, b7e163b and 3e9aed3, review fix in 570c6b1). All acceptance tests pass. `scripts/test.ps1` and `-AgentDemo` each ran 132 smoke boots, on `qemu64,+smep,+smap` by default: `cr4=0x300660 smep=1 smap=1 umip=0` on every CPU and `user_ac=4`; the `-BaselineCpu` boot shows all protections 0 and no `MIRROR_ENTRY_AC_OK`. KernelSmep gave `error=0x11` with cr2 0x5e000000, KernelSmap `error=0x1` with cr2 0x5a000000, UserSyscall vector 6 and UserUmip vector 13. Open question 1: QEMU 11.1.0's TCG `-cpu max` reports `cpuid_umip=1`, so UserUmip runs in the `-ExtendedCpu` battery. Test 6, VMware Workstation Pro 26.0.1 in a Workstation-created VM, `Monitor Mode: ULM`, two boots each at 1 and 4 vCPUs: every vCPU printed `MIRROR_CPU_HARDENING cpu=<n> cr4=0x300e60 smep=1 smap=1 umip=1 sce=0 cpuid_smep=1 cpuid_smap=1 cpuid_umip=1`, and every boot printed `MIRROR_CPU_VULN vendor=intel hypervisor=1 arch_caps=1 meltdown=affected mds=affected mitigation=none`, the input for the S9 KPTI/MDS spec: VMware under ULM exposes IA32_ARCH_CAPABILITIES without RDCL_NO or MDS_NO. The Interfaces keep their HEAD 4614249 line numbers. (Confirmed 2026-10-09.)
+
+Implementation notes (2026-10-11):
+- Items 1 and 2: item 1 sets SMEP and UMIP and leaves SMAP clear; item 2 adds the entry stub's CLAC and turns SMAP on in the same commit, so no commit runs SMAP without CLAC. `MIRROR_SMAP_ACTIVE` is set only by the BSP, from its CPUID, before any CPU enables SMAP.
+- New AP failure reasons: 11 when `configure_current` fails and 12 when an AP's protections differ from the BSP's. An AP whose CPUID set differs is caught by `hardening::matches_bsp` before it loads the IDT, so it never runs the CLAC in the entry stubs. QEMU gives every vCPU one model, so neither reason is exercised.
+- `MIRROR_CPU_HARDENING` (item 1) and `MIRROR_CPU_VULN` (item 3) print from the item that adds their code, so no item leaves dead code under clippy `-D warnings`.
+- The scripts pin each CPU model's protections, stricter than the spec: SMEP and SMAP 1 on the default model and `max`, 0 on `-BaselineCpu`; UMIP 1 only on `max`; and `vendor=amd hypervisor=1 arch_caps=0` for QEMU's models. `capture.ps1` checks both markers on trace and default boots, and the image scan requires them in trace and default kernels.
+- The IA32_ARCH_CAPABILITIES read is exercised only in VMware: QEMU's TCG refuses `+arch-capabilities`.
 Depends on: 0015a, only for the manual VMware check (it boots the disk image); the code and QEMU tests depend on no other spec. In the M0 order it lands after 0013 and 0016a, though it does not need 0016a (see Interfaces), and before 0017a.
 Ledger: S9, A9 (supports), A11 (relates), S6a (prepares 0021), G3a (test platforms)
 

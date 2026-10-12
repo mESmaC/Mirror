@@ -32,7 +32,7 @@ Decisions in 0017a that also govern this spec:
 
 **Markers** (lifecycle and device markers, no user content)
 - `MIRROR_PS2_INIT elapsed_ms=<n> clock=hpet|pit selftest=0` prints after init in every build flavor.
-- On a timeout, `MIRROR_PS2_TIMEOUT wait=controller|ack|response|bat elapsed_ms=<n> clock=hpet|pit` prints before the existing SKIPPED line (main.rs:314-340). Here elapsed_ms is that wait's own duration.
+- On a timeout, `MIRROR_PS2_TIMEOUT wait=controller|ack|response|bat elapsed_ms=<n> clock=hpet|pit` prints before the existing SKIPPED line (main.rs:316-342). Here elapsed_ms is that wait's own duration.
 
 **Init order** (ps2.rs:253-335)
 - D8: remove 0xAA and the block that reapplies the config after it (ps2.rs:260-268). The initial drain (ps2.rs:256) and the quiet config write (ps2.rs:259) stay.
@@ -42,14 +42,14 @@ Decisions in 0017a that also govern this spec:
 - `mirror.test=ps2-bat-timeout` (`Ps2BatTimeout`): during the mouse BAT wait only, mouse-source bytes are read and dropped.
 - `mirror.test=ps2-stale-scancode` (`Ps2StaleScancode`): the first keyboard-source read after 0xAE returns an injected 0x1c before any real controller data, and the kernel prints `MIRROR_PS2_INJECTED stale=1`.
 
-**Files touched:** `kernel/src/{ps2,timer,boot,main}.rs`, `scripts/run.ps1`, `scripts/test.ps1`, `readme.md:334` (init waits are bounded by elapsed time).
+**Files touched:** `kernel/src/{ps2,timer,boot,main}.rs`, `scripts/run.ps1`, `scripts/test.ps1`, `readme.md:345` (init waits are bounded by elapsed time).
 
 ## Acceptance tests
 1. `timer::policy_self_test` (boot-smoke, MIRROR_TIMER_POLICY_OK): `pit_elapsed` cases with no wrap, one wrap, equal samples, and the divisor boundary (previous 1, current PIT_DIVISOR gives 1).
 
 QEMU integration (`scripts/run.ps1`, `scripts/test.ps1`):
 2. Every smoke boot that has an i8042, except the `Ps2BatTimeout` cases, asserts `MIRROR_PS2_INIT ... selftest=0` with elapsed_ms < 250 and no `MIRROR_PS2_TIMEOUT`. The `-NoKeyboard` case still ends in both SKIPPED markers and prints no timeout.
-3. `-Fault Ps2BatTimeout`, run once by default (clock=hpet) and once with `-NoHpet` (clock=pit). Expected: MIRROR_KEYBOARD_READY, `MIRROR_MOUSE_SKIPPED reason=OutputTimeout`, and `MIRROR_PS2_TIMEOUT wait=bat` with 4000 <= elapsed_ms <= 4500. run.ps1:678-680 expects MOUSE_SKIPPED instead of MOUSE_READY only for this fault.
+3. `-Fault Ps2BatTimeout`, run once by default (clock=hpet) and once with `-NoHpet` (clock=pit). Expected: MIRROR_KEYBOARD_READY, `MIRROR_MOUSE_SKIPPED reason=OutputTimeout`, and `MIRROR_PS2_TIMEOUT wait=bat` with 4000 <= elapsed_ms <= 4500. run.ps1:721-723 expects MOUSE_SKIPPED instead of MOUSE_READY only for this fault.
 4. `-Fault Ps2StaleScancode`: MIRROR_KEYBOARD_READY, MIRROR_MOUSE_READY and `MIRROR_PS2_INJECTED stale=1`. The implementer lands the fault before the reorder and records that it then gives `MIRROR_KEYBOARD_SKIPPED reason=Configuration`.
 5. `scripts/test.ps1` runs cases 3 (both clocks) and 4 in each profile, which adds 3 smoke boots per profile. Before merge (ledger P8), the full `scripts/test.ps1` passes.
 
