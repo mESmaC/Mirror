@@ -10,7 +10,8 @@
 //! be created before `share_with_secondaries` seals kernel mappings.
 //!
 //! The stack arena starts with the BSP region: the scheduler stack, which
-//! replaces Limine's boot stack, the RSP0 trap stack and the IST1 (#DF), IST2
+//! replaces Limine's boot stack, the RSP0 placeholder stack (each user thread
+//! traps onto its own stack from `kernel_va`, 0050-D2) and the IST1 (#DF), IST2
 //! (NMI) and IST3 (#MC) stacks. The AP slots (smp.rs) follow it from `AP_BASE`,
 //! each with the AP's kernel stack, which is also its RSP0, and its own IST1-3
 //! stacks. The arena sits in the shared upper half, so every process root, which
@@ -83,8 +84,10 @@ const fn ist_bottom(index: usize) -> u64 {
     IST_BASE + index as u64 * span(IST_PAGES) + PAGE_SIZE
 }
 
-/// The tops of the BSP's guarded stacks that boot installs by hand. RSP0 is
-/// read through `bsp_rsp0_top` when userspace starts.
+/// The tops of the BSP's guarded stacks that boot installs by hand. The RSP0
+/// stack is read through `bsp_rsp0_top`: it is the TSS.RSP0 placeholder
+/// whenever no thread runs, since each thread traps onto its own stack
+/// (0050-D2).
 pub struct BspStacks {
     pub scheduler_top: u64,
     pub ist_tops: [u64; IST_COUNT],
@@ -115,7 +118,8 @@ pub unsafe fn map_bsp(
     })
 }
 
-/// The top of the BSP's guarded RSP0 stack, for the TSS on user entry.
+/// The top of the BSP's guarded RSP0 stack, the TSS.RSP0 placeholder while
+/// no thread runs (0050-D2).
 pub fn bsp_rsp0_top() -> u64 {
     assert!(BSP_MAPPED.load(Ordering::Acquire), "BSP stacks not mapped");
     top(RSP0_BOTTOM, RSP0_PAGES)
@@ -148,27 +152,42 @@ pub fn report(tables: &PageTables) {
 }
 
 /// Overflow the BSP's RSP0 stack on purpose (smoke mode
-/// `kernel-stack-overflow`). RSP starts 2 KiB below the stack's top and moves
-/// down one page per step, writing a word each time, until a write reaches the
-/// guard page below the stack. That write faults with RSP inside the guard
-/// page, so pushing the #PF frame faults again and the CPU raises #DF, which
-/// its gate delivers on IST1.
+/// `kernel-stack-overflow`), through `overflow`.
 ///
 /// # Safety
 /// Only the BSP calls this, with IF clear and no user context active, so
 /// nothing else uses the RSP0 stack. The #DF handler must end the guest.
 #[cfg(feature = "boot-smoke")]
 pub unsafe fn overflow_rsp0() -> ! {
+    // SAFETY: Inherited from the caller; `report` checked the RSP0 stack's
+    // guard page below.
+    unsafe { overflow(bsp_rsp0_top()) }
+}
+
+/// Overflow a guarded stack on purpose (smoke modes `kernel-stack-overflow`
+/// and `thread-stack-overflow`). RSP starts 2 KiB below the stack's top and
+/// moves down one page per step, writing a word each time, until a write
+/// reaches the guard page below the stack. That write faults with RSP inside
+/// the guard page, so pushing the #PF frame faults again and the CPU raises
+/// #DF, which its gate delivers on IST1.
+///
+/// # Safety
+/// Only the BSP calls this, with IF clear and no user context active. `top`
+/// is the page-aligned top of a mapped, writable kernel stack of at least one
+/// page whose guard page below is unmapped, and nothing else uses the stack.
+/// The #DF handler must end the guest.
+#[cfg(feature = "boot-smoke")]
+pub unsafe fn overflow(top: u64) -> ! {
     assert!(
         !crate::arch::interrupts_enabled(),
         "stack overflow probe requires IF=0"
     );
-    let start = bsp_rsp0_top() - 2048;
-    // SAFETY: The caller's contract leaves the RSP0 stack idle and IF clear,
-    // so no interrupt shares the walk. Each write lands in the RSP0 stack
-    // until RSP enters the unmapped guard page below it, which `report`
-    // checked. Nothing returns: the resulting #DF runs on IST1 and its
-    // handler ends the guest.
+    assert!(top.is_multiple_of(PAGE_SIZE) && top >= KERNEL_HALF + 2 * PAGE_SIZE);
+    let start = top - 2048;
+    // SAFETY: The caller's contract leaves the stack idle and IF clear, so no
+    // interrupt shares the walk. Each write lands in the stack until RSP
+    // enters the unmapped guard page below it. Nothing returns: the resulting
+    // #DF runs on IST1 and its handler ends the guest.
     unsafe {
         asm!(
             "mov rsp, {start}",

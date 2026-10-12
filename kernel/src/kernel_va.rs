@@ -20,14 +20,8 @@
 //! Every operation runs on the BSP with IF=0 under a reentry guard. IRQ, NMI
 //! and AP paths never touch the window state.
 
-#![cfg_attr(
-    not(feature = "boot-smoke"),
-    expect(
-        dead_code,
-        reason = "the per-thread stacks of spec 0050 part 2 are the first client outside the self-test"
-    )
-)]
-
+#[cfg(feature = "boot-smoke")]
+use core::sync::atomic::AtomicUsize;
 use core::{
     cell::UnsafeCell,
     marker::PhantomData,
@@ -115,6 +109,7 @@ pub struct KvaStats {
     pub pooled: usize,
 }
 
+#[cfg(feature = "boot-smoke")]
 impl KvaStats {
     /// The frames live and pooled stacks hold together.
     pub fn stack_frames(&self) -> usize {
@@ -148,10 +143,12 @@ impl KernelStack {
         self.bottom() + STACK_PAGES as u64 * PAGE_SIZE
     }
 
+    #[cfg(feature = "boot-smoke")]
     pub fn guard_below(&self) -> u64 {
         page_address(usize::from(self.first))
     }
 
+    #[cfg(feature = "boot-smoke")]
     pub fn guard_above(&self) -> u64 {
         self.top()
     }
@@ -264,6 +261,12 @@ static BUSY: AtomicBool = AtomicBool::new(false);
 static READY: AtomicBool = AtomicBool::new(false);
 // Only the boot-smoke switch (0050 test 4) sets this.
 static TRANSPORT_WITHHELD: AtomicBool = AtomicBool::new(false);
+/// The frame index at which the next stack build fails (0050 test 5), or
+/// `NO_INJECTION`. One-shot: `allocate_stack` consumes it.
+#[cfg(feature = "boot-smoke")]
+static INJECT_AT: AtomicUsize = AtomicUsize::new(NO_INJECTION);
+#[cfg(feature = "boot-smoke")]
+const NO_INJECTION: usize = usize::MAX;
 
 /// Shootdown waits briefly enable IRQs. Reject reentry instead of spinning;
 /// handlers never take this guard.
@@ -354,8 +357,36 @@ pub unsafe fn allocate_stack(
     frames: &mut FrameAllocator<'_>,
     offset: u64,
 ) -> Result<KernelStack, KvaError> {
+    // An armed injection fails this build at its Nth frame (0050 test 5). It
+    // is armed only while the pool is empty, so the build really allocates.
+    #[cfg(feature = "boot-smoke")]
+    {
+        let limit = INJECT_AT.swap(NO_INJECTION, Ordering::AcqRel);
+        if limit != NO_INJECTION {
+            assert_eq!(
+                stats()?.pooled,
+                0,
+                "stack failure injected with a pooled stack"
+            );
+            // SAFETY: Inherited from the caller.
+            return unsafe { allocate(tables, frames, offset, Source::FailAt(limit)) };
+        }
+    }
     // SAFETY: Inherited from the caller.
     unsafe { allocate(tables, frames, offset, Source::Allocator) }
+}
+
+/// Make the next `allocate_stack` build a fresh stack and fail at frame
+/// `index` (0..16), returning `OutOfFrames` after rolling back (0050 test 5).
+/// The caller arms it only while the pool is empty.
+#[cfg(feature = "boot-smoke")]
+pub fn arm_frame_failure(index: usize) {
+    assert!(index < STACK_PAGES, "stack failure index out of range");
+    assert_eq!(
+        INJECT_AT.swap(index, Ordering::AcqRel),
+        NO_INJECTION,
+        "stack failure injected twice"
+    );
 }
 
 /// Return a stack to the reuse pool. It keeps its mapping and frames, so a
@@ -591,6 +622,7 @@ unsafe fn recycle_frames(frames: &mut FrameAllocator<'_>, physical: &[u64]) {
     }
 }
 
+#[cfg(feature = "boot-smoke")]
 fn allocated(frames: &FrameAllocator<'_>) -> usize {
     frames.stats().expect("frame accounting").allocated_frames
 }
@@ -600,6 +632,57 @@ fn allocated(frames: &FrameAllocator<'_>) -> usize {
 #[cfg(feature = "boot-smoke")]
 pub fn withhold_transport_for_test(withheld: bool) {
     TRANSPORT_WITHHELD.store(withheld, Ordering::Release);
+}
+
+/// Read and clear the dirty bits of a stack's pages and return how many
+/// pages from its top down to its deepest written page, 0 when nothing wrote
+/// it (0050-D2, boot-smoke). Every allocation and every session drain clears
+/// them, so a reused stack never reports an earlier thread's depth. The
+/// hardware dirty bits stand in for a fill pattern: filling and scanning
+/// 64 KiB per thread under TCG kept IF=0 long enough to perturb the timing
+/// of init's wake-order checks.
+///
+/// # Safety
+/// Run on the BSP with IF=0 and the kernel root active. The caller owns the
+/// stack, and nothing runs on it.
+#[cfg(feature = "boot-smoke")]
+pub unsafe fn take_high_water(tables: &PageTables, stack: &KernelStack) -> usize {
+    // SAFETY: Inherited from the caller.
+    unsafe { take_span_high_water(tables, stack.bottom()) }
+}
+
+/// `take_high_water` for every pooled stack: the deepest of them.
+///
+/// # Safety
+/// As for `take_high_water`; pooled stacks are in use nowhere.
+#[cfg(feature = "boot-smoke")]
+pub unsafe fn take_pool_high_water(tables: &PageTables) -> Result<usize, KvaError> {
+    let mut guard = WindowGuard::acquire()?;
+    let window = guard.window();
+    let mut deepest = 0;
+    for &first in &window.pool[..window.pooled] {
+        // SAFETY: Inherited from the caller; the guard keeps the stack pooled.
+        let pages = unsafe { take_span_high_water(tables, page_address(usize::from(first) + 1)) };
+        deepest = deepest.max(pages);
+    }
+    Ok(deepest)
+}
+
+/// # Safety
+/// As for `take_high_water`, for the stack whose lowest page is `bottom`.
+#[cfg(feature = "boot-smoke")]
+unsafe fn take_span_high_water(tables: &PageTables, bottom: u64) -> usize {
+    let mut pages = 0;
+    // Every page's bit is cleared; the lowest dirty page sets the depth.
+    for page in 0..STACK_PAGES {
+        let address = bottom + page as u64 * PAGE_SIZE;
+        // SAFETY: Inherited from the caller; the leaf is a mapped stack page.
+        let dirty = unsafe { tables.take_kva_dirty(address) }.expect("kernel stack dirty bit");
+        if dirty && pages == 0 {
+            pages = STACK_PAGES - page;
+        }
+    }
+    pages
 }
 
 #[cfg(feature = "boot-smoke")]

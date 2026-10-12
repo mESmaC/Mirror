@@ -629,6 +629,34 @@ impl PageTables {
         Ok(())
     }
 
+    /// Read and clear the dirty bit of one mapped kernel VA leaf, for the
+    /// thread stacks' high-water mark (0050-D2, boot-smoke). A cleared bit
+    /// also drops this CPU's cached translation, so the next write through it
+    /// sets the bit again. Only the BSP writes thread stacks: no other CPU
+    /// holds a translation that could write without setting the bit.
+    ///
+    /// # Safety
+    /// Run on the BSP with IF=0 and this kernel root active. The leaf belongs
+    /// to a stack that kernel_va handed out or pooled.
+    #[cfg(feature = "boot-smoke")]
+    pub unsafe fn take_kva_dirty(&self, address: u64) -> Result<bool, PagingError> {
+        const DIRTY: u64 = 1 << 6;
+        self.check_kva_range(address, 1)?;
+        let leaf = self.kva_leaf(address)?;
+        if leaf.load(Ordering::Acquire) & PRESENT == 0 {
+            return Err(PagingError::NotMapped);
+        }
+        // Hardware sets A and D with locked updates; an atomic AND keeps
+        // them and clears only D.
+        if leaf.fetch_and(!DIRTY, Ordering::AcqRel) & DIRTY == 0 {
+            return Ok(false);
+        }
+        // SAFETY: CPL0 with IF clear and a checked, page-aligned window
+        // address; the PTE write precedes the invalidation.
+        unsafe { crate::arch::invalidate_tlb_page(address) };
+        Ok(true)
+    }
+
     fn check_kva_range(&self, address: u64, pages: usize) -> Result<(), PagingError> {
         check_page_address(address)?;
         if pages == 0

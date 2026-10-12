@@ -611,8 +611,10 @@ pub(super) fn thread_entry(slot: u16) -> *mut Thread {
     THREADS.entry(usize::from(slot))
 }
 
-/// Remove a thread from the table, the run queue and every wait queue. A
-/// thread owns no resource beyond its entry, so it is simply dropped.
+/// Remove a thread from the table, the run queue and every wait queue. Its
+/// kernel stack, unless its exit already freed it, goes to the reuse pool;
+/// only the scheduler and kernel setup remove a thread that still holds one
+/// (0050-D2). The rest of the entry is simply dropped.
 ///
 /// # Safety
 /// `slot` is occupied and no reference to its entry is live. Its owner drops
@@ -620,7 +622,10 @@ pub(super) fn thread_entry(slot: u16) -> *mut Thread {
 pub(super) unsafe fn remove_thread(slot: u16) {
     detach(slot);
     // SAFETY: The caller guarantees an occupied, unreferenced entry.
-    let _thread = unsafe { THREADS.remove(usize::from(slot)) };
+    let thread = unsafe { THREADS.remove(usize::from(slot)) };
+    if let Some(stack) = thread.stack {
+        super::release_stack(stack);
+    }
 }
 
 /// Move a process and all its threads out of the tables. The caller owns

@@ -22,7 +22,7 @@ param(
     [switch]$LegacyPic,
     [switch]$PitTimer,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
-    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation', 'Ps2BatTimeout', 'Ps2StaleScancode', 'VmmouseError', 'Reset', 'ResetFromKbc', 'ResetFromCf9', 'ResetFromTripleFault', 'ResetSuppressed')][string]$Fault = 'None',
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'ThreadStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation', 'Ps2BatTimeout', 'Ps2StaleScancode', 'VmmouseError', 'Reset', 'ResetFromKbc', 'ResetFromCf9', 'ResetFromTripleFault', 'ResetSuppressed')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -292,6 +292,7 @@ $testMode = switch ($Fault) {
     'PageFault' { 'page-fault' }
     'InvalidOpcode' { 'invalid-opcode' }
     'KernelStackOverflow' { 'kernel-stack-overflow' }
+    'ThreadStackOverflow' { 'thread-stack-overflow' }
     'KernelSmep' { 'kernel-smep' }
     'KernelSmap' { 'kernel-smap' }
     'UserKernelRead' { 'user-kernel-read' }
@@ -528,7 +529,7 @@ try {
     if (-not $expectedTlbTimeout -and $serial -match '(?im)^(?:MIRROR_PANIC|PANIC|\[panic\])') {
         throw "Mirror reported a panic. See $serialLog."
     }
-    $fatalKernelFault = $Fault -in @('PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap')
+    $fatalKernelFault = $Fault -in @('PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'ThreadStackOverflow', 'KernelSmep', 'KernelSmap')
     # A reset case restarts after every self-test, and -no-reboot turns the
     # guest reset into a QEMU exit with code 0 (spec 0058a, D11).
     $resetCase = $Fault -like 'Reset*'
@@ -597,6 +598,10 @@ try {
     # The kernel VA window is ready before SMP startup, and its self-test
     # probes every online CPU (spec 0050, acceptance test 4).
     Assert-MirrorKernelVa -Serial $serial -OnlineCpus $(if ($LegacyPic) { 1 } else { $CpuCount }) -Smoke $true
+    # Each init-pair session reports its thread stacks at its drain, the first
+    # with the window's transport withheld; only ThreadStackOverflow reports
+    # a thread stack's guard page (spec 0050, acceptance tests 3 and 4).
+    $threadStackGuard = Assert-MirrorKernelStacks -Serial $serial -FaultMode $Fault
     # Every online CPU runs with its own CpuData in GS, proved through an IPI
     # on each (spec 0050, acceptance test 2).
     Assert-MirrorCpuData -Serial $serial -Smoke $true
@@ -1039,7 +1044,7 @@ try {
         }
     }
     elseif ($fatalKernelFault) {
-        $vector = switch ($Fault) { 'PageFault' { 14 } 'InvalidOpcode' { 6 } 'KernelStackOverflow' { 8 } 'KernelSmep' { 14 } 'KernelSmap' { 14 } }
+        $vector = switch ($Fault) { 'PageFault' { 14 } 'InvalidOpcode' { 6 } 'KernelStackOverflow' { 8 } 'ThreadStackOverflow' { 8 } 'KernelSmep' { 14 } 'KernelSmap' { 14 } }
         # A supervisor fetch from a present user page sets P and I/D, and a
         # supervisor read of one sets P only (spec 0016b). Every other fatal
         # fault reports error 0.
@@ -1071,6 +1076,11 @@ try {
         # double fault on IST1, both land in the guard page below RSP0.
         if ($Fault -eq 'KernelStackOverflow' -and ($cr2 -lt $rsp0Guard -or $cr2 -ge $rsp0Guard + 4096)) {
             throw "The RSP0 overflow must fault inside the guard page at $('0x{0:x}' -f $rsp0Guard). See $serialLog."
+        }
+        # The same walk down a thread stack from the kernel VA window faults
+        # in the guard page that MIRROR_KSTACK_GUARD reports (spec 0050).
+        if ($Fault -eq 'ThreadStackOverflow' -and ($cr2 -lt $threadStackGuard -or $cr2 -ge $threadStackGuard + 4096)) {
+            throw "The thread stack overflow must fault inside the guard page at $('0x{0:x}' -f $threadStackGuard). See $serialLog."
         }
         if ($serial -match '(?m)^MIRROR_BOOT_OK(?:\s|$)') {
             throw "Fatal-fault test incorrectly reached normal boot completion. See $serialLog."

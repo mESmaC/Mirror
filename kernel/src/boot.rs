@@ -150,6 +150,9 @@ pub enum SmokeMode {
     PageFault,
     InvalidOpcode,
     KernelStackOverflow,
+    /// Overflow a thread kernel stack from the kernel VA window into its
+    /// guard page (spec 0050, acceptance test 3).
+    ThreadStackOverflow,
     KernelSmep,
     KernelSmap,
     BlockIoError,
@@ -201,6 +204,7 @@ pub fn smoke_mode() -> SmokeMode {
         b"mirror.test=page-fault" => SmokeMode::PageFault,
         b"mirror.test=invalid-opcode" => SmokeMode::InvalidOpcode,
         b"mirror.test=kernel-stack-overflow" => SmokeMode::KernelStackOverflow,
+        b"mirror.test=thread-stack-overflow" => SmokeMode::ThreadStackOverflow,
         b"mirror.test=kernel-smep" => SmokeMode::KernelSmep,
         b"mirror.test=kernel-smap" => SmokeMode::KernelSmap,
         b"mirror.test=user-kernel-read" => SmokeMode::User(1),

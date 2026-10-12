@@ -513,6 +513,24 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
                 // IST1 must report the fault and terminate the guest.
                 unsafe { stacks::overflow_rsp0() };
             }
+            boot::SmokeMode::ThreadStackOverflow => {
+                // Spec 0050, acceptance test 3: a thread kernel stack from
+                // the kernel VA window, with its unmapped guard page below.
+                // SAFETY: The BSP with IF=0 on the active kernel root, with
+                // the sole allocator and its HHDM; no window guard is held.
+                let stack = unsafe {
+                    kernel_va::allocate_stack(&tables, &mut frames, boot.direct_map_offset)
+                }
+                .expect("thread stack for the overflow probe");
+                serial::println!("MIRROR_KSTACK_GUARD guard={:#x}", stack.guard_below());
+                serial::println!("MIRROR_TEST_EXPECT_FATAL vector=8");
+                // SAFETY: Deliberate smoke-test #DF on the BSP. Userspace has
+                // finished, so no user context is active, IF is clear, and
+                // this freshly allocated stack is used by nothing else; its
+                // guard page below is unmapped. The #DF handler on IST1 must
+                // report the fault and terminate the guest.
+                unsafe { stacks::overflow(stack.top()) };
+            }
             mode @ (boot::SmokeMode::KernelSmep | boot::SmokeMode::KernelSmap) => {
                 serial::println!("MIRROR_TEST_EXPECT_FATAL vector=14");
                 let probe = if matches!(mode, boot::SmokeMode::KernelSmep) {

@@ -730,7 +730,21 @@ pub(crate) unsafe fn installed_ists(cpu: usize) -> [u64; IST_COUNT] {
     core::array::from_fn(|index| fields[index])
 }
 
-/// Set the dedicated kernel stack used by hardware on CPL3 -> CPL0 entry.
+/// The BSP's TSS.RSP0: the running thread's kernel stack top during a
+/// dispatch, the placeholder otherwise (0050-D2).
+pub(crate) fn kernel_stack() -> u64 {
+    // SAFETY: Only the BSP writes RSP0, with IF clear, and this unaligned read
+    // of the packed field forms no reference.
+    unsafe {
+        addr_of!(TSS.privilege_stacks)
+            .cast::<u64>()
+            .read_unaligned()
+    }
+}
+
+/// Set the kernel stack used by hardware on CPL3 -> CPL0 entry: the running
+/// thread's own stack at each dispatch, and the BSP's placeholder stack while
+/// no thread runs (0050-D2).
 ///
 /// # Safety
 /// Only the BSP may call, with interrupts disabled and no active user context.
@@ -828,13 +842,7 @@ pub(crate) unsafe fn resume_user(frame: &TrapFrame, extended: *mut fpu::State) {
     );
     let mut prepared = *frame;
     prepared.rflags = (prepared.rflags & USER_RFLAGS_MASK) | 0x202;
-    // SAFETY: Exclusive BSP call with IF clear; no mutable reference is formed.
-    let rsp0 = unsafe {
-        addr_of!(TSS.privilege_stacks)
-            .cast::<u64>()
-            .read_unaligned()
-    };
-    assert_ne!(rsp0, 0, "user entry requires a kernel stack");
+    assert_ne!(kernel_stack(), 0, "user entry requires a kernel stack");
     assert!(
         !USER_ACTIVE.swap(true, Ordering::SeqCst),
         "nested user entry"
