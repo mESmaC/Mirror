@@ -27,7 +27,7 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 - 0016b Hardening: SMEP/SMAP/UMIP, EFER.SCE, CPU vulnerability reporting (S9). Done (2026-10-11)
 - 0017a PS/2: separate keyboard and mouse loss handling, mouse coalescing and resync. Done (2026-10-12)
 - 0017b PS/2: time-based init timeouts and init order. Done (2026-10-12)
-- 0017c Absolute pointing on VMware: vmmouse protocol (S1a, S1d). Implemented (2026-10-12); the GUI half of check 7 is open
+- 0017c Absolute pointing on VMware: vmmouse protocol (S1a, S1d). Implemented (2026-10-12); the GUI half of check 7 is deferred (Cameron, 2026-10-12)
 - 0058a (split): reboot without AML (FADT reset register, then 8042, then 0xCF9, then triple fault) and a console `restart` command
 - 0018 Performance baseline harness: the four gates, measured on Linux and Windows VMs in the host's ULM monitor mode (G7, G7a, O3). Its Linux and Windows baseline track runs in parallel; its Mirror rows follow Phase 4
 - 0013 showed VMware handing off in xAPIC mode (2026-10-11), so 0055a stays in Phase 1 (RD11). If 0017c check 7 needs a Tools-running state, 0087a moves here (RD10).

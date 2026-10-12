@@ -97,6 +97,12 @@ msg.autoAnswer = "TRUE"
 rtc.diffFromUTC = "0"
 ```
 
+**Backdoor.** Limit the VMware backdoor to CPL0 (0017-D19), so no Mirror user process can reach the host RPC or clipboard channel. Workstation 26.0.1 accepts it in ULM mode, and the vmmouse still works.
+
+```
+monitor_control.restrict_backdoor = "TRUE"
+```
+
 **Left unset.** `keyboard.queryScancodeSet`, which must not be `"FALSE"` (0017b, open question 1), and `chipset.motherboardLayout`.
 
 ## Display
