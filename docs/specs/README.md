@@ -25,9 +25,9 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 - Docs-only: the G11 daily VM (12 vCPUs, 20 GB, NAT) in `docs/vm-settings.md` (RD16)
 - 0016a Hardening: guarded boot-CPU stacks, NMI/#MC stacks. Done (2026-10-11)
 - 0016b Hardening: SMEP/SMAP/UMIP, EFER.SCE, CPU vulnerability reporting (S9). Done (2026-10-11)
-- 0017a PS/2: separate keyboard and mouse loss handling, mouse coalescing and resync. Implemented (2026-10-11); manual check 6 waits for 0017c
+- 0017a PS/2: separate keyboard and mouse loss handling, mouse coalescing and resync. Done (2026-10-12)
 - 0017b PS/2: time-based init timeouts and init order. Done (2026-10-12)
-- 0017c Absolute pointing on VMware: vmmouse protocol (S1a, S1d)
+- 0017c Absolute pointing on VMware: vmmouse protocol (S1a, S1d). Implemented (2026-10-12); the GUI half of check 7 is open
 - 0058a (split): reboot without AML (FADT reset register, then 8042, then 0xCF9, then triple fault) and a console `restart` command
 - 0018 Performance baseline harness: the four gates, measured on Linux and Windows VMs in the host's ULM monitor mode (G7, G7a, O3). Its Linux and Windows baseline track runs in parallel; its Mirror rows follow Phase 4
 - 0013 showed VMware handing off in xAPIC mode (2026-10-11), so 0055a stays in Phase 1 (RD11). If 0017c check 7 needs a Tools-running state, 0087a moves here (RD10).
@@ -170,7 +170,7 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 - 0015b Live ISO and its test case (S5, S5a). Moved here on 2026-10-11 (RD1); re-drafted and re-confirmed before this phase
 - 0199 Performance gates and daily-drive checklist; local-inference floors and input latency under inference (G7, G7a, I15)
 
-Execution order (confirmed 2026-10-11): Phase 0 runs 0015a (done), then 0013 (done), then 0016a (done), 0016b (done), 0017a (implemented), 0017b (done) and 0017c, one at a time, each updating the AGENTS.md lines it changes in the same commit (P9). The vmrun lane, the G11 docs commit and 0058a join Phase 0 once confirmed (RD1, RD16). 0018's baseline track runs in parallel. Later phases run in the order listed, except where a line's own note orders it after a later line (0095 runs after 0098). Done earlier: 0012, 0011, 0014, 0010 and side spec 0029.
+Execution order (confirmed 2026-10-11): Phase 0 runs 0015a (done), then 0013 (done), then 0016a (done), 0016b (done), 0017a (done), 0017b (done) and 0017c (implemented), one at a time, each updating the AGENTS.md lines it changes in the same commit (P9). The vmrun lane, the G11 docs commit and 0058a join Phase 0 once confirmed (RD1, RD16). 0018's baseline track runs in parallel. Later phases run in the order listed, except where a line's own note orders it after a later line (0095 runs after 0098). Done earlier: 0012, 0011, 0014, 0010 and side spec 0029.
 
 **Specs the re-plan splits**, with their original scope (split specs keep their decision IDs, rule 1):
 - 0019 Mirror perf instrumentation and telemetry: kernel side of 0018-D9 and device/link telemetry (S7b, C3)
