@@ -597,6 +597,9 @@ try {
     # The kernel VA window is ready before SMP startup, and its self-test
     # probes every online CPU (spec 0050, acceptance test 4).
     Assert-MirrorKernelVa -Serial $serial -OnlineCpus $(if ($LegacyPic) { 1 } else { $CpuCount }) -Smoke $true
+    # Every online CPU runs with its own CpuData in GS, proved through an IPI
+    # on each (spec 0050, acceptance test 2).
+    Assert-MirrorCpuData -Serial $serial -Smoke $true
     # Every online CPU also reports its protections, and the BSP its
     # speculative-execution exposure (spec 0016b). The default model and max
     # report SMEP and SMAP, and only max reports UMIP; -BaselineCpu's plain

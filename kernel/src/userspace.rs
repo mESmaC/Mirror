@@ -341,6 +341,12 @@ struct Process {
     sync_cancelled: u64,
     #[cfg(feature = "boot-smoke")]
     tls_checks: bool,
+    /// Preemptions while init held non-null user FS/GS selectors (0050,
+    /// acceptance test 1), counted between its two TLS preemption markers.
+    #[cfg(feature = "boot-smoke")]
+    tls_preemption_start: Option<usize>,
+    #[cfg(feature = "boot-smoke")]
+    tls_preemptions: usize,
     #[cfg(feature = "boot-smoke")]
     clock_checks: bool,
     #[cfg(feature = "boot-smoke")]
@@ -872,6 +878,10 @@ fn load_process(
         #[cfg(feature = "boot-smoke")]
         tls_checks: false,
         #[cfg(feature = "boot-smoke")]
+        tls_preemption_start: None,
+        #[cfg(feature = "boot-smoke")]
+        tls_preemptions: 0,
+        #[cfg(feature = "boot-smoke")]
         clock_checks: false,
         #[cfg(feature = "boot-smoke")]
         clock_unavailable: false,
@@ -1349,6 +1359,8 @@ fn resume_process(
         core::ptr::from_mut(session).cast()
     });
     let windows_pointer = windows.map_or(core::ptr::null_mut(), core::ptr::from_mut);
+    // This CPU's CpuData names the thread while it runs (0050-D1).
+    crate::cpudata::set_current_thread(process.thread().id);
     ACTIVE_WINDOWS.store(windows_pointer, Ordering::SeqCst);
     ACTIVE_SURFACE.store(surface_pointer, Ordering::SeqCst);
     ACTIVE_INPUT.store(input_pointer, Ordering::SeqCst);
@@ -1367,6 +1379,7 @@ fn resume_process(
         interrupts::resume_user(&context, &raw mut extended);
     }
     ACTIVE.store(core::ptr::null_mut(), Ordering::SeqCst);
+    crate::cpudata::set_current_thread(0);
     // SAFETY: All handlers returned, the user is suspended, and IF remains clear.
     unsafe { kernel.activate() }.expect("restore kernel root");
     process.thread_mut().context.extended = extended;
@@ -2566,7 +2579,7 @@ fn validate_process(process: &Process, scenario: u64) {
         process.thread_preemptions
     );
     assert!(
-        process.tls_checks,
+        process.tls_checks && process.tls_preemptions > 0,
         "TLS checks did not complete: {:?}",
         process.outcome
     );
@@ -2801,6 +2814,13 @@ fn with_active(frame: &TrapFrame, operation: impl FnOnce(&mut Process)) {
     unsafe {
         let process = &mut *pointer;
         assert_eq!(process.thread().state, State::Running);
+        // The trapping thread is the one this CPU's CpuData names (0050-D1).
+        #[cfg(feature = "boot-smoke")]
+        assert_eq!(
+            crate::cpudata::current_thread(),
+            process.thread().id,
+            "per-CPU current thread"
+        );
         operation(process);
     }
 }
@@ -2934,6 +2954,15 @@ fn match_init_oracles(process: &mut Process, message: &[u8]) {
     process.capacity_checks |= message == b"Mirror init: thread capacity checks passed\n";
     process.wait_queue_checks |= message == b"Mirror init: wait queue checks passed\n";
     process.sync_checks |= message == b"Mirror init: synchronization checks passed\n";
+    if message == b"Mirror init: TLS preemption begin\n" {
+        process.tls_preemption_start = Some(process.preemptions);
+    }
+    if message == b"Mirror init: TLS preemption end\n" {
+        process.tls_preemptions = process
+            .tls_preemption_start
+            .take()
+            .map_or(0, |start| process.preemptions.saturating_sub(start));
+    }
     if message == b"Mirror init: FPU preemption begin\n" {
         process.fpu_preemption_start = Some(process.preemptions);
     }

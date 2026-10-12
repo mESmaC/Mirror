@@ -1131,7 +1131,7 @@ extern "C" fn init_main(launch: u64) -> ! {
     let pid = syscall(SYS_PID, 0, 0, 0);
     require(pid > 0, 34);
     require(syscall(SYS_PID, 0, 0, 0) == pid, 35);
-    tls::start(pid as u64);
+    tls::start(console, pid as u64);
     fpu::check(console, pid as u64);
     tls::finish(console, pid as u64);
     clock::check(console);

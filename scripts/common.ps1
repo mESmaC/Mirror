@@ -439,6 +439,55 @@ function Assert-MirrorKernelVa {
     }
 }
 
+function Assert-MirrorCpuData {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [Parameter(Mandatory = $true)][bool]$Smoke
+    )
+
+    # Spec 0050-D4. After SMP startup every flavor checks that each online CPU
+    # runs with its own CpuData in GS and reports it exactly once, after
+    # MIRROR_KVA_READY. cpus= is recomputed from the SMP line: online= of
+    # MIRROR_SMP_READY, or 1 when MIRROR_SMP_SKIPPED kept the APs offline.
+    $startup = [regex]::Matches($Serial, '(?m)^MIRROR_SMP_(?:READY|SKIPPED)(?:\s|$)')
+    if ($startup.Count -ne 1) {
+        throw 'Mirror must report SMP startup exactly once before its per-CPU data.'
+    }
+    $smpReady = [regex]::Matches($Serial, '(?m)^MIRROR_SMP_READY discovered=\d+ online=(\d+) ')
+    $smpSkipped = [regex]::Matches($Serial, '(?m)^MIRROR_SMP_SKIPPED reason=\S+ online=1\r?$')
+    if ($smpReady.Count -eq 1 -and $smpSkipped.Count -eq 0) {
+        $cpus = [int]$smpReady[0].Groups[1].Value
+    }
+    elseif ($smpReady.Count -eq 0 -and $smpSkipped.Count -eq 1) {
+        $cpus = 1
+    }
+    else {
+        throw 'Mirror reported no SMP startup line to count online CPUs from.'
+    }
+    $names = [regex]::Matches($Serial, '(?m)^MIRROR_CPU_DATA_READY(?:\s|$)')
+    $records = [regex]::Matches($Serial, ('(?m)^MIRROR_CPU_DATA_READY cpus={0}\r?$' -f $cpus))
+    if ($names.Count -ne 1 -or $records.Count -ne 1) {
+        throw "Mirror must report MIRROR_CPU_DATA_READY cpus=$cpus exactly once."
+    }
+    $kva = [regex]::Match($Serial, '(?m)^MIRROR_KVA_READY(?:\s|$)')
+    if (-not $kva.Success -or $records[0].Index -le $kva.Index -or $records[0].Index -le $startup[0].Index) {
+        throw 'MIRROR_CPU_DATA_READY must follow MIRROR_KVA_READY and SMP startup.'
+    }
+    # Only smoke kernels send OP_READ_CPU_DATA to the BSP and every online AP
+    # (0050, acceptance test 2), just before the report.
+    $tests = [regex]::Matches($Serial, '(?m)^MIRROR_CPU_DATA_TESTS_OK(?:\s|$)')
+    if ($Smoke) {
+        $valid = [regex]::Matches($Serial, ('(?m)^MIRROR_CPU_DATA_TESTS_OK cpus={0}\r?$' -f $cpus))
+        if ($tests.Count -ne 1 -or $valid.Count -ne 1 -or $valid[0].Index -le $startup[0].Index -or
+            $valid[0].Index -ge $records[0].Index) {
+            throw "A smoke kernel must prove per-CPU data on $cpus CPU(s) exactly once, before MIRROR_CPU_DATA_READY."
+        }
+    }
+    elseif ($tests.Count -ne 0) {
+        throw 'Only smoke kernels run the per-CPU data probe.'
+    }
+}
+
 function Assert-MirrorStacks {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,

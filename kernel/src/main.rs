@@ -13,6 +13,7 @@ mod capability;
 mod clock;
 mod console;
 mod context;
+mod cpudata;
 mod dma;
 mod drivers;
 mod elf;
@@ -61,11 +62,18 @@ pub extern "C" fn _start() -> ! {
     #[cfg(feature = "test-trace")]
     serial::println!("MIRROR_TRACE_ON");
     interrupts::init();
+    // SAFETY: CPL0 with IF clear on the BSP, after interrupts::init's
+    // descriptor load zeroed both GS MSRs and before anything reads through
+    // GS (spec 0050-D1 (e)). Slot 0 is the BSP's and is installed once.
+    assert!(unsafe { cpudata::install(0) }, "BSP per-CPU data install");
     fpu::init();
     hardening::init();
     interrupts::tls_ready();
     #[cfg(feature = "boot-smoke")]
-    fpu::self_test();
+    {
+        fpu::self_test();
+        cpudata::self_test();
+    }
 
     let boot = boot::info();
     let entries = boot.memory_map.entries();
@@ -359,6 +367,9 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
     // allocator, before AP release and before any retained user root.
     unsafe { kernel_va::init(&mut tables, &mut frames) };
     smp::init(&boot, topology.as_ref(), &mut tables, &mut frames);
+    // Every flavor checks that each online CPU runs with its own CpuData in
+    // GS and reports it once (spec 0050-D4).
+    smp::report_cpu_data();
     // Every flavor reports each online CPU's stacks, then the BSP region,
     // then each online CPU's protections and the BSP's speculative-execution
     // exposure.

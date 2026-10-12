@@ -7,8 +7,8 @@ use mirror_thread_protocol::{SYS_TLS_GET, SYS_TLS_SET, TLS_BASES_SIZE, USER_ADDR
 
 use crate::{
     EFAULT, EINVAL, KERNEL_BASE, PAGE_SIZE, PROT_READ, PROT_READ_WRITE, SYS_PID, SYS_SLEEP,
-    SYS_YIELD, require, syscall, vm_protect, vm_read, vm_release, vm_reserve, vm_stats, vm_write,
-    write,
+    SYS_TICKS, SYS_YIELD, require, syscall, vm_protect, vm_read, vm_release, vm_reserve, vm_stats,
+    vm_write, write,
 };
 
 global_asm!(include_str!("tls.S"));
@@ -130,7 +130,35 @@ pub(super) fn check_initial() {
     require(unsafe { (&raw const CANARIES).read() } == [0; 8], 407);
 }
 
-pub(super) fn start(pid: u64) {
+/// Spin with the user data selector in FS and GS until eight timer ticks pass
+/// (spec 0050, acceptance test 1). The interval never yields or sleeps, and
+/// the kernel requires a preemption between the two markers, so the selectors
+/// and the base they loaded survive a CPL3 timer entry and a dispatch back.
+fn check_selector_preemption(console: u64) {
+    write(console, b"Mirror init: TLS preemption begin\n");
+    let first = syscall(SYS_TICKS, 0, 0, 0);
+    require(first >= 0, 448);
+    let mut previous = first;
+    let mut completed = false;
+    for _ in 0..1_000_000u64 {
+        for _ in 0..1024 {
+            require(selectors() == [0x2b, 0x2b], 449);
+        }
+        // TICKS only observes time; it never reschedules.
+        let tick = syscall(SYS_TICKS, 0, 0, 0);
+        require(tick >= previous, 450);
+        previous = tick;
+        if tick - first >= 8 {
+            completed = true;
+            break;
+        }
+    }
+    require(completed, 451);
+    write(console, b"Mirror init: TLS preemption end\n");
+    require(selectors() == [0x2b, 0x2b] && bases() == [0, 0], 452);
+}
+
+pub(super) fn start(console: u64, pid: u64) {
     // Unmapped and unaligned low-half bases are valid. Mapping and offset
     // validity are checked by the CPU only when a segment access is performed.
     for [fs, gs] in [[0, 0], [1, USER_ADDRESS_END - 1], [USER_ADDRESS_END - 1, 1]] {
@@ -178,6 +206,7 @@ pub(super) fn start(pid: u64) {
     require(selectors() == [0x2b, 0x2b] && bases() == [0, 0], 418);
     require(syscall(SYS_SLEEP, 2, 0, 0) == 0, 419);
     require(selectors() == [0x2b, 0x2b] && bases() == [0, 0], 420);
+    check_selector_preemption(console);
     set(fs, gs);
 
     // SAFETY: Loading null selectors into FS and GS is permitted at CPL 3, and AX
