@@ -669,6 +669,99 @@ function Assert-MirrorClock {
     }
 }
 
+function Assert-MirrorReset {
+    # Spec 0058a, closed-world over MIRROR_ACPI_RESET_* and MIRROR_RESET_*:
+    # QEMU's FADT reset register at discovery, the smoke policy check, and at
+    # most one restart, whose lines end the log. A smoke reset case (-Fault
+    # Reset*) restarts with cause=test; a capture types restart at the console.
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [bool]$Smoke,
+        [string]$FaultMode = 'None',
+        [bool]$WithoutKeyboard,
+        [bool]$WithoutHpet,
+        [bool]$ConsoleRestart
+    )
+
+    $first = switch ($FaultMode) {
+        'Reset' { 0 }
+        'ResetFromKbc' { 1 }
+        'ResetFromCf9' { 2 }
+        'ResetFromTripleFault' { 3 }
+        'ResetSuppressed' { 0 }
+        default { $null }
+    }
+    if (($null -ne $first -and -not $Smoke) -or ($ConsoleRestart -and ($Smoke -or $null -ne $first))) {
+        throw 'A reset fault needs a smoke kernel, and a console restart a trace or default one.'
+    }
+    # q35 describes ICH9's RST_CNT with 0x0F, revision 3 or later (test 4).
+    $expected = [System.Collections.Generic.List[string]]::new()
+    $expected.Add('MIRROR_ACPI_RESET_READY revision=([0-9]+) port=0xcf9 value=0xf')
+    if ($Smoke) { $expected.Add('MIRROR_RESET_POLICY_OK') }
+    $restarted = $ConsoleRestart -or $null -ne $first
+    if ($ConsoleRestart) {
+        $expected.Add('MIRROR_RESET_BEGIN cause=console')
+        $expected.Add('MIRROR_RESET_ATTEMPT method=fadt')
+    }
+    elseif ($null -ne $first) {
+        $expected.Add('MIRROR_RESET_BEGIN cause=test')
+        # Every write but a suppressed one resets QEMU, ending the log there.
+        $suppressed = $FaultMode -eq 'ResetSuppressed'
+        $clock = if ($WithoutHpet) { 'pit' } else { 'hpet' }
+        $methods = @(
+            @{ Name = 'fadt'; Writes = @('port=0xcf9 value=0xb', 'port=0xcf9 value=0xf') },
+            @{ Name = 'kbc'; Writes = @('port=0x64 value=0xfe') },
+            @{ Name = 'cf9'; Writes = @('port=0xcf9 value=0x2', 'port=0xcf9 value=0x6') }
+        )
+        $reset = $false
+        for ($index = 0; $index -lt $methods.Count -and -not $reset; $index++) {
+            $name = $methods[$index].Name
+            if ($index -lt $first) {
+                $expected.Add("MIRROR_RESET_SKIPPED method=$name reason=test_skip")
+            }
+            elseif ($name -eq 'kbc' -and $WithoutKeyboard) {
+                $expected.Add('MIRROR_RESET_SKIPPED method=kbc reason=absent')
+            }
+            else {
+                $expected.Add("MIRROR_RESET_ATTEMPT method=$name")
+                if (-not $suppressed) { $reset = $true }
+                else {
+                    foreach ($write in $methods[$index].Writes) {
+                        $expected.Add("MIRROR_RESET_SUPPRESSED method=$name $write")
+                    }
+                    $expected.Add("MIRROR_RESET_TIMEOUT method=$name elapsed_ms=([0-9]+) clock=$clock")
+                }
+            }
+        }
+        if (-not $reset) { $expected.Add('MIRROR_RESET_ATTEMPT method=triple_fault') }
+    }
+    $records = [regex]::Matches($Serial, '(?m)^MIRROR_(?:ACPI_RESET|RESET)_[^\r\n]*')
+    if ($records.Count -ne $expected.Count) {
+        throw "Mirror must print exactly $($expected.Count) reset line(s) ($($expected -join '; ')); it printed $($records.Count)."
+    }
+    for ($index = 0; $index -lt $expected.Count; $index++) {
+        $line = $records[$index].Value
+        $match = [regex]::Match($line, "^$($expected[$index])`$")
+        if (-not $match.Success) { throw "Reset line $($index + 1) must be '$($expected[$index])'; it is '$line'." }
+        if ($index -eq 0 -and [uint64]$match.Groups[1].Value -lt 2) {
+            throw "The FADT reset register needs revision 2 or later: '$line'."
+        }
+        if ($line.StartsWith('MIRROR_RESET_TIMEOUT ')) {
+            $elapsed = [uint64]$match.Groups[1].Value
+            if ($elapsed -lt 500 -or $elapsed -gt 750) {
+                throw "Each reset wait must last 500 to 750 ms; '$line'."
+            }
+        }
+    }
+    if ($restarted) {
+        # Nothing follows the method that restarted the machine.
+        $markers = [regex]::Matches($Serial, '(?m)^MIRROR_[^\r\n]*')
+        if ($markers[$markers.Count - 1].Index -ne $records[$records.Count - 1].Index) {
+            throw "The restart's last line must be the log's last marker; found '$($markers[$markers.Count - 1].Value)' after it."
+        }
+    }
+}
+
 function Assert-MirrorTimer {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,

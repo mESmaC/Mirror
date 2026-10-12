@@ -3,8 +3,10 @@
 //! Every status/data pair is routed by AUX, never by the IRQ that caused the
 //! drain. Device decoders own separate state and never call this module while
 //! borrowed. Initialization runs with both PIC input IRQs masked and IF clear;
-//! runtime commands, hotplug, ACPI discovery and output-port/A20 writes are absent.
-//! Every initialization wait is bounded by elapsed time (spec 0017b-D5).
+//! runtime commands, hotplug, ACPI discovery and output-port/A20 writes are
+//! absent, except the one reset-line pulse that the restart path sends through
+//! `reset_prepare` (spec 0058a, D4). Every wait is bounded by elapsed time
+//! (spec 0017b-D5).
 //!
 //! Protocol references (no implementation copied):
 //! https://github.com/qemu/qemu/blob/v10.1.0/hw/input/pckbd.c
@@ -15,7 +17,8 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::{arch, clock, keyboard, mouse, serial, timer, vmmouse};
+use crate::timer::{RESET_POLL_LIMIT, Stopwatch};
+use crate::{arch, keyboard, mouse, serial, vmmouse};
 
 const DATA: u16 = 0x60;
 const STATUS_COMMAND: u16 = 0x64;
@@ -28,7 +31,6 @@ const RECEIVE_ERROR: u8 = 0xc0;
 const POLL_LIMIT: usize = 80_000_000;
 const _: () = assert!(POLL_LIMIT as u64 * 50 >= Wait::Bat.budget_ms() * NANOS_PER_MS);
 const NANOS_PER_MS: u64 = 1_000_000;
-const NANOS_PER_SECOND: u128 = 1_000_000_000;
 const INIT_DRAIN_LIMIT: usize = 256;
 const DRAIN_LIMIT: usize = 32;
 const RESEND_LIMIT: usize = 3;
@@ -87,54 +89,6 @@ impl Source {
     }
 }
 
-/// Elapsed time since initialization began (spec 0017b-D5). Init runs with IF
-/// clear, so delivered ticks never advance: use the HPET clock when it is
-/// published, else poll PIT channel 0 and sum its deltas. Every wait samples
-/// once per status read, far more often than the PIT's 10 ms period; a wrap
-/// missed while the VM is descheduled can only lengthen a wait.
-enum InitClock {
-    Hpet { origin_ns: u64 },
-    Pit { last: u16, ticks: u64 },
-}
-
-impl InitClock {
-    fn start() -> Self {
-        match clock::snapshot() {
-            Some(now) => Self::Hpet {
-                origin_ns: now.monotonic_ns,
-            },
-            None => Self::Pit {
-                last: timer::pit_counter(),
-                ticks: 0,
-            },
-        }
-    }
-
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Hpet { .. } => "hpet",
-            Self::Pit { .. } => "pit",
-        }
-    }
-
-    fn elapsed_ns(&mut self) -> u64 {
-        match self {
-            Self::Hpet { origin_ns } => clock::snapshot()
-                .expect("published HPET clock")
-                .monotonic_ns
-                .saturating_sub(*origin_ns),
-            Self::Pit { last, ticks } => {
-                let current = timer::pit_counter();
-                *ticks = ticks.saturating_add(u64::from(timer::pit_elapsed(*last, current)));
-                *last = current;
-                let nanoseconds =
-                    u128::from(*ticks) * NANOS_PER_SECOND / u128::from(timer::PIT_INPUT_HZ);
-                u64::try_from(nanoseconds).unwrap_or(u64::MAX)
-            }
-        }
-    }
-}
-
 /// One kind of bounded init wait, with its Linux budget (spec 0017b-D5): the
 /// i8042 controller's IBF/OBF timeout, and libps2's ACK, reset ACK, response
 /// and reset BAT waits.
@@ -178,24 +132,24 @@ struct Deadline {
 }
 
 impl Deadline {
-    fn start(clock: &mut InitClock, wait: Wait) -> Self {
+    fn start(clock: &mut Stopwatch, wait: Wait) -> Self {
         Self {
             wait,
             start_ns: clock.elapsed_ns(),
         }
     }
 
-    fn waited_ns(self, clock: &mut InitClock) -> u64 {
+    fn waited_ns(self, clock: &mut Stopwatch) -> u64 {
         clock.elapsed_ns().saturating_sub(self.start_ns)
     }
 
-    fn expired(self, clock: &mut InitClock) -> bool {
+    fn expired(self, clock: &mut Stopwatch) -> bool {
         self.waited_ns(clock) >= self.wait.budget_ms() * NANOS_PER_MS
     }
 
     /// Report this wait's own duration before the device's SKIPPED line. It is
     /// a content-free device marker, so every build flavor prints it.
-    fn timed_out(self, clock: &mut InitClock, error: Ps2Error) -> Ps2Error {
+    fn timed_out(self, clock: &mut Stopwatch, error: Ps2Error) -> Ps2Error {
         serial::println!(
             "MIRROR_PS2_TIMEOUT wait={} elapsed_ms={} clock={}",
             self.wait.name(),
@@ -380,7 +334,7 @@ pub fn init() -> InitResult {
             return InitResult::failed(Ps2Error::AlreadyInitialized);
         }
         state.attempted = true;
-        let mut clock = InitClock::start();
+        let mut clock = Stopwatch::start();
         let mut quiet_config = None;
         let result = match initialize(state, &mut clock, &mut quiet_config) {
             Ok(result) => result,
@@ -418,7 +372,7 @@ fn configuration(original: u8, keyboard: bool, mouse: bool, irqs: bool) -> u8 {
 
 fn initialize(
     state: &mut State,
-    clock: &mut InitClock,
+    clock: &mut Stopwatch,
     quiet_config: &mut Option<u8>,
 ) -> Result<InitResult, Ps2Error> {
     command(clock, 0xad)?;
@@ -480,7 +434,7 @@ fn initialize(
     Ok(InitResult { keyboard, mouse })
 }
 
-fn prepare_keyboard(state: &State, clock: &mut InitClock, quiet: u8) -> Result<(), Ps2Error> {
+fn prepare_keyboard(state: &State, clock: &mut Stopwatch, quiet: u8) -> Result<(), Ps2Error> {
     command(clock, 0xab)?;
     if read_reply(state, clock, Source::Keyboard, Wait::Controller)? != 0 {
         return Err(Ps2Error::KeyboardPortTest);
@@ -519,7 +473,7 @@ fn prepare_keyboard(state: &State, clock: &mut InitClock, quiet: u8) -> Result<(
 
 fn prepare_mouse(
     state: &State,
-    clock: &mut InitClock,
+    clock: &mut Stopwatch,
     quiet: u8,
     keyboard: bool,
 ) -> Result<(), Ps2Error> {
@@ -559,7 +513,7 @@ fn data() -> u8 {
     unsafe { arch::in8(DATA) }
 }
 
-fn wait_input_empty(clock: &mut InitClock) -> Result<(), Ps2Error> {
+fn wait_input_empty(clock: &mut Stopwatch) -> Result<(), Ps2Error> {
     let deadline = Deadline::start(clock, Wait::Controller);
     for _ in 0..POLL_LIMIT {
         let expired = deadline.expired(clock);
@@ -578,18 +532,85 @@ fn wait_input_empty(clock: &mut InitClock) -> Result<(), Ps2Error> {
     Err(deadline.timed_out(clock, Ps2Error::InputTimeout))
 }
 
-fn command(clock: &mut InitClock, value: u8) -> Result<(), Ps2Error> {
+fn command(clock: &mut Stopwatch, value: u8) -> Result<(), Ps2Error> {
     wait_input_empty(clock)?;
     // SAFETY: Exclusively owned command port and an empty input buffer.
     unsafe { arch::out8(STATUS_COMMAND, value) };
     Ok(())
 }
 
-fn write_data(clock: &mut InitClock, value: u8) -> Result<(), Ps2Error> {
+fn write_data(clock: &mut Stopwatch, value: u8) -> Result<(), Ps2Error> {
     wait_input_empty(clock)?;
     // SAFETY: Exclusively owned data port and an empty input buffer.
     unsafe { arch::out8(DATA, value) };
     Ok(())
+}
+
+/// The 8042 command that pulses output-port bit 0, the CPU reset line.
+const PULSE_RESET_LINE: u8 = 0xfe;
+const _: () = assert!(
+    PULSE_RESET_LINE == mirror_acpi::KBC_RESET_PULSE
+        && STATUS_COMMAND == mirror_acpi::KBC_COMMAND_PORT
+);
+
+/// Why the restart path skips the 8042 pulse (spec 0058a, D4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResetSkip {
+    /// The status port reads 0xFF: no controller decodes it (`-NoKeyboard`).
+    Absent,
+    /// The input buffer stayed full for the whole controller budget.
+    Busy,
+}
+
+/// Proof that the controller's input buffer was empty, which the one reset
+/// pulse needs. Dropping it writes nothing.
+pub(crate) struct ResetPulse {
+    _empty: (),
+}
+
+impl ResetPulse {
+    /// Write the pulse command once. If the machine survives, the restart
+    /// path's own timed wait follows.
+    pub(crate) fn pulse(self) {
+        // SAFETY: This module owns port 0x64. `reset_prepare` observed an empty
+        // input buffer on the BSP with IF clear, and the restart path that
+        // holds this token never returns to input handling.
+        unsafe { arch::out8(STATUS_COMMAND, PULSE_RESET_LINE) };
+    }
+}
+
+/// D4's choice as a pure function of one status read and the time waited so
+/// far: `None` keeps waiting. An absent controller and an empty buffer are
+/// decided by the read itself, so the read after an expired sample still
+/// accepts a buffer that emptied in time.
+pub(crate) fn reset_choice(status: u8, waited_ms: u64) -> Option<Result<(), ResetSkip>> {
+    if status == 0xff {
+        Some(Err(ResetSkip::Absent))
+    } else if status & INPUT_FULL == 0 {
+        Some(Ok(()))
+    } else if waited_ms >= Wait::Controller.budget_ms() {
+        Some(Err(ResetSkip::Busy))
+    } else {
+        None
+    }
+}
+
+/// Wait up to the controller budget (500 ms, 0017b-D5) for the input buffer
+/// to empty, then hand out the single pulse. Prints nothing: the restart path
+/// reports the outcome. The shared poll limit ends a wait whose stopwatch
+/// stalls, as `busy`. Call only from the restart path, on the BSP, IF clear.
+pub(crate) fn reset_prepare(stopwatch: &mut Stopwatch) -> Result<ResetPulse, ResetSkip> {
+    assert!(!arch::interrupts_enabled(), "reset pulse requires IF clear");
+    let start_ns = stopwatch.elapsed_ns();
+    for _ in 0..RESET_POLL_LIMIT {
+        let waited_ms = stopwatch.elapsed_ns().saturating_sub(start_ns) / NANOS_PER_MS;
+        match reset_choice(status(), waited_ms) {
+            Some(Ok(())) => return Ok(ResetPulse { _empty: () }),
+            Some(Err(skip)) => return Err(skip),
+            None => core::hint::spin_loop(),
+        }
+    }
+    Err(ResetSkip::Busy)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -619,7 +640,7 @@ fn classify_response(expected: Source, status: u8, byte: u8) -> Result<Response,
 /// can share. Bytes from the other source go to its decoder, if active.
 fn read_response(
     state: &State,
-    clock: &mut InitClock,
+    clock: &mut Stopwatch,
     expected: Source,
     deadline: Deadline,
 ) -> Result<u8, Ps2Error> {
@@ -652,7 +673,7 @@ fn read_response(
 /// One reply with its own deadline.
 fn read_reply(
     state: &State,
-    clock: &mut InitClock,
+    clock: &mut Stopwatch,
     expected: Source,
     wait: Wait,
 ) -> Result<u8, Ps2Error> {
@@ -662,7 +683,7 @@ fn read_reply(
 
 /// The mouse's reset result. Smoke fault Ps2BatTimeout (spec 0017b) reads and
 /// drops every mouse byte during this wait only, so it ends at its deadline.
-fn read_bat(state: &State, clock: &mut InitClock) -> Result<u8, Ps2Error> {
+fn read_bat(state: &State, clock: &mut Stopwatch) -> Result<u8, Ps2Error> {
     let deadline = Deadline::start(clock, Wait::Bat);
     #[cfg(feature = "boot-smoke")]
     if matches!(
@@ -700,17 +721,17 @@ fn drain_initial_output() -> Result<(), Ps2Error> {
     }
 }
 
-fn read_config(state: &State, clock: &mut InitClock) -> Result<u8, Ps2Error> {
+fn read_config(state: &State, clock: &mut Stopwatch) -> Result<u8, Ps2Error> {
     command(clock, 0x20)?;
     read_reply(state, clock, Source::Keyboard, Wait::Controller)
 }
 
-fn write_config(clock: &mut InitClock, config: u8) -> Result<(), Ps2Error> {
+fn write_config(clock: &mut Stopwatch, config: u8) -> Result<(), Ps2Error> {
     command(clock, 0x60)?;
     write_data(clock, config)
 }
 
-fn verify_config(state: &State, clock: &mut InitClock, expected: u8) -> Result<(), Ps2Error> {
+fn verify_config(state: &State, clock: &mut Stopwatch, expected: u8) -> Result<(), Ps2Error> {
     if read_config(state, clock)? & 0x73 != expected & 0x73 {
         return Err(Ps2Error::Configuration);
     }
@@ -719,7 +740,7 @@ fn verify_config(state: &State, clock: &mut InitClock, expected: u8) -> Result<(
 
 fn device_command(
     state: &State,
-    clock: &mut InitClock,
+    clock: &mut Stopwatch,
     target: Source,
     value: u8,
 ) -> Result<(), Ps2Error> {
@@ -728,7 +749,7 @@ fn device_command(
 
 fn send_device(
     state: &State,
-    clock: &mut InitClock,
+    clock: &mut Stopwatch,
     target: Source,
     value: u8,
     ack: Wait,

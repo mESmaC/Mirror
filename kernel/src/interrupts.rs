@@ -231,6 +231,21 @@ pub(crate) fn is_initialized() -> bool {
     INITIALIZED.load(Ordering::SeqCst)
 }
 
+/// The restart path's last method (spec 0058a, D6): load an IDT whose limit
+/// leaves no gate for any vector, then raise #BP. Its delivery raises #GP,
+/// whose delivery raises #DF, whose delivery shuts the processor down; a PC
+/// platform resets on that shutdown. No NMI or interrupt can be delivered
+/// either. The halt loop is the backstop if the platform ignores shutdown.
+pub(crate) fn trigger_triple_fault() -> ! {
+    arch::disable_interrupts();
+    let empty = DescriptorPointer { limit: 0, base: 0 };
+    // SAFETY: CPL0, IF clear. Only the restart path calls this, and it never
+    // returns: after this LIDT nothing on this CPU uses the real IDT again,
+    // and INT3 cannot be delivered, so execution ends in a triple fault.
+    unsafe { asm!("lidt [{idtr}]", "int3", idtr = in(reg) &raw const empty) };
+    arch::halt()
+}
+
 /// Report the TLS execution contract after fpu::init disabled FSGSBASE. Only
 /// the syscall ABI may install arbitrary bases; selector loads remain legal.
 pub(crate) fn tls_ready() {

@@ -31,6 +31,7 @@ mod paging;
 mod pci;
 mod pointer;
 mod ps2;
+mod reset;
 mod serial;
 mod smp;
 mod stacks;
@@ -192,6 +193,7 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
         frame_stats.recycled_frames + frame_stats.never_allocated_frames
     );
     let discovered = acpi::discover(&boot, &mut tables, &mut frames);
+    reset::init(discovered.reset);
     let topology = discovered.topology;
     apic::init(topology.as_ref(), &boot, &mut tables, &mut frames);
     clock::init(
@@ -260,6 +262,7 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
         input::self_test();
         pointer::self_test();
         console::self_test();
+        reset::policy_self_test();
         assert!(devices.functions > 0, "no PCI devices discovered");
         assert!(
             devices.virtio_block_devices > 0,
@@ -457,6 +460,9 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
             | boot::SmokeMode::SmpTlbTimeout => {
                 interrupts::arm_expected_page_fault(paging::TEST_ADDRESS)
             }
+            // Every self-test has run; restart instead of the expected #PF
+            // (spec 0058a, D11). QEMU's -no-reboot ends the boot.
+            boot::SmokeMode::Reset(_) => reset::restart(reset::Cause::Test),
             boot::SmokeMode::PageFault => {
                 serial::println!("MIRROR_TEST_EXPECT_FATAL vector=14");
             }
@@ -680,6 +686,11 @@ fn run_console(
                 }
             }
             arch::disable_interrupts();
+            // Input after `restart` stays queued: redraw, then restart.
+            if console.restart_requested() {
+                full_batch = false;
+                break;
+            }
         }
         if dirty || pointer_changed {
             // Rendering must not hold off IRQ delivery for a whole frame.
@@ -725,6 +736,12 @@ fn run_console(
                 buttons,
                 mouse::irq_count()
             );
+        }
+        // The redraw above showed "Restarting." (spec 0058a, D9). The shell
+        // and its apps have exited and released their memory, the device
+        // probes have quiesced their DMA, and the APs only idle (D10).
+        if console.restart_requested() {
+            reset::restart(reset::Cause::Console);
         }
         if dirty || pointer_changed || full_batch {
             continue;

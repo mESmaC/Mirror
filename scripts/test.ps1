@@ -25,6 +25,8 @@ function Assert-MirrorKernelImage {
     )
     # Spec 0010, acceptance test 4: a byte search of the staged kernel. Latin-1
     # maps every byte to one character, so an ordinal search is a byte search.
+    $resetRequired = @('MIRROR_ACPI_RESET_READY revision=', 'MIRROR_ACPI_RESET_SKIPPED reason=', 'MIRROR_RESET_BEGIN cause=', 'MIRROR_RESET_SKIPPED method=', 'MIRROR_RESET_ATTEMPT method=', 'MIRROR_RESET_TIMEOUT method=')
+    $resetForbidden = @('test_skip', 'MIRROR_RESET_POLICY_OK', 'MIRROR_RESET_SUPPRESSED')
     $image = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes((Join-Path $repositoryRoot 'build/esp/kernel.elf')))
     if ($Flavor -eq 'Default') {
         # MIRROR_PERF_ strings (spec 0019) are allowed under 0010-D4's exception.
@@ -33,12 +35,15 @@ function Assert-MirrorKernelImage {
         # #MC IST stacks (specs 0016a, 0016b). Every flavor reports PS/2 init
         # and its timeouts; only smoke kernels inject PS/2 faults (spec 0017b).
         # Every flavor reports its process and thread tables (spec 0030a).
-        $required = @('MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=')
-        $forbidden = @('MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_TRACE_ON', 'MIRROR_CONSOLE_COMMAND operation=', 'MIRROR_POINTER_UPDATED', 'MIRROR_POINTER_CLICK', 'MIRROR_SHELL_FRAME', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'Mirror shell: ready', 'MIRROR_USERSPACE_OK', 'Mirror init: VM checks passed', 'fixture data mismatch', 'unexpected budget exhaustion', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK')
+        # Every flavor reports the FADT reset register and each restart step,
+        # failures included, which no default or trace run prints; only smoke
+        # kernels test the policy, skip methods or suppress writes (0058a).
+        $required = @('MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=') + $resetRequired
+        $forbidden = @('MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_TRACE_ON', 'MIRROR_CONSOLE_COMMAND operation=', 'MIRROR_POINTER_UPDATED', 'MIRROR_POINTER_CLICK', 'MIRROR_SHELL_FRAME', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'Mirror shell: ready', 'MIRROR_USERSPACE_OK', 'Mirror init: VM checks passed', 'fixture data mismatch', 'unexpected budget exhaustion', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK') + $resetForbidden
     }
     else {
-        $required = @('MIRROR_TRACE_ON', 'MIRROR_SHELL_FRAME', 'MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=')
-        $forbidden = @('MIRROR_USERSPACE_OK', 'fixture data mismatch', 'MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK')
+        $required = @('MIRROR_TRACE_ON', 'MIRROR_SHELL_FRAME', 'MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=') + $resetRequired
+        $forbidden = @('MIRROR_USERSPACE_OK', 'fixture data mismatch', 'MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK') + $resetForbidden
     }
     foreach ($text in $required) {
         if ($image.IndexOf($text, [StringComparison]::Ordinal) -lt 0) {
@@ -218,6 +223,20 @@ try {
         Save-MirrorSmokeLogs "$profile-NoTestDisk"
         & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -NoKeyboard -Release:$release -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
         Save-MirrorSmokeLogs "$profile-NoKeyboard"
+        # Restart after every self-test (spec 0058a, test 4): from each method
+        # in turn, past an absent 8042, and with every write suppressed, timed
+        # on HPET and on the PIT. -no-reboot turns the reset into QEMU's exit.
+        foreach ($case in @(
+                @{ Name = 'Reset'; Fault = 'Reset'; NoKeyboard = $false; NoHpet = $false },
+                @{ Name = 'ResetFromKbc'; Fault = 'ResetFromKbc'; NoKeyboard = $false; NoHpet = $false },
+                @{ Name = 'ResetFromKbc-NoKeyboard'; Fault = 'ResetFromKbc'; NoKeyboard = $true; NoHpet = $false },
+                @{ Name = 'ResetFromCf9'; Fault = 'ResetFromCf9'; NoKeyboard = $false; NoHpet = $false },
+                @{ Name = 'ResetFromTripleFault'; Fault = 'ResetFromTripleFault'; NoKeyboard = $false; NoHpet = $false },
+                @{ Name = 'ResetSuppressed'; Fault = 'ResetSuppressed'; NoKeyboard = $false; NoHpet = $false },
+                @{ Name = 'ResetSuppressed-NoHpet'; Fault = 'ResetSuppressed'; NoKeyboard = $false; NoHpet = $true })) {
+            & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -NoKeyboard:$case.NoKeyboard -NoHpet:$case.NoHpet -Fault $case.Fault -Release:$release -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+            Save-MirrorSmokeLogs "$profile-$($case.Name)"
+        }
         if ((Get-FileHash -LiteralPath $diskImage -Algorithm SHA256).Hash -ne $diskImageHash) {
             throw "The $profile smoke cases changed build/mirror.img."
         }

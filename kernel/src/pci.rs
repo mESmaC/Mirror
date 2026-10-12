@@ -1,7 +1,8 @@
 //! Bounded PCI discovery, Virtio/AHCI/xHCI claims through mechanism 1.
 //!
 //! One BSP owns CF8/CFC; each address/data transaction preserves the caller's
-//! interrupt state. Only firmware-configured segment 0 is visible. No ECAM,
+//! interrupt state. Port 0xCF9, the reset control register between them, is
+//! `reset.rs`'s alone (spec 0058a, D5); this module never accesses it. Only firmware-configured segment 0 is visible. No ECAM,
 //! extended configuration, ARI, hotplug synchronization, BAR sizing, resource
 //! assignment, or IRQ routing. Discovery never writes device configuration.
 //! A claimed function permits only 16-bit command changes; its
