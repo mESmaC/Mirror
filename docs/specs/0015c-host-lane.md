@@ -22,13 +22,13 @@ Other-OS downloads, setup and benchmarks remain deferred until Cameron requests 
 
 ## Verified starting point
 
-Source and oracle behavior below was checked at merged main `838c3b6`. Unmerged diagnostic and decision-documentation evidence is identified separately:
+Source and oracle behavior below was checked at merged main `838c3b6`. The later diagnostic, decision and team-lock documentation is merged at `1789c59`:
 
 - `package.ps1` copies a default image without provenance. `Assert-MirrorKernelImage` scans the staged ELF, not an older package. [0015a](0015a-disk-image.md) asks whether VMware preserves the descriptor after boot; the inspected completion notes do not record that result.
-- The existing lock is `C:\Users\engin\Desktop\Mirror-locks\qemu`, with human-readable nick/task/worktree/start-time ownership (`838c3b6:AGENTS.md:39`; live `xros_chat/MIRROR-TEAM.md:75`, updated 2026-10-12 with the owner's `released=` fallback). It survives process exit; apparent staleness never authorizes takeover.
+- The existing lane lock path is `C:\Users\engin\Desktop\Mirror-locks\qemu`, with human-readable nick/task/worktree/start-time ownership (`1789c59:AGENTS.md:38`). The team rule also provides a `qemu2` slot. A lock survives process exit; apparent staleness never authorizes takeover. Under the current manual rule, only Claude reclaims an owner-released folder and posts `lock free`; other agents wait. VMR-D6's identity-checked tooling replaces that manual procedure only when implemented, with the matching P9 documentation update.
 - `bbc88e4` preserves **unreviewed WIP** RFB/frame primitives and a library in `tools/perf-probe`, with synthetic tests and no VMware capture validation. [0018-D10](0018-performance-baseline-harness.md) assigns RFB to this workspace; its benchmark CLI's 1920x1080 rule is separate.
 
-The source/guest evidence and D19 documentation prerequisite are recorded in [0015d's verified starting point](0015d-vmware-cases.md#verified-starting-point). Those runtime facts are not claimed by host tests.
+The source/guest evidence and merged D19 documentation are recorded in [0015d's verified starting point](0015d-vmware-cases.md#verified-starting-point). Those runtime facts are not claimed by host tests.
 
 ## Decisions
 
@@ -139,7 +139,7 @@ No new third-party crates/test framework. Existing pinned Rust 1.99.0/std, MSVC/
 
 ## Open prerequisites and handoff
 
-- Claude owns the confirmation ledger/map update; use its merged record and record the eventual merged D19 documentation revision before implementation. Cameron's D10/D11 confirmations authorize their VM work; this structural split adds no further authorization. Coordinate each operation with Claude under the shared machine lock as 0015d requires.
+- The confirmation ledger/map and D19 documentation are merged at `1789c59`; Claude owns their updates. Cameron's D10/D11 confirmations authorize their VM work; this structural split adds no further authorization. Coordinate each operation with Claude under the shared machine lock as 0015d requires.
 
 - [0015d](0015d-vmware-cases.md) owns D10/D11 and all external VMware facts. A failed fact returns for a reviewed choice; never weaken this host contract or silently fall back. The actual adapter and VM recovery stay disabled together pending that evidence.
 

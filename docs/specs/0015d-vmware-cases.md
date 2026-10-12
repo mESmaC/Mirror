@@ -22,12 +22,12 @@ The shared controllers, packaging, journals, lock protocol and recovery algorith
 
 ## Verified starting point
 
-Source and oracle behavior below was checked at merged main `838c3b6`. Unmerged diagnostic and decision-documentation evidence is identified separately:
+Source and oracle behavior below was checked at merged main `838c3b6`. The later diagnostic and decision documentation is merged at `1789c59`:
 
 - [vm-settings](../vm-settings.md) records Workstation Pro 26.0.1 build 25688693, hardware 22, UEFI, ULM and 1024x768. [0013](0013-firmware-and-pci-tolerance.md) records successful 1/4-vCPU boots, not resume; its 42 functions/34 bridges are observations, with the bridge count explicitly informational.
 - Merged 0017b ends at `14cb7b2`, with completion notes at `6d50e7d`; `ps2::prepare_keyboard` accepts `0x02 | 0x41` (`838c3b6:kernel/src/ps2.rs:483-516`). Merged 0017c ends at `3c87bcb`, with notes at `a803e9a`. Guest packages require both code tips as ancestors.
 - Installed help read on 2026-10-12 reports `vmrun` 1.17.0.25688693 and start/stop/suspend syntax. Help proves neither reliable power-state detection nor live serial, resume, recovery or disk-preservation behavior.
-- Claude's 2026-10-12 diagnostic, recorded in `0017c-absolute-pointing.md` at the unmerged `claude/0017c-restrict-backdoor` commit `358d170`, found that the first VNC move after power-on delivered no AUX byte and queued no packet; the second delivered only its own packet. That branch also records Cameron's confirmed 0017-D19. Its eventual merged documentation revision must be recorded before lane implementation; `358d170` is evidence, not a merged package capability. This draft claims no new runtime result.
+- Claude's 2026-10-12 diagnostic, recorded in merged `1789c59:docs/specs/0017c-absolute-pointing.md:11`, found that the first VNC move after power-on delivered no AUX byte and queued no packet; the second delivered only its own packet. The same file at line 37 records Cameron's confirmed 0017-D19, including the unverified CPL3-enforcement caveat under ULM. This documentation is evidence, not a package capability. This draft claims no new runtime result.
 
 Packaging, existing team-lock and unreviewed `tools/perf-probe` WIP evidence are recorded in [0015c](0015c-host-lane.md#verified-starting-point).
 
@@ -138,7 +138,7 @@ No new third-party crates/test framework. Existing pinned Rust 1.99.0/std, MSVC/
 
 ## Open prerequisites
 
-- Claude owns the ledger/map confirmation record. Record the eventual merged D19 documentation revision before lane implementation; do not treat unmerged diagnostic evidence as a package capability.
+- Claude owns the ledger/map confirmation record, merged with the D19 documentation at `1789c59`. The diagnostic note remains evidence rather than a package capability.
 
 - D11 must settle pending-operation completion/job membership, state/listener identity, serial epochs, repeated RFB requests, vmmouse stability, artifact preservation and both PowerOff paths. A failed fact returns for a choice, not a silent fallback. Coordinate the confirmed D10/D11 work separately with Claude under the team run lock; this spec records no completed experiment.
 
