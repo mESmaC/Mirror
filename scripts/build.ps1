@@ -72,7 +72,9 @@ try {
         throw "Cached Limine archive checksum mismatch: $archivePath"
     }
     # Re-extract the verified archive so a modified cached EFI file is not trusted.
-    $extractedDirectory = Join-Path $limineDirectory 'extracted'
+    # Extract into this checkout's build folder: .tools is shared across
+    # worktrees, and two builds at once must not write the same files.
+    $extractedDirectory = Join-Path $repositoryRoot 'build/limine-extracted'
     Expand-Archive -LiteralPath $archivePath -DestinationPath $extractedDirectory -Force
     $bootFiles = @(Get-ChildItem -LiteralPath $extractedDirectory -Recurse -File -Filter 'BOOTX64.EFI')
     if ($bootFiles.Count -ne 1) {
