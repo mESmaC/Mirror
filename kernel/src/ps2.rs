@@ -486,13 +486,23 @@ fn prepare_keyboard(state: &State, clock: &mut InitClock, quiet: u8) -> Result<(
     }
     let config = configuration(quiet, true, false, false);
     write_config(clock, config)?;
-    verify_config(state, clock, config)?;
+    // Stop scanning before the config readback (spec 0017b). A keyboard that
+    // firmware left scanning can buffer a scancode at boot, and the readback
+    // would take it as the config byte: replies share the keyboard source tag.
+    // F5's ACK wait discards up to 32 such bytes first.
     device_command(state, clock, Source::Keyboard, 0xf5)?;
+    verify_config(state, clock, config)?;
     device_command(state, clock, Source::Keyboard, 0xf0)?;
     device_command(state, clock, Source::Keyboard, 0x02)?;
     device_command(state, clock, Source::Keyboard, 0xf0)?;
     device_command(state, clock, Source::Keyboard, 0x00)?;
-    if read_reply(state, clock, Source::Keyboard, Wait::Response)? != 2 {
+    // Set 2 reads back as 0x02, or as 0x41, its translated form, which VMware
+    // returns even with translation off while it sends raw Set 2 scancodes
+    // (0017b-D9, amended 2026-10-11). Any other reply is a wrong set.
+    if !matches!(
+        read_reply(state, clock, Source::Keyboard, Wait::Response)?,
+        0x02 | 0x41
+    ) {
         return Err(Ps2Error::WrongScanSet);
     }
     Ok(())
