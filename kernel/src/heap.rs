@@ -542,6 +542,61 @@ fn clear_shortfall() {
     unsafe { *ALLOCATOR.shortfall.get() = (0, 0) };
 }
 
+// ---- Boot-smoke test hooks (0059's tests 2 and 5) ----
+
+/// Arms the held-memory step: the relaunch pair's first loop top holds the
+/// heap near-full, so its next loop-top ensure grows mid-session (test 2).
+#[cfg(feature = "boot-smoke")]
+static HOLD_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Arms the hold for the next pair session (called by run_init between the
+/// pairs).
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn arm_hold_across_session() {
+    HOLD_ARMED.store(true, Ordering::Relaxed);
+}
+
+/// Test 5's injection arming: 1 = cancel before commit, N >= 2 = fail after
+/// N - 2 frames (consumed once by the next ensure's growth).
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn arm_ensure_inject(value: u64) {
+    ENSURE_INJECT.store(value, Ordering::Relaxed);
+}
+
+/// How many growths ran under the injection (0059 test 5 asserts it).
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn ensure_injected() -> u64 {
+    ENSURE_INJECTED.load(Ordering::Relaxed)
+}
+
+/// Begin the hold, if armed: hold all but 128 KiB of the free heap, so the
+/// largest free block falls below the 256 KiB mark and the next loop-top
+/// ensure grows exactly one step (256 pages). Returns the block to hold across
+/// the session, or None when not armed.
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn test_hold_begin() -> Option<(*mut u8, Layout)> {
+    if !HOLD_ARMED.swap(false, Ordering::Relaxed) {
+        return None;
+    }
+    let free = stats().free;
+    let size = free - 128 * 1024;
+    let layout = Layout::from_size_align(size, PAGE_SIZE as usize).expect("hold layout");
+    // SAFETY: a valid bounded layout on the live heap; null is checked.
+    let pointer = unsafe { ALLOCATOR.alloc(layout) };
+    assert!(!pointer.is_null(), "the hold block must fit the free heap");
+    Some((pointer, layout))
+}
+
+/// Free the held block at the session's drain, before its frame check.
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn test_hold_end(held: Option<(*mut u8, Layout)>) {
+    let Some((pointer, layout)) = held else {
+        return;
+    };
+    // SAFETY: the block is live, owned, and freed once with its exact layout.
+    unsafe { ALLOCATOR.dealloc(pointer, layout) };
+}
+
 /// Grow the heap on demand at a safe point (0059-D1), while the largest free
 /// block is below the mark or a feasible recorded shortfall still misses.
 ///
@@ -1089,13 +1144,73 @@ pub unsafe fn capacity_self_test(
     frames: &mut FrameAllocator<'_>,
     offset: u64,
 ) {
-    let before = stats();
-    assert_eq!(before.used, 0, "heap limit test requires an empty heap");
-    assert!(before.size > 0 && before.size <= HEAP_MAX_SIZE);
-    let frame_baseline = frames
+    let start = stats();
+    assert_eq!(start.used, 0, "heap limit test requires an empty heap");
+    assert!(start.size > 0 && start.size <= HEAP_MAX_SIZE);
+    let frame_start = frames
         .stats()
         .expect("heap limit frame accounting")
         .allocated_frames;
+
+    // 0059 test 2, part 1 (the test-only safe point): an allocation one page
+    // over the heap's size misses (alloc never grows), records the shortfall,
+    // and this direct ensure grows exactly one step so the retry succeeds.
+    // Frames rise by exactly the grown pages and nothing else (heap.rs:607-610's
+    // pattern).
+    let request =
+        Layout::from_size_align(start.size + PAGE_SIZE as usize, PAGE_SIZE as usize).unwrap();
+    // SAFETY: a valid bounded layout, one page over the heap's size.
+    let block = unsafe { ALLOCATOR.alloc(request) };
+    assert!(
+        block.is_null(),
+        "an allocation over the heap's size must miss"
+    );
+    assert_eq!(ensure(tables, frames, offset), Ensure::Grew);
+    // SAFETY: the shortfall was feasible under the cap, and one step suffices.
+    let block = unsafe { ALLOCATOR.alloc(request) };
+    assert!(
+        !block.is_null(),
+        "the shortfall must be served after one step"
+    );
+    assert_eq!(
+        frames.stats().unwrap().allocated_frames,
+        frame_start + MAX_GROW_PAGES
+    );
+    assert_eq!(
+        stats().size,
+        start.size + MAX_GROW_PAGES * PAGE_SIZE as usize
+    );
+    // SAFETY: free the block once with its exact layout.
+    unsafe { ALLOCATOR.dealloc(block, request) };
+
+    // 0059 test 5: with the largest block held below the mark, the injected
+    // FailFramesAfter and CancelBeforeCommit modes reach ensure through the
+    // static; each stops the safe point with stats and frames unchanged and
+    // the tail unmapped, neither prints nor arms the back-off, and the counter
+    // asserts both attempts ran (a skipped attempt fails).
+    let hold_size = stats().free - 128 * 1024;
+    let hold_layout = Layout::from_size_align(hold_size, PAGE_SIZE as usize).unwrap();
+    // SAFETY: a valid bounded layout sized to the free heap.
+    let hold = unsafe { ALLOCATOR.alloc(hold_layout) };
+    assert!(!hold.is_null(), "the injection workload must fit");
+    let before_inject = stats();
+    let frames_before_inject = frames.stats().unwrap().allocated_frames;
+    arm_ensure_inject(2); // fail after 0 frames
+    assert_eq!(ensure(tables, frames, offset), Ensure::Deferred);
+    arm_ensure_inject(1); // cancel before commit
+    assert_eq!(ensure(tables, frames, offset), Ensure::Deferred);
+    assert_eq!(ensure_injected(), 2, "an injected attempt was skipped");
+    assert_eq!(stats(), before_inject);
+    assert_eq!(
+        frames.stats().unwrap().allocated_frames,
+        frames_before_inject
+    );
+    assert_heap_guards(tables, before_inject.size);
+    // SAFETY: free the workload once with its exact layout.
+    unsafe { ALLOCATOR.dealloc(hold, hold_layout) };
+
+    let before = stats();
+    let frame_baseline = frames.stats().unwrap().allocated_frames;
     let mut current = before;
     while current.size < HEAP_MAX_SIZE {
         let pages = ((HEAP_MAX_SIZE - current.size) / PAGE_SIZE as usize).min(MAX_GROW_PAGES);
@@ -1122,6 +1237,21 @@ pub unsafe fn capacity_self_test(
     assert_eq!(stats(), full);
     assert_eq!(frames.stats().unwrap().allocated_frames, full_frames);
     assert_heap_guards(tables, HEAP_MAX_SIZE);
+
+    // 0059 test 2's record (0059-D4): at the cap with the largest free block
+    // held below the mark, this test-only safe point reports AtCap, and this
+    // test prints the one accepted SKIPPED record per boot-smoke boot.
+    let hold_size = HEAP_MAX_SIZE - 128 * 1024;
+    let hold_layout = Layout::from_size_align(hold_size, PAGE_SIZE as usize).unwrap();
+    // SAFETY: a valid bounded layout sized to the full heap.
+    let hold = unsafe { ALLOCATOR.alloc(hold_layout) };
+    assert!(!hold.is_null(), "the near-full hold must fit at the cap");
+    assert_eq!(ensure(tables, frames, offset), Ensure::AtCap);
+    crate::serial::println!("MIRROR_HEAP_GROW_SKIPPED phase=auto reason=LimitExceeded");
+    assert_eq!(stats().size, HEAP_MAX_SIZE);
+    assert_eq!(frames.stats().unwrap().allocated_frames, full_frames);
+    // SAFETY: free the hold once with its exact layout.
+    unsafe { ALLOCATOR.dealloc(hold, hold_layout) };
 
     let layout = Layout::from_size_align(HEAP_MAX_SIZE, PAGE_SIZE as usize).unwrap();
     // SAFETY: Valid bounded allocation of the complete empty heap. This can

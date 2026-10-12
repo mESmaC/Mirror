@@ -441,6 +441,10 @@ pub fn run_init(
     // exercise frame reuse and continuation recovery after both exit and fault.
     // 0059-D1: a session's seeding is a heap safe point.
     heap::ensure(kernel, frames, direct_map);
+    // 0059 test 2's second step: the relaunch pair holds the heap near-full at
+    // its first loop top, so its next loop-top ensure grows mid-session.
+    #[cfg(feature = "boot-smoke")]
+    heap::arm_hold_across_session();
     run_pair(kernel, frames, bytes, &image, direct_map, 0, display);
 }
 
@@ -724,6 +728,8 @@ fn run_pair(
     // of every root. IF=0 and no user process is active.
     unsafe { interrupts::set_kernel_stack(stack_top) };
     let mut cursor = 0;
+    #[cfg(feature = "boot-smoke")]
+    let held = heap::test_hold_begin();
     let mut last = None;
     let mut switches = 0;
     let mut idle_ticks = 0;
@@ -805,6 +811,19 @@ fn run_pair(
         unsafe { process.space.destroy(frames) }.expect("release user address space");
         #[cfg(feature = "boot-smoke")]
         process.check_charges_zero();
+    }
+    // 0059 test 2: the held block returns before the frame check, and the
+    // relaunch pair's mid-session growth is exactly one step.
+    #[cfg(feature = "boot-smoke")]
+    {
+        heap::test_hold_end(held);
+        if held.is_some() {
+            assert_eq!(
+                heap::stats().size - heap_before,
+                heap::MAX_GROW_PAGES * PAGE_SIZE as usize,
+                "the relaunch pair must grow exactly once"
+            );
+        }
     }
     assert_eq!(
         frames.stats().unwrap().allocated_frames,
