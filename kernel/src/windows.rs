@@ -16,7 +16,13 @@ const PIXEL_BYTES: usize = WIDTH * HEIGHT * 4;
 const PIXEL_PAGES: usize = PIXEL_BYTES / PAGE_SIZE as usize;
 pub const SURFACE_PAGES: usize = 2 * PIXEL_PAGES;
 const TILES: usize = WIDTH / EDGE * (HEIGHT / EDGE);
-const QUEUE_SIZE: usize = 32;
+/// Routed records an app can hold, not counting pointer Resets.
+const QUEUE_EVENTS: usize = 32;
+/// Queued records plus the pointer Resets between them. As in the shell's
+/// queue, a Reset is a marker, not an event: it never counts against
+/// `QUEUE_EVENTS`, and two never sit side by side, so one slot more than twice
+/// the capacity holds every queue (spec 0017a-D3).
+const QUEUE_SLOTS: usize = 2 * QUEUE_EVENTS + 1;
 const _: () = assert!(PIXEL_BYTES.is_multiple_of(PAGE_SIZE as usize));
 
 struct Pixels {
@@ -115,9 +121,11 @@ pub struct Application {
     back: Pixels,
     coverage: [u64; TILES.div_ceil(64)],
     covered: usize,
-    events: [[u8; EVENT_SIZE]; QUEUE_SIZE],
+    events: [[u8; EVENT_SIZE]; QUEUE_SLOTS],
     head: usize,
     length: usize,
+    /// Queued records other than Reset markers; at most `QUEUE_EVENTS`.
+    real: usize,
 }
 
 impl Application {
@@ -150,9 +158,10 @@ impl Application {
             back,
             coverage: [0; TILES.div_ceil(64)],
             covered: 0,
-            events: [[0; EVENT_SIZE]; QUEUE_SIZE],
+            events: [[0; EVENT_SIZE]; QUEUE_SLOTS],
             head: 0,
             length: 0,
+            real: 0,
         };
         application.push(reset_event());
         Ok(application)
@@ -270,24 +279,36 @@ impl Application {
         Ok(())
     }
 
-    /// Queue one routed record, or push back with -11 while the queue is full.
-    /// Nothing queued is ever dropped here: the shell keeps a refused record
-    /// and applies the only loss policy, in which a pointer Reset takes no
-    /// capacity (spec 0017a-D3).
+    /// Queue one validated routed record, or push back with -11 while 32
+    /// records other than Resets are queued. Nothing queued is ever dropped
+    /// here: the shell keeps a refused record and applies the only loss policy.
+    /// A pointer Reset is a marker that takes no capacity, and one right after
+    /// another adds nothing, so a pointer loss never costs a key (0017a-D3).
     pub fn enqueue(&mut self, event: [u8; EVENT_SIZE]) -> Result<(), i64> {
         if self.state != 1 {
             return Err(-32);
         }
-        if self.length == QUEUE_SIZE {
+        if protocol::Event::decode(&event) == Ok(protocol::Event::Reset) {
+            if self.length == 0 || self.events[self.tail()] != reset_event() {
+                self.push(reset_event());
+            }
+            return Ok(());
+        }
+        if self.real == QUEUE_EVENTS {
             return Err(-11);
         }
         self.push(event);
+        self.real += 1;
         Ok(())
     }
 
+    fn tail(&self) -> usize {
+        (self.head + self.length - 1) % QUEUE_SLOTS
+    }
+
     fn push(&mut self, event: [u8; EVENT_SIZE]) {
-        assert!(self.length < QUEUE_SIZE);
-        self.events[(self.head + self.length) % QUEUE_SIZE] = event;
+        assert!(self.length < QUEUE_SLOTS);
+        self.events[(self.head + self.length) % QUEUE_SLOTS] = event;
         self.length += 1;
     }
 
@@ -297,8 +318,11 @@ impl Application {
 
     pub fn consume(&mut self) {
         assert_ne!(self.length, 0);
+        if self.events[self.head] != reset_event() {
+            self.real -= 1;
+        }
         self.events[self.head] = [0; EVENT_SIZE];
-        self.head = (self.head + 1) % QUEUE_SIZE;
+        self.head = (self.head + 1) % QUEUE_SLOTS;
         self.length -= 1;
     }
 
@@ -308,6 +332,7 @@ impl Application {
         self.events.fill([0; EVENT_SIZE]);
         self.head = 0;
         self.length = 0;
+        self.real = 0;
     }
 
     /// # Safety
@@ -450,35 +475,35 @@ pub fn self_test(frames: &mut FrameAllocator<'_>, direct_map: u64) {
         .encode()
         .unwrap()
     };
-    // A full queue pushes back and keeps every record, Resets included, so a
-    // pointer Reset can never clear the keys queued before it (0017a-D3).
-    for index in 0..QUEUE_SIZE as u8 {
-        let event = if index % 2 == 0 {
-            reset_event()
-        } else {
-            key(b'a' + index / 2)
-        };
-        application.enqueue(event).unwrap();
+    // Pointer Resets take no capacity and a full queue pushes back, keeping
+    // every record (codex's 0017a reviews): 32 keys, each after a Reset, and a
+    // final Reset fill all 65 slots; a second Reset in a row adds nothing, and
+    // a 33rd key is refused until a key, not a Reset, is consumed.
+    for index in 0..QUEUE_EVENTS as u8 {
+        application.enqueue(reset_event()).unwrap();
+        application.enqueue(key(b'A' + index)).unwrap();
     }
-    assert_eq!(application.enqueue(reset_event()), Err(-11));
+    application.enqueue(reset_event()).unwrap();
+    application.enqueue(reset_event()).unwrap();
+    assert_eq!(application.length, QUEUE_SLOTS);
     assert_eq!(application.enqueue(key(b'z')), Err(-11));
-    for index in 0..QUEUE_SIZE as u8 {
-        let expected = if index % 2 == 0 {
-            reset_event()
-        } else {
-            key(b'a' + index / 2)
-        };
-        assert_eq!(
-            application.peek(),
-            Some(expected),
-            "full queue lost a record"
-        );
+    for index in 0..QUEUE_EVENTS as u8 {
+        assert_eq!(application.peek(), Some(reset_event()), "lost a Reset");
+        application.consume();
+        if index == 0 {
+            assert_eq!(application.enqueue(key(b'z')), Err(-11));
+        }
+        assert_eq!(application.peek(), Some(key(b'A' + index)), "lost a key");
         application.consume();
         if index == 0 {
             application.enqueue(key(b'z')).unwrap();
         }
     }
+    assert_eq!(application.peek(), Some(reset_event()));
+    application.consume();
     assert_eq!(application.peek(), Some(key(b'z')));
+    application.consume();
+    assert_eq!((application.peek(), application.real), (None, 0));
     let key = key(b'x');
     let mut invalid = key;
     invalid[16] = 1;

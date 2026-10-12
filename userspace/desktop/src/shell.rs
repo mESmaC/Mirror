@@ -1211,10 +1211,12 @@ fn smoke_test(console: u64, supervisor: u64) -> ! {
     // This color is published only by the gated diagnostic handler immediately
     // before its CPU-bound loop. A timer/focus frame cannot satisfy this fence.
     wait_pixel(&mut shell, busy, 0, 0, [255, 128, 0, 0]);
-    // A full kernel queue pushes back instead of clearing (codex's 0017a
-    // review). While this app spins, Reset then sixteen keys each followed by
-    // a Reset is 33 records: the kernel's 32-record queue takes all but the
-    // last Reset, which stays queued here, and no key is lost on either side.
+    // A full kernel queue pushes back instead of clearing, and its pointer
+    // Resets take no capacity (codex's 0017a reviews). While this app spins,
+    // Reset then sixteen keys each followed by a Reset (33 records), then
+    // sixteen more key-Reset pairs, all reach the kernel, which holds 32 keys
+    // in 65 records. A 33rd key is refused and stays queued here; no key is
+    // lost on either side.
     let key = |ascii| Event::Key {
         flags: 1,
         kind: 1,
@@ -1229,6 +1231,17 @@ fn smoke_test(console: u64, supervisor: u64) -> ! {
     for _ in 0..PENDING_SLOTS {
         shell.flush_events();
     }
+    let after_first = shell.windows[busy].unwrap().pending;
+    for index in 0..PENDING_EVENTS as u8 {
+        shell.enqueue(busy, key(b'A' + index));
+        shell.enqueue(busy, Event::Reset);
+    }
+    for _ in 0..PENDING_SLOTS {
+        shell.flush_events();
+    }
+    let after_second = shell.windows[busy].unwrap().pending;
+    shell.enqueue(busy, key(b'z'));
+    shell.flush_events();
     let left = shell.windows[busy].unwrap().pending;
     require(
         read_pixel(shell.windows[busy].unwrap().handle, 0, 0) == Some([255, 128, 0, 0]),
@@ -1237,9 +1250,11 @@ fn smoke_test(console: u64, supervisor: u64) -> ! {
     require(
         queued.length == PENDING_SLOTS
             && queued.real == PENDING_EVENTS
+            && after_first.length == 0
+            && after_second.length == 0
             && left.length == 1
-            && left.real == 0
-            && left.events[0] == Some(Event::Reset),
+            && left.real == 1
+            && left.events[0] == Some(key(b'z')),
         179,
     );
     shell.focus(Some(second));
