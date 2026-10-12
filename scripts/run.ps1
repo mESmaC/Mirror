@@ -5,7 +5,6 @@ param(
     [switch]$Trace,
     [switch]$NoBuild,
     [switch]$Graphical,
-    [switch]$AgentDemo,
     [switch]$NoDisplayDevice,
     [switch]$NoTestDisk,
     [ValidateSet('V1', 'LegacyVirtio')][string]$DeviceProfile = 'V1',
@@ -273,7 +272,7 @@ $codePath = Get-MirrorFirmware -RequestedPath $FirmwareCode -QemuDirectory $qemu
 $varsTemplate = Get-MirrorFirmware -RequestedPath $FirmwareVars -QemuDirectory $qemuDirectory -Names @('edk2-i386-vars.fd', 'OVMF_VARS.fd', 'OVMF_VARS.4m.fd') -ParameterName 'FirmwareVars'
 
 if (-not $NoBuild) {
-    & (Join-Path $PSScriptRoot 'build.ps1') -Release:$Release -Smoke:$Smoke -Trace:$Trace -AgentDemo:$AgentDemo
+    & (Join-Path $PSScriptRoot 'build.ps1') -Release:$Release -Smoke:$Smoke -Trace:$Trace
 }
 
 $buildDirectory = Join-Path $repositoryRoot 'build'
@@ -689,25 +688,13 @@ try {
     }
     if ($NoKeyboard -or $NoDisplayDevice) {
         $markers += 'MIRROR_DESKTOP_SKIPPED reason=missing_display_or_input'
-        if ($serial -match '(?m)^MIRROR_(?:DESKTOP|AGENT|SHELL)_(?:READY|TESTS_OK|CLEANUP_OK)(?:\s|$)') {
+        if ($serial -match '(?m)^MIRROR_SHELL_(?:READY|TESTS_OK|CLEANUP_OK)(?:\s|$)') {
             throw "Mirror unexpectedly ran a desktop without input/display. See $serialLog."
-        }
-    } elseif ($AgentDemo) {
-        $markers += @('MIRROR_DESKTOP_TESTS_OK', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'MIRROR_DESKTOP_CLEANUP_OK reason=fault handles_reclaimed=1')
-        $markers += @('MIRROR_AGENT_READY', 'MIRROR_AGENT_TESTS_OK', 'MIRROR_AGENT_CLEANUP_OK reason=exit handles_reclaimed=1 status=0')
-        if ($serial -notmatch '(?m)^user: Mirror desktop: agent operations passed\\n\r?$') {
-            throw 'Native desktop did not verify the agent operation results.'
-        }
-        if ($serial -match '(?m)^MIRROR_DESKTOP_SKIPPED(?:\s|$)') {
-            throw "Mirror skipped its desktop lifecycle checks. See $serialLog."
         }
     } else {
         $markers += @('MIRROR_WINDOW_TESTS_OK', 'MIRROR_APP_LOAD_ROLLBACK_OK', 'MIRROR_SHELL_TESTS_OK', 'MIRROR_SHELL_CLEANUP_OK apps_reclaimed=1')
         if ($serial -notmatch '(?m)^user: Mirror shell: checks passed\\n\r?$') {
             throw 'Native shell did not finish its application lifecycle checks.'
-        }
-        if ($serial -match '(?m)^MIRROR_AGENT_(?:READY|TESTS_OK)(?:\s|$)') {
-            throw 'Default desktop unexpectedly started the agent demo.'
         }
         # A published busy frame can survive the loop until its next commit.
         # Bracket the supervisor's observation of the committed peer edit with

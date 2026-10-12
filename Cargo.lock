@@ -28,13 +28,6 @@ name = "mirror-acpi"
 version = "0.1.0"
 
 [[package]]
-name = "mirror-agent"
-version = "0.1.0"
-dependencies = [
- "mirror-desktop-protocol",
-]
-
-[[package]]
 name = "mirror-app"
 version = "0.1.0"
 dependencies = [
@@ -50,7 +43,6 @@ version = "0.1.0"
 name = "mirror-desktop"
 version = "0.1.0"
 dependencies = [
- "mirror-desktop-protocol",
  "mirror-ui-tokens",
  "mirror-window-protocol",
 ]

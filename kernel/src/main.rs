@@ -362,9 +362,8 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
     kernel_vm::heap_window_self_test(&tables, &mut frames, boot.direct_map_offset);
     grow_kernel_heap(&tables, &mut frames, boot.direct_map_offset, "boot");
     // Only smoke kernels run init's self-test battery. Default and trace
-    // kernels start the shell, or the agent-demo desktop, as the first
-    // userspace process (spec 0010-D3). The rendezvous and heap-growth phase
-    // below run in every flavor.
+    // kernels start the shell as the first userspace process (spec 0010-D3).
+    // The rendezvous and heap-growth phase below run in every flavor.
     #[cfg(feature = "boot-smoke")]
     {
         let scenario = if let boot::SmokeMode::User(value) = boot::smoke_mode() {
@@ -400,27 +399,15 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
     serial::println!("MIRROR_BOOT_OK");
     let mut input_consumer = ps2::Consumer::claim().expect("exclusive input consumer");
     if let Some(display) = display.as_mut().filter(|_| keyboard_ready || mouse_ready) {
-        if cfg!(feature = "agent-demo") {
-            userspace::run_desktop(
-                &tables,
-                &mut frames,
-                [boot.desktop, boot.agent],
-                boot.direct_map_offset,
-                display,
-                &mut input_consumer,
-                cfg!(feature = "boot-smoke"),
-            );
-        } else {
-            userspace::run_shell(
-                &tables,
-                &mut frames,
-                [boot.desktop, boot.app],
-                boot.direct_map_offset,
-                display,
-                &mut input_consumer,
-                cfg!(feature = "boot-smoke"),
-            );
-        }
+        userspace::run_shell(
+            &tables,
+            &mut frames,
+            [boot.desktop, boot.app],
+            boot.direct_map_offset,
+            display,
+            &mut input_consumer,
+            cfg!(feature = "boot-smoke"),
+        );
     } else {
         serial::println!("MIRROR_DESKTOP_SKIPPED reason=missing_display_or_input");
     }

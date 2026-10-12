@@ -240,6 +240,10 @@ impl Renderer {
     /// otherwise in `background`, so a partial repaint also clears an old ring.
     /// `Rect` is unsigned, so a ring next to the left or top screen edge
     /// saturates at x=0 or y=0.
+    #[expect(
+        dead_code,
+        reason = "0029-D7 focus ring; only the retired Scratchpad drew it so far"
+    )]
     pub fn focus_ring(&mut self, rect: Rect, shown: bool, background: u8) {
         let color = if shown { FOCUS_RING } else { background };
         for grow in FOCUS_RING_OFFSET + 1..=FOCUS_RING_OFFSET + FOCUS_RING_WIDTH {
@@ -293,10 +297,6 @@ impl Renderer {
         self.cursor_x = x;
         self.cursor_y = y;
         self.mark(Rect::new(x, y, CURSOR_WIDTH, CURSOR_HEIGHT));
-    }
-
-    pub fn flush(&mut self, surface: u64) -> bool {
-        self.flush_windows(surface, &[])
     }
 
     /// Views are ordered back to front. Every outer rectangle first restores

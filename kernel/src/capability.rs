@@ -18,6 +18,12 @@ static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Object {
     Console,
+    /// Only init's smoke pair holds channels until a spawn call can grant
+    /// them (Phase 3); the agent-demo session that used them retired (RS6).
+    #[cfg_attr(
+        not(feature = "boot-smoke"),
+        expect(dead_code, reason = "only boot-smoke sessions grant channels")
+    )]
     Channel(usize),
     /// The single borrowed graphics surface lives for the complete run session.
     Surface,
@@ -153,6 +159,7 @@ impl HandleTable {
         }
     }
 
+    #[cfg(feature = "boot-smoke")]
     pub(crate) fn len(&self) -> usize {
         self.entries.iter().flatten().count()
     }

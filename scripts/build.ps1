@@ -2,8 +2,7 @@
 param(
     [switch]$Release,
     [switch]$Smoke,
-    [switch]$Trace,
-    [switch]$AgentDemo
+    [switch]$Trace
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
@@ -22,7 +21,7 @@ try {
         # prebuilt core uses the kernel model; do not merge their LLVM bitcode.
         # The kernel build below retains the workspace's release LTO setting.
         $env:CARGO_PROFILE_RELEASE_LTO = 'false'
-        foreach ($nativePackage in @('init', 'desktop', 'agent', 'app')) {
+        foreach ($nativePackage in @('init', 'desktop', 'app')) {
             $nativeLinker = Join-Path $repositoryRoot "userspace/$nativePackage/linker.ld"
             $env:CARGO_ENCODED_RUSTFLAGS = @('-C', 'relocation-model=static', '-C', 'code-model=small', '-C', "link-arg=-T$nativeLinker", '-C', 'link-arg=-zmax-page-size=0x1000') -join [char]31
             $nativeArguments = @('build', '--locked', '-p', "mirror-$nativePackage", '--target', 'x86_64-unknown-none')
@@ -41,7 +40,6 @@ try {
     # trace (test-trace) and smoke (boot-smoke, which implies test-trace).
     if ($Smoke) { $cargoArguments += @('--features', 'boot-smoke') }
     if ($Trace) { $cargoArguments += @('--features', 'test-trace') }
-    if ($AgentDemo) { $cargoArguments += @('--features', 'agent-demo') }
     & cargo @cargoArguments
     if ($LASTEXITCODE -ne 0) { throw "Kernel build failed with exit code $LASTEXITCODE." }
 
@@ -105,7 +103,6 @@ try {
     Copy-Item -LiteralPath $kernelPath -Destination (Join-Path $espDirectory 'kernel.elf') -Force
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "target/x86_64-unknown-none/$profile/mirror-init") -Destination (Join-Path $espDirectory 'init.elf') -Force
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "target/x86_64-unknown-none/$profile/mirror-desktop") -Destination (Join-Path $espDirectory 'desktop.elf') -Force
-    Copy-Item -LiteralPath (Join-Path $repositoryRoot "target/x86_64-unknown-none/$profile/mirror-agent") -Destination (Join-Path $espDirectory 'agent.elf') -Force
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "target/x86_64-unknown-none/$profile/mirror-app") -Destination (Join-Path $espDirectory 'app.elf') -Force
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'boot/limine.conf') -Destination (Join-Path $espDirectory 'limine.conf') -Force
     # The image redistributes Limine's binaries (BSD-2-Clause), so it carries
@@ -120,7 +117,7 @@ try {
         Copy-Item -LiteralPath $licenseSource -Destination (Join-Path $licenseDirectory $licenseFile) -Force
     }
     $flavor = if ($Smoke) { 'smoke' } elseif ($Trace) { 'trace' } else { 'default' }
-    Write-Host "Mirror $profile $flavor kernel and native programs staged in $espDirectory (agent-demo=$AgentDemo)"
+    Write-Host "Mirror $profile $flavor kernel and native programs staged in $espDirectory"
 
     # tools/mirror-image writes the GPT disk image and its VMDK descriptor from
     # the staged tree, then reads the image back against the tree (spec 0015a).

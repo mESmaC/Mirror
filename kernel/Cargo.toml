@@ -24,7 +24,6 @@ mirror-clock-protocol = { path = "../crates/clock-protocol" }
 [features]
 test-trace = []
 boot-smoke = ["test-trace"]
-agent-demo = []
 
 [lints]
 workspace = true

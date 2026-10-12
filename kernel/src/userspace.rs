@@ -42,16 +42,6 @@ const MAX_SLEEP_TICKS: u64 = 1000;
 const RECEIVE_TIMEOUT: u64 = 100;
 const SERVICE_ALLOWANCE: u64 = 32;
 const SERVICE_PERIOD: u64 = 100;
-#[cfg(feature = "test-trace")]
-const DESKTOP_READY: &[u8] = b"Mirror desktop: ready\n";
-#[cfg(feature = "test-trace")]
-const DESKTOP_FRAME: &[u8] = b"Mirror desktop: frame\n";
-#[cfg(feature = "test-trace")]
-const DESKTOP_CHECKS: &[u8] = b"Mirror desktop: checks passed\n";
-#[cfg(feature = "test-trace")]
-const AGENT_READY: &[u8] = b"Mirror agent: ready\n";
-#[cfg(feature = "test-trace")]
-const AGENT_CHECKS: &[u8] = b"Mirror agent: checks passed\n";
 
 // Only the BSP accesses this slot, with IF=0. It is populated immediately before
 // entry and cleared after the synchronous return; it never owns the context.
@@ -213,8 +203,6 @@ impl ServicePolicy {
 #[derive(Clone, Copy, Debug)]
 enum CpuPolicy {
     Probe,
-    Desktop(ServicePolicy),
-    Agent(ServicePolicy),
     Shell(ServicePolicy),
     Application(ServicePolicy),
 }
@@ -325,8 +313,6 @@ struct Process<'kernel> {
     desktop_checks: bool,
     #[cfg(feature = "test-trace")]
     desktop_revision: u64,
-    agent_ready: bool,
-    agent_checks: bool,
     input_events: u64,
     input_lost: u64,
     input_waits: u64,
@@ -392,8 +378,8 @@ impl Process<'_> {
 }
 
 /// Run init's self-test battery. Only smoke kernels run init: default and
-/// trace kernels start the shell, or the agent-demo desktop, as the first
-/// userspace process instead (spec 0010-D3).
+/// trace kernels start the shell as the first userspace process instead
+/// (spec 0010-D3).
 #[cfg(feature = "boot-smoke")]
 pub fn run_init(
     kernel: &PageTables,
@@ -600,8 +586,6 @@ fn create_process<'kernel, 'slot>(
         desktop_checks: false,
         #[cfg(feature = "test-trace")]
         desktop_revision: 0,
-        agent_ready: false,
-        agent_checks: false,
         input_events: 0,
         input_lost: 0,
         input_waits: 0,
@@ -1215,243 +1199,6 @@ fn syscall_buffer(process: &Process<'_>, frame: &TrapFrame) -> Option<(u64, usiz
     Some((range.0, range.1 as usize, range.2))
 }
 
-/// Run a native desktop and its capability-connected automation client. Each
-/// service has its own renewable CPU allowance. The desktop owns the session;
-/// its termination also cancels a client that has not already exited or faulted.
-pub fn run_desktop(
-    kernel: &PageTables,
-    frames: &mut FrameAllocator<'_>,
-    programs: [&[u8]; 2],
-    direct_map: u64,
-    display: &mut framebuffer::Driver<'_>,
-    consumer: &mut ps2::Consumer,
-    smoke: bool,
-) {
-    assert!(!arch::interrupts_enabled());
-    let before = frames.stats().expect("recycling required").allocated_frames;
-    let (desktop_outcome, agent_outcome) = {
-        // Validate both immutable modules before acquiring either address space.
-        let desktop_image = elf::parse(programs[0]).expect("invalid native desktop ELF");
-        let agent_image = elf::parse(programs[1]).expect("invalid native agent ELF");
-        let mut slots = [None, None];
-        create_process(
-            &mut slots[0],
-            kernel,
-            frames,
-            programs[0],
-            &desktop_image,
-            direct_map,
-            u64::from(smoke),
-        )
-        .expect("load native desktop");
-        if let Err(error) = create_process(
-            &mut slots[1],
-            kernel,
-            frames,
-            programs[1],
-            &agent_image,
-            direct_map,
-            u64::from(smoke),
-        ) {
-            // SAFETY: Neither root has been active. Failed creation released
-            // its own mappings; the desktop owns all remaining user pages.
-            unsafe { slots[0].as_mut().unwrap().space.destroy(frames) }
-                .expect("agent-load cleanup");
-            assert_eq!(frames.stats().unwrap().allocated_frames, before);
-            panic!("could not load native agent: {error:?}");
-        }
-        let [Some(desktop), Some(agent)] = slots else {
-            unreachable!("both processes were created");
-        };
-        let mut processes = [desktop, agent];
-        let now = timer::ticks();
-        processes[0].policy = CpuPolicy::Desktop(ServicePolicy::new(now));
-        processes[1].policy = CpuPolicy::Agent(ServicePolicy::new(now));
-        let mut ipc = Ipc::new();
-        let mut surface = surface::Session::desktop(display).expect("desktop surface");
-        let (framebuffer, region) = surface.placement();
-        let mut input = input::Session::new(consumer, framebuffer, region);
-        for (index, process) in processes.iter_mut().enumerate() {
-            // Channel 0 carries requests to the desktop; channel 1 carries
-            // replies/jobs to the agent. Handles never cross process tables.
-            for (slot, object, rights) in [
-                (0, Object::Console, capability::WRITE),
-                (1, Object::Channel(1 - index), capability::SEND),
-                (2, Object::Channel(index), capability::RECEIVE),
-            ] {
-                process.boot_handles[slot] = process
-                    .handles
-                    .insert(object, rights)
-                    .expect("service bootstrap capability");
-                ipc.grant(Capability { object, rights });
-            }
-        }
-        for (slot, object, rights) in [
-            (3, Object::Surface, capability::WRITE),
-            (4, Object::Input, capability::RECEIVE),
-        ] {
-            processes[0].boot_handles[slot] = processes[0]
-                .handles
-                .insert(object, rights)
-                .expect("desktop bootstrap capability");
-        }
-        assert_eq!(processes[0].handles.len(), 5);
-        assert_eq!(processes[1].handles.len(), 3);
-        assert_eq!(processes[1].boot_handles[3..], [0, 0, 0]);
-        let stack_top = stacks::bsp_rsp0_top();
-        // SAFETY: IF=0, no active user, and the BSP's guarded RSP0 stack
-        // remains mapped in the shared upper half of every process root.
-        unsafe { interrupts::set_kernel_stack(stack_top) };
-
-        let mut cursor = 0;
-        while !processes[0].finished() {
-            assert!(!arch::interrupts_enabled());
-            // Endpoint closure is visible before checking a peer's pending
-            // receive. A client may exit while the desktop remains interactive.
-            release_finished_handles(&mut processes, &mut ipc);
-            let now = timer::ticks();
-            for (index, process) in processes.iter_mut().enumerate() {
-                wake_threads(
-                    process,
-                    &mut ipc,
-                    if index == 0 { Some(&mut input) } else { None },
-                    None,
-                    now,
-                );
-            }
-            let mut selected = None;
-            for offset in 0..processes.len() {
-                let index = (cursor + offset) % processes.len();
-                let process = &mut processes[index];
-                let policy = match &mut process.policy {
-                    CpuPolicy::Desktop(policy) | CpuPolicy::Agent(policy) => policy,
-                    _ => panic!("service lost its recurring allowance"),
-                };
-                // Wakes and yields cannot reset either service's spent credit.
-                if policy.eligible(now) && process.ready() {
-                    selected = Some(index);
-                    break;
-                }
-            }
-            if let Some(index) = selected {
-                cursor = (index + 1) % processes.len();
-                resume_process(
-                    kernel,
-                    frames,
-                    &mut processes[index],
-                    &mut ipc,
-                    if index == 0 { Some(&mut surface) } else { None },
-                    if index == 0 { Some(&mut input) } else { None },
-                    None,
-                );
-            } else {
-                let before_charge = processes.each_ref().map(|process| process.charged_ticks);
-                // SAFETY: No published user/session pointers or outstanding
-                // borrows. IF stays clear from the queue/deadline check through
-                // STI-HLT, so a pending input IRQ cannot create a lost wakeup.
-                unsafe { core::arch::asm!("sti", "hlt", "cli", options(nostack)) };
-                assert_eq!(
-                    processes.each_ref().map(|process| process.charged_ticks),
-                    before_charge,
-                    "service idle/throttling charged user CPU ticks"
-                );
-            }
-        }
-        if !processes[1].finished() {
-            assert!(processes[1].outcome.is_none());
-            processes[1].finish(Outcome::SessionEnded);
-        }
-        assert!(ACTIVE.load(Ordering::SeqCst).is_null());
-        assert!(ACTIVE_IPC.load(Ordering::SeqCst).is_null());
-        assert!(ACTIVE_INPUT.load(Ordering::SeqCst).is_null());
-        assert!(ACTIVE_SURFACE.load(Ordering::SeqCst).is_null());
-        assert_eq!(
-            surface.totals(),
-            (processes[0].surface_tiles, processes[0].surface_pixels)
-        );
-        assert_eq!(processes[1].surface_tiles, 0, "agent used display directly");
-        assert_eq!(processes[1].input_events, 0, "agent read hardware input");
-        release_finished_handles(&mut processes, &mut ipc);
-        assert!(ipc.is_drained());
-        for process in &mut processes {
-            assert!(process.handles.is_empty());
-            // SAFETY: Both processes are finished, all handlers unwound, every
-            // published pointer is clear, and the kernel root is active with IF=0.
-            unsafe { process.space.destroy(frames) }.expect("service address-space cleanup");
-        }
-        assert_eq!(
-            frames.stats().unwrap().allocated_frames,
-            before,
-            "desktop/agent frame leak"
-        );
-        let process = &processes[0];
-        let outcome = process.outcome.expect("desktop finished without outcome");
-        let agent = &processes[1];
-        let agent_outcome = agent.outcome.expect("agent finished without outcome");
-        if smoke {
-            assert!(
-                matches!(outcome, Outcome::Fault { vector: 6, .. }),
-                "desktop smoke did not end in contained UD2: {outcome:?}"
-            );
-            assert!(process.desktop_checks, "desktop smoke checks missing");
-            assert!(process.throttles > 0, "desktop allowance never throttled");
-            assert!(process.input_timeouts > 0, "desktop input never timed out");
-            assert!(
-                process.input_lost > 0,
-                "desktop did not read initial loss barrier"
-            );
-            assert!(process.input_waits > 0);
-            serial::println!(
-                "MIRROR_DESKTOP_TESTS_OK throttles={} timeouts={} input_events={}",
-                process.throttles,
-                process.input_timeouts,
-                process.input_events
-            );
-            assert!(agent.agent_ready, "agent ready marker missing");
-            assert!(agent.agent_checks, "agent checks did not complete");
-            assert_eq!(
-                agent_outcome,
-                Outcome::Exit(0),
-                "agent did not exit successfully"
-            );
-            assert!(agent.dispatches > 1, "agent never resumed");
-            assert!(
-                agent.ipc_sent > 0 && agent.ipc_received > 0,
-                "agent did not exchange IPC"
-            );
-            serial::println!(
-                "MIRROR_AGENT_TESTS_OK sent={} received={} dispatches={}",
-                agent.ipc_sent,
-                agent.ipc_received,
-                agent.dispatches
-            );
-        }
-        // Surface and input sessions leave scope before the caller can start
-        // the kernel console. No service handle or frame survives this return.
-        (outcome, agent_outcome)
-    };
-    match desktop_outcome {
-        Outcome::Exit(status) => serial::println!(
-            "MIRROR_DESKTOP_CLEANUP_OK reason=exit handles_reclaimed=1 status={}",
-            status
-        ),
-        _ => serial::println!("MIRROR_DESKTOP_CLEANUP_OK reason=fault handles_reclaimed=1"),
-    }
-    match agent_outcome {
-        Outcome::Exit(status) => serial::println!(
-            "MIRROR_AGENT_CLEANUP_OK reason=exit handles_reclaimed=1 status={}",
-            status
-        ),
-        Outcome::SessionEnded => {
-            serial::println!("MIRROR_AGENT_CLEANUP_OK reason=session_ended handles_reclaimed=1")
-        }
-        outcome => serial::println!(
-            "MIRROR_AGENT_CLEANUP_OK reason=fault handles_reclaimed=1 outcome={:?}",
-            outcome
-        ),
-    }
-}
-
 struct ShellRuntime<'kernel, 'image> {
     kernel: &'kernel PageTables,
     bytes: &'image [u8],
@@ -1734,14 +1481,6 @@ fn wake_threads(
                 if result == -11 && deadline_reached(now, pending.deadline) {
                     result = -110;
                     process.input_timeouts += 1;
-                    // Whether this prints depends on input timing, so it is a
-                    // per-input marker and only trace kernels print it (0010).
-                    #[cfg(feature = "test-trace")]
-                    if matches!(process.policy, CpuPolicy::Desktop(_))
-                        && process.input_timeouts == 1
-                    {
-                        serial::println!("MIRROR_DESKTOP_INPUT_TIMEOUT");
-                    }
                 }
                 if result != -11 {
                     process.thread_mut().context.frame.rax = result as u64;
@@ -2703,69 +2442,33 @@ fn match_init_oracles(process: &mut Process<'_>, message: &[u8]) {
     process.surface_denied_checks |= message == SURFACE_DENIED_CHECKS;
 }
 
-/// Shell, desktop and agent console-text oracles and their markers. Only trace
-/// kernels match console text (spec 0010-D4).
+/// The shell's console-text oracles and their markers. Only trace kernels
+/// match console text (spec 0010-D4).
 #[cfg(feature = "test-trace")]
 fn service_message(process: &mut Process<'_>, message: &[u8]) {
-    if matches!(process.policy, CpuPolicy::Shell(_)) {
-        if message == b"Mirror shell: ready\n" && !process.desktop_ready {
-            process.desktop_ready = true;
-            let info = with_surface(|session| session.info());
-            let width = u32::from_le_bytes(info[4..8].try_into().unwrap());
-            let height = u32::from_le_bytes(info[8..12].try_into().unwrap());
-            serial::println!(
-                "MIRROR_SHELL_READY pid={} width={} height={}",
-                process.pid,
-                width,
-                height
-            );
-        } else if message == b"Mirror shell: frame\n" {
-            process.desktop_revision += 1;
-            serial::println!(
-                "MIRROR_SHELL_FRAME revision={} tiles={} input_events={}",
-                process.desktop_revision,
-                process.surface_tiles,
-                process.input_events
-            );
-        } else if message == b"Mirror shell: checks passed\n" {
-            process.desktop_checks = true;
-        }
+    if !matches!(process.policy, CpuPolicy::Shell(_)) {
         return;
     }
-    if matches!(process.policy, CpuPolicy::Agent(_)) {
-        if message == AGENT_READY && !process.agent_ready {
-            process.agent_ready = true;
-            serial::println!("MIRROR_AGENT_READY pid={}", process.pid);
-        } else if message == AGENT_CHECKS {
-            process.agent_checks = true;
-        }
-        return;
-    }
-    if !matches!(process.policy, CpuPolicy::Desktop(_)) {
-        return;
-    }
-    if message == DESKTOP_READY && !process.desktop_ready {
+    if message == b"Mirror shell: ready\n" && !process.desktop_ready {
         process.desktop_ready = true;
         let info = with_surface(|session| session.info());
         let width = u32::from_le_bytes(info[4..8].try_into().unwrap());
         let height = u32::from_le_bytes(info[8..12].try_into().unwrap());
         serial::println!(
-            "MIRROR_DESKTOP_READY pid={} width={} height={}",
+            "MIRROR_SHELL_READY pid={} width={} height={}",
             process.pid,
             width,
             height
         );
-    } else if message == DESKTOP_FRAME {
+    } else if message == b"Mirror shell: frame\n" {
         process.desktop_revision += 1;
         serial::println!(
-            "MIRROR_DESKTOP_FRAME revision={} tiles={} input_events={} keyboard_irq={} mouse_irq={}",
+            "MIRROR_SHELL_FRAME revision={} tiles={} input_events={}",
             process.desktop_revision,
             process.surface_tiles,
-            process.input_events,
-            crate::keyboard::irq_count(),
-            crate::mouse::irq_count()
+            process.input_events
         );
-    } else if message == DESKTOP_CHECKS {
+    } else if message == b"Mirror shell: checks passed\n" {
         process.desktop_checks = true;
     }
 }
@@ -3502,10 +3205,9 @@ pub(crate) fn timer_tick(frame: &mut TrapFrame) {
         process.thread_mut().quantum_left -= 1;
         let throttled = match &mut process.policy {
             CpuPolicy::Probe => false,
-            CpuPolicy::Desktop(policy)
-            | CpuPolicy::Agent(policy)
-            | CpuPolicy::Shell(policy)
-            | CpuPolicy::Application(policy) => policy.charge(timer::ticks()),
+            CpuPolicy::Shell(policy) | CpuPolicy::Application(policy) => {
+                policy.charge(timer::ticks())
+            }
         };
         if matches!(process.policy, CpuPolicy::Probe) && process.charged_ticks >= USER_TICK_BUDGET {
             process.finish(Outcome::BudgetExhausted);

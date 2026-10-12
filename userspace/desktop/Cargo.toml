@@ -6,7 +6,6 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-mirror-desktop-protocol = { path = "../../crates/desktop-protocol" }
 mirror-ui-tokens = { path = "../../crates/ui-tokens" }
 mirror-window-protocol = { path = "../../crates/window-protocol" }
 
