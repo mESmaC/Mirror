@@ -896,9 +896,17 @@ fn check_ipc(console: u64, role: u64, probe: u64, surface: u64) {
     if role == 0 {
         require(receive_message(receiver, 1, 1, true) == 0, 180);
         send_message(sender, 0, 2, surface);
+        // The kernel times this receive, from the peer's sending syscall to
+        // this thread's dispatch (spec 0030a, acceptance 4). Message 3 always
+        // finds it blocked: the peer sends it only after receiving message 2
+        // through VM calls that each return the peer to the scheduler.
+        write(console, b"Mirror init: preempt receive\n");
         require(receive_message(receiver, 1, 3, false) == 0, 181);
         // Give the peer a deterministic opportunity to block waiting for EOF.
         require(syscall(SYS_YIELD, 0, 0, 0) == 0, 108);
+        // The deadline half runs while the peer waits, far inside its
+        // 100-tick receive deadline.
+        threads::check_wake_preemption(console);
         if probe == 9 {
             require(syscall(SYS_SLEEP, 110, 0, 0) == 0, 109);
         }
@@ -1128,6 +1136,13 @@ extern "C" fn init_main(launch: u64) -> ! {
     tls::finish(console, pid as u64);
     clock::check(console);
     threads::check(console, pid as u64);
+    if role == 0 {
+        // Both roles run the battery at once, so only one fills its thread
+        // table: a pair session then peaks at 16 + 4 live threads. The FIFO
+        // wait-queue check follows with nine (spec 0030a, acceptance 3).
+        threads::check_capacity(console);
+        sync::check_wait_queue(console);
+    }
     sync::check(console);
 
     // SAFETY: Both statics are live in this process's private address space, and

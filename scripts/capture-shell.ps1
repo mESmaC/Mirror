@@ -264,8 +264,5 @@ function Invoke-MirrorShellCapture {
     Wait-MirrorDesktopMessage $Process '(?m)^MIRROR_SHELL_CLEANUP_OK apps_reclaimed=1(?:\s|$)' $offset
     Wait-MirrorAppReclaimed $Process $counterPid $offset
     Wait-MirrorAppReclaimed $Process $reopenedPid $offset
-    if ((Read-MirrorSerial) -match '(?m)^MIRROR_AGENT_READY(?:\s|$)') {
-        throw 'Default desktop unexpectedly launched an agent.'
-    }
     Write-Host 'Shell capture passed: independent apps, focus, drag, minimize/restore, close/relaunch, refused launch, Counter, and session cleanup.'
 }

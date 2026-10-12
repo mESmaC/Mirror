@@ -66,7 +66,6 @@ pub struct BootInfo {
     #[cfg(feature = "boot-smoke")]
     pub init: &'static [u8],
     pub desktop: &'static [u8],
-    pub agent: &'static [u8],
     pub app: &'static [u8],
     pub framebuffer: Option<limine::framebuffer::Framebuffer<'static>>,
 }
@@ -77,16 +76,14 @@ pub fn info() -> BootInfo {
         .get_response()
         .expect("missing native modules")
         .modules();
-    assert_eq!(modules.len(), 4, "expected four native boot modules");
+    assert_eq!(modules.len(), 3, "expected three native boot modules");
     let mut init = None;
     let mut desktop = None;
-    let mut agent = None;
     let mut app = None;
     for module in modules {
         let slot = match module.string().to_bytes() {
             b"mirror-init" => &mut init,
             b"mirror-desktop" => &mut desktop,
-            b"mirror-agent" => &mut agent,
             b"mirror-app" => &mut app,
             _ => panic!("unexpected native boot module"),
         };
@@ -117,7 +114,6 @@ pub fn info() -> BootInfo {
         #[cfg(feature = "boot-smoke")]
         init: init.expect("missing native init"),
         desktop: desktop.expect("missing native desktop"),
-        agent: agent.expect("missing native agent"),
         app: app.expect("missing native application"),
         framebuffer: FRAMEBUFFER
             .get_response()

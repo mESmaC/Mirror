@@ -7,7 +7,7 @@ use crate::capability::{Capability, Object, RECEIVE, SEND};
 
 pub(crate) const MESSAGE_SIZE: usize = 64;
 pub(crate) const QUEUE_CAPACITY: usize = 4;
-const CHANNEL_COUNT: usize = 2;
+pub(crate) const CHANNEL_COUNT: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Message {

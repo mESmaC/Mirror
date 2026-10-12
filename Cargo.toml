@@ -1,5 +1,5 @@
 [workspace]
-members = ["kernel", "userspace/init", "userspace/desktop", "userspace/agent", "userspace/app", "crates/desktop-protocol", "crates/window-protocol", "crates/vm-protocol", "crates/thread-protocol", "crates/clock-protocol", "crates/sync", "crates/acpi", "crates/ui-tokens", "crates/ext2-layout"]
+members = ["kernel", "userspace/init", "userspace/desktop", "userspace/app", "crates/desktop-protocol", "crates/window-protocol", "crates/vm-protocol", "crates/thread-protocol", "crates/clock-protocol", "crates/sync", "crates/acpi", "crates/ui-tokens", "crates/ext2-layout"]
 exclude = ["tools/mirror-image"]
 default-members = ["kernel"]
 resolver = "3"

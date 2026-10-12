@@ -5,7 +5,6 @@ param(
     [switch]$Trace,
     [switch]$NoBuild,
     [switch]$Graphical,
-    [switch]$AgentDemo,
     [switch]$NoDisplayDevice,
     [switch]$NoTestDisk,
     [ValidateSet('V1', 'LegacyVirtio')][string]$DeviceProfile = 'V1',
@@ -273,7 +272,7 @@ $codePath = Get-MirrorFirmware -RequestedPath $FirmwareCode -QemuDirectory $qemu
 $varsTemplate = Get-MirrorFirmware -RequestedPath $FirmwareVars -QemuDirectory $qemuDirectory -Names @('edk2-i386-vars.fd', 'OVMF_VARS.fd', 'OVMF_VARS.4m.fd') -ParameterName 'FirmwareVars'
 
 if (-not $NoBuild) {
-    & (Join-Path $PSScriptRoot 'build.ps1') -Release:$Release -Smoke:$Smoke -Trace:$Trace -AgentDemo:$AgentDemo
+    & (Join-Path $PSScriptRoot 'build.ps1') -Release:$Release -Smoke:$Smoke -Trace:$Trace
 }
 
 $buildDirectory = Join-Path $repositoryRoot 'build'
@@ -636,12 +635,42 @@ try {
     Assert-MirrorUsbMarkers -Serial $serial -Attached ([bool]$Xhci) -UsbDevice $usbFixture -FullSpeed ([bool]$XhciFullSpeed) -WithoutHpet ([bool]$NoHpet) -Smoke $true -FaultMode $Fault
     # boot-smoke implies test-trace, so every smoke log carries one MIRROR_TRACE_ON.
     Assert-MirrorTraceMarker -Serial $serial -Expected $true
+    Assert-MirrorSchedReady -Serial $serial
     $markers += 'MIRROR_USER_SYNC_OK'
     if (@([regex]::Matches($serial, '(?m)^user: Mirror init: synchronization checks passed\\n\r?$')).Count -ne 4) {
         throw 'Both native processes must complete their synchronization checks before and after teardown/relaunch.'
     }
     if (@([regex]::Matches($serial, '(?m)^MIRROR_USER_SYNC_OK(?:\s|$)')).Count -ne 4) {
         throw 'Both native process runs must validate address waits, wakeups, and synchronization cleanup.'
+    }
+    # Only the primary process fills its sixteen thread slots (spec 0030a,
+    # acceptance 2); the kernel asserts that it held them all at once.
+    if (@([regex]::Matches($serial, '(?m)^user: Mirror init: thread capacity checks passed\\n\r?$')).Count -ne 2) {
+        throw 'The primary native process must complete its thread capacity check before and after teardown/relaunch.'
+    }
+    # The primary alone then checks FIFO wake order (spec 0030a, acceptance
+    # 3); the kernel asserts that its peer did not.
+    if (@([regex]::Matches($serial, '(?m)^user: Mirror init: wait queue checks passed\\n\r?$')).Count -ne 2) {
+        throw 'The primary native process must complete its wait queue check before and after teardown/relaunch.'
+    }
+    # Wakeup preemption (spec 0030a, acceptance 4): each pair's primary times
+    # a sleeper's and a receiver's dispatch, each at most one tick late. The
+    # fatal kernel faults run after both pairs, so every case reports twice.
+    $preemptLines = @([regex]::Matches($serial, '(?m)^MIRROR_PREEMPT_OK(?:\s|$)')).Count
+    $preemptValid = @([regex]::Matches($serial, '(?m)^MIRROR_PREEMPT_OK wake_lateness=[01] ipc_lateness=[01]\r?$')).Count
+    if ($preemptLines -ne 2 -or $preemptValid -ne 2) {
+        throw "Both native process runs must report MIRROR_PREEMPT_OK with wake_lateness and ipc_lateness of at most one tick. See $serialLog."
+    }
+    # Table bounds (spec 0030a, acceptance 5): before the first session, the
+    # kernel fills both tables, checks EAGAIN, and restores its frame baseline
+    # exactly, once with both tables full and once with only the thread table.
+    $bounds = @([regex]::Matches($serial, '(?m)^MIRROR_SCHED_BOUNDS_OK(?:\s|$)'))
+    $boundsValid = @([regex]::Matches($serial, '(?m)^MIRROR_SCHED_BOUNDS_OK processes=64 threads=256\r?$'))
+    $firstSession = [regex]::Match($serial, '(?m)^Native process: ')
+    $schedReady = [regex]::Match($serial, '(?m)^MIRROR_SCHED_READY ')
+    if ($bounds.Count -ne 1 -or $boundsValid.Count -ne 1 -or -not $firstSession.Success -or
+        $boundsValid[0].Index -le $schedReady.Index -or $boundsValid[0].Index -ge $firstSession.Index) {
+        throw "Mirror must report MIRROR_SCHED_BOUNDS_OK processes=64 threads=256 exactly once, after MIRROR_SCHED_READY and before the first session. See $serialLog."
     }
     if ($serial -notmatch '(?m)^MIRROR_TLS_READY[^\r\n]* fsgsbase=0(?:\s|$)') {
         throw 'Mirror must keep direct user FS/GS base instructions disabled.'
@@ -684,25 +713,13 @@ try {
     }
     if ($NoKeyboard -or $NoDisplayDevice) {
         $markers += 'MIRROR_DESKTOP_SKIPPED reason=missing_display_or_input'
-        if ($serial -match '(?m)^MIRROR_(?:DESKTOP|AGENT|SHELL)_(?:READY|TESTS_OK|CLEANUP_OK)(?:\s|$)') {
+        if ($serial -match '(?m)^MIRROR_SHELL_(?:READY|TESTS_OK|CLEANUP_OK)(?:\s|$)') {
             throw "Mirror unexpectedly ran a desktop without input/display. See $serialLog."
-        }
-    } elseif ($AgentDemo) {
-        $markers += @('MIRROR_DESKTOP_TESTS_OK', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'MIRROR_DESKTOP_CLEANUP_OK reason=fault handles_reclaimed=1')
-        $markers += @('MIRROR_AGENT_READY', 'MIRROR_AGENT_TESTS_OK', 'MIRROR_AGENT_CLEANUP_OK reason=exit handles_reclaimed=1 status=0')
-        if ($serial -notmatch '(?m)^user: Mirror desktop: agent operations passed\\n\r?$') {
-            throw 'Native desktop did not verify the agent operation results.'
-        }
-        if ($serial -match '(?m)^MIRROR_DESKTOP_SKIPPED(?:\s|$)') {
-            throw "Mirror skipped its desktop lifecycle checks. See $serialLog."
         }
     } else {
         $markers += @('MIRROR_WINDOW_TESTS_OK', 'MIRROR_APP_LOAD_ROLLBACK_OK', 'MIRROR_SHELL_TESTS_OK', 'MIRROR_SHELL_CLEANUP_OK apps_reclaimed=1')
         if ($serial -notmatch '(?m)^user: Mirror shell: checks passed\\n\r?$') {
             throw 'Native shell did not finish its application lifecycle checks.'
-        }
-        if ($serial -match '(?m)^MIRROR_AGENT_(?:READY|TESTS_OK)(?:\s|$)') {
-            throw 'Default desktop unexpectedly started the agent demo.'
         }
         # A published busy frame can survive the loop until its next commit.
         # Bracket the supervisor's observation of the committed peer edit with

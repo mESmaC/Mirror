@@ -1,6 +1,12 @@
-//! Native BSP scheduling with finite probes and periodically limited services.
-//! IRQ/syscall handlers return to the scheduler before another process resumes.
-//! User buffers are checked and copied through the direct map before use.
+//! Native processes, their sessions and syscalls, with finite probes and
+//! periodically limited services. The scheduler and its process and thread
+//! tables are in `sched` (kernel/src/sched.rs, spec 0030a). IRQ/syscall
+//! handlers return to the scheduler before another thread resumes. User
+//! buffers are checked and copied through the direct map before use.
+
+// A child module, so the scheduler shares these private types (spec 0030a).
+#[path = "sched.rs"]
+mod sched;
 
 #[cfg(feature = "boot-smoke")]
 use core::sync::atomic::AtomicBool;
@@ -15,7 +21,7 @@ use crate::{
     ipc::{Ipc, IpcError, MESSAGE_SIZE},
     memory::{FrameAllocator, PAGE_SIZE},
     paging::{PageTables, PagingError, UserAddressSpace, UserPermissions},
-    ps2, serial, stacks, surface, timer, vm, windows,
+    ps2, serial, surface, timer, vm, windows,
 };
 use mirror_clock_protocol as clock_abi;
 use mirror_thread_protocol as thread_abi;
@@ -35,25 +41,17 @@ const SURFACE_DENIED_CHECKS: &[u8] = b"Mirror init: surface denied\n";
 #[cfg(feature = "boot-smoke")]
 const PROCESS_COUNT: usize = 2;
 const QUANTUM_TICKS: u64 = 2;
-// Finite init probes include register/preemption loops and 21 thread creations.
-// Leave headroom for the complete debug workload, including IRQs delivered on
-// syscall return. This finite lifetime allowance is shared by all its threads;
-// it does not change the independent recurring budgets of ordinary services.
+// Finite init probes include register/preemption loops and 20 thread creations,
+// plus 15 more in role 0's capacity check and 8 in its wait-queue check (spec
+// 0030a). Leave headroom for the complete debug workload, including IRQs
+// delivered on syscall return. This finite lifetime allowance is shared by all
+// its threads; it does not change the independent recurring budgets of
+// ordinary services.
 const USER_TICK_BUDGET: u64 = 128;
 const MAX_SLEEP_TICKS: u64 = 1000;
 const RECEIVE_TIMEOUT: u64 = 100;
 const SERVICE_ALLOWANCE: u64 = 32;
 const SERVICE_PERIOD: u64 = 100;
-#[cfg(feature = "test-trace")]
-const DESKTOP_READY: &[u8] = b"Mirror desktop: ready\n";
-#[cfg(feature = "test-trace")]
-const DESKTOP_FRAME: &[u8] = b"Mirror desktop: frame\n";
-#[cfg(feature = "test-trace")]
-const DESKTOP_CHECKS: &[u8] = b"Mirror desktop: checks passed\n";
-#[cfg(feature = "test-trace")]
-const AGENT_READY: &[u8] = b"Mirror agent: ready\n";
-#[cfg(feature = "test-trace")]
-const AGENT_CHECKS: &[u8] = b"Mirror agent: checks passed\n";
 
 // Only the BSP accesses this slot, with IF=0. It is populated immediately before
 // entry and cleared after the synchronous return; it never owns the context.
@@ -111,30 +109,93 @@ enum State {
     Finished,
 }
 
+/// A thread-table entry (spec 0030a). It belongs to the process in slot
+/// `process`, which reaches it through its member list.
 struct Thread {
     id: u64,
+    /// The owning process's table slot.
+    process: u16,
+    /// This thread's own table slot, its run-queue key.
+    slot: u16,
     context: Context,
     state: State,
     joiner: Option<u64>,
     charged_ticks: u64,
     sleep_charge: u64,
     quantum_left: u64,
+    /// A wake displaced this thread with quantum left, so its next dispatch
+    /// keeps `quantum_left` instead of starting a new quantum (0030-D3).
+    displaced: bool,
+    /// The wake whose latency the kernel times for init's battery.
+    #[cfg(feature = "boot-smoke")]
+    probe: Option<LatencyProbe>,
+    /// When the timed wake became due, until the thread's next dispatch.
+    #[cfg(feature = "boot-smoke")]
+    due: Option<u64>,
+}
+
+/// A wake that role 0 of init's battery asks the kernel to time (spec 0030a,
+/// acceptance 4). Only the thread that writes the oracle line is flagged.
+#[cfg(feature = "boot-smoke")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LatencyProbe {
+    /// The next sleep: from its deadline to the sleeper's dispatch.
+    Sleep,
+    /// The next blocked receive: from the sending syscall's trap exit to the
+    /// receiver's dispatch.
+    Receive,
+    /// The next displacement by a wake: the thread must resume with the
+    /// rest of its quantum.
+    Spin,
 }
 
 impl Thread {
-    fn new(entry: u64, stack: u64, argument: u64) -> Self {
+    fn new(entry: u64, stack: u64, argument: u64, process: usize, slot: u16) -> Self {
         let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
         assert!((1..=i64::MAX as u64).contains(&id), "thread IDs exhausted");
         Self {
             id,
+            process: u16::try_from(process).expect("process slot"),
+            slot,
             context: Context::new(entry, stack, argument),
             state: State::Ready,
             joiner: None,
             charged_ticks: 0,
             sleep_charge: 0,
             quantum_left: QUANTUM_TICKS,
+            displaced: false,
+            #[cfg(feature = "boot-smoke")]
+            probe: None,
+            #[cfg(feature = "boot-smoke")]
+            due: None,
         }
     }
+
+    /// Mark a blocked thread ready and append it to the run queue as woken
+    /// in this completion pass. New threads start ready and are queued by
+    /// their creator.
+    fn wake(&mut self) {
+        assert!(
+            !matches!(
+                self.state,
+                State::Ready | State::Running | State::Exited(_) | State::Finished
+            ),
+            "woke a thread that was not waiting: {:?}",
+            self.state
+        );
+        self.state = State::Ready;
+        sched::enqueue_woken(self.slot);
+    }
+}
+
+/// The session objects a process may use while it runs: the surface (both
+/// processes of init's pair, gated by the handle; the shell), physical input
+/// (the shell) and the app windows (the shell and its apps).
+#[derive(Clone, Copy, Default)]
+struct Access {
+    surface: bool,
+    input: bool,
+    windows: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,6 +218,8 @@ struct PendingReceive {
     address: u64,
     capacity: usize,
     deadline: u64,
+    /// The channel whose queue the receiver waits on.
+    channel: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,6 +227,8 @@ struct PendingInput {
     handle: u64,
     address: u64,
     deadline: u64,
+    /// Device input or one app's routed input.
+    queue: sched::Queue,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,8 +284,6 @@ impl ServicePolicy {
 #[derive(Clone, Copy, Debug)]
 enum CpuPolicy {
     Probe,
-    Desktop(ServicePolicy),
-    Agent(ServicePolicy),
     Shell(ServicePolicy),
     Application(ServicePolicy),
 }
@@ -228,24 +291,34 @@ enum CpuPolicy {
 // Fields gated on `boot-smoke` are bookkeeping that only init's self-test
 // battery reads. Fields gated on `test-trace` feed only trace markers. Neither
 // exists in a default kernel (spec 0010).
-struct Process<'kernel> {
+struct Process {
     pid: u64,
-    space: UserAddressSpace<'kernel>,
+    space: UserAddressSpace,
     vm: vm::Vm,
     direct_map: u64,
+    access: Access,
     #[cfg(feature = "boot-smoke")]
     vm_checks: bool,
     #[cfg(feature = "boot-smoke")]
     demand_faults: u64,
     #[cfg(feature = "boot-smoke")]
     copy_faults: u64,
-    threads: [Option<Thread>; thread_abi::MAX_THREADS],
-    current_thread: usize,
-    next_thread: usize,
+    /// Thread-table slots of this process's threads by member index, or
+    /// NO_SLOT. The index is the process-local position that thread
+    /// creation fills lowest-first, up to MAX_THREADS.
+    members: [u16; thread_abi::MAX_THREADS],
+    /// The member index of the thread being run or completed.
+    current: usize,
     #[cfg(feature = "boot-smoke")]
     thread_checks: bool,
     #[cfg(feature = "boot-smoke")]
     threads_created: u64,
+    #[cfg(feature = "boot-smoke")]
+    threads_peak: usize,
+    #[cfg(feature = "boot-smoke")]
+    capacity_checks: bool,
+    #[cfg(feature = "boot-smoke")]
+    wait_queue_checks: bool,
     #[cfg(feature = "boot-smoke")]
     threads_joined: u64,
     #[cfg(feature = "boot-smoke")]
@@ -254,7 +327,6 @@ struct Process<'kernel> {
     threads_cancelled: u64,
     #[cfg(feature = "boot-smoke")]
     thread_preemptions: u64,
-    next_waiter: usize,
     #[cfg(feature = "boot-smoke")]
     sync_checks: bool,
     #[cfg(feature = "boot-smoke")]
@@ -279,6 +351,16 @@ struct Process<'kernel> {
     fpu_preemption_start: Option<usize>,
     #[cfg(feature = "boot-smoke")]
     fpu_preemptions: usize,
+    /// Ticks from a flagged sleeper's deadline to its dispatch.
+    #[cfg(feature = "boot-smoke")]
+    wake_lateness: Option<u64>,
+    /// Ticks from a flagged receive's sender trap exit to its dispatch.
+    #[cfg(feature = "boot-smoke")]
+    ipc_lateness: Option<u64>,
+    /// A flagged spinner resumed with the rest of its quantum after a wake
+    /// displaced it.
+    #[cfg(feature = "boot-smoke")]
+    spin_kept_quantum: bool,
     outcome: Option<Outcome>,
     #[cfg(feature = "boot-smoke")]
     checks_passed: bool,
@@ -331,45 +413,79 @@ struct Process<'kernel> {
     desktop_checks: bool,
     #[cfg(feature = "test-trace")]
     desktop_revision: u64,
-    agent_ready: bool,
-    agent_checks: bool,
     input_events: u64,
     input_lost: u64,
     input_waits: u64,
     input_timeouts: u64,
 }
 
-impl Process<'_> {
+impl Process {
+    /// The member thread at `index`, if any.
+    fn member(&self, index: usize) -> Option<&Thread> {
+        let slot = self.members[index];
+        // SAFETY: A member slot is an occupied thread entry that only this
+        // process reaches, through these accessors, which tie the borrow to
+        // the process's own. The scheduler reads entries directly only while
+        // it holds no process reference.
+        (slot != sched::NO_SLOT).then(|| unsafe { &*sched::thread_entry(slot) })
+    }
+
+    /// The member thread at `index`, if any, mutably.
+    fn member_mut(&mut self, index: usize) -> Option<&mut Thread> {
+        let slot = self.members[index];
+        // SAFETY: As in `member`; `&mut self` makes this the only borrow.
+        (slot != sched::NO_SLOT).then(|| unsafe { &mut *sched::thread_entry(slot) })
+    }
+
+    /// Every member thread, in member order.
+    fn threads(&self) -> impl Iterator<Item = &Thread> {
+        (0..thread_abi::MAX_THREADS).filter_map(|index| self.member(index))
+    }
+
+    /// Remove the member at `index` from this process and the thread table.
+    fn remove_member(&mut self, index: usize) {
+        let slot = core::mem::replace(&mut self.members[index], sched::NO_SLOT);
+        assert_ne!(slot, sched::NO_SLOT, "removed an empty member");
+        // SAFETY: The slot was this process's member, and no reference to
+        // it is live: member borrows are tied to this `&mut self`.
+        unsafe { sched::remove_thread(slot) };
+    }
+
     fn thread(&self) -> &Thread {
-        self.threads[self.current_thread]
-            .as_ref()
-            .expect("current thread")
+        self.member(self.current).expect("current thread")
     }
 
     fn thread_mut(&mut self) -> &mut Thread {
-        self.threads[self.current_thread]
-            .as_mut()
-            .expect("current thread")
+        self.member_mut(self.current).expect("current thread")
     }
 
     fn finished(&self) -> bool {
         self.outcome.is_some()
     }
 
+    /// Record the outcome and finish every thread, taking each off the run
+    /// queue and every wait queue. Threads keep their slots until the process
+    /// is reaped.
     fn finish(&mut self, outcome: Outcome) {
         assert!(self.outcome.is_none());
         self.outcome = Some(outcome);
-        for thread in self.threads.iter_mut().flatten() {
+        for index in 0..thread_abi::MAX_THREADS {
+            let Some(thread) = self.member_mut(index) else {
+                continue;
+            };
+            let state = core::mem::replace(&mut thread.state, State::Finished);
+            sched::detach(thread.slot);
             #[cfg(feature = "boot-smoke")]
             {
-                if !matches!(thread.state, State::Exited(_)) {
+                if !matches!(state, State::Exited(_)) {
                     self.threads_cancelled += 1;
                 }
-                if matches!(thread.state, State::Waiting(_)) {
+                if matches!(state, State::Waiting(_)) {
                     self.sync_cancelled += 1;
                 }
             }
-            thread.state = State::Finished;
+            #[cfg(not(feature = "boot-smoke"))]
+            let _ = state;
         }
     }
 
@@ -392,33 +508,33 @@ impl Process<'_> {
         self.surface_frames == 0 && self.space.owned_table_count() == 0
     }
 
-    fn ready(&self) -> bool {
-        !self.finished()
-            && self
-                .threads
-                .iter()
-                .flatten()
-                .any(|thread| thread.state == State::Ready)
+    /// Release a finished process's thread entries, once no thread context
+    /// is in use. The zombie keeps only its outcome, counters, handles and
+    /// address space until its session validates and reaps it (0030-D5).
+    fn release_threads(&mut self) {
+        assert!(self.finished(), "released a live process's threads");
+        for index in 0..thread_abi::MAX_THREADS {
+            if self.members[index] != sched::NO_SLOT {
+                self.remove_member(index);
+            }
+        }
     }
 
-    fn select_thread(&mut self) {
-        assert!(!self.finished());
-        let index = (0..self.threads.len())
-            .map(|offset| (self.next_thread + offset) % self.threads.len())
-            .find(|&index| {
-                self.threads[index]
-                    .as_ref()
-                    .is_some_and(|thread| thread.state == State::Ready)
-            })
-            .expect("process has no runnable thread");
-        self.current_thread = index;
-        self.next_thread = (index + 1) % self.threads.len();
+    /// A finished process that holds no thread entry.
+    fn zombie(&self) -> bool {
+        self.finished() && self.members.iter().all(|&slot| slot == sched::NO_SLOT)
     }
 }
 
+/// Print `MIRROR_SCHED_READY` once, before the first session, in every
+/// flavor (spec 0030a).
+pub fn report_scheduler() {
+    sched::report_ready();
+}
+
 /// Run init's self-test battery. Only smoke kernels run init: default and
-/// trace kernels start the shell, or the agent-demo desktop, as the first
-/// userspace process instead (spec 0010-D3).
+/// trace kernels start the shell as the first userspace process instead
+/// (spec 0010-D3).
 #[cfg(feature = "boot-smoke")]
 pub fn run_init(
     kernel: &PageTables,
@@ -442,6 +558,7 @@ pub fn run_init(
     assert!(deadline_reached(3, u64::MAX - 2));
     test_load_rollback(kernel, frames, bytes, &image, direct_map);
     vm::self_test(kernel, frames, direct_map);
+    table_bounds_self_test(kernel, frames, bytes, &image, direct_map);
     run_pair(
         kernel,
         frames,
@@ -506,42 +623,232 @@ fn test_load_rollback(
     serial::println!("MIRROR_USER_LOAD_ROLLBACK_OK");
 }
 
-fn create_process<'kernel>(
-    kernel: &'kernel PageTables,
+/// Fill the process and thread tables, check that both refuse more with
+/// EAGAIN, and check that tearing every entry down restores the frame
+/// baseline exactly (spec 0030a, acceptance 5). Case 1 fills both tables
+/// with 64 processes of four threads, finishes them into zombies, which give
+/// up every thread entry but keep their process slots, and reaps them. Case 2
+/// fills only the thread table, with 16 processes of sixteen threads, so a
+/// process create fails for want of a main-thread entry before it allocates
+/// anything. No entry ever runs: threads are created ready and queued.
+#[cfg(feature = "boot-smoke")]
+fn table_bounds_self_test(
+    kernel: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    bytes: &[u8],
+    image: &elf::Image,
+    direct_map: u64,
+) {
+    let allocated =
+        |frames: &FrameAllocator<'_>| frames.stats().expect("recycling required").allocated_frames;
+    sched::assert_drained();
+    let baseline = allocated(frames);
+    let start = thread_abi::ThreadStart {
+        entry: image.entry,
+        stack: STACK_TOP - 8,
+        argument: 0,
+        fs: 0,
+        gs: 0,
+    };
+    let mut slots = [0; sched::PROCESS_SLOTS];
+
+    // Case 1: both tables full.
+    for slot in &mut slots {
+        *slot = load_process(kernel, frames, bytes, image, direct_map, 0)
+            .expect("table-bounds process");
+        // SAFETY: A fresh slot that nothing else references.
+        let process = unsafe { sched::process(*slot) };
+        for _ in 1..sched::THREAD_SLOTS / sched::PROCESS_SLOTS {
+            add_thread(process, *slot, &start).expect("table-bounds thread");
+        }
+    }
+    assert!(
+        !sched::has_room(1, 0) && !sched::has_room(0, 1),
+        "the tables did not fill"
+    );
+    let full = allocated(frames);
+    let refused = load_process(kernel, frames, bytes, image, direct_map, 0);
+    assert_eq!(
+        refused.map_err(|error| error.errno()),
+        Err(-11),
+        "a full process table took a process"
+    );
+    // SAFETY: An occupied slot that nothing else references.
+    let process = unsafe { sched::process(slots[0]) };
+    assert_eq!(
+        add_thread(process, slots[0], &start),
+        Err(-11),
+        "a full thread table took a thread"
+    );
+    assert_eq!(allocated(frames), full, "a refused create allocated frames");
+    for &slot in &slots {
+        // SAFETY: As above; one entry is borrowed at a time.
+        let process = unsafe { sched::process(slot) };
+        process.finish(Outcome::Terminated);
+        process.release_threads();
+        assert!(process.zombie());
+    }
+    assert!(
+        sched::has_room(0, sched::THREAD_SLOTS) && !sched::has_room(1, 0),
+        "zombies kept thread entries or gave up process slots"
+    );
+    let refused = load_process(kernel, frames, bytes, image, direct_map, 0);
+    assert_eq!(
+        refused.map_err(|error| error.errno()),
+        Err(-11),
+        "a table of zombies took a process"
+    );
+    for &slot in &slots {
+        // SAFETY: No reference to the zombie is live.
+        let mut zombie = unsafe { sched::reap(slot) };
+        assert_eq!(zombie.outcome, Some(Outcome::Terminated));
+        // SAFETY: Its root has never been active, and nothing references
+        // its tree.
+        unsafe { zombie.space.destroy(frames) }.expect("table-bounds teardown");
+    }
+    sched::assert_drained();
+    assert_eq!(allocated(frames), baseline, "table-bounds frame leak");
+
+    // Case 2: only the thread table full.
+    let count = sched::THREAD_SLOTS / thread_abi::MAX_THREADS;
+    for slot in &mut slots[..count] {
+        *slot = load_process(kernel, frames, bytes, image, direct_map, 0)
+            .expect("table-bounds process");
+        // SAFETY: A fresh slot that nothing else references.
+        let process = unsafe { sched::process(*slot) };
+        for _ in 1..thread_abi::MAX_THREADS {
+            add_thread(process, *slot, &start).expect("table-bounds thread");
+        }
+        assert_eq!(
+            add_thread(process, *slot, &start),
+            Err(-11),
+            "a full process took a thread"
+        );
+    }
+    let free = sched::PROCESS_SLOTS - count;
+    assert!(
+        sched::has_room(free, 0) && !sched::has_room(free + 1, 0) && !sched::has_room(0, 1),
+        "only the thread table should be full"
+    );
+    let full = allocated(frames);
+    let refused = load_process(kernel, frames, bytes, image, direct_map, 0);
+    assert_eq!(
+        refused.map_err(|error| error.errno()),
+        Err(-11),
+        "a full thread table took a process"
+    );
+    assert_eq!(allocated(frames), full, "a refused create allocated frames");
+    for &slot in &slots[..count] {
+        // SAFETY: The process never ran, and nothing references it.
+        let mut process = unsafe { sched::discard(slot) };
+        // SAFETY: Its root has never been active, and nothing references
+        // its tree.
+        unsafe { process.space.destroy(frames) }.expect("table-bounds teardown");
+    }
+    sched::assert_drained();
+    assert_eq!(allocated(frames), baseline, "table-bounds frame leak");
+    serial::println!(
+        "MIRROR_SCHED_BOUNDS_OK processes={} threads={}",
+        sched::PROCESS_SLOTS,
+        sched::THREAD_SLOTS
+    );
+}
+
+#[derive(Debug)]
+enum CreateError {
+    /// The process or thread table has no room (EAGAIN, 0030-D4).
+    TableFull,
+    Paging(#[expect(dead_code, reason = "load panics print it through Debug")] PagingError),
+}
+
+impl CreateError {
+    /// The error a launch returns to its caller.
+    fn errno(&self) -> i64 {
+        match self {
+            Self::TableFull => -11,
+            Self::Paging(_) => -12,
+        }
+    }
+}
+
+/// Load a process into the process table, with its main thread queued, and
+/// return its slot. Room for both entries is checked before anything is
+/// allocated; on failure no entry exists and every frame the load took is
+/// released. The caller seeds handles, policy and access before it runs.
+fn create_process(
+    kernel: &PageTables,
     frames: &mut FrameAllocator<'_>,
     bytes: &[u8],
     image: &elf::Image,
     direct_map: u64,
     argument: u64,
-) -> Result<Process<'kernel>, PagingError> {
+) -> Result<usize, CreateError> {
+    let slot = load_process(kernel, frames, bytes, image, direct_map, argument)?;
+    // SAFETY: The slot was just filled, and nothing else references it.
+    let process = unsafe { sched::process(slot) };
+    serial::println!(
+        "Native process: pid={} entry={:#x} root={:#x} pages={} tables={}",
+        process.pid,
+        image.entry,
+        process.space.root_physical_address(),
+        process.space.owned_page_count(),
+        process.space.owned_table_count()
+    );
+    Ok(slot)
+}
+
+/// `create_process` without its report, which the table-bounds self-test
+/// would otherwise print for every entry it fills.
+fn load_process(
+    kernel: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    bytes: &[u8],
+    image: &elf::Image,
+    direct_map: u64,
+    argument: u64,
+) -> Result<usize, CreateError> {
+    if !sched::has_room(1, 1) {
+        return Err(CreateError::TableFull);
+    }
     // SAFETY: The BSP is alone with IF=0, kernel root active, and the shared
     // upper mappings and unique allocator remain live throughout this run.
-    let space = unsafe { UserAddressSpace::new(kernel, frames) }?;
+    // The kernel tables live in continue_boot's frame, which never returns.
+    let mut space =
+        unsafe { UserAddressSpace::new(kernel, frames) }.map_err(CreateError::Paging)?;
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     assert!(
         (1..=i64::MAX as u64).contains(&pid),
         "process IDs exhausted"
     );
-    let mut process = Process {
+    if let Err(error) = load(&mut space, frames, bytes, image, direct_map) {
+        // SAFETY: This root has never been active; mapped frames belong to it.
+        unsafe { space.destroy(frames) }.expect("failed-load cleanup");
+        return Err(CreateError::Paging(error));
+    }
+    let slot = sched::insert_process(Process {
         pid,
         space,
         vm: vm::Vm::new(),
         direct_map,
+        access: Access::default(),
         #[cfg(feature = "boot-smoke")]
         vm_checks: false,
         #[cfg(feature = "boot-smoke")]
         demand_faults: 0,
         #[cfg(feature = "boot-smoke")]
         copy_faults: 0,
-        threads: core::array::from_fn(|index| {
-            (index == 0).then(|| Thread::new(image.entry, STACK_TOP - 8, argument))
-        }),
-        current_thread: 0,
-        next_thread: 0,
+        members: [sched::NO_SLOT; thread_abi::MAX_THREADS],
+        current: 0,
         #[cfg(feature = "boot-smoke")]
         thread_checks: false,
         #[cfg(feature = "boot-smoke")]
         threads_created: 1,
+        #[cfg(feature = "boot-smoke")]
+        threads_peak: 1,
+        #[cfg(feature = "boot-smoke")]
+        capacity_checks: false,
+        #[cfg(feature = "boot-smoke")]
+        wait_queue_checks: false,
         #[cfg(feature = "boot-smoke")]
         threads_joined: 0,
         #[cfg(feature = "boot-smoke")]
@@ -550,7 +857,6 @@ fn create_process<'kernel>(
         threads_cancelled: 0,
         #[cfg(feature = "boot-smoke")]
         thread_preemptions: 0,
-        next_waiter: 0,
         #[cfg(feature = "boot-smoke")]
         sync_checks: false,
         #[cfg(feature = "boot-smoke")]
@@ -575,6 +881,12 @@ fn create_process<'kernel>(
         fpu_preemption_start: None,
         #[cfg(feature = "boot-smoke")]
         fpu_preemptions: 0,
+        #[cfg(feature = "boot-smoke")]
+        wake_lateness: None,
+        #[cfg(feature = "boot-smoke")]
+        ipc_lateness: None,
+        #[cfg(feature = "boot-smoke")]
+        spin_kept_quantum: false,
         outcome: None,
         #[cfg(feature = "boot-smoke")]
         checks_passed: false,
@@ -624,27 +936,19 @@ fn create_process<'kernel>(
         desktop_checks: false,
         #[cfg(feature = "test-trace")]
         desktop_revision: 0,
-        agent_ready: false,
-        agent_checks: false,
         input_events: 0,
         input_lost: 0,
         input_waits: 0,
         input_timeouts: 0,
-    };
-    if let Err(error) = load(&mut process.space, frames, bytes, image, direct_map) {
-        // SAFETY: This root has never been active; mapped frames belong to it.
-        unsafe { process.space.destroy(frames) }.expect("failed-load cleanup");
-        return Err(error);
-    }
-    serial::println!(
-        "Native process: pid={} entry={:#x} root={:#x} pages={} tables={}",
-        pid,
-        image.entry,
-        process.space.root_physical_address(),
-        process.space.owned_page_count(),
-        process.space.owned_table_count()
-    );
-    Ok(process)
+    });
+    let thread = sched::insert_thread(|thread| {
+        Thread::new(image.entry, STACK_TOP - 8, argument, slot, thread)
+    });
+    // SAFETY: The slot was just filled, and nothing else references it.
+    let process = unsafe { sched::process(slot) };
+    process.members[0] = thread;
+    sched::enqueue(thread);
+    Ok(slot)
 }
 
 #[cfg(feature = "boot-smoke")]
@@ -659,34 +963,41 @@ fn run_pair(
 ) {
     // The framebuffer borrow belongs to this whole session, never to a user
     // mapping or handle. Only syscall handlers may reborrow it during resume.
-    let mut surface = display
+    let surface = display
         .map(surface::Session::new)
         .transpose()
         .expect("surface session");
     let before = frames.stats().expect("recycling required").allocated_frames;
     let heap_before = heap::stats().size;
-    let mut first = create_process(kernel, frames, bytes, image, direct_map, scenario)
+    let first = create_process(kernel, frames, bytes, image, direct_map, scenario)
         .expect("load first native process");
     let second = match create_process(kernel, frames, bytes, image, direct_map, 1 << 8) {
-        Ok(process) => process,
+        Ok(second) => second,
         Err(error) => {
-            // SAFETY: Neither process has been activated; the failed creation
-            // cleaned its own tree and this first process has no live users.
-            unsafe { first.space.destroy(frames) }.expect("peer-load cleanup");
+            // SAFETY: The first process has never run and nothing references
+            // it; the failed creation already released its own frames.
+            let mut process = unsafe { sched::discard(first) };
+            // SAFETY: Its root has never been active, and no handler or
+            // other reference reaches its tree.
+            unsafe { process.space.destroy(frames) }.expect("peer-load cleanup");
             assert_eq!(frames.stats().unwrap().allocated_frames, before);
             panic!("could not load peer: {error:?}");
         }
     };
-    let mut processes = [first, second];
     // 0059-D4: the pair's charge peak is set at seeding; nothing here charges
     // surfaces. Printed at the drain (boot-smoke).
     #[cfg(feature = "boot-smoke")]
-    let tables_peak: usize = processes
-        .iter()
-        .map(|process| process.space.owned_table_count())
+    let tables_peak: usize = [first, second]
+        .into_iter()
+        .map(|slot| {
+            // SAFETY: Seeding holds one process reference at a time.
+            unsafe { sched::process(slot) }.space.owned_table_count()
+        })
         .sum();
     let mut ipc = Ipc::new();
-    for (index, process) in processes.iter_mut().enumerate() {
+    for (index, slot) in [first, second].into_iter().enumerate() {
+        // SAFETY: Seeding holds one process reference at a time.
+        let process = unsafe { sched::process(slot) };
         // Each process can send only to its peer's inbound channel. Console
         // access is an explicit bootstrap capability, independent of IPC rights.
         let grants = [
@@ -703,132 +1014,87 @@ fn run_pair(
             process.boot_handles[slot] = handle;
         }
         assert_eq!(process.handles.len(), 3);
+        // Both processes see the surface session; only the handle grants use.
+        process.access.surface = surface.is_some();
     }
     if surface.is_some() {
-        let handle = processes[0]
+        // SAFETY: Seeding holds one process reference at a time.
+        let owner = unsafe { sched::process(first) };
+        let handle = owner
             .handles
             .insert(Object::Surface, capability::WRITE)
             .expect("bootstrap surface capability");
-        processes[0].boot_handles[3] = handle;
+        owner.boot_handles[3] = handle;
+        assert_eq!(owner.handles.len(), 4);
         // Trusted verification knows the owner's token but grants no entry to
         // the peer. Its real IPC fixture must receive and try this exact token.
-        processes[1].foreign_surface = handle;
-        assert_eq!(processes[0].handles.len(), 4);
+        // SAFETY: As above; the owner's borrow has ended.
+        unsafe { sched::process(second) }.foreign_surface = handle;
     }
-    assert_eq!(processes[1].handles.len(), 3);
-    assert_eq!(processes[1].boot_handles[3], 0);
-    assert!(processes.iter().all(|process| process.boot_handles[4] == 0));
-    assert!(ACTIVE_IPC.load(Ordering::SeqCst).is_null());
-    assert!(ACTIVE_SURFACE.load(Ordering::SeqCst).is_null());
-    assert!(ACTIVE_INPUT.load(Ordering::SeqCst).is_null());
-    assert_ne!(processes[0].pid, processes[1].pid);
-    assert_ne!(
-        processes[0].space.root_physical_address(),
-        processes[1].space.root_physical_address()
-    );
-    assert_ne!(
-        processes[0]
-            .space
-            .translate(STACK_BASE)
-            .unwrap()
-            .unwrap()
-            .physical,
-        processes[1]
-            .space
-            .translate(STACK_BASE)
-            .unwrap()
-            .unwrap()
-            .physical
-    );
-    let stack_top = stacks::bsp_rsp0_top();
-    assert!(ACTIVE.load(Ordering::SeqCst).is_null());
-    // SAFETY: The BSP's guarded RSP0 stack is mapped in the shared upper half
-    // of every root. IF=0 and no user process is active.
-    unsafe { interrupts::set_kernel_stack(stack_top) };
-    let mut cursor = 0;
+    {
+        // SAFETY: Two distinct occupied slots, and no other reference.
+        let (owner, peer) = unsafe { (sched::process(first), sched::process(second)) };
+        assert_eq!(peer.handles.len(), 3);
+        assert_eq!(peer.boot_handles[3], 0);
+        assert!(owner.boot_handles[4] == 0 && peer.boot_handles[4] == 0);
+        assert_ne!(owner.pid, peer.pid);
+        assert_ne!(
+            owner.space.root_physical_address(),
+            peer.space.root_physical_address()
+        );
+        assert_ne!(
+            owner.space.translate(STACK_BASE).unwrap().unwrap().physical,
+            peer.space.translate(STACK_BASE).unwrap().unwrap().physical
+        );
+    }
     #[cfg(feature = "boot-smoke")]
     let held = heap::test_hold_begin();
-    let mut last = None;
-    let mut switches = 0;
-    let mut idle_ticks = 0;
-    while processes.iter().any(|process| !process.finished()) {
-        assert!(!arch::interrupts_enabled());
-        // 0059-D1: the loop top is a heap safe point (kernel root active, no
-        // syscall frame live, no scheduler structure half-updated).
-        heap::ensure(kernel, frames, direct_map);
-        release_finished_handles(&mut processes, &mut ipc);
-        let now = timer::ticks();
-        for process in &mut processes {
-            wake_threads(process, &mut ipc, None, None, now);
-        }
-        let selected = (0..PROCESS_COUNT)
-            .map(|offset| (cursor + offset) % PROCESS_COUNT)
-            .find(|&index| processes[index].ready());
-        let Some(index) = selected else {
-            assert!(processes.iter().any(|process| !process.finished()
-                && process.threads.iter().flatten().any(|thread| matches!(
-                    thread.state,
-                    State::Sleeping(_) | State::Receiving(_) | State::Waiting(_)
-                ))));
-            let before_idle = timer::ticks();
-            let before_charge: u64 = processes.iter().map(|process| process.charged_ticks).sum();
-            // SAFETY: No active process or locks, kernel root restored, timer
-            // ready. STI's interrupt shadow closes the check-to-HLT wakeup race.
-            // The CPL0 IRQ path only acknowledges/increments; CLI restores IF=0.
-            unsafe { core::arch::asm!("sti", "hlt", "cli", options(nostack)) };
-            idle_ticks += timer::ticks().wrapping_sub(before_idle);
-            assert_eq!(
-                processes
-                    .iter()
-                    .map(|process| process.charged_ticks)
-                    .sum::<u64>(),
-                before_charge,
-                "idle charged user CPU ticks"
-            );
-            continue;
-        };
-        cursor = (index + 1) % PROCESS_COUNT;
-        if last != Some(index) {
-            switches += 1;
-            last = Some(index);
-        }
-        resume_process(
-            kernel,
-            frames,
-            &mut processes[index],
-            &mut ipc,
-            surface.as_mut(),
-            None,
-            None,
-        );
-        if processes[index].outcome == Some(Outcome::BudgetExhausted) {
-            assert_eq!(index, 0, "peer exhausted its budget");
-            assert_eq!(scenario, 7, "unexpected budget exhaustion");
-            assert_eq!(
-                processes[1].outcome,
-                Some(Outcome::Exit(0)),
-                "CPU-bound task starved peer"
-            );
-            assert!(
-                processes[0].post_checks_preemptions > 0,
-                "CPU-only loop was never preempted"
-            );
-        }
-    }
-    release_finished_handles(&mut processes, &mut ipc);
+    let mut session = sched::Session {
+        ipc,
+        surface,
+        input: None,
+        runtime: None,
+        end: sched::End::Pair {
+            first,
+            second,
+            scenario,
+        },
+    };
+    let stats = sched::run(&mut session, kernel, frames, direct_map);
+    let sched::Session { ipc, surface, .. } = session;
     assert!(ACTIVE_SURFACE.load(Ordering::SeqCst).is_null());
     assert!(ACTIVE_INPUT.load(Ordering::SeqCst).is_null());
     assert!(
         ipc.is_drained(),
         "IPC messages or endpoint references leaked"
     );
-    for process in &mut processes {
-        assert!(process.handles.is_empty());
+    // Both processes are zombies now: finished, with their handles closed and
+    // their thread entries released. Validation reads their outcomes and
+    // counters in the table; only then are they reaped (0030-D5).
+    {
+        // SAFETY: Two distinct occupied slots. The scheduler has returned and
+        // ACTIVE is clear, so nothing else references either entry until
+        // these shared borrows end with this block, before the reap below.
+        let [owner, peer] = unsafe { [sched::process(first), sched::process(second)] };
+        let processes: [&Process; 2] = [owner, peer];
+        assert!(
+            processes
+                .iter()
+                .all(|process| process.zombie() && process.handles.is_empty()),
+            "a finished process kept its threads or handles"
+        );
+        validate_pair(processes, scenario, stats, surface);
+    }
+    // SAFETY: Validation's borrows have ended, ACTIVE is clear, and nothing
+    // references either entry; reap checks that each finished.
+    let mut zombies = unsafe { [sched::reap(first), sched::reap(second)] };
+    sched::assert_drained();
+    for zombie in &mut zombies {
         // SAFETY: All contexts are finished, ACTIVE is clear, the kernel root
         // is active, and no handler retains a reference into either user tree.
-        unsafe { process.space.destroy(frames) }.expect("release user address space");
+        unsafe { zombie.space.destroy(frames) }.expect("release user address space");
         #[cfg(feature = "boot-smoke")]
-        process.check_charges_zero();
+        zombie.check_charges_zero();
     }
     // 0059 test 2: the held block returns before the frame check, and the
     // relaunch pair's mid-session growth is exactly one step.
@@ -843,6 +1109,7 @@ fn run_pair(
             );
         }
     }
+    // Each session ends at its own frame baseline.
     assert_eq!(
         frames.stats().unwrap().allocated_frames,
         // 0050-D2's shared rule, heap term: heap pages committed this session
@@ -857,23 +1124,33 @@ fn run_pair(
     // then prints the marker. Armed before the relaunch pair when no desktop
     // session follows, making this drain the boot's last.
     if CHARGE_PROBE.swap(false, Ordering::Relaxed) {
-        let process = &mut processes[0];
-        process.surface_frames = 1;
-        assert!(!process.charges_zero(), "reap check missed a leaked charge");
-        process.surface_frames = 0;
-        assert!(process.charges_zero(), "a repaired charge must pass");
+        let zombie = &mut zombies[0];
+        zombie.surface_frames = 1;
+        assert!(!zombie.charges_zero(), "reap check missed a leaked charge");
+        zombie.surface_frames = 0;
+        assert!(zombie.charges_zero(), "a repaired charge must pass");
     }
-    #[cfg(feature = "boot-smoke")]
     serial::println!(
         "MIRROR_HEAP_CHARGE_OK tables_peak={} surfaces_peak=0",
         tables_peak
     );
+}
+
+/// Validate a finished init pair's zombies, which stay in the table until
+/// this returns, and report the pair's markers.
+#[cfg(feature = "boot-smoke")]
+fn validate_pair(
+    processes: [&Process; 2],
+    scenario: u64,
+    stats: sched::Stats,
+    surface: Option<surface::Session<'_, '_>>,
+) {
     assert_eq!(
         processes[1].surface_tiles, 0,
         "peer painted without authority"
     );
-    // Taking the session releases its display borrow when this branch ends.
-    if let Some(session) = surface.take() {
+    // Dropping the session releases its display borrow when this branch ends.
+    if let Some(session) = surface {
         assert!(
             processes[0].surface_checks,
             "owner surface checks did not complete: {:?}",
@@ -917,8 +1194,25 @@ fn run_pair(
     // session releases its exclusive display borrow back to the kernel console.
     assert!(processes.iter().all(|process| process.handles.is_empty()));
     serial::println!("MIRROR_USER_SURFACE_CLEANUP_OK handles_reclaimed=1");
-    validate_process(&processes[0], scenario);
-    validate_process(&processes[1], 0);
+    validate_process(processes[0], scenario);
+    validate_process(processes[1], 0);
+    // Spec 0030a, acceptance 2: only role 0 fills its thread table, and the
+    // kernel saw it hold every slot at once; role 1 keeps the 3-worker battery.
+    assert!(
+        processes[0].capacity_checks
+            && processes[0].threads_peak == thread_abi::MAX_THREADS
+            && !processes[1].capacity_checks
+            && processes[1].threads_peak < thread_abi::MAX_THREADS,
+        "thread capacity checks did not complete: peaks {} and {}",
+        processes[0].threads_peak,
+        processes[1].threads_peak
+    );
+    // Acceptance 3: only role 0 checks FIFO wake order, after its capacity
+    // check. Each completion asserted that its blocked thread was not charged.
+    assert!(
+        processes[0].wait_queue_checks && !processes[1].wait_queue_checks,
+        "wait queue checks did not complete"
+    );
     assert_eq!(
         processes
             .iter()
@@ -954,18 +1248,49 @@ fn run_pair(
         waits,
         timeouts
     );
+    // Acceptance 4: only role 0 times its wakes. A sleeper is dispatched by
+    // its deadline's own tick, a receiver as its sender's syscall exits, and
+    // the spinner they displace keeps the rest of its quantum. One tick of
+    // slack covers an IRQ held across a tick boundary by a critical section.
+    assert!(
+        processes[1].wake_lateness.is_none()
+            && processes[1].ipc_lateness.is_none()
+            && !processes[1].spin_kept_quantum,
+        "peer timed a wake"
+    );
+    let (Some(wake_lateness), Some(ipc_lateness)) =
+        (processes[0].wake_lateness, processes[0].ipc_lateness)
+    else {
+        panic!(
+            "wake preemption checks did not complete: sleep {:?}, receive {:?}",
+            processes[0].wake_lateness, processes[0].ipc_lateness
+        );
+    };
+    assert!(
+        processes[0].spin_kept_quantum,
+        "a displaced spinner lost its quantum"
+    );
+    assert!(
+        wake_lateness <= 1 && ipc_lateness <= 1,
+        "late wake: sleep {wake_lateness} ticks, receive {ipc_lateness} ticks"
+    );
+    serial::println!(
+        "MIRROR_PREEMPT_OK wake_lateness={} ipc_lateness={}",
+        wake_lateness,
+        ipc_lateness
+    );
     let yields: usize = processes.iter().map(|process| process.yields).sum();
     let sleeps: usize = processes.iter().map(|process| process.sleeps).sum();
     let preemptions: usize = processes.iter().map(|process| process.preemptions).sum();
-    assert!(switches >= 4, "processes did not alternate");
+    assert!(stats.switches >= 4, "processes did not alternate");
     serial::println!(
         "MIRROR_SCHEDULER_OK processes={} switches={} yields={} sleeps={} preemptions={} idle_ticks={}",
         PROCESS_COUNT,
-        switches,
+        stats.switches,
         yields,
         sleeps,
         preemptions,
-        idle_ticks
+        stats.idle_ticks
     );
 }
 
@@ -975,7 +1300,7 @@ fn run_pair(
 fn resume_process(
     kernel: &PageTables,
     frames: &mut FrameAllocator<'_>,
-    process: &mut Process<'_>,
+    process: &mut Process,
     ipc: &mut Ipc,
     surface: Option<&mut surface::Session<'_, '_>>,
     input: Option<&mut input::Session<'_>>,
@@ -987,10 +1312,24 @@ fn resume_process(
     assert!(ACTIVE_SURFACE.load(Ordering::SeqCst).is_null());
     assert!(ACTIVE_INPUT.load(Ordering::SeqCst).is_null());
     assert!(ACTIVE_WINDOWS.load(Ordering::SeqCst).is_null());
-    process.select_thread();
+    // The scheduler dequeued this thread and made it current.
+    assert!(!process.finished());
     assert_eq!(process.thread().state, State::Ready);
-    process.thread_mut().state = State::Running;
-    process.thread_mut().quantum_left = QUANTUM_TICKS;
+    let thread = process.thread_mut();
+    thread.state = State::Running;
+    // A thread that a wake displaced resumes its interrupted quantum; any
+    // other dispatch starts a new one (0030-D3).
+    let resumed = core::mem::take(&mut thread.displaced);
+    if resumed {
+        assert!(
+            (1..=QUANTUM_TICKS).contains(&thread.quantum_left),
+            "displaced thread has no quantum left"
+        );
+    } else {
+        thread.quantum_left = QUANTUM_TICKS;
+    }
+    #[cfg(feature = "boot-smoke")]
+    record_latency(process, resumed);
     process.dispatches += 1;
     // Save a copy, not a reference into a context that handlers can mutate.
     let context = process.thread().context.frame;
@@ -1049,13 +1388,35 @@ fn resume_process(
     );
 }
 
+/// At a dispatch, record a flagged wake's latency, or that a flagged spinner
+/// resumed with the rest of its quantum (spec 0030a, acceptance 4). Each
+/// flag times one event and is then cleared.
+#[cfg(feature = "boot-smoke")]
+fn record_latency(process: &mut Process, resumed: bool) {
+    let now = timer::ticks();
+    let thread = process.thread_mut();
+    let probe = thread.probe;
+    if probe == Some(LatencyProbe::Spin) && resumed && thread.quantum_left < QUANTUM_TICKS {
+        thread.probe = None;
+        process.spin_kept_quantum = true;
+        return;
+    }
+    let Some(due) = thread.due.take() else {
+        return;
+    };
+    thread.probe = None;
+    let lateness = now.wrapping_sub(due);
+    let slot = match probe {
+        Some(LatencyProbe::Sleep) => &mut process.wake_lateness,
+        Some(LatencyProbe::Receive) => &mut process.ipc_lateness,
+        _ => unreachable!("timed a wake without its probe"),
+    };
+    assert!(slot.replace(lateness).is_none(), "wake timed twice");
+}
+
 /// Complete bounded VM work with the kernel root active and no interrupt frames
 /// or published process borrow. Disjoint I/O sessions remain borrowed by resume.
-fn complete_memory(
-    process: &mut Process<'_>,
-    frames: &mut FrameAllocator<'_>,
-    request: MemoryRequest,
-) {
+fn complete_memory(process: &mut Process, frames: &mut FrameAllocator<'_>, request: MemoryRequest) {
     assert!(ACTIVE.load(Ordering::SeqCst).is_null());
     assert!(!arch::interrupts_enabled());
     match request {
@@ -1088,14 +1449,16 @@ fn complete_memory(
                 }
                 _ => unreachable!("invalid deferred VM operation"),
             };
-            if result.is_ok()
-                && (frame.rax == vm_abi::SYS_VM_RELEASE
-                    || (frame.rax == vm_abi::SYS_VM_PROTECT && frame.rdx == vm_abi::PROT_NONE))
-            {
+            if result.is_ok() && frame.rax != vm_abi::SYS_VM_RESERVE {
                 // Invalidate the old wait key before any sibling can run or
                 // re-reserve this address. Failed transactional changes leave
                 // waiters untouched. No backing page or raw pointer is pinned.
-                invalidate_waits(process, frame.rdi, frame.rsi);
+                invalidate_waits(
+                    process,
+                    frame.rdi,
+                    frame.rsi,
+                    frame.rax == vm_abi::SYS_VM_RELEASE || frame.rdx == vm_abi::PROT_NONE,
+                );
             }
             process.thread_mut().context.frame.rax = result.unwrap_or_else(|error| error) as u64;
             process.thread_mut().state = State::Ready;
@@ -1157,16 +1520,7 @@ fn complete_memory(
             let outcome = dispatch_syscall(process, &mut frame);
             process.thread_mut().context.frame = frame;
             if !outcome.finished {
-                process.thread_mut().state = outcome.suspension.unwrap_or(State::Ready);
-                if matches!(
-                    process.thread().state,
-                    State::Sleeping(_)
-                        | State::Receiving(_)
-                        | State::InputWaiting(_)
-                        | State::Waiting(_)
-                ) {
-                    process.thread_mut().sleep_charge = process.thread().charged_ticks;
-                }
+                park(process, outcome.suspension.unwrap_or(State::Ready));
             }
         }
     }
@@ -1175,7 +1529,7 @@ fn complete_memory(
 /// Describe only authorized, bounded copy operations. Bad handles, wrong object
 /// types and malformed lengths keep their existing error precedence and cannot
 /// cause page allocation. Actual dispatch repeats all validation after page-in.
-fn syscall_buffer(process: &Process<'_>, frame: &TrapFrame) -> Option<(u64, usize, bool)> {
+fn syscall_buffer(process: &Process, frame: &TrapFrame) -> Option<(u64, usize, bool)> {
     let require = |handle, rights| {
         process
             .handles
@@ -1260,281 +1614,49 @@ fn syscall_buffer(process: &Process<'_>, frame: &TrapFrame) -> Option<(u64, usiz
     Some((range.0, range.1 as usize, range.2))
 }
 
-/// Run a native desktop and its capability-connected automation client. Each
-/// service has its own renewable CPU allowance. The desktop owns the session;
-/// its termination also cancels a client that has not already exited or faulted.
-pub fn run_desktop(
-    kernel: &PageTables,
-    frames: &mut FrameAllocator<'_>,
-    programs: [&[u8]; 2],
-    direct_map: u64,
-    display: &mut framebuffer::Driver<'_>,
-    consumer: &mut ps2::Consumer,
-    smoke: bool,
-) {
-    assert!(!arch::interrupts_enabled());
-    let before = frames.stats().expect("recycling required").allocated_frames;
-    let heap_before = heap::stats().size;
-    let (desktop_outcome, agent_outcome) = {
-        // Validate both immutable modules before acquiring either address space.
-        let desktop_image = elf::parse(programs[0]).expect("invalid native desktop ELF");
-        let agent_image = elf::parse(programs[1]).expect("invalid native agent ELF");
-        let mut desktop = create_process(
-            kernel,
-            frames,
-            programs[0],
-            &desktop_image,
-            direct_map,
-            u64::from(smoke),
-        )
-        .expect("load native desktop");
-        let mut agent = match create_process(
-            kernel,
-            frames,
-            programs[1],
-            &agent_image,
-            direct_map,
-            u64::from(smoke),
-        ) {
-            Ok(process) => process,
-            Err(error) => {
-                // SAFETY: Neither root has been active. Failed creation released
-                // its own mappings; the desktop owns all remaining user pages.
-                unsafe { desktop.space.destroy(frames) }.expect("agent-load cleanup");
-                assert_eq!(frames.stats().unwrap().allocated_frames, before);
-                panic!("could not load native agent: {error:?}");
-            }
-        };
-        let now = timer::ticks();
-        desktop.policy = CpuPolicy::Desktop(ServicePolicy::new(now));
-        agent.policy = CpuPolicy::Agent(ServicePolicy::new(now));
-        let mut processes = [desktop, agent];
-        let mut ipc = Ipc::new();
-        // 0059-D4: the session's charge peak is set at seeding.
-        #[cfg(feature = "boot-smoke")]
-        let tables_peak: usize = processes
-            .iter()
-            .map(|process| process.space.owned_table_count())
-            .sum();
-        let mut surface = surface::Session::desktop(display).expect("desktop surface");
-        let (framebuffer, region) = surface.placement();
-        let mut input = input::Session::new(consumer, framebuffer, region);
-        for (index, process) in processes.iter_mut().enumerate() {
-            // Channel 0 carries requests to the desktop; channel 1 carries
-            // replies/jobs to the agent. Handles never cross process tables.
-            for (slot, object, rights) in [
-                (0, Object::Console, capability::WRITE),
-                (1, Object::Channel(1 - index), capability::SEND),
-                (2, Object::Channel(index), capability::RECEIVE),
-            ] {
-                process.boot_handles[slot] = process
-                    .handles
-                    .insert(object, rights)
-                    .expect("service bootstrap capability");
-                ipc.grant(Capability { object, rights });
-            }
-        }
-        for (slot, object, rights) in [
-            (3, Object::Surface, capability::WRITE),
-            (4, Object::Input, capability::RECEIVE),
-        ] {
-            processes[0].boot_handles[slot] = processes[0]
-                .handles
-                .insert(object, rights)
-                .expect("desktop bootstrap capability");
-        }
-        assert_eq!(processes[0].handles.len(), 5);
-        assert_eq!(processes[1].handles.len(), 3);
-        assert_eq!(processes[1].boot_handles[3..], [0, 0, 0]);
-        let stack_top = stacks::bsp_rsp0_top();
-        // SAFETY: IF=0, no active user, and the BSP's guarded RSP0 stack
-        // remains mapped in the shared upper half of every process root.
-        unsafe { interrupts::set_kernel_stack(stack_top) };
-
-        let mut cursor = 0;
-        while !processes[0].finished() {
-            assert!(!arch::interrupts_enabled());
-            // 0059-D1: the loop top is a heap safe point.
-            heap::ensure(kernel, frames, direct_map);
-            // Endpoint closure is visible before checking a peer's pending
-            // receive. A client may exit while the desktop remains interactive.
-            release_finished_handles(&mut processes, &mut ipc);
-            let now = timer::ticks();
-            for (index, process) in processes.iter_mut().enumerate() {
-                wake_threads(
-                    process,
-                    &mut ipc,
-                    if index == 0 { Some(&mut input) } else { None },
-                    None,
-                    now,
-                );
-            }
-            let mut selected = None;
-            for offset in 0..processes.len() {
-                let index = (cursor + offset) % processes.len();
-                let process = &mut processes[index];
-                let policy = match &mut process.policy {
-                    CpuPolicy::Desktop(policy) | CpuPolicy::Agent(policy) => policy,
-                    _ => panic!("service lost its recurring allowance"),
-                };
-                // Wakes and yields cannot reset either service's spent credit.
-                if policy.eligible(now) && process.ready() {
-                    selected = Some(index);
-                    break;
-                }
-            }
-            if let Some(index) = selected {
-                cursor = (index + 1) % processes.len();
-                resume_process(
-                    kernel,
-                    frames,
-                    &mut processes[index],
-                    &mut ipc,
-                    if index == 0 { Some(&mut surface) } else { None },
-                    if index == 0 { Some(&mut input) } else { None },
-                    None,
-                );
-            } else {
-                let before_charge = processes.each_ref().map(|process| process.charged_ticks);
-                // SAFETY: No published user/session pointers or outstanding
-                // borrows. IF stays clear from the queue/deadline check through
-                // STI-HLT, so a pending input IRQ cannot create a lost wakeup.
-                unsafe { core::arch::asm!("sti", "hlt", "cli", options(nostack)) };
-                assert_eq!(
-                    processes.each_ref().map(|process| process.charged_ticks),
-                    before_charge,
-                    "service idle/throttling charged user CPU ticks"
-                );
-            }
-        }
-        if !processes[1].finished() {
-            assert!(processes[1].outcome.is_none());
-            processes[1].finish(Outcome::SessionEnded);
-        }
-        assert!(ACTIVE.load(Ordering::SeqCst).is_null());
-        assert!(ACTIVE_IPC.load(Ordering::SeqCst).is_null());
-        assert!(ACTIVE_INPUT.load(Ordering::SeqCst).is_null());
-        assert!(ACTIVE_SURFACE.load(Ordering::SeqCst).is_null());
-        assert_eq!(
-            surface.totals(),
-            (processes[0].surface_tiles, processes[0].surface_pixels)
-        );
-        assert_eq!(processes[1].surface_tiles, 0, "agent used display directly");
-        assert_eq!(processes[1].input_events, 0, "agent read hardware input");
-        release_finished_handles(&mut processes, &mut ipc);
-        assert!(ipc.is_drained());
-        for process in &mut processes {
-            assert!(process.handles.is_empty());
-            // SAFETY: Both processes are finished, all handlers unwound, every
-            // published pointer is clear, and the kernel root is active with IF=0.
-            unsafe { process.space.destroy(frames) }.expect("service address-space cleanup");
-            #[cfg(feature = "boot-smoke")]
-            process.check_charges_zero();
-        }
-        assert_eq!(
-            frames.stats().unwrap().allocated_frames,
-            // 0050-D2's shared rule, heap term (0059).
-            before + (heap::stats().size - heap_before) / PAGE_SIZE as usize,
-            "desktop/agent frame leak"
-        );
-        // 0059 acceptance test 4: the last session's drain leaks one charge,
-        // requires the reap check to report it, repairs it, and only then
-        // prints the marker.
-        #[cfg(feature = "boot-smoke")]
-        {
-            let process = &mut processes[0];
-            process.surface_frames = 1;
-            assert!(!process.charges_zero(), "reap check missed a leaked charge");
-            process.surface_frames = 0;
-            assert!(process.charges_zero(), "a repaired charge must pass");
-        }
-        #[cfg(feature = "boot-smoke")]
-        serial::println!(
-            "MIRROR_HEAP_CHARGE_OK tables_peak={} surfaces_peak=0",
-            tables_peak
-        );
-        let process = &processes[0];
-        let outcome = process.outcome.expect("desktop finished without outcome");
-        let agent = &processes[1];
-        let agent_outcome = agent.outcome.expect("agent finished without outcome");
-        if smoke {
-            assert!(
-                matches!(outcome, Outcome::Fault { vector: 6, .. }),
-                "desktop smoke did not end in contained UD2: {outcome:?}"
-            );
-            assert!(process.desktop_checks, "desktop smoke checks missing");
-            assert!(process.throttles > 0, "desktop allowance never throttled");
-            assert!(process.input_timeouts > 0, "desktop input never timed out");
-            assert!(
-                process.input_lost > 0,
-                "desktop did not read initial loss barrier"
-            );
-            assert!(process.input_waits > 0);
-            serial::println!(
-                "MIRROR_DESKTOP_TESTS_OK throttles={} timeouts={} input_events={}",
-                process.throttles,
-                process.input_timeouts,
-                process.input_events
-            );
-            assert!(agent.agent_ready, "agent ready marker missing");
-            assert!(agent.agent_checks, "agent checks did not complete");
-            assert_eq!(
-                agent_outcome,
-                Outcome::Exit(0),
-                "agent did not exit successfully"
-            );
-            assert!(agent.dispatches > 1, "agent never resumed");
-            assert!(
-                agent.ipc_sent > 0 && agent.ipc_received > 0,
-                "agent did not exchange IPC"
-            );
-            serial::println!(
-                "MIRROR_AGENT_TESTS_OK sent={} received={} dispatches={}",
-                agent.ipc_sent,
-                agent.ipc_received,
-                agent.dispatches
-            );
-        }
-        // Surface and input sessions leave scope before the caller can start
-        // the kernel console. No service handle or frame survives this return.
-        (outcome, agent_outcome)
-    };
-    match desktop_outcome {
-        Outcome::Exit(status) => serial::println!(
-            "MIRROR_DESKTOP_CLEANUP_OK reason=exit handles_reclaimed=1 status={}",
-            status
-        ),
-        _ => serial::println!("MIRROR_DESKTOP_CLEANUP_OK reason=fault handles_reclaimed=1"),
-    }
-    match agent_outcome {
-        Outcome::Exit(status) => serial::println!(
-            "MIRROR_AGENT_CLEANUP_OK reason=exit handles_reclaimed=1 status={}",
-            status
-        ),
-        Outcome::SessionEnded => {
-            serial::println!("MIRROR_AGENT_CLEANUP_OK reason=session_ended handles_reclaimed=1")
-        }
-        outcome => serial::println!(
-            "MIRROR_AGENT_CLEANUP_OK reason=fault handles_reclaimed=1 outcome={:?}",
-            outcome
-        ),
-    }
-}
-
-struct ShellRuntime<'kernel, 'image> {
-    kernel: &'kernel PageTables,
-    bytes: &'image [u8],
+/// The shell session's application state. Apps are process-table entries;
+/// `children` holds their slots by window index.
+struct ShellRuntime<'a> {
+    kernel: &'a PageTables,
+    bytes: &'a [u8],
     image: elf::Image,
     direct_map: u64,
-    children: [Option<Process<'kernel>>; windows::APP_COUNT],
+    children: [Option<usize>; windows::APP_COUNT],
     windows: windows::Session,
+    /// The session's peak charged frames, sampled at each scheduler loop top
+    /// (0059-D4; boot-smoke only).
+    #[cfg(feature = "boot-smoke")]
+    tables_peak: u64,
+    #[cfg(feature = "boot-smoke")]
+    surfaces_peak: u64,
 }
 
-impl<'kernel> ShellRuntime<'kernel, '_> {
+impl ShellRuntime<'_> {
+    /// 0059-D4 (boot-smoke): sample the session's charge peaks — the shell's
+    /// own table and surface charges plus the live children's table charges.
+    /// The scheduler calls this at each loop top, one iteration after any
+    /// launch, close or reclaim.
+    #[cfg(feature = "boot-smoke")]
+    fn sample_charge_peaks(&mut self, desktop: &Process) {
+        let children: u64 = self
+            .children
+            .iter()
+            .flatten()
+            .map(|&slot| {
+                // SAFETY: The scheduler holds no other reference to the child.
+                unsafe { sched::process(slot) }.space.owned_table_count() as u64
+            })
+            .sum();
+        self.tables_peak = self
+            .tables_peak
+            .max(desktop.space.owned_table_count() as u64 + children);
+        self.surfaces_peak = self.surfaces_peak.max(desktop.surface_frames);
+    }
+
     fn launch(
         &mut self,
         frames: &mut FrameAllocator<'_>,
-        desktop: &mut Process<'kernel>,
+        desktop: &mut Process,
         kind: u64,
     ) -> Result<u64, i64> {
         let index = self
@@ -1545,7 +1667,7 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
             .ok_or(-11)?;
         assert!(self.children[index].is_none());
         let before = frames.stats().unwrap().allocated_frames;
-        let mut child = create_process(
+        let slot = create_process(
             self.kernel,
             frames,
             self.bytes,
@@ -1553,7 +1675,10 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
             self.direct_map,
             kind,
         )
-        .map_err(|_| -12)?;
+        .map_err(|error| error.errno())?;
+        // SAFETY: A fresh slot, distinct from the shell's, that nothing else
+        // references; this borrow ends before any rollback removes it.
+        let child = unsafe { sched::process(slot) };
         let pid = child.pid;
         let prepared = (|| {
             for (slot, object, rights) in [
@@ -1586,6 +1711,8 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
         let (application, handle) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
+                // SAFETY: The child has never run and its borrow has ended.
+                let mut child = unsafe { sched::discard(slot) };
                 // SAFETY: The child has never run, and failed resource creation
                 // released all offscreen pages before this address-space teardown.
                 unsafe { child.space.destroy(frames) }.expect("application-load rollback");
@@ -1598,7 +1725,8 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
             desktop.space.root_physical_address()
         );
         child.policy = CpuPolicy::Application(ServicePolicy::new(timer::ticks()));
-        self.children[index] = Some(child);
+        child.access.windows = true;
+        self.children[index] = Some(slot);
         self.windows.applications[index] = Some(application);
         self.windows.launches += 1;
         serial::println!("MIRROR_APP_STARTED pid={} kind={}", pid, kind);
@@ -1606,12 +1734,14 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
     }
 
     fn reclaim(&mut self, index: usize, frames: &mut FrameAllocator<'_>, ipc: &mut Ipc) {
-        let mut child = self.children[index]
+        let slot = self.children[index]
             .take()
             .expect("reclaim live child slot");
-        assert!(child.finished());
+        // SAFETY: The scheduler holds no reference to the child; reap checks
+        // that it finished.
+        let mut child = unsafe { sched::reap(slot) };
         let outcome = child.outcome.expect("child ended without outcome");
-        release_finished_handles(core::slice::from_mut(&mut child), ipc);
+        release_handles(&mut child, ipc);
         assert!(child.handles.is_empty());
         let before = frames.stats().unwrap().allocated_frames;
         let owned = child.space.owned_page_count() + child.space.owned_table_count();
@@ -1649,10 +1779,10 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
 
     fn reclaim_finished(&mut self, frames: &mut FrameAllocator<'_>, ipc: &mut Ipc) {
         for index in 0..self.children.len() {
-            if self.children[index]
-                .as_ref()
-                .is_some_and(|child| child.finished())
-            {
+            if self.children[index].is_some_and(|slot| {
+                // SAFETY: The scheduler holds no other reference to the child.
+                unsafe { sched::process(slot) }.finished()
+            }) {
                 self.reclaim(index, frames, ipc);
             }
         }
@@ -1661,7 +1791,7 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
     fn close(
         &mut self,
         frames: &mut FrameAllocator<'_>,
-        desktop: &mut Process<'_>,
+        desktop: &mut Process,
         ipc: &mut Ipc,
         pid: u64,
         reason: Outcome,
@@ -1676,8 +1806,11 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
                     .is_some_and(|application| application.pid == pid)
             })
             .ok_or(-9)?;
-        if let Some(child) = &mut self.children[index] {
-            assert_ne!(child.thread().state, State::Running);
+        if let Some(slot) = self.children[index] {
+            // SAFETY: The child's slot is distinct from the shell's, and this
+            // borrow ends before reclaim removes the entry.
+            let child = unsafe { sched::process(slot) };
+            assert!(child.threads().all(|thread| thread.state != State::Running));
             if !child.finished() {
                 child.finish(reason);
             }
@@ -1704,154 +1837,208 @@ impl<'kernel> ShellRuntime<'kernel, '_> {
     }
 }
 
-fn service_eligible(process: &mut Process<'_>, now: u64) -> bool {
-    let policy = match &mut process.policy {
-        CpuPolicy::Shell(policy) | CpuPolicy::Application(policy) => policy,
-        _ => panic!("invalid shell scheduling policy"),
+/// Record the current thread's suspension (0030-D2). A blocking state
+/// snapshots the thread's charge and attaches it to its event queue and, for
+/// a timed wait, the deadline heap. A joiner waits on its target's `joiner`
+/// field, so an exit signals that joiner instead.
+fn park(process: &mut Process, state: State) {
+    let owner = process.thread().process;
+    let (queue, deadline) = match state {
+        State::Sleeping(deadline) => (None, Some(deadline)),
+        State::Receiving(pending) => (
+            Some(sched::Queue::Channel(pending.channel)),
+            Some(pending.deadline),
+        ),
+        State::InputWaiting(pending) => (Some(pending.queue), Some(pending.deadline)),
+        State::Waiting(pending) => (
+            Some(sched::Queue::Futex {
+                process: owner,
+                address: pending.address,
+            }),
+            pending.deadline,
+        ),
+        State::Joining(_) => (None, None),
+        State::Exited(_) => {
+            if let Some(tid) = process.thread().joiner {
+                let joiner = member_by_id(process, tid).expect("join waiter exists");
+                sched::signal(process.members[joiner], None);
+            }
+            process.thread_mut().state = state;
+            return;
+        }
+        _ => {
+            process.thread_mut().state = state;
+            return;
+        }
     };
-    policy.eligible(now) && process.ready()
+    let thread = process.thread_mut();
+    thread.state = state;
+    thread.sleep_charge = thread.charged_ticks;
+    sched::block(thread.slot, queue, deadline);
 }
 
-/// Every wake runs with the kernel root active. Siblings may have changed a
-/// shared mapping or closed a shared handle while this thread was blocked, so
-/// the original checked receive helpers repeat permission/range validation.
-fn wake_threads(
-    process: &mut Process<'_>,
+/// Complete one signaled wait, in the scheduler with the kernel root active,
+/// never in the handler that signaled it (0030-D2). A preset result decided
+/// by the event completes an address wait as is. Otherwise the condition is
+/// checked again: siblings may have changed a shared mapping or closed a
+/// shared handle meanwhile, so the checked receive helpers repeat permission
+/// and range validation. Readiness or closure beats a deadline reached in the
+/// same check. A wait that still cannot complete stays queued.
+fn complete_wait(
+    process: &mut Process,
+    signal: sched::Signal,
     ipc: &mut Ipc,
-    mut input: Option<&mut input::Session<'_>>,
-    mut windows: Option<&mut windows::Session>,
+    input: Option<&mut input::Session<'_>>,
+    windows: Option<&mut windows::Session>,
     now: u64,
 ) {
-    if process.finished() {
-        return;
-    }
-    complete_joins(process);
-    for index in 0..process.threads.len() {
-        if process.threads[index].is_none() {
-            continue;
+    let sched::Signal { slot, preset, at } = signal;
+    assert!(ACTIVE.load(Ordering::SeqCst).is_null());
+    process.current = process
+        .members
+        .iter()
+        .position(|&member| member == slot)
+        .expect("signaled thread has no owner");
+    let state = process.thread().state;
+    assert_eq!(
+        process.thread().charged_ticks,
+        process.thread().sleep_charge,
+        "blocked thread charged user CPU ticks"
+    );
+    assert!(
+        preset.is_none() || matches!(state, State::Waiting(_)),
+        "preset result for a {state:?} wait"
+    );
+    // The result for RAX, or None to keep the one the syscall saved.
+    let result = match state {
+        State::Sleeping(deadline) => {
+            assert!(deadline_reached(now, deadline), "sleep signaled early");
+            None
         }
-        process.current_thread = index;
-        let state = process.thread().state;
-        if matches!(
-            state,
-            State::Sleeping(_)
-                | State::Receiving(_)
-                | State::InputWaiting(_)
-                | State::Joining(_)
-                | State::Waiting(_)
-        ) {
-            assert_eq!(
-                process.thread().charged_ticks,
-                process.thread().sleep_charge,
-                "blocked thread charged user CPU ticks"
-            );
-        }
-        match state {
-            State::Sleeping(deadline) if deadline_reached(now, deadline) => {
-                process.thread_mut().state = State::Ready;
+        State::Waiting(pending) => Some(preset.unwrap_or_else(|| {
+            assert!(pending.expired(now), "address wait signaled early");
+            #[cfg(feature = "boot-smoke")]
+            {
+                process.sync_timeouts += 1;
             }
-            State::Waiting(pending) if pending.expired(now) => {
-                complete_wait(process.thread_mut(), -110);
+            -110
+        })),
+        State::Receiving(pending) => {
+            let mut result = receive(
+                process,
+                ipc,
+                pending.handle,
+                pending.address,
+                pending.capacity,
+            );
+            if result == -11 && deadline_reached(now, pending.deadline) {
+                result = -110;
                 #[cfg(feature = "boot-smoke")]
                 {
-                    process.sync_timeouts += 1;
+                    process.ipc_timeouts += 1;
                 }
             }
-            State::Receiving(pending) => {
-                let mut result = receive(
-                    process,
-                    ipc,
-                    pending.handle,
-                    pending.address,
-                    pending.capacity,
-                );
-                if result == -11 && deadline_reached(now, pending.deadline) {
-                    result = -110;
-                    #[cfg(feature = "boot-smoke")]
-                    {
-                        process.ipc_timeouts += 1;
-                    }
-                }
-                if result != -11 {
-                    #[cfg(feature = "boot-smoke")]
-                    if result == -32 {
-                        process.ipc_closed_wakes += 1;
-                    }
-                    process.thread_mut().context.frame.rax = result as u64;
-                    process.thread_mut().state = State::Ready;
-                }
+            if result == -11 {
+                return;
             }
-            State::InputWaiting(pending) => {
-                // Resolve the capability afresh: it may have been closed by a
-                // sibling since the wait began. Session availability is tied
-                // to process authority, never to the thread that issued it.
-                let mut result = match process.handles.require(pending.handle, capability::RECEIVE)
-                {
-                    Ok(cap) => match cap.object {
-                        Object::Input => receive_input(
-                            process,
-                            input.as_deref_mut().expect("input owner session"),
-                            pending.handle,
-                            pending.address,
-                            input::EVENT_SIZE as u64,
-                        ),
-                        Object::AppInput(pid) if pid == process.pid => receive_app_input(
-                            process,
-                            windows.as_deref_mut().expect("application input session"),
-                            pending.handle,
-                            pending.address,
-                            windows::EVENT_SIZE as u64,
-                        ),
-                        _ => -13,
-                    },
-                    Err(error) => cap_error(error),
-                };
-                if result == -11 && deadline_reached(now, pending.deadline) {
-                    result = -110;
-                    process.input_timeouts += 1;
-                    // Whether this prints depends on input timing, so it is a
-                    // per-input marker and only trace kernels print it (0010).
-                    #[cfg(feature = "test-trace")]
-                    if matches!(process.policy, CpuPolicy::Desktop(_))
-                        && process.input_timeouts == 1
-                    {
-                        serial::println!("MIRROR_DESKTOP_INPUT_TIMEOUT");
-                    }
-                }
-                if result != -11 {
-                    process.thread_mut().context.frame.rax = result as u64;
-                    process.thread_mut().state = State::Ready;
-                }
+            #[cfg(feature = "boot-smoke")]
+            if result == -32 {
+                process.ipc_closed_wakes += 1;
             }
-            State::Ready
-            | State::Sleeping(_)
-            | State::Joining(_)
-            | State::Waiting(_)
-            | State::Exited(_)
-            | State::Launching(_)
-            | State::Closing(_) => {}
-            State::Running | State::Memory(_) | State::Finished => {
-                panic!("invalid thread suspension")
-            }
+            Some(result)
         }
+        State::InputWaiting(pending) => {
+            // Resolve the capability afresh: it may have been closed by a
+            // sibling since the wait began. Session availability is tied
+            // to process authority, never to the thread that issued it.
+            let mut result = match process.handles.require(pending.handle, capability::RECEIVE) {
+                Ok(cap) => match cap.object {
+                    Object::Input => receive_input(
+                        process,
+                        input.expect("input owner session"),
+                        pending.handle,
+                        pending.address,
+                        input::EVENT_SIZE as u64,
+                    ),
+                    Object::AppInput(pid) if pid == process.pid => receive_app_input(
+                        process,
+                        windows.expect("application input session"),
+                        pending.handle,
+                        pending.address,
+                        windows::EVENT_SIZE as u64,
+                    ),
+                    _ => -13,
+                },
+                Err(error) => cap_error(error),
+            };
+            if result == -11 && deadline_reached(now, pending.deadline) {
+                result = -110;
+                process.input_timeouts += 1;
+            }
+            if result == -11 {
+                return;
+            }
+            Some(result)
+        }
+        State::Joining(tid) => {
+            // The target's exit signaled this join after its context was
+            // saved and its pointer released, so it is reaped here.
+            let target = member_by_id(process, tid).expect("join target exists");
+            let State::Exited(status) = process.member(target).expect("join target").state else {
+                panic!("join signaled before its target exited");
+            };
+            process.thread_mut().context.frame.rdx = status;
+            process.remove_member(target);
+            #[cfg(feature = "boot-smoke")]
+            {
+                process.threads_joined += 1;
+            }
+            Some(0)
+        }
+        _ => panic!("signaled a thread that is not waiting: {state:?}"),
+    };
+    sched::release(slot);
+    let thread = process.thread_mut();
+    if let Some(result) = result {
+        thread.context.frame.rax = result as u64;
     }
+    // A flagged sleep is due at its deadline; a flagged receive that got a
+    // message, at the sending syscall's trap exit, when it was signaled.
+    #[cfg(feature = "boot-smoke")]
+    {
+        thread.due = match (thread.probe, state) {
+            (Some(LatencyProbe::Sleep), State::Sleeping(deadline)) => Some(deadline),
+            (Some(LatencyProbe::Receive), State::Receiving(_)) if result.is_some_and(|r| r > 0) => {
+                Some(at)
+            }
+            _ => None,
+        };
+    }
+    #[cfg(not(feature = "boot-smoke"))]
+    let _ = at;
+    thread.wake();
 }
 
-fn complete_wait(thread: &mut Thread, result: i64) {
-    assert!(matches!(thread.state, State::Waiting(_)));
-    assert_eq!(
-        thread.charged_ticks, thread.sleep_charge,
-        "wait charged user CPU ticks"
-    );
-    thread.context.frame.rax = result as u64;
-    thread.state = State::Ready;
+/// Signal this process's receive and input waits for a recheck, on `handle`
+/// only or on any. A closed handle or a changed mapping can fail them.
+fn signal_handle_waits(process: &Process, handle: Option<u64>) {
+    for thread in process.threads() {
+        let waited = match thread.state {
+            State::Receiving(pending) => pending.handle,
+            State::InputWaiting(pending) => pending.handle,
+            _ => continue,
+        };
+        if handle.is_none_or(|handle| handle == waited) {
+            sched::signal(thread.slot, None);
+        }
+    }
 }
 
 /// Compare and enqueue are one non-preemptible operation on the sole CPU.
 /// Deferred page-in also completes with IF=0 before another user can run. An
 /// SMP implementation must instead serialize the value check and wait queue
 /// with wake/invalidation under the same lock; disabling local IRQs won't do.
-fn wait_word(process: &mut Process<'_>, frame: &TrapFrame) -> Result<State, i64> {
+fn wait_word(process: &mut Process, frame: &TrapFrame) -> Result<State, i64> {
     assert!(!arch::interrupts_enabled());
     if !thread_abi::wait_arguments_valid(frame.rdi, frame.rsi, frame.rdx) {
         return Err(-22);
@@ -1888,7 +2075,8 @@ fn wait_word(process: &mut Process<'_>, frame: &TrapFrame) -> Result<State, i64>
 /// Wake only private wait keys in this process. Values are never read or
 /// written: a wake on untouched but readable reserved memory allocates nothing.
 /// Expired waits complete as timeouts and do not consume the caller's count.
-fn wake_word(process: &mut Process<'_>, frame: &TrapFrame) -> Result<u64, i64> {
+/// Waiters are selected in FIFO order (0030-D6); the scheduler completes them.
+fn wake_word(process: &mut Process, frame: &TrapFrame) -> Result<u64, i64> {
     assert!(!arch::interrupts_enabled());
     if !thread_abi::wake_arguments_valid(frame.rdi, frame.rsi, frame.rdx) {
         return Err(-22);
@@ -1905,88 +2093,49 @@ fn wake_word(process: &mut Process<'_>, frame: &TrapFrame) -> Result<u64, i64> {
             false,
         )
         .map_err(|_| -14)?;
-    let now = timer::ticks();
-    let first = process.next_waiter;
-    let mut woken = 0;
-    for offset in 0..process.threads.len() {
-        let index = (first + offset) % process.threads.len();
-        let Some(thread) = &mut process.threads[index] else {
-            continue;
-        };
-        let State::Waiting(pending) = thread.state else {
-            continue;
-        };
-        if pending.address != frame.rdi {
-            continue;
-        }
-        if pending.expired(now) {
-            complete_wait(thread, -110);
-            #[cfg(feature = "boot-smoke")]
-            {
-                process.sync_timeouts += 1;
-            }
-        } else if woken < frame.rsi {
-            complete_wait(thread, 0);
-            woken += 1;
-            process.next_waiter = (index + 1) % process.threads.len();
-        }
-    }
+    let (woken, expired) = sched::wake_address(
+        process.thread().process,
+        frame.rdi,
+        frame.rsi,
+        timer::ticks(),
+    );
     #[cfg(feature = "boot-smoke")]
     {
         process.sync_wakes += woken;
+        process.sync_timeouts += expired;
     }
+    #[cfg(not(feature = "boot-smoke"))]
+    let _ = expired;
     Ok(woken)
 }
 
-fn invalidate_waits(process: &mut Process<'_>, address: u64, length: u64) {
+/// After a successful release or protection change of `length` bytes at
+/// `address`, cancel the process's address waits in that range when the
+/// change removed access, and recheck its receive and input waits, whose
+/// buffers may no longer be writable.
+fn invalidate_waits(process: &mut Process, address: u64, length: u64, cancel: bool) {
     assert!(ACTIVE.load(Ordering::SeqCst).is_null());
     assert!(!arch::interrupts_enabled());
     let end = address.checked_add(length).expect("successful VM interval");
-    for thread in process.threads.iter_mut().flatten() {
-        if let State::Waiting(pending) = thread.state
-            && (address..end).contains(&pending.address)
-        {
-            complete_wait(thread, -14);
-            #[cfg(feature = "boot-smoke")]
-            {
-                process.sync_invalidations += 1;
-            }
-        }
-    }
-}
-
-/// Reap only after resume_user has saved/scrubbed the exiting context's FPU
-/// state and released its raw pointer. A join result needs no user buffer and
-/// is delivered atomically in the waiting thread's saved RAX/RDX registers.
-fn complete_joins(process: &mut Process<'_>) {
-    assert!(ACTIVE.load(Ordering::SeqCst).is_null());
-    for index in 0..process.threads.len() {
-        let Some(target) = &process.threads[index] else {
-            continue;
-        };
-        let (State::Exited(status), Some(waiter)) = (target.state, target.joiner) else {
-            continue;
-        };
-        let tid = target.id;
-        let joiner = process
-            .threads
-            .iter_mut()
-            .flatten()
-            .find(|thread| thread.id == waiter)
-            .expect("join waiter exists");
-        assert_eq!(joiner.state, State::Joining(tid));
-        joiner.context.frame.rax = 0;
-        joiner.context.frame.rdx = status;
-        joiner.state = State::Ready;
-        process.threads[index] = None;
+    if cancel {
+        let cancelled = sched::cancel_addresses(process.thread().process, address, end);
         #[cfg(feature = "boot-smoke")]
         {
-            process.threads_joined += 1;
+            process.sync_invalidations += cancelled;
         }
+        #[cfg(not(feature = "boot-smoke"))]
+        let _ = cancelled;
     }
+    signal_handle_waits(process, None);
 }
 
-fn create_thread(process: &mut Process<'_>, frame: &TrapFrame) -> Result<u64, i64> {
+/// The member index of the thread with this ID, if it belongs to `process`.
+fn member_by_id(process: &Process, tid: u64) -> Option<usize> {
+    (0..thread_abi::MAX_THREADS)
+        .find(|&index| process.member(index).is_some_and(|thread| thread.id == tid))
+}
+
+fn create_thread(process: &mut Process, frame: &TrapFrame) -> Result<u64, i64> {
     if frame.rsi != thread_abi::THREAD_START_SIZE as u64 || frame.rdx != 0 {
         return Err(-22);
     }
@@ -2008,24 +2157,47 @@ fn create_thread(process: &mut Process<'_>, frame: &TrapFrame) -> Result<u64, i6
     {
         return Err(-14);
     }
+    let owner = usize::from(process.thread().process);
+    add_thread(process, owner, &start)
+}
+
+/// Add a ready, queued thread to `process`, which occupies table slot
+/// `owner`, and return its ID. A full process or a full thread table both
+/// refuse with EAGAIN (0030-D4).
+fn add_thread(
+    process: &mut Process,
+    owner: usize,
+    start: &thread_abi::ThreadStart,
+) -> Result<u64, i64> {
     let index = process
-        .threads
+        .members
         .iter()
-        .position(Option::is_none)
+        .position(|&member| member == sched::NO_SLOT)
         .ok_or(-11)?;
-    let mut thread = Thread::new(start.entry, start.stack, start.argument);
-    thread.context.frame.fs_base = start.fs;
-    thread.context.frame.gs_base = start.gs;
-    let tid = thread.id;
-    process.threads[index] = Some(thread);
+    if !sched::has_room(0, 1) {
+        return Err(-11);
+    }
+    // A running thread's own entry is the process's current member; this
+    // insert touches only a vacant slot and the table's occupancy bitmap.
+    let slot = sched::insert_thread(|slot| {
+        let mut thread = Thread::new(start.entry, start.stack, start.argument, owner, slot);
+        thread.context.frame.fs_base = start.fs;
+        thread.context.frame.gs_base = start.gs;
+        thread
+    });
+    process.members[index] = slot;
+    sched::enqueue(slot);
+    let tid = process.member(index).expect("new thread").id;
     #[cfg(feature = "boot-smoke")]
     {
         process.threads_created += 1;
+        let live = process.threads().count();
+        process.threads_peak = process.threads_peak.max(live);
     }
     Ok(tid)
 }
 
-fn join_thread(process: &mut Process<'_>, frame: &mut TrapFrame) -> Result<Option<State>, i64> {
+fn join_thread(process: &mut Process, frame: &mut TrapFrame) -> Result<Option<State>, i64> {
     if frame.rsi != 0 || frame.rdx != 0 {
         return Err(-22);
     }
@@ -2033,18 +2205,14 @@ fn join_thread(process: &mut Process<'_>, frame: &mut TrapFrame) -> Result<Optio
     if frame.rdi == current {
         return Err(-35);
     }
-    let index = process
-        .threads
-        .iter()
-        .position(|slot| slot.as_ref().is_some_and(|thread| thread.id == frame.rdi))
-        .ok_or(-3)?;
-    let target = process.threads[index].as_ref().unwrap();
+    let index = member_by_id(process, frame.rdi).ok_or(-3)?;
+    let target = process.member(index).expect("join target");
     if target.joiner.is_some() {
         return Err(-16);
     }
     if let State::Exited(status) = target.state {
         frame.rdx = status;
-        process.threads[index] = None;
+        process.remove_member(index);
         #[cfg(feature = "boot-smoke")]
         {
             process.threads_joined += 1;
@@ -2054,7 +2222,7 @@ fn join_thread(process: &mut Process<'_>, frame: &mut TrapFrame) -> Result<Optio
     // A bounded wait-for walk rejects cycles before claiming the target. All
     // joins are within one process; TIDs are never interpreted as slot indexes.
     let mut state = target.state;
-    for _ in 0..process.threads.len() {
+    for _ in 0..thread_abi::MAX_THREADS {
         let State::Joining(tid) = state else {
             break;
         };
@@ -2062,19 +2230,19 @@ fn join_thread(process: &mut Process<'_>, frame: &mut TrapFrame) -> Result<Optio
             return Err(-35);
         }
         state = process
-            .threads
-            .iter()
-            .flatten()
+            .threads()
             .find(|thread| thread.id == tid)
             .expect("join target exists")
             .state;
     }
-    process.threads[index].as_mut().unwrap().joiner = Some(current);
+    process.member_mut(index).expect("join target").joiner = Some(current);
     Ok(Some(State::Joining(frame.rdi)))
 }
 
 /// Supervise two native applications without granting them scanout or physical
-/// input. Lifecycle operations execute here after all syscall frames unwind.
+/// input. Lifecycle operations execute in the scheduler after all syscall
+/// frames unwind. The session ends when the shell finishes; its live apps are
+/// then closed with SessionEnded (0030-D1).
 pub fn run_shell(
     kernel: &PageTables,
     frames: &mut FrameAllocator<'_>,
@@ -2091,7 +2259,7 @@ pub fn run_shell(
     let heap_before = heap::stats().size;
     let desktop_image = elf::parse(programs[0]).expect("invalid shell ELF");
     let image = elf::parse(programs[1]).expect("invalid application ELF");
-    let mut desktop = create_process(
+    let shell = create_process(
         kernel,
         frames,
         programs[0],
@@ -2100,156 +2268,60 @@ pub fn run_shell(
         2 + u64::from(smoke),
     )
     .expect("load native shell");
-    desktop.policy = CpuPolicy::Shell(ServicePolicy::new(timer::ticks()));
-    for (slot, object, rights) in [
-        (0, Object::Console, capability::WRITE),
-        (3, Object::Surface, capability::WRITE),
-        (4, Object::Input, capability::RECEIVE),
-        (5, Object::Supervisor, capability::WRITE),
-    ] {
-        desktop.boot_handles[slot] = desktop
-            .handles
-            .insert(object, rights)
-            .expect("shell bootstrap capability");
-    }
-    let mut runtime = ShellRuntime {
+    let runtime = ShellRuntime {
         kernel,
         bytes: programs[1],
         image,
         direct_map,
         children: [None, None],
         windows: windows::Session::new(smoke),
-    };
-    #[cfg(feature = "boot-smoke")]
-    {
-        // Exhaust the supervisor's remaining handle slots after loading the
-        // shell, then force a launch to roll back its root and both buffers.
-        let baseline = frames.stats().unwrap().allocated_frames;
-        let mut temporary = [0; 8];
-        let mut count = 0;
-        loop {
-            match desktop
-                .handles
-                .insert(Object::Supervisor, capability::WRITE)
-            {
-                Ok(handle) => {
-                    temporary[count] = handle;
-                    count += 1;
-                }
-                Err(CapError::TableFull) => break,
-                Err(error) => panic!("rollback test handle failure: {error:?}"),
-            }
-        }
-        assert_eq!(runtime.launch(frames, &mut desktop, 0), Err(-24));
-        assert_eq!(frames.stats().unwrap().allocated_frames, baseline);
-        assert!(runtime.children.iter().all(Option::is_none));
-        assert!(runtime.windows.applications.iter().all(Option::is_none));
-        for handle in &temporary[..count] {
-            desktop.handles.close(*handle).unwrap();
-        }
-        serial::println!("MIRROR_APP_LOAD_ROLLBACK_OK");
-    }
-    let mut ipc = Ipc::new();
-    let mut surface = surface::Session::desktop(display).expect("shell scanout");
-    let (framebuffer, region) = surface.placement();
-    let mut input = input::Session::new(consumer, framebuffer, region);
-    let stack_top = stacks::bsp_rsp0_top();
-    // SAFETY: IF=0, no active users; the guarded RSP0 stack stays mapped in
-    // every root's shared upper half.
-    unsafe { interrupts::set_kernel_stack(stack_top) };
-    #[cfg(feature = "boot-smoke")]
-    let (mut tables_peak, mut surfaces_peak) = (desktop.space.owned_table_count() as u64, 0);
-    let mut cursor = 0;
-    while !desktop.finished() {
-        assert!(ACTIVE_WINDOWS.load(Ordering::SeqCst).is_null());
-        // 0059-D1: the loop top is a heap safe point.
-        heap::ensure(kernel, frames, direct_map);
         #[cfg(feature = "boot-smoke")]
-        {
-            // 0059-D4: the session's charge peaks, sampled at every loop top
-            // (one iteration after any launch, close or reclaim).
-            let tables: u64 = runtime
-                .children
-                .iter()
-                .flatten()
-                .map(|child| child.space.owned_table_count() as u64)
-                .sum();
-            tables_peak = tables_peak.max(desktop.space.owned_table_count() as u64 + tables);
-            surfaces_peak = surfaces_peak.max(desktop.surface_frames);
-        }
-        runtime.reclaim_finished(frames, &mut ipc);
-        let now = timer::ticks();
-        wake_threads(&mut desktop, &mut ipc, Some(&mut input), None, now);
-        for index in 0..desktop.threads.len() {
-            if desktop.threads[index].is_none() {
-                continue;
-            }
-            desktop.current_thread = index;
-            match desktop.thread().state {
-                State::Launching(kind) => {
-                    let result = runtime
-                        .launch(frames, &mut desktop, kind)
-                        .unwrap_or_else(|error| error as u64);
-                    desktop.thread_mut().context.frame.rax = result;
-                    desktop.thread_mut().state = State::Ready;
-                }
-                State::Closing(pid) => {
-                    let result = runtime
-                        .close(frames, &mut desktop, &mut ipc, pid, Outcome::Terminated)
-                        .map_or_else(|error| error as u64, |()| 0);
-                    desktop.thread_mut().context.frame.rax = result;
-                    desktop.thread_mut().state = State::Ready;
-                }
-                _ => {}
-            }
-        }
-        for child in runtime.children.iter_mut().flatten() {
-            wake_threads(child, &mut ipc, None, Some(&mut runtime.windows), now);
-        }
-        let mut selected = None;
-        for offset in 0..=windows::APP_COUNT {
-            let index = (cursor + offset) % (windows::APP_COUNT + 1);
-            let ready = if index == 0 {
-                service_eligible(&mut desktop, now)
-            } else {
-                runtime.children[index - 1]
-                    .as_mut()
-                    .is_some_and(|child| service_eligible(child, now))
-            };
-            if ready {
-                selected = Some(index);
-                break;
-            }
-        }
-        if let Some(index) = selected {
-            cursor = (index + 1) % (windows::APP_COUNT + 1);
-            if index == 0 {
-                resume_process(
-                    kernel,
-                    frames,
-                    &mut desktop,
-                    &mut ipc,
-                    Some(&mut surface),
-                    Some(&mut input),
-                    Some(&mut runtime.windows),
-                );
-            } else {
-                resume_process(
-                    kernel,
-                    frames,
-                    runtime.children[index - 1].as_mut().unwrap(),
-                    &mut ipc,
-                    None,
-                    None,
-                    Some(&mut runtime.windows),
-                );
-            }
-        } else {
-            // SAFETY: No published context/resource pointers or locks; IF stayed
-            // clear from the queue checks through this atomic enable-and-sleep.
-            unsafe { core::arch::asm!("sti", "hlt", "cli", options(nostack)) };
+        tables_peak: 0,
+        #[cfg(feature = "boot-smoke")]
+        surfaces_peak: 0,
+    };
+    {
+        // SAFETY: Seeding holds the only reference to the shell's entry.
+        let desktop = unsafe { sched::process(shell) };
+        desktop.policy = CpuPolicy::Shell(ServicePolicy::new(timer::ticks()));
+        desktop.access = Access {
+            surface: true,
+            input: true,
+            windows: true,
+        };
+        for (slot, object, rights) in [
+            (0, Object::Console, capability::WRITE),
+            (3, Object::Surface, capability::WRITE),
+            (4, Object::Input, capability::RECEIVE),
+            (5, Object::Supervisor, capability::WRITE),
+        ] {
+            desktop.boot_handles[slot] = desktop
+                .handles
+                .insert(object, rights)
+                .expect("shell bootstrap capability");
         }
     }
+    #[cfg(feature = "boot-smoke")]
+    let runtime = app_load_rollback_test(runtime, frames, shell);
+    let surface = surface::Session::desktop(display).expect("shell scanout");
+    let (framebuffer, region) = surface.placement();
+    let input = input::Session::new(consumer, framebuffer, region);
+    let mut session = sched::Session {
+        ipc: Ipc::new(),
+        surface: Some(surface),
+        input: Some(input),
+        runtime: Some(runtime),
+        end: sched::End::Shell { shell },
+    };
+    sched::run(&mut session, kernel, frames, direct_map);
+    let sched::Session {
+        mut ipc,
+        surface,
+        runtime,
+        ..
+    } = session;
+    let surface = surface.expect("shell scanout");
+    let mut runtime = runtime.expect("shell runtime");
     runtime.reclaim_finished(frames, &mut ipc);
     let pids = runtime
         .windows
@@ -2257,24 +2329,48 @@ pub fn run_shell(
         .each_ref()
         .map(|application| application.as_ref().map(|application| application.pid));
     for pid in pids.into_iter().flatten() {
+        // SAFETY: The scheduler has returned; nothing else references the
+        // shell, and close reaches only the apps' own slots.
+        let desktop = unsafe { sched::process(shell) };
         runtime
-            .close(frames, &mut desktop, &mut ipc, pid, Outcome::SessionEnded)
+            .close(frames, desktop, &mut ipc, pid, Outcome::SessionEnded)
             .expect("shell child cancellation");
     }
-    release_finished_handles(core::slice::from_mut(&mut desktop), &mut ipc);
-    assert!(desktop.handles.is_empty() && ipc.is_drained());
-    assert!(
-        ACTIVE.load(Ordering::SeqCst).is_null() && ACTIVE_WINDOWS.load(Ordering::SeqCst).is_null()
-    );
-    assert_eq!(
-        surface.totals(),
-        (desktop.surface_tiles, desktop.surface_pixels)
-    );
+    // The shell is a zombie now: finished, with its thread entries released.
+    // Validation reads its outcome and counters in the table; only then is
+    // it reaped (0030-D5).
+    let outcome = {
+        // SAFETY: The scheduler has returned and every app has been reaped,
+        // so nothing else references the shell's entry until this borrow
+        // ends with this block, before the reap below.
+        let desktop = unsafe { sched::process(shell) };
+        release_handles(desktop, &mut ipc);
+        assert!(desktop.zombie(), "the finished shell kept its threads");
+        assert!(desktop.handles.is_empty() && ipc.is_drained());
+        assert!(
+            ACTIVE.load(Ordering::SeqCst).is_null()
+                && ACTIVE_WINDOWS.load(Ordering::SeqCst).is_null()
+        );
+        assert_eq!(
+            surface.totals(),
+            (desktop.surface_tiles, desktop.surface_pixels)
+        );
+        let outcome = desktop.outcome.expect("shell ended without outcome");
+        if smoke {
+            validate_shell(desktop, outcome, &runtime.windows);
+        }
+        outcome
+    };
+    // SAFETY: The validation borrow has ended, and nothing references the
+    // shell's entry; reap checks that it finished.
+    let mut desktop = unsafe { sched::reap(shell) };
+    sched::assert_drained();
     // SAFETY: The shell and children are stopped; all active pointers are clear
     // and no resource retains a reference to the shell's private address space.
     unsafe { desktop.space.destroy(frames) }.expect("shell address-space cleanup");
     #[cfg(feature = "boot-smoke")]
     desktop.check_charges_zero();
+    // Each session ends at its own frame baseline.
     assert_eq!(
         frames.stats().unwrap().allocated_frames,
         // 0050-D2's shared rule, heap term (0059).
@@ -2294,37 +2390,76 @@ pub fn run_shell(
     #[cfg(feature = "boot-smoke")]
     serial::println!(
         "MIRROR_HEAP_CHARGE_OK tables_peak={} surfaces_peak={}",
-        tables_peak,
-        surfaces_peak
+        runtime.tables_peak,
+        runtime.surfaces_peak
     );
-    let outcome = desktop.outcome.expect("shell ended without outcome");
-    if smoke {
-        assert_eq!(outcome, Outcome::Exit(0), "shell smoke failed");
-        assert!(desktop.desktop_checks, "shell checks marker missing");
-        assert!(
-            runtime.windows.launches >= 3 && runtime.windows.closes >= 2,
-            "application lifecycle checks missing"
-        );
-        assert!(
-            runtime.windows.faults >= 1,
-            "application fault containment missing"
-        );
-        assert!(
-            runtime.windows.preemptions > 0,
-            "applications were never preempted"
-        );
-        serial::println!(
-            "MIRROR_SHELL_TESTS_OK launches={} closes={} faults={} preemptions={}",
-            runtime.windows.launches,
-            runtime.windows.closes,
-            runtime.windows.faults,
-            runtime.windows.preemptions
-        );
-    }
     serial::println!(
         "MIRROR_SHELL_CLEANUP_OK apps_reclaimed=1 outcome={:?}",
         outcome
     );
+}
+
+/// Validate the smoke shell's zombie and its session's app lifecycle counts.
+fn validate_shell(desktop: &Process, outcome: Outcome, windows: &windows::Session) {
+    assert_eq!(outcome, Outcome::Exit(0), "shell smoke failed");
+    assert!(desktop.desktop_checks, "shell checks marker missing");
+    assert!(
+        windows.launches >= 3 && windows.closes >= 2,
+        "application lifecycle checks missing"
+    );
+    assert!(windows.faults >= 1, "application fault containment missing");
+    assert!(windows.preemptions > 0, "applications were never preempted");
+    serial::println!(
+        "MIRROR_SHELL_TESTS_OK launches={} closes={} faults={} preemptions={}",
+        windows.launches,
+        windows.closes,
+        windows.faults,
+        windows.preemptions
+    );
+}
+
+/// Exhaust the supervisor's remaining handle slots after loading the shell,
+/// then force a launch to roll back its root, both buffers and its table
+/// entries.
+#[cfg(feature = "boot-smoke")]
+fn app_load_rollback_test<'a>(
+    mut runtime: ShellRuntime<'a>,
+    frames: &mut FrameAllocator<'_>,
+    shell: usize,
+) -> ShellRuntime<'a> {
+    // SAFETY: Seeding holds the only reference to the shell's entry, and the
+    // failed launch reaches only the slot it creates and discards.
+    let desktop = unsafe { sched::process(shell) };
+    let baseline = frames.stats().unwrap().allocated_frames;
+    let mut temporary = [0; 8];
+    let mut count = 0;
+    loop {
+        match desktop
+            .handles
+            .insert(Object::Supervisor, capability::WRITE)
+        {
+            Ok(handle) => {
+                temporary[count] = handle;
+                count += 1;
+            }
+            Err(CapError::TableFull) => break,
+            Err(error) => panic!("rollback test handle failure: {error:?}"),
+        }
+    }
+    assert_eq!(runtime.launch(frames, desktop, 0), Err(-24));
+    assert_eq!(frames.stats().unwrap().allocated_frames, baseline);
+    assert!(runtime.children.iter().all(Option::is_none));
+    assert!(runtime.windows.applications.iter().all(Option::is_none));
+    assert_eq!(
+        sched::process_slots().count(),
+        1,
+        "rollback left a table entry"
+    );
+    for handle in &temporary[..count] {
+        desktop.handles.close(*handle).unwrap();
+    }
+    serial::println!("MIRROR_APP_LOAD_ROLLBACK_OK");
+    runtime
 }
 
 #[cfg(feature = "boot-smoke")]
@@ -2359,19 +2494,27 @@ fn deadline_reached(now: u64, deadline: u64) -> bool {
     now.wrapping_sub(deadline) < (1 << 63)
 }
 
-fn release_finished_handles(processes: &mut [Process<'_>], ipc: &mut Ipc) {
-    for process in processes {
-        if process.finished() && !process.handles_closed {
-            while let Some(capability) = process.handles.take_one() {
-                ipc.release(capability);
-            }
-            process.handles_closed = true;
+/// Close a finished process's handles once, releasing its IPC endpoints.
+fn release_handles(process: &mut Process, ipc: &mut Ipc) {
+    if process.finished() && !process.handles_closed {
+        while let Some(capability) = process.handles.take_one() {
+            ipc.release(capability);
+            endpoint_released(capability);
         }
+        process.handles_closed = true;
+    }
+}
+
+/// A released channel reference can close the channel or discard its
+/// messages, so its receivers recheck their waits.
+fn endpoint_released(capability: Capability) {
+    if let Object::Channel(index) = capability.object {
+        sched::signal_queue(sched::Queue::Channel(index));
     }
 }
 
 #[cfg(feature = "boot-smoke")]
-fn validate_process(process: &Process<'_>, scenario: u64) {
+fn validate_process(process: &Process, scenario: u64) {
     let available = crate::clock::is_available();
     assert!(
         if available {
@@ -2412,13 +2555,6 @@ fn validate_process(process: &Process<'_>, scenario: u64) {
             && process.thread_preemptions > 0,
         "thread checks did not complete: {:?}",
         process.outcome
-    );
-    assert!(
-        process
-            .threads
-            .iter()
-            .flatten()
-            .all(|thread| thread.state == State::Finished)
     );
     serial::println!(
         "MIRROR_USER_THREADS_OK pid={} created={} joined={} exited={} cancelled={} preemptions={}",
@@ -2573,7 +2709,7 @@ fn validate_process(process: &Process<'_>, scenario: u64) {
 }
 
 fn load(
-    space: &mut UserAddressSpace<'_>,
+    space: &mut UserAddressSpace,
     frames: &mut FrameAllocator<'_>,
     bytes: &[u8],
     image: &elf::Image,
@@ -2625,7 +2761,7 @@ fn load(
 }
 
 fn map_initialized(
-    space: &mut UserAddressSpace<'_>,
+    space: &mut UserAddressSpace,
     frames: &mut FrameAllocator<'_>,
     direct_map: u64,
     address: u64,
@@ -2653,10 +2789,10 @@ fn map_initialized(
     result
 }
 
-fn with_active(frame: &TrapFrame, operation: impl FnOnce(&mut Process<'_>)) {
+fn with_active(frame: &TrapFrame, operation: impl FnOnce(&mut Process)) {
     assert_eq!(frame.cs & 3, 3, "userspace handler requires CPL3");
     assert!(!arch::interrupts_enabled());
-    let pointer = ACTIVE.load(Ordering::SeqCst).cast::<Process<'_>>();
+    let pointer = ACTIVE.load(Ordering::SeqCst).cast::<Process>();
     assert!(!pointer.is_null(), "no active process");
     // SAFETY: The owning scheduler suspends its stack while this is published. Only
     // this BSP, with IF=0, accesses it; no handler retains a reference or reenters
@@ -2734,7 +2870,7 @@ fn ipc_error(error: IpcError) -> i64 {
     }
 }
 
-fn channel_for(process: &Process<'_>, handle: u64, rights: u64) -> Result<usize, i64> {
+fn channel_for(process: &Process, handle: u64, rights: u64) -> Result<usize, i64> {
     let capability = process.handles.require(handle, rights).map_err(cap_error)?;
     match capability.object {
         Object::Channel(index) => Ok(index),
@@ -2743,7 +2879,7 @@ fn channel_for(process: &Process<'_>, handle: u64, rights: u64) -> Result<usize,
 }
 
 fn receive_input(
-    process: &mut Process<'_>,
+    process: &mut Process,
     session: &mut input::Session<'_>,
     handle: u64,
     address: u64,
@@ -2788,13 +2924,15 @@ fn receive_input(
 
 /// Init's console-text oracles. Only smoke kernels run init (spec 0010-D3).
 #[cfg(feature = "boot-smoke")]
-fn match_init_oracles(process: &mut Process<'_>, message: &[u8]) {
+fn match_init_oracles(process: &mut Process, message: &[u8]) {
     process.checks_passed |= message == CHECKS_PASSED;
     process.vm_checks |= message == b"Mirror init: VM checks passed\n";
     process.tls_checks |= message == b"Mirror init: TLS checks passed\n";
     process.clock_checks |= message == b"Mirror init: clock checks passed\n";
     process.clock_unavailable |= message == b"Mirror init: clock unavailable\n";
     process.thread_checks |= message == b"Mirror init: thread checks passed\n";
+    process.capacity_checks |= message == b"Mirror init: thread capacity checks passed\n";
+    process.wait_queue_checks |= message == b"Mirror init: wait queue checks passed\n";
     process.sync_checks |= message == b"Mirror init: synchronization checks passed\n";
     if message == b"Mirror init: FPU preemption begin\n" {
         process.fpu_preemption_start = Some(process.preemptions);
@@ -2808,76 +2946,51 @@ fn match_init_oracles(process: &mut Process<'_>, message: &[u8]) {
     process.ipc_checks |= message == IPC_CHECKS_PASSED;
     process.surface_checks |= message == SURFACE_CHECKS_PASSED;
     process.surface_denied_checks |= message == SURFACE_DENIED_CHECKS;
+    // Spec 0030a, acceptance 4: the writing thread asks for its next wake,
+    // or its next displacement, to be timed.
+    let probe = match message {
+        b"Mirror init: preempt sleep\n" => Some(LatencyProbe::Sleep),
+        b"Mirror init: preempt receive\n" => Some(LatencyProbe::Receive),
+        b"Mirror init: preempt spin\n" => Some(LatencyProbe::Spin),
+        _ => None,
+    };
+    if probe.is_some() {
+        process.thread_mut().probe = probe;
+    }
 }
 
-/// Shell, desktop and agent console-text oracles and their markers. Only trace
-/// kernels match console text (spec 0010-D4).
+/// The shell's console-text oracles and their markers. Only trace kernels
+/// match console text (spec 0010-D4).
 #[cfg(feature = "test-trace")]
-fn service_message(process: &mut Process<'_>, message: &[u8]) {
-    if matches!(process.policy, CpuPolicy::Shell(_)) {
-        if message == b"Mirror shell: ready\n" && !process.desktop_ready {
-            process.desktop_ready = true;
-            let info = with_surface(|session| session.info());
-            let width = u32::from_le_bytes(info[4..8].try_into().unwrap());
-            let height = u32::from_le_bytes(info[8..12].try_into().unwrap());
-            serial::println!(
-                "MIRROR_SHELL_READY pid={} width={} height={}",
-                process.pid,
-                width,
-                height
-            );
-        } else if message == b"Mirror shell: frame\n" {
-            process.desktop_revision += 1;
-            serial::println!(
-                "MIRROR_SHELL_FRAME revision={} tiles={} input_events={}",
-                process.desktop_revision,
-                process.surface_tiles,
-                process.input_events
-            );
-        } else if message == b"Mirror shell: checks passed\n" {
-            process.desktop_checks = true;
-        }
+fn service_message(process: &mut Process, message: &[u8]) {
+    if !matches!(process.policy, CpuPolicy::Shell(_)) {
         return;
     }
-    if matches!(process.policy, CpuPolicy::Agent(_)) {
-        if message == AGENT_READY && !process.agent_ready {
-            process.agent_ready = true;
-            serial::println!("MIRROR_AGENT_READY pid={}", process.pid);
-        } else if message == AGENT_CHECKS {
-            process.agent_checks = true;
-        }
-        return;
-    }
-    if !matches!(process.policy, CpuPolicy::Desktop(_)) {
-        return;
-    }
-    if message == DESKTOP_READY && !process.desktop_ready {
+    if message == b"Mirror shell: ready\n" && !process.desktop_ready {
         process.desktop_ready = true;
         let info = with_surface(|session| session.info());
         let width = u32::from_le_bytes(info[4..8].try_into().unwrap());
         let height = u32::from_le_bytes(info[8..12].try_into().unwrap());
         serial::println!(
-            "MIRROR_DESKTOP_READY pid={} width={} height={}",
+            "MIRROR_SHELL_READY pid={} width={} height={}",
             process.pid,
             width,
             height
         );
-    } else if message == DESKTOP_FRAME {
+    } else if message == b"Mirror shell: frame\n" {
         process.desktop_revision += 1;
         serial::println!(
-            "MIRROR_DESKTOP_FRAME revision={} tiles={} input_events={} keyboard_irq={} mouse_irq={}",
+            "MIRROR_SHELL_FRAME revision={} tiles={} input_events={}",
             process.desktop_revision,
             process.surface_tiles,
-            process.input_events,
-            crate::keyboard::irq_count(),
-            crate::mouse::irq_count()
+            process.input_events
         );
-    } else if message == DESKTOP_CHECKS {
+    } else if message == b"Mirror shell: checks passed\n" {
         process.desktop_checks = true;
     }
 }
 
-fn require_surface(process: &Process<'_>, handle: u64) -> Result<Option<u64>, i64> {
+fn require_surface(process: &Process, handle: u64) -> Result<Option<u64>, i64> {
     match process.handles.require(handle, capability::WRITE) {
         Ok(capability) if capability.object == Object::Surface => Ok(None),
         Ok(Capability {
@@ -2892,13 +3005,13 @@ fn require_surface(process: &Process<'_>, handle: u64) -> Result<Option<u64>, i6
 /// Init's peer must try, and be denied, its owner's exact surface token. Record
 /// each surface operation that rejected that token as a bad handle.
 #[cfg(feature = "boot-smoke")]
-fn note_foreign_surface(process: &mut Process<'_>, handle: u64, error: i64, operation: u8) {
+fn note_foreign_surface(process: &mut Process, handle: u64, error: i64, operation: u8) {
     if error == cap_error(CapError::BadHandle) && handle != 0 && handle == process.foreign_surface {
         process.foreign_surface_denials |= operation;
     }
 }
 
-fn surface_info(process: &mut Process<'_>, handle: u64, address: u64, length: u64) -> i64 {
+fn surface_info(process: &mut Process, handle: u64, address: u64, length: u64) -> i64 {
     let application = match require_surface(process, handle) {
         Ok(application) => application,
         Err(error) => {
@@ -2935,7 +3048,7 @@ fn surface_info(process: &mut Process<'_>, handle: u64, address: u64, length: u6
     surface::INFO_SIZE as i64
 }
 
-fn surface_present(process: &mut Process<'_>, handle: u64, address: u64, length: u64) -> i64 {
+fn surface_present(process: &mut Process, handle: u64, address: u64, length: u64) -> i64 {
     let application = match require_surface(process, handle) {
         Ok(application) => application,
         Err(error) => {
@@ -2971,7 +3084,7 @@ fn surface_present(process: &mut Process<'_>, handle: u64, address: u64, length:
     }
 }
 
-fn application_pid(process: &Process<'_>, handle: u64) -> Result<u64, i64> {
+fn application_pid(process: &Process, handle: u64) -> Result<u64, i64> {
     match process
         .handles
         .require(handle, capability::WRITE)
@@ -2985,7 +3098,7 @@ fn application_pid(process: &Process<'_>, handle: u64) -> Result<u64, i64> {
     }
 }
 
-fn application_info(process: &mut Process<'_>, handle: u64, address: u64, length: u64) -> i64 {
+fn application_info(process: &mut Process, handle: u64, address: u64, length: u64) -> i64 {
     let pid = match application_pid(process, handle) {
         Ok(pid) => pid,
         Err(error) => return error,
@@ -3006,7 +3119,7 @@ fn application_info(process: &mut Process<'_>, handle: u64, address: u64, length
     }
 }
 
-fn application_event(process: &mut Process<'_>, handle: u64, address: u64, length: u64) -> i64 {
+fn application_event(process: &mut Process, handle: u64, address: u64, length: u64) -> i64 {
     let pid = match application_pid(process, handle) {
         Ok(pid) => pid,
         Err(error) => return error,
@@ -3022,14 +3135,18 @@ fn application_event(process: &mut Process<'_>, handle: u64, address: u64, lengt
     }
     match with_windows(|session| {
         windows::validate_event(&event, session.smoke && cfg!(feature = "boot-smoke"))?;
-        session.get_mut(pid)?.enqueue(event)
+        let index = session.index(pid)?;
+        session.get_mut(pid)?.enqueue(event).map(|()| index)
     }) {
-        Ok(()) => 0,
+        Ok(index) => {
+            sched::signal_queue(sched::Queue::App(index));
+            0
+        }
         Err(error) => error,
     }
 }
 
-fn application_read(process: &mut Process<'_>, handle: u64, address: u64, length: u64) -> i64 {
+fn application_read(process: &mut Process, handle: u64, address: u64, length: u64) -> i64 {
     let pid = match application_pid(process, handle) {
         Ok(pid) => pid,
         Err(error) => return error,
@@ -3061,7 +3178,7 @@ fn application_read(process: &mut Process<'_>, handle: u64, address: u64, length
 }
 
 fn receive_app_input(
-    process: &mut Process<'_>,
+    process: &mut Process,
     session: &mut windows::Session,
     handle: u64,
     address: u64,
@@ -3105,7 +3222,7 @@ fn receive_app_input(
     windows::EVENT_SIZE as i64
 }
 
-fn send(process: &mut Process<'_>, ipc: &mut Ipc, handle: u64, address: u64, length: u64) -> i64 {
+fn send(process: &mut Process, ipc: &mut Ipc, handle: u64, address: u64, length: u64) -> i64 {
     let channel = match channel_for(process, handle, capability::SEND) {
         Ok(channel) => channel,
         Err(error) => return error,
@@ -3129,6 +3246,7 @@ fn send(process: &mut Process<'_>, ipc: &mut Ipc, handle: u64, address: u64, len
     match ipc.send(channel, &buffer[..length as usize]) {
         Ok(length) => {
             process.ipc_sent += 1;
+            sched::signal_queue(sched::Queue::Channel(channel));
             length as i64
         }
         Err(error) => ipc_error(error),
@@ -3136,7 +3254,7 @@ fn send(process: &mut Process<'_>, ipc: &mut Ipc, handle: u64, address: u64, len
 }
 
 fn receive(
-    process: &mut Process<'_>,
+    process: &mut Process,
     ipc: &mut Ipc,
     handle: u64,
     address: u64,
@@ -3223,10 +3341,13 @@ pub(crate) fn syscall(frame: &mut TrapFrame) {
         interrupts::return_from_user(frame);
     } else if let Some(state) = outcome.suspension {
         suspend(frame, state);
+    } else if sched::take_reschedule() {
+        // The call signaled a wait: the threads it woke run first (0030-D3).
+        displace(frame);
     }
 }
 
-fn dispatch_syscall(process: &mut Process<'_>, frame: &mut TrapFrame) -> SyscallResult {
+fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResult {
     let mut result = -38_i64;
     let mut finished = false;
     let mut suspension = None;
@@ -3360,11 +3481,16 @@ fn dispatch_syscall(process: &mut Process<'_>, frame: &mut TrapFrame) -> Syscall
                     {
                         process.ipc_waits += 1;
                     }
+                    // Only an open, empty channel the handle may receive
+                    // from returns -11.
+                    let channel = channel_for(process, frame.rdi, capability::RECEIVE)
+                        .expect("blocked receive has a channel");
                     suspension = Some(State::Receiving(PendingReceive {
                         handle: frame.rdi,
                         address: frame.rsi,
                         capacity: frame.rdx as usize,
                         deadline: timer::ticks().wrapping_add(RECEIVE_TIMEOUT),
+                        channel,
                     }));
                 }
             }
@@ -3372,6 +3498,8 @@ fn dispatch_syscall(process: &mut Process<'_>, frame: &mut TrapFrame) -> Syscall
                 result = match process.handles.close(frame.rdi) {
                     Ok(capability) => {
                         with_ipc(|ipc| ipc.release(capability));
+                        endpoint_released(capability);
+                        signal_handle_waits(process, Some(frame.rdi));
                         0
                     }
                     Err(error) => cap_error(error),
@@ -3417,10 +3545,20 @@ fn dispatch_syscall(process: &mut Process<'_>, frame: &mut TrapFrame) -> Syscall
                 };
                 if frame.rax == 15 && result == -11 {
                     process.input_waits += 1;
+                    // An empty routed queue implies the app's window exists.
+                    let queue = if routed {
+                        sched::Queue::App(
+                            with_windows(|session| session.index(process.pid))
+                                .expect("blocked app input has a window"),
+                        )
+                    } else {
+                        sched::Queue::Input
+                    };
                     suspension = Some(State::InputWaiting(PendingInput {
                         handle: frame.rdi,
                         address: frame.rsi,
                         deadline: timer::ticks().wrapping_add(RECEIVE_TIMEOUT),
+                        queue,
                     }));
                 }
             }
@@ -3542,9 +3680,7 @@ fn dispatch_syscall(process: &mut Process<'_>, frame: &mut TrapFrame) -> Syscall
                         process.threads_exited += 1;
                     }
                     let last = process
-                        .threads
-                        .iter()
-                        .flatten()
+                        .threads()
                         .filter(|thread| !matches!(thread.state, State::Exited(_)))
                         .count()
                         == 1;
@@ -3609,10 +3745,9 @@ pub(crate) fn timer_tick(frame: &mut TrapFrame) {
         process.thread_mut().quantum_left -= 1;
         let throttled = match &mut process.policy {
             CpuPolicy::Probe => false,
-            CpuPolicy::Desktop(policy)
-            | CpuPolicy::Agent(policy)
-            | CpuPolicy::Shell(policy)
-            | CpuPolicy::Application(policy) => policy.charge(timer::ticks()),
+            CpuPolicy::Shell(policy) | CpuPolicy::Application(policy) => {
+                policy.charge(timer::ticks())
+            }
         };
         if matches!(process.policy, CpuPolicy::Probe) && process.charged_ticks >= USER_TICK_BUDGET {
             process.finish(Outcome::BudgetExhausted);
@@ -3625,9 +3760,7 @@ pub(crate) fn timer_tick(frame: &mut TrapFrame) {
             #[cfg(feature = "boot-smoke")]
             {
                 if process
-                    .threads
-                    .iter()
-                    .flatten()
+                    .threads()
                     .filter(|thread| !matches!(thread.state, State::Exited(_)))
                     .count()
                     > 1
@@ -3645,10 +3778,36 @@ pub(crate) fn timer_tick(frame: &mut TrapFrame) {
         interrupts::return_from_user(frame);
     } else if preempt {
         suspend(frame, State::Ready);
+    } else if sched::deadline_due(timer::ticks()) {
+        // The deadline's own tick hands the CPU to the waits it ends, and the
+        // charged thread keeps the rest of its quantum (0030-D3).
+        displace(frame);
+    }
+}
+
+/// A PS/2 IRQ interrupted CPL3, after its EOI. When it completed input that
+/// a thread waits for, the interrupted thread returns to the scheduler with
+/// no tick charged, its quantum unchanged and no preemption or throttle
+/// counted: an IRQ fires per byte, not per tick (0030-D2). The scheduler
+/// clears the arrival flag and wakes the waiters.
+pub(crate) fn input_interrupt(frame: &mut TrapFrame) {
+    if input::arrival_pending() && input::waiters() > 0 {
+        displace(frame);
     }
 }
 
 fn suspend(frame: &mut TrapFrame, state: State) {
+    park_current(frame, state, false);
+}
+
+/// Return the running thread to the scheduler still ready, so the threads
+/// that an event woke dispatch first. It keeps the rest of its quantum and
+/// then rejoins the run queue behind them (0030-D3).
+fn displace(frame: &mut TrapFrame) {
+    park_current(frame, State::Ready, true);
+}
+
+fn park_current(frame: &mut TrapFrame, state: State, displaced: bool) {
     // Validate before saving. Otherwise a malformed user stack could enter a
     // ready context and fail a kernel invariant on its next resume.
     prepare_return(frame);
@@ -3669,18 +3828,10 @@ fn suspend(frame: &mut TrapFrame, state: State) {
                 | State::Waiting(_)
                 | State::Exited(_)
         ));
-        process.thread_mut().context.frame = *frame;
-        if matches!(
-            state,
-            State::Sleeping(_)
-                | State::Receiving(_)
-                | State::InputWaiting(_)
-                | State::Joining(_)
-                | State::Waiting(_)
-        ) {
-            process.thread_mut().sleep_charge = process.thread().charged_ticks;
-        }
-        process.thread_mut().state = state;
+        let thread = process.thread_mut();
+        thread.context.frame = *frame;
+        thread.displaced = displaced;
+        park(process, state);
     });
     // The current handler must unwind before the scheduler touches other tasks.
     interrupts::return_from_user(frame);
@@ -3707,7 +3858,7 @@ pub(crate) fn fault(frame: &mut TrapFrame, cr2: u64) {
     interrupts::return_from_user(frame);
 }
 
-fn record_fault(process: &mut Process<'_>, frame: &TrapFrame, cr2: u64) {
+fn record_fault(process: &mut Process, frame: &TrapFrame, cr2: u64) {
     process.finish(Outcome::Fault {
         vector: frame.vector,
         error: frame.error,

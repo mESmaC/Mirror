@@ -4,6 +4,8 @@
 //! record is copied by value and committed only after successful user copyout;
 //! failed requests cannot consume it or reorder later device events.
 
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
 use crate::framebuffer::SurfaceRegion;
 use crate::{keyboard::Key, mouse, ps2};
 
@@ -13,6 +15,39 @@ pub const KIND_MOUSE: u32 = 2;
 pub const KIND_LOST: u32 = 3;
 pub const KIND_POSITION: u32 = 4;
 const BUTTONS: u8 = mouse::LEFT | mouse::RIGHT | mouse::MIDDLE;
+
+/// Set by a PS/2 IRQ that completed an input record and cleared by the
+/// scheduler before it rechecks device-input waits (spec 0030a, 0030-D2).
+/// It needs no session pointer: the IRQ works during any slice and between
+/// sessions, and touches no scheduler state beyond these atomics.
+static ARRIVED: AtomicBool = AtomicBool::new(false);
+/// Threads blocked on device input, mirrored by the scheduler. A CPL3 input
+/// IRQ reschedules only when this is nonzero.
+static WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Record that a device produced an input record.
+pub(crate) fn note_arrival() {
+    ARRIVED.store(true, Ordering::Release);
+}
+
+/// Whether input arrived since the last `take_arrival`.
+pub(crate) fn arrival_pending() -> bool {
+    ARRIVED.load(Ordering::Acquire)
+}
+
+/// Clear the arrival flag, returning whether it was set.
+pub(crate) fn take_arrival() -> bool {
+    ARRIVED.swap(false, Ordering::AcqRel)
+}
+
+/// The scheduler's count of threads blocked on device input.
+pub(crate) fn set_waiters(count: usize) {
+    WAITERS.store(count, Ordering::Release);
+}
+
+pub(crate) fn waiters() -> usize {
+    WAITERS.load(Ordering::Acquire)
+}
 
 /// Where kind 4 positions land (spec 0017-D14, D17): absolute device units
 /// span the framebuffer, and records carry pixels local to the desktop

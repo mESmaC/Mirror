@@ -13,7 +13,7 @@ pub const PROT_READ: u64 = 1;
 pub const PROT_READ_WRITE: u64 = 3;
 pub const ARENA_START: u64 = 0x1_0000_0000;
 pub const ARENA_END: u64 = 0x10_0000_0000;
-pub const MAX_REGIONS: usize = 32;
+pub const MAX_REGIONS: usize = 64;
 pub const RESERVED_LIMIT: u64 = 256 * 1024 * 1024;
 pub const COMMITTED_LIMIT: u64 = 32 * 1024 * 1024;
 pub const STATS_SIZE: usize = 48;
@@ -96,5 +96,24 @@ mod tests {
         bytes = stats.encode();
         bytes[8] = 1;
         assert_eq!(VmStats::decode(&bytes), None);
+    }
+
+    #[test]
+    fn region_count_is_bounded_by_the_sixty_four_region_limit() {
+        // ABI (spec 0030a, 0030-D4): sixty-four regions per process.
+        assert_eq!(MAX_REGIONS, 64);
+        let full = VmStats {
+            reserved_bytes: PAGE_SIZE * MAX_REGIONS as u64,
+            committed_bytes: 0,
+            regions: MAX_REGIONS as u64,
+            reserved_limit: RESERVED_LIMIT,
+            committed_limit: COMMITTED_LIMIT,
+        };
+        assert_eq!(VmStats::decode(&full.encode()), Some(full));
+        let over = VmStats {
+            regions: MAX_REGIONS as u64 + 1,
+            ..full
+        };
+        assert_eq!(VmStats::decode(&over.encode()), None);
     }
 }
