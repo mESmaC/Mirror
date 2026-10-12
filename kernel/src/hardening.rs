@@ -7,7 +7,7 @@
 //! exception entry executes CLAC once the BSP has set `MIRROR_SMAP_ACTIVE`, and
 //! the kernel continuation after a user return starts with AC clear. Each
 //! setting is verified by reading the register back. An AP whose CPUID set
-//! differs from the BSP's fails startup.
+//! differs from the BSP's fails startup before it loads the IDT.
 //!
 //! The BSP also reports its Meltdown and MDS exposure from the CPU vendor and
 //! IA32_ARCH_CAPABILITIES, and the kernel applies no mitigation (0016-D5).
@@ -69,7 +69,8 @@ static BSP_CONTROLS: AtomicU8 = AtomicU8::new(0);
 /// every entry while it is set. Only the BSP sets it, in `init`, before any CPU
 /// enables SMAP and only when its own CPUID reports SMAP, where CLAC is
 /// defined. A CPU enables SMAP only while it is set, and an AP whose SMAP
-/// support differs from the BSP's fails startup (0016-D1). No code is patched.
+/// support differs from the BSP's fails startup before it loads the IDT, so it
+/// never runs that CLAC (0016-D1). No code is patched.
 #[unsafe(no_mangle)]
 static MIRROR_SMAP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -148,6 +149,16 @@ pub(crate) fn init() {
 pub(crate) fn bsp_controls() -> Option<Controls> {
     let bits = BSP_CONTROLS.load(Ordering::Acquire);
     (bits & PUBLISHED != 0).then(|| Controls::from_bits(bits))
+}
+
+/// Whether the executing CPU's CPUID reports exactly the protections the BSP
+/// published; false before `init` has published them. An AP checks this
+/// before it loads the shared IDT, because the common entry stub executes
+/// CLAC while `MIRROR_SMAP_ACTIVE` is set, and CLAC raises #UD on a CPU whose
+/// CPUID lacks SMAP. Only CPUID runs, so no Mirror stack or descriptor is
+/// needed.
+pub(crate) fn matches_bsp() -> bool {
+    bsp_controls() == Some(Controls::detect())
 }
 
 /// Configure only the executing CPU: set CR4.SMEP, CR4.SMAP and CR4.UMIP

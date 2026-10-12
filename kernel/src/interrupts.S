@@ -121,7 +121,8 @@ mirror_exception_common:
     # With SMAP on, Rust also runs with AC=0, or an entry from CPL3 with AC set
     # would let the kernel touch user pages. IRET restores AC too. The BSP sets
     # this byte before any CPU enables SMAP, and only when its CPUID reports
-    # SMAP, where CLAC is defined (hardening.rs). No code is patched.
+    # SMAP, where CLAC is defined. An AP whose CPUID differs fails before it
+    # loads the IDT (hardening.rs, smp.rs). No code is patched.
     cmp byte ptr [rip + MIRROR_SMAP_ACTIVE], 0
     je 2f
     clac

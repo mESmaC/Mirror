@@ -472,7 +472,9 @@ unsafe fn load_descriptors(gdtr: &DescriptorPointer, idtr: &DescriptorPointer) {
 ///
 /// # Safety
 /// The caller runs at CPL0 on the identified secondary with IF clear, exactly
-/// once for a slot in 1..64. The BSP has completed init. `kernel_stack_top` is
+/// once for a slot in 1..64. The BSP has completed init, and
+/// `hardening::matches_bsp` holds on this CPU, so the CLAC that every entry
+/// stub executes once the BSP has SMAP is defined here. `kernel_stack_top` is
 /// immediately above this CPU's future private supervisor-writable stack, and
 /// `ist_tops` are immediately above its own private IST1 (#DF), IST2 (NMI) and
 /// IST3 (#MC) stacks. This routine only stores those addresses in the TSS; it

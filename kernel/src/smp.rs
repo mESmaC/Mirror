@@ -469,8 +469,16 @@ unsafe extern "C" fn secondary_entry(cpu: &Cpu) -> ! {
     if slot.state.load(Ordering::Acquire) != STARTING {
         arch::halt();
     }
+    // Every CPU must report the BSP's protections (0016-D1). Check CPUID before
+    // the IDT load: once the BSP has SMAP, every entry stub executes CLAC,
+    // which raises #UD on a CPU whose CPUID lacks SMAP, so an exception on such
+    // an AP would recurse through the #UD gate on Limine's stack.
+    if !hardening::matches_bsp() {
+        fail(index, 12);
+    }
     let top = slot.stack_top.load(Ordering::Relaxed);
-    // SAFETY: Unique validated AP slot. Limine's reserved stack and the kernel
+    // SAFETY: Unique validated AP slot whose CPUID matches the BSP's, so the
+    // entry stubs' CLAC is defined here. Limine's reserved stack and the kernel
     // image, with this CPU's descriptors and the shared IDT, are mapped now and
     // in the sealed root. The RSP0 and IST1-3 tops sit above this slot's
     // guarded stacks, which the BSP mapped before publication, but only in the
@@ -489,8 +497,9 @@ unsafe extern "C" fn secondary_entry(cpu: &Cpu) -> ! {
         fail(index, 3);
     }
     // Still on Limine's stack and root, whose kernel mappings are
-    // supervisor-only, so SMEP and UMIP change nothing here. Every CPU must
-    // report the BSP's protections (0016-D1).
+    // supervisor-only, so SMEP, SMAP and UMIP change nothing here, and neither
+    // does clearing AC. Recheck that the set configure_current enabled matches
+    // the BSP's (0016-D1).
     let Ok(controls) = hardening::configure_current() else {
         fail(index, 11);
     };
