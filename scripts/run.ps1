@@ -22,7 +22,7 @@ param(
     [switch]$LegacyPic,
     [switch]$PitTimer,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
-    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation', 'Ps2BatTimeout', 'Ps2StaleScancode', 'VmmouseError')][string]$Fault = 'None',
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation', 'Ps2BatTimeout', 'Ps2StaleScancode', 'VmmouseError', 'Reset', 'ResetFromKbc', 'ResetFromCf9', 'ResetFromTripleFault', 'ResetSuppressed')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -332,6 +332,11 @@ $testMode = switch ($Fault) {
     'Ps2BatTimeout' { 'ps2-bat-timeout' }
     'Ps2StaleScancode' { 'ps2-stale-scancode' }
     'VmmouseError' { 'vmmouse-error' }
+    'Reset' { 'reset' }
+    'ResetFromKbc' { 'reset-from-kbc' }
+    'ResetFromCf9' { 'reset-from-cf9' }
+    'ResetFromTripleFault' { 'reset-from-triple-fault' }
+    'ResetSuppressed' { 'reset-suppressed' }
     default { $null }
 }
 $kernelArguments = @()
@@ -368,7 +373,6 @@ $qemuArguments = @(
     '-vga', $(if ($NoDisplayDevice) { 'none' } else { 'std' }),
     '-monitor', 'none',
     '-nic', 'none',
-    '-no-reboot',
     '-drive', "if=pflash,unit=0,format=raw,readonly=on,file=$(ConvertTo-QemuOptionValue $codePath)",
     '-drive', "if=pflash,unit=1,format=raw,file=$(ConvertTo-QemuOptionValue $varsPath)",
     # Only firmware reads the image; Mirror never binds this device (0015-D10).
@@ -464,6 +468,8 @@ if (Test-Path -LiteralPath (Join-Path $qemuDirectory 'share') -PathType Containe
 }
 
 if (-not $Smoke) {
+    # Interactive boots reboot on a guest reset, such as the console's
+    # restart command (spec 0058a, D11).
     Write-Host 'Booting Mirror. Serial output follows; press Ctrl+C to stop QEMU.'
     & $qemu @qemuArguments '-no-shutdown' '-serial' 'stdio'
     if ($LASTEXITCODE -ne 0) { throw "QEMU exited with code $LASTEXITCODE." }
@@ -471,7 +477,9 @@ if (-not $Smoke) {
 }
 
 [System.IO.File]::WriteAllText($serialLog, '')
-$qemuArguments += @('-serial', "file:$serialLog", '-device', 'isa-debug-exit,iobase=0xf4,iosize=0x04')
+# A guest reset ends a smoke boot: the SMBIOS command line survives a reset,
+# so a rebooting reset case would run again (spec 0058a, D11).
+$qemuArguments += @('-no-reboot', '-serial', "file:$serialLog", '-device', 'isa-debug-exit,iobase=0xf4,iosize=0x04')
 $processArguments = @($qemuArguments | ForEach-Object { ConvertTo-WindowsProcessArgument $_ })
 $start = [System.Diagnostics.ProcessStartInfo]::new()
 $start.FileName = $qemu
@@ -521,7 +529,10 @@ try {
         throw "Mirror reported a panic. See $serialLog."
     }
     $fatalKernelFault = $Fault -in @('PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap')
-    $expectedExitCode = if ($fatalKernelFault -or $expectedTlbTimeout) { 35 } else { 33 }
+    # A reset case restarts after every self-test, and -no-reboot turns the
+    # guest reset into a QEMU exit with code 0 (spec 0058a, D11).
+    $resetCase = $Fault -like 'Reset*'
+    $expectedExitCode = if ($fatalKernelFault -or $expectedTlbTimeout) { 35 } elseif ($resetCase) { 0 } else { 33 }
     if ($qemuExitCode -ne $expectedExitCode) {
         $qemuError = [System.IO.File]::ReadAllText($stderrLog)
         throw "Mirror smoke test expected QEMU exit $expectedExitCode; got $qemuExitCode. $qemuError See $serialLog."
@@ -557,6 +568,9 @@ try {
     if ($serial -match '(?m)^MIRROR_(?:ACPI_TABLE_SKIPPED|APIC_IOAPIC_ID)(?:\s|$)') {
         throw "QEMU's firmware unexpectedly produced a skipped root-table entry or an IOAPIC ID mismatch."
     }
+    # The FADT reset register, the policy self-test and a reset case's chain,
+    # closed-world (spec 0058a, test 4). Other cases print no restart line.
+    Assert-MirrorReset -Serial $serial -Smoke $true -FaultMode $Fault -WithoutKeyboard ([bool]$NoKeyboard) -WithoutHpet ([bool]$NoHpet)
     if ($LegacyPic) {
         $markers += 'MIRROR_APIC_SKIPPED reason=boot_policy'
         if ($serial -match '(?m)^MIRROR_APIC_(?:READY|SPURIOUS_OK)(?:\s|$)') {
@@ -1007,7 +1021,13 @@ try {
         }
     }
     if (-not $expectedTlbTimeout -and -not $fatalKernelFault) {
-        $markers += @('MIRROR_PAGE_FAULT_OK', 'MIRROR_BOOT_OK')
+        if ($resetCase) {
+            # The restart replaces the smoke tail's expected #PF.
+            if ($serial -match '(?m)^MIRROR_(?:PAGE_FAULT_OK|BOOT_OK)(?:\s|$)') {
+                throw "A reset case reached the expected page fault instead of restarting. See $serialLog."
+            }
+        }
+        else { $markers += @('MIRROR_PAGE_FAULT_OK', 'MIRROR_BOOT_OK') }
         if ($serial -match '(?im)^(?:EXCEPTION|MIRROR_EXCEPTION)(?:\s|:|$)') {
             throw "Mirror reported an unexpected exception. See $serialLog."
         }

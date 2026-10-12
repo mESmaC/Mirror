@@ -168,7 +168,22 @@ pub enum SmokeMode {
     Ps2BatTimeout,
     Ps2StaleScancode,
     VmmouseError,
+    /// Restart through `reset::restart(test)` after every self-test, in place
+    /// of the expected page fault (spec 0058a, D11).
+    Reset(ResetTest),
     User(u64),
+}
+
+/// The restart case: the method the chain starts at, every earlier one
+/// skipped with `test_skip`, or the whole chain with its writes suppressed.
+#[cfg(feature = "boot-smoke")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetTest {
+    Fadt,
+    Kbc,
+    Cf9,
+    TripleFault,
+    Suppressed,
 }
 
 #[cfg(feature = "boot-smoke")]
@@ -226,6 +241,11 @@ pub fn smoke_mode() -> SmokeMode {
         b"mirror.test=ps2-bat-timeout" => SmokeMode::Ps2BatTimeout,
         b"mirror.test=ps2-stale-scancode" => SmokeMode::Ps2StaleScancode,
         b"mirror.test=vmmouse-error" => SmokeMode::VmmouseError,
+        b"mirror.test=reset" => SmokeMode::Reset(ResetTest::Fadt),
+        b"mirror.test=reset-from-kbc" => SmokeMode::Reset(ResetTest::Kbc),
+        b"mirror.test=reset-from-cf9" => SmokeMode::Reset(ResetTest::Cf9),
+        b"mirror.test=reset-from-triple-fault" => SmokeMode::Reset(ResetTest::TripleFault),
+        b"mirror.test=reset-suppressed" => SmokeMode::Reset(ResetTest::Suppressed),
         _ => panic!("unknown smoke-test command line"),
     };
     assert!(tokens.next().is_none(), "multiple smoke-test arguments");

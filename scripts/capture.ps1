@@ -51,6 +51,10 @@ $desktopAwayScreenshot = Join-Path $buildDirectory 'desktop-cursor-away.png'
 $desktopRestoredScreenshot = Join-Path $buildDirectory 'desktop-cursor-restored.png'
 [System.IO.File]::WriteAllText($serialLog, '')
 
+# Every QMP event read while waiting for a command's response, in order. The
+# restart step checks its SHUTDOWN event here (spec 0058a, test 5).
+$qmpEvents = [System.Collections.Generic.List[object]]::new()
+
 function Read-MirrorSerial {
     # The guest writes continuously. Share both read and write access so Windows
     # allows inspecting this invocation's serial log without closing QEMU.
@@ -76,6 +80,8 @@ function Assert-MirrorCaptureSmp {
     Assert-MirrorHardening -Serial $Serial -OnlineCpus $RequestedCpus -SmepSmap $true -Umip $false
     # And the BSP's speculative-execution exposure (spec 0016b).
     Assert-MirrorCpuVulnerability -Serial $Serial
+    # Every capture ends with the console's restart (spec 0058a, test 5).
+    Assert-MirrorReset -Serial $Serial -Smoke $false -ConsoleRestart $true
     if ($Serial -match '(?m)^MIRROR_(?:SMP_SKIPPED|SMP_CPU_FAILED|SMP_GUARD_OK|SMP_UNMAP_OK|SMP_TLB_TIMEOUT_ARMED|SHARED_TIMEOUT_\w+|SHARED_VM_SKIPPED|SHARED_OFFLINE_OK)(?:\s|$)') {
         throw 'Normal capture skipped SMP, lost a CPU, or ran an injected guard fault.'
     }
@@ -149,7 +155,8 @@ function Read-MirrorQmp {
 
 function Invoke-MirrorQmp {
     # With -ExpectError the command must fail, and its QMP error is returned.
-    param([System.Diagnostics.Process]$Process, [string]$Command, [hashtable]$Arguments = @{}, [switch]$ExpectError)
+    # With -PassThru its return value is returned. Events are recorded.
+    param([System.Diagnostics.Process]$Process, [string]$Command, [hashtable]$Arguments = @{}, [switch]$ExpectError, [switch]$PassThru)
     $id = [guid]::NewGuid().ToString('N')
     $request = @{ execute = $Command; arguments = $Arguments; id = $id } | ConvertTo-Json -Compress -Depth 8
     $Process.StandardInput.WriteLine($request)
@@ -167,8 +174,10 @@ function Invoke-MirrorQmp {
             }
             if (-not $response.PSObject.Properties['return']) { throw 'Malformed QMP response.' }
             if ($ExpectError) { throw "QMP $Command unexpectedly succeeded." }
+            if ($PassThru) { return $response.return }
             return
         }
+        if ($response.PSObject.Properties['event']) { $qmpEvents.Add($response) }
     }
     throw 'Too many unrelated QMP messages.'
 }
@@ -599,6 +608,46 @@ function Assert-MirrorHygieneLog {
     }
 }
 
+function Invoke-MirrorRestart {
+    # Spec 0058a, test 5: every capture ends by typing restart at the kernel
+    # console. Under -no-reboot -no-shutdown the guest reset stops the VM with
+    # one SHUTDOWN event (guest-reset), and quit then exits QEMU with 0.
+    param([System.Diagnostics.Process]$Process)
+    $length = Get-MirrorSerialLength
+    Send-MirrorText $Process 'restart'
+    Send-MirrorKey $Process 'ret'
+    # Trace kernels log the command and redraw before restarting.
+    if (-not $Hygiene) { Wait-MirrorConsoleCommand $Process 'operation=restart text=' }
+    $deadline = [System.Diagnostics.Stopwatch]::StartNew()
+    do {
+        if ($Process.HasExited) { throw "QEMU exited on the guest reset instead of stopping. See $serialLog." }
+        $status = Invoke-MirrorQmp $Process 'query-status' -PassThru
+        if ($status.status -eq 'shutdown') { break }
+        if ($deadline.Elapsed.TotalSeconds -ge $TimeoutSeconds) { throw "The restart command did not reset the guest (status $($status.status)). See $serialLog." }
+        Start-Sleep -Milliseconds 100
+    } while ($true)
+    if ($status.running) { throw 'The VM kept running after the guest reset.' }
+    $shutdowns = @($qmpEvents | Where-Object { $_.event -eq 'SHUTDOWN' })
+    if ($shutdowns.Count -ne 1 -or $shutdowns[0].data.guest -ne $true -or $shutdowns[0].data.reason -ne 'guest-reset') {
+        throw "QMP must report exactly one SHUTDOWN event, from the guest, with reason guest-reset; got $($shutdowns | ConvertTo-Json -Compress -Depth 4)."
+    }
+    if ($Hygiene) {
+        # The default kernel prints nothing for the typing; the only bytes
+        # after it are the restart's two lifecycle lines.
+        $stream = [System.IO.File]::Open($serialLog, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $tail = [byte[]]::new($stream.Length - $length)
+            $null = $stream.Seek($length, [System.IO.SeekOrigin]::Begin)
+            if ($stream.Read($tail, 0, $tail.Length) -ne $tail.Length) { throw 'Short serial log read.' }
+        }
+        finally { $stream.Dispose() }
+        $expected = "MIRROR_RESET_BEGIN cause=console`r`nMIRROR_RESET_ATTEMPT method=fadt`r`n"
+        if ([System.Text.Encoding]::ASCII.GetString($tail) -cne $expected) {
+            throw "After the typed restart the default kernel must print only its two reset lines. See $serialLog."
+        }
+    }
+}
+
 function Complete-MirrorCapture {
     param([System.Diagnostics.Process]$Process)
     # QMP permits quit to terminate before returning a response. Require clean
@@ -697,6 +746,7 @@ try {
     $pointerMode = if ($RelativePointer) { 'relative' } else { 'absolute' }
     if ($Hygiene) {
         Invoke-MirrorHygieneProbe $process
+        Invoke-MirrorRestart $process
         Complete-MirrorCapture $process
         Write-Host "Default kernel hygiene probe passed: decoy fixture probed, no user content or per-input markers on serial (pointer=$pointerMode, cpus=$CpuCount). Images: $buildDirectory"
         return
@@ -823,6 +873,7 @@ try {
     if ((Get-FileHash -LiteralPath $devicesScreenshot).Hash -eq (Get-FileHash -LiteralPath $devicesSecondScreenshot).Hash) {
         throw 'Device catalog pagination did not change the visible fallback console.'
     }
+    Invoke-MirrorRestart $process
     Complete-MirrorCapture $process
     Write-Host "Native desktop and fallback console captures passed (pointer=$pointerMode, cpus=$CpuCount). Images: $buildDirectory"
 }

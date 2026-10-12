@@ -33,6 +33,20 @@ fn byte(value: u8) {
     }
 }
 
+/// Wait until the transmitter is empty (LSR bit 6), so every byte written so
+/// far has left the UART: the restart path calls it before a write that may
+/// reset the machine (spec 0058a, D7). Bounded like `byte`.
+pub fn flush() {
+    for _ in 0..100_000 {
+        // SAFETY: COM1 belongs to the boot console; reading LSR has no effect
+        // on the transmitter, and IF exclusion is the caller's (restart, IF=0).
+        if unsafe { in8(COM1 + 5) } & 0x40 != 0 {
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 struct Console;
 
 impl Write for Console {

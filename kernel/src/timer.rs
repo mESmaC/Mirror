@@ -271,6 +271,109 @@ pub fn pit_elapsed(previous: u16, current: u16) -> u32 {
     (i32::from(previous) - i32::from(current)).rem_euclid(PIT_DIVISOR as i32) as u32
 }
 
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
+
+/// Elapsed time with IF clear, for bounded waits where delivered ticks never
+/// advance (spec 0017b-D5): the HPET clock when it is published, else polled
+/// PIT channel 0 with its deltas summed. Callers sample far more often than
+/// the PIT's 10 ms period; a wrap missed while the VM is descheduled can only
+/// lengthen a wait. BSP only, after init, with IF clear.
+pub(crate) enum Stopwatch {
+    Hpet {
+        origin_ns: u64,
+    },
+    /// The restart path's HPET clock (spec 0058a, D7): forward deltas between
+    /// samples are summed and a sample below the last one adds nothing, so a
+    /// counter that a reset write sent back to zero lengthens the wait by at
+    /// most one sample instead of panicking. A stopped counter stalls it, and
+    /// RESET_POLL_LIMIT then ends the wait.
+    RestartHpet {
+        last_ns: u64,
+        elapsed_ns: u64,
+    },
+    Pit {
+        last: u16,
+        ticks: u64,
+    },
+}
+
+impl Stopwatch {
+    pub(crate) fn start() -> Self {
+        match crate::clock::snapshot() {
+            Some(now) => Self::Hpet {
+                origin_ns: now.monotonic_ns,
+            },
+            None => Self::pit(),
+        }
+    }
+
+    /// The stopwatch for `reset::restart`, which must reach its next method
+    /// whatever a reset write did to the HPET.
+    pub(crate) fn start_restart() -> Self {
+        match crate::clock::restart_counter_ns() {
+            Some(now_ns) => Self::RestartHpet {
+                last_ns: now_ns,
+                elapsed_ns: 0,
+            },
+            None => Self::pit(),
+        }
+    }
+
+    fn pit() -> Self {
+        Self::Pit {
+            last: pit_counter(),
+            ticks: 0,
+        }
+    }
+
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::Hpet { .. } | Self::RestartHpet { .. } => "hpet",
+            Self::Pit { .. } => "pit",
+        }
+    }
+
+    pub(crate) fn elapsed_ns(&mut self) -> u64 {
+        match self {
+            Self::Hpet { origin_ns } => crate::clock::snapshot()
+                .expect("published HPET clock")
+                .monotonic_ns
+                .saturating_sub(*origin_ns),
+            Self::RestartHpet {
+                last_ns,
+                elapsed_ns,
+            } => {
+                let now_ns = crate::clock::restart_counter_ns().expect("published HPET clock");
+                *elapsed_ns = restart_elapsed(*last_ns, *elapsed_ns, now_ns);
+                *last_ns = now_ns;
+                *elapsed_ns
+            }
+            Self::Pit { last, ticks } => {
+                let current = pit_counter();
+                *ticks = ticks.saturating_add(u64::from(pit_elapsed(*last, current)));
+                *last = current;
+                let nanoseconds = u128::from(*ticks) * NANOS_PER_SECOND / u128::from(PIT_INPUT_HZ);
+                u64::try_from(nanoseconds).unwrap_or(u64::MAX)
+            }
+        }
+    }
+}
+
+/// One `RestartHpet` sample: time since the last sample adds, and a counter
+/// below the last sample only becomes the new base.
+fn restart_elapsed(last_ns: u64, elapsed_ns: u64, now_ns: u64) -> u64 {
+    elapsed_ns.saturating_add(now_ns.saturating_sub(last_ns))
+}
+
+/// The restart path's backstop for its waits (spec 0058a, D7): the 8042
+/// input-buffer wait and each 500 ms wait after a reset write. The stopwatch
+/// ends every wait; if it stalls, this sample count still ends it, so the
+/// sequence always reaches its triple fault. At 50 ns per sample it cannot
+/// fire before 500 ms.
+pub(crate) const RESET_POLL_LIMIT: usize = 10_000_000;
+pub(crate) const RESET_WAIT_MS: u64 = 500;
+const _: () = assert!(RESET_POLL_LIMIT as u64 * 50 >= RESET_WAIT_MS * 1_000_000);
+
 /// Unmask IRQ1 after the keyboard driver has initialized its controller and
 /// queue. The BSP owns both interrupt controllers; preserve all other routes.
 pub fn enable_keyboard_irq() {
@@ -405,6 +508,14 @@ fn policy_self_test() {
     assert_eq!(pit_elapsed(divisor, 1), PIT_DIVISOR - 1);
     assert_eq!(pit_elapsed(7_777, 7_777), 0);
     assert_eq!(pit_elapsed(divisor, divisor), 0);
+    // The restart stopwatch (spec 0058a, D7): forward time adds, a counter
+    // sent back to zero adds nothing and counts on from there, and a stopped
+    // counter stalls, leaving the end to RESET_POLL_LIMIT.
+    assert_eq!(restart_elapsed(100, 0, 600), 500);
+    assert_eq!(restart_elapsed(600, 500, 40), 500);
+    assert_eq!(restart_elapsed(40, 500, 140), 600);
+    assert_eq!(restart_elapsed(140, 600, 140), 600);
+    assert_eq!(restart_elapsed(0, u64::MAX - 1, u64::MAX), u64::MAX);
     serial::println!("MIRROR_TIMER_POLICY_OK");
 }
 

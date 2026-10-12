@@ -2,7 +2,9 @@
 //!
 //! The keyboard editor and typed callers share the same bounded dispatcher.
 //! These commands inspect counters or change console text; they do not execute
-//! programs, interpret shell syntax, or access files/storage.
+//! programs, interpret shell syntax, or access files/storage. `restart` only
+//! marks the console; its caller redraws, then restarts the machine (spec
+//! 0058a, D9).
 
 use core::fmt::{self, Write};
 
@@ -95,6 +97,7 @@ pub enum Operation {
     Devices(u8),
     Echo(Text),
     Clear,
+    Restart,
     Unknown(Text),
 }
 
@@ -141,6 +144,7 @@ pub struct Console<'a> {
     history_length: usize,
     notice: &'static str,
     devices: Option<&'a pci::Inventory>,
+    restart_requested: bool,
 }
 
 impl<'a> Console<'a> {
@@ -152,6 +156,7 @@ impl<'a> Console<'a> {
             history_length: 0,
             notice: EDIT_NOTICE,
             devices: None,
+            restart_requested: false,
         };
         console.output("Mirror kernel diagnostic console.");
         console.output("Type help for commands. No programs or file operations run here.");
@@ -184,6 +189,11 @@ impl<'a> Console<'a> {
     }
     pub fn notice(&self) -> &'static str {
         self.notice
+    }
+    /// Whether `restart` was dispatched. The console never clears it: its
+    /// caller restarts the machine after the next redraw.
+    pub fn restart_requested(&self) -> bool {
+        self.restart_requested
     }
 
     /// Discard incomplete input after a queue/decoder loss. Modifier recovery
@@ -297,6 +307,7 @@ impl<'a> Console<'a> {
                 self.output("devices N  Show PCI IDs and driver candidates; first page is devices or devices 1.");
                 self.output("echo TEXT  Print text without interpreting it.");
                 self.output("clear      Clear console history and current input.");
+                self.output("restart    Restart the machine.");
                 ("help", Text::EMPTY)
             }
             Operation::Status => {
@@ -326,6 +337,11 @@ impl<'a> Console<'a> {
                 self.history_length = 0;
                 self.clear_input();
                 ("clear", Text::EMPTY)
+            }
+            Operation::Restart => {
+                self.output("Restarting.");
+                self.restart_requested = true;
+                ("restart", Text::EMPTY)
             }
             Operation::Unknown(text) => {
                 self.output("Unknown command. Type help for available commands.");
@@ -429,6 +445,7 @@ fn parse(line: Text) -> Option<Operation> {
         "status" => Operation::Status,
         "devices" => Operation::Devices(0),
         "clear" => Operation::Clear,
+        "restart" => Operation::Restart,
         "echo" => Operation::Echo(Text::EMPTY),
         _ => match text.strip_prefix("echo ") {
             Some(argument) => Operation::Echo(
@@ -723,5 +740,46 @@ pub fn self_test() {
     assert!(console.history().is_empty());
     assert_eq!(console.input(), "");
     assert_eq!(console.cursor(), 0);
+
+    // `restart` matches exactly after space trimming; any argument, suffix
+    // or capital makes it unknown (spec 0058a, test 2).
+    for command in ["restart", " restart ", "  restart"] {
+        assert_eq!(parse(Text::new(command).unwrap()), Some(Operation::Restart));
+    }
+    for command in [
+        "restart now",
+        "restartx",
+        "Restart",
+        "re start",
+        "restart 1",
+    ] {
+        assert!(matches!(
+            parse(Text::new(command).unwrap()),
+            Some(Operation::Unknown(_))
+        ));
+    }
+    // Dispatch only marks the console and says so; nothing resets here.
+    assert!(!console.restart_requested());
+    console.dispatch(Operation::Help);
+    assert!(
+        console
+            .history()
+            .iter()
+            .any(|line| line.text.as_str() == "restart    Restart the machine.")
+    );
+    assert!(!console.restart_requested());
+    type_text(&mut console, " restart ");
+    assert_eq!(
+        console.process(key(Key::Enter)),
+        Some(Action::Submitted {
+            operation: "restart",
+            text: Text::EMPTY,
+        })
+    );
+    assert!(console.restart_requested());
+    assert_eq!(
+        console.history().last().unwrap().text.as_str(),
+        "Restarting."
+    );
     crate::serial::println!("MIRROR_CONSOLE_TESTS_OK");
 }

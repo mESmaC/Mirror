@@ -308,8 +308,8 @@ pub fn is_available() -> bool {
 
 /// Nanoseconds since this boot's counter initialization, with no IRQ dependency.
 /// The counter is never reset after publication. Conversion saturates at u64::MAX
-/// instead of wrapping (~584 years). A raw counter reset/regression is fatal;
-/// suspend/resume and extending a full 64-bit rollover are not yet supported.
+/// instead of wrapping (~584 years). A raw counter reset/regression is fatal
+/// (except to `restart_counter_ns`); suspend/resume and extending a full 64-bit rollover are not yet supported.
 /// Current consumers are BSP-only with IF clear, serializing sample observation.
 pub fn snapshot() -> Option<ClockSnapshot> {
     assert!(!arch::interrupts_enabled(), "clock read requires IF clear");
@@ -332,6 +332,28 @@ pub fn snapshot() -> Option<ClockSnapshot> {
         monotonic_ns: nanoseconds(counter, period),
         resolution_ns: resolution_ns(period),
     })
+}
+
+/// The HPET counter in nanoseconds for the restart path only (spec 0058a,
+/// D7), without `snapshot`'s regression check or `LAST_COUNTER` update. A
+/// reset write that resets the chipset but not the CPU may send the counter
+/// back to zero, and the restart chain must then go on to its next method
+/// rather than panic and halt; the restart stopwatch sums forward deltas.
+/// `None` without a published clock. BSP only, IF clear.
+pub(crate) fn restart_counter_ns() -> Option<u64> {
+    assert!(!arch::interrupts_enabled(), "clock read requires IF clear");
+    assert!(
+        !crate::smp::is_secondary(),
+        "clock read requires BSP ownership"
+    );
+    let period = PERIOD_FS.load(Ordering::Acquire);
+    if period == 0 {
+        return None;
+    }
+    // SAFETY: Acquire observed the permanent UC mapping and enabled 64-bit
+    // counter. Reads do not mutate device state; no later writer is permitted.
+    let counter = unsafe { read(COUNTER) };
+    Some(nanoseconds(counter, period))
 }
 
 fn nanoseconds(counter: u64, period: u32) -> u64 {

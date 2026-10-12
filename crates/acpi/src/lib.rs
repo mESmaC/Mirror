@@ -8,13 +8,23 @@
 //! <https://uefi.org/specs/ACPI/6.6/05_ACPI_Software_Programming_Model.html>.
 //! HPET layouts follow the IA-PC HPET Specification 1.0a, section 3.2.4:
 //! <https://www.intel.com/content/dam/www/public/us/en/documents/technical-specifications/software-developers-hpet-spec-1-0a.pdf>.
-//! These are x86 topology and optional timer descriptors, not an AML interpreter.
-//! Capacity and table-size limits are kernel policy and bound each table parse.
+//! The FADT's reset register follows ACPI 6.6 sections 5.2.3.2 (the Generic
+//! Address Structure) and 5.2.9 (the FADT, its Flags and RESET_REG).
+//! These are x86 topology, optional timer and reset descriptors, not an AML
+//! interpreter. Capacity and table-size limits are kernel policy and bound
+//! each table parse.
 
 pub const RSDP_V1_SIZE: usize = 20;
 pub const RSDP_V2_SIZE: usize = 36;
 pub const SDT_HEADER_SIZE: usize = 36;
 pub const HPET_TABLE_SIZE: usize = 56;
+/// The shortest FADT that holds RESET_VALUE, at offset 128 (spec 0058a, D2).
+pub const FADT_RESET_MIN_LENGTH: usize = 129;
+/// The PIIX/ICH reset control register.
+pub const RESET_CONTROL_PORT: u16 = 0xcf9;
+/// The i8042 command port, and its pulse-reset-line command.
+pub const KBC_COMMAND_PORT: u16 = 0x64;
+pub const KBC_RESET_PULSE: u8 = 0xfe;
 pub const MAX_RSDP_SIZE: usize = 4096;
 pub const MAX_TABLE_SIZE: usize = 256 * 1024;
 pub const MAX_ROOT_ENTRIES: usize = 256;
@@ -43,6 +53,20 @@ pub enum Error {
     RecordLength,
     InvalidIsaIrq,
     UnsupportedInterruptModel,
+    /// The FADT does not set RESET_REG_SUP.
+    Unsupported,
+    /// The reset register is not in system I/O space.
+    AddressSpace,
+    /// The reset register is not 8 bits wide.
+    Width,
+    /// The reset register has a nonzero bit offset.
+    Offset,
+    /// The reset register's access size is neither undefined nor byte.
+    AccessSize,
+    /// The reset register is a port other than 0xCF9 or 0x64.
+    Port,
+    /// The reset value is not a hard reset for its port.
+    Value,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,6 +233,81 @@ impl Hpet {
             minimum_tick: u16::from_le_bytes([bytes[53], bytes[54]]),
             page_protection,
             oem_attributes: bytes[55] >> 4,
+        })
+    }
+}
+
+/// The FADT's reset register, accepted fail-closed in the only two shapes
+/// Mirror drives (spec 0058a, D2): an 8-bit system I/O register at 0xCF9 whose
+/// value sets bits 1 and 2 (a hard reset) and clears bits 4-7, or the i8042
+/// command port with its pulse command. Memory and PCI configuration space
+/// registers, and any other port, are rejected: an arbitrary port could belong
+/// to another driver. Nothing here touches the port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FadtReset {
+    pub revision: u8,
+    pub port: u16,
+    pub value: u8,
+}
+
+impl FadtReset {
+    /// Checks, in order: the table header (length bound, then checksum), the
+    /// FACP signature, a length that holds RESET_VALUE, revision 2 or later,
+    /// RESET_REG_SUP, the GAS (space, width, offset, access size, address),
+    /// the port and the value. The first failure is the error.
+    pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        const FLAGS: usize = 112;
+        const RESET_REG_SUP: u32 = 1 << 10;
+        const RESET_REGISTER: usize = 116;
+        const RESET_VALUE: usize = 128;
+        const SYSTEM_IO: u8 = 1;
+        let table = Sdt::parse(bytes)?;
+        if table.signature() != *b"FACP" {
+            return Err(Error::Signature);
+        }
+        let bytes = table.bytes;
+        if bytes.len() < FADT_RESET_MIN_LENGTH {
+            return Err(Error::Length);
+        }
+        let revision = table.header.revision;
+        // Revision 1 (ACPI 1.0) has no reset register; its bytes are reserved.
+        if revision < 2 {
+            return Err(Error::Revision);
+        }
+        if u32_at(bytes, FLAGS) & RESET_REG_SUP == 0 {
+            return Err(Error::Unsupported);
+        }
+        let register = &bytes[RESET_REGISTER..RESET_VALUE];
+        if register[0] != SYSTEM_IO {
+            return Err(Error::AddressSpace);
+        }
+        if register[1] != 8 {
+            return Err(Error::Width);
+        }
+        if register[2] != 0 {
+            return Err(Error::Offset);
+        }
+        // 0 is the pre-ACPI 3.0 "undefined" encoding, 1 is byte access.
+        if register[3] > 1 {
+            return Err(Error::AccessSize);
+        }
+        let port = u16::try_from(u64_at(register, 4))
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or(Error::Address)?;
+        let value = bytes[RESET_VALUE];
+        match port {
+            // Bit 1 clear would select a CPU-only reset, and bits 4-7 are
+            // reserved; bit 3 (full reset) and bit 0 are the firmware's choice.
+            RESET_CONTROL_PORT if value & 0xf6 == 0x06 => {}
+            KBC_COMMAND_PORT if value == KBC_RESET_PULSE => {}
+            RESET_CONTROL_PORT | KBC_COMMAND_PORT => return Err(Error::Value),
+            _ => return Err(Error::Port),
+        }
+        Ok(Self {
+            revision,
+            port,
+            value,
         })
     }
 }

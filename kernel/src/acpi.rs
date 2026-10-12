@@ -2,13 +2,13 @@
 //!
 //! Limine base revision 3 returns a physical RSDP and does not map ACPI RAM.
 //! Copy tables through one temporary RO/NX/WB page, validate owned bytes, and
-//! retain only parsed topology and HPET descriptors. Optional tables fail
-//! independently; no firmware pointer outlives its mapping.
+//! retain only parsed topology, HPET and reset-register descriptors. Optional
+//! tables fail independently; no firmware pointer outlives its mapping.
 
 use alloc::vec::Vec;
 use core::fmt;
 use limine::memory_map::{Entry, EntryType};
-use mirror_acpi::{Header, Hpet, Root, Rsdp, SDT_HEADER_SIZE, Topology};
+use mirror_acpi::{FadtReset, Header, Hpet, Root, Rsdp, SDT_HEADER_SIZE, Topology};
 
 use crate::{boot::BootInfo, memory::FrameAllocator, paging::PageTables, serial};
 
@@ -30,6 +30,7 @@ enum Error {
     MissingMadt,
     DuplicateMadt,
     DuplicateHpet,
+    DuplicateFadt,
 }
 
 impl fmt::Display for Error {
@@ -46,6 +47,8 @@ impl fmt::Display for Error {
 pub struct Discovery {
     pub topology: Option<Topology>,
     pub hpet: Option<Hpet>,
+    /// The FADT's reset register, if it passed 0058a-D2's checks.
+    pub reset: Option<FadtReset>,
 }
 
 /// Called once before AP release or private address-space creation on the BSP.
@@ -65,9 +68,11 @@ pub fn discover(
         Err(error) => {
             serial::println!("MIRROR_ACPI_SKIPPED reason={}", error);
             serial::println!("MIRROR_ACPI_HPET_SKIPPED reason=acpi_unavailable");
+            serial::println!("MIRROR_ACPI_RESET_SKIPPED reason=acpi_unavailable");
             Discovery {
                 topology: None,
                 hpet: None,
+                reset: None,
             }
         }
     }
@@ -108,14 +113,17 @@ impl Reader<'_, '_> {
         let root = Root::parse(&root_bytes, rsdp.root_kind).map_err(Error::Table)?;
         let mut topology = None;
         let mut hpet = None;
+        let mut reset = None;
         let mut skipped_tables = 0_u32;
         // Root entries are handled one at a time (0013-D6). `addresses` skips
         // null and repeated entries. Identify each table by its signature
         // before validating its length or copying its body, so a malformed
         // descriptor costs only that table. An unreadable signature skips its
         // entry with a diagnostic whose index is the entry's position among
-        // those `addresses` yields. Tables other than APIC and HPET are not
-        // read past their signature. Only the RSDP and root table abort.
+        // those `addresses` yields. Tables other than APIC, HPET and FACP are
+        // not read past their signature; of the FACP only its header, Flags
+        // and reset fields are read (0058-D3, amending 0013-D6). A bad FACP
+        // costs only the reset register. Only the RSDP and root table abort.
         for (index, address) in root.addresses().enumerate() {
             let mut signature = [0; 4];
             if let Err(error) = self.read(address, &mut signature) {
@@ -140,6 +148,12 @@ impl Reader<'_, '_> {
                         .table(address)
                         .and_then(|bytes| Hpet::parse(&bytes).map_err(Error::Table));
                     unique_table(&mut hpet, candidate, Error::DuplicateHpet);
+                }
+                b"FACP" => {
+                    let candidate = self
+                        .table(address)
+                        .and_then(|bytes| FadtReset::parse(&bytes).map_err(Error::Table));
+                    unique_table(&mut reset, candidate, Error::DuplicateFadt);
                 }
                 _ => {}
             }
@@ -202,7 +216,31 @@ impl Reader<'_, '_> {
                 None
             }
         };
-        Ok(Discovery { topology, hpet })
+        // Content-free device markers in every flavor (0058-D8).
+        let reset = match reset {
+            Some(Ok(reset)) => {
+                serial::println!(
+                    "MIRROR_ACPI_RESET_READY revision={} port={:#x} value={:#x}",
+                    reset.revision,
+                    reset.port,
+                    reset.value
+                );
+                Some(reset)
+            }
+            Some(Err(error)) => {
+                serial::println!("MIRROR_ACPI_RESET_SKIPPED reason={}", reset_reason(&error));
+                None
+            }
+            None => {
+                serial::println!("MIRROR_ACPI_RESET_SKIPPED reason=missing");
+                None
+            }
+        };
+        Ok(Discovery {
+            topology,
+            hpet,
+            reset,
+        })
     }
 
     fn table(&mut self, physical: u64) -> Result<Vec<u8>, Error> {
@@ -268,6 +306,46 @@ impl Reader<'_, '_> {
             copied += count;
         }
         Ok(())
+    }
+}
+
+/// 0058-D8's reason for a rejected or unreadable FACP: one name per parse
+/// failure, `duplicate`, and `read` for any copy or mapping failure.
+fn reset_reason(error: &Error) -> &'static str {
+    use mirror_acpi::Error as Table;
+    match error {
+        Error::DuplicateFadt => "duplicate",
+        Error::Table(error) => match error {
+            Table::Truncated => "truncated",
+            Table::Signature => "signature",
+            Table::Revision => "revision",
+            Table::Length => "length",
+            Table::Checksum => "checksum",
+            Table::Address => "address",
+            Table::Unsupported => "unsupported",
+            Table::AddressSpace => "space",
+            Table::Width => "width",
+            Table::Offset => "offset",
+            Table::AccessSize => "access_size",
+            Table::Port => "port",
+            Table::Value => "value",
+            // FadtReset::parse never returns these MADT and HPET failures.
+            Table::Reserved
+            | Table::Capacity
+            | Table::Duplicate
+            | Table::Conflict
+            | Table::RecordLength
+            | Table::InvalidIsaIrq
+            | Table::UnsupportedInterruptModel => "table",
+        },
+        Error::MissingRsdp
+        | Error::InvalidRange
+        | Error::UnreservedMemory
+        | Error::OutOfMemory
+        | Error::Paging(_)
+        | Error::MissingMadt
+        | Error::DuplicateMadt
+        | Error::DuplicateHpet => "read",
     }
 }
 
@@ -359,5 +437,112 @@ pub fn self_test() {
     ] {
         assert!(!firmware_range(&entries, start, end));
     }
+    fadt_self_test();
     serial::println!("MIRROR_ACPI_MAPPING_TESTS_OK");
+}
+
+/// The kernel side of 0058a's FADT handling: good and malformed tables
+/// through the parser that discovery uses, each failure's D8 reason, and the
+/// duplicate rule for a second FACP. The host tests cover the parser in full.
+#[cfg(feature = "boot-smoke")]
+fn fadt_self_test() {
+    const RESET_REG_SUP: u32 = 1 << 10;
+    fn seal(bytes: &mut [u8]) {
+        bytes[9] = 0;
+        bytes[9] = 0_u8.wrapping_sub(bytes.iter().fold(0_u8, |sum, byte| sum.wrapping_add(*byte)));
+    }
+    fn table(revision: u8, flags: u32, register: [u8; 4], port: u64, value: u8) -> [u8; 244] {
+        let mut bytes = [0_u8; 244];
+        bytes[..4].copy_from_slice(b"FACP");
+        bytes[4..8].copy_from_slice(&244_u32.to_le_bytes());
+        bytes[8] = revision;
+        bytes[112..116].copy_from_slice(&flags.to_le_bytes());
+        bytes[116..120].copy_from_slice(&register);
+        bytes[120..128].copy_from_slice(&port.to_le_bytes());
+        bytes[128] = value;
+        seal(&mut bytes);
+        bytes
+    }
+    fn reason(bytes: &[u8]) -> &'static str {
+        reset_reason(&Error::Table(
+            FadtReset::parse(bytes).expect_err("malformed FADT accepted"),
+        ))
+    }
+    let qemu = table(3, RESET_REG_SUP, [1, 8, 0, 0], 0xcf9, 0x0f);
+    assert_eq!(
+        FadtReset::parse(&qemu),
+        Ok(FadtReset {
+            revision: 3,
+            port: 0xcf9,
+            value: 0x0f
+        })
+    );
+    for (port, value) in [(0xcf9, 0x06), (0x64, 0xfe)] {
+        assert_eq!(
+            FadtReset::parse(&table(4, RESET_REG_SUP, [1, 8, 0, 1], port, value)),
+            Ok(FadtReset {
+                revision: 4,
+                port: port as u16,
+                value
+            })
+        );
+    }
+    let mut signature = qemu;
+    signature[..4].copy_from_slice(b"FACX");
+    seal(&mut signature);
+    let mut short = qemu;
+    short[4..8].copy_from_slice(&128_u32.to_le_bytes());
+    seal(&mut short[..128]);
+    let mut checksum = qemu;
+    checksum[200] ^= 1;
+    for (bytes, expected) in [
+        (signature, "signature"),
+        (short, "length"),
+        (checksum, "checksum"),
+        (
+            table(1, RESET_REG_SUP, [1, 8, 0, 0], 0xcf9, 0x0f),
+            "revision",
+        ),
+        (table(3, 0, [1, 8, 0, 0], 0xcf9, 0x0f), "unsupported"),
+        (table(3, RESET_REG_SUP, [0, 8, 0, 0], 0xcf9, 0x0f), "space"),
+        (table(3, RESET_REG_SUP, [2, 8, 0, 0], 0xcf9, 0x0f), "space"),
+        (table(3, RESET_REG_SUP, [1, 16, 0, 0], 0xcf9, 0x0f), "width"),
+        (table(3, RESET_REG_SUP, [1, 8, 1, 0], 0xcf9, 0x0f), "offset"),
+        (
+            table(3, RESET_REG_SUP, [1, 8, 0, 2], 0xcf9, 0x0f),
+            "access_size",
+        ),
+        (
+            table(3, RESET_REG_SUP, [1, 8, 0, 0], 0x1_0000, 0x0f),
+            "address",
+        ),
+        (table(3, RESET_REG_SUP, [1, 8, 0, 0], 0x92, 0x0f), "port"),
+        (table(3, RESET_REG_SUP, [1, 8, 0, 0], 0xcf9, 0x02), "value"),
+        (table(4, RESET_REG_SUP, [1, 8, 0, 1], 0x64, 0xfd), "value"),
+    ] {
+        assert_eq!(reason(&bytes), expected);
+    }
+    assert_eq!(reason(&qemu[..200]), "truncated");
+    assert_eq!(reset_reason(&Error::DuplicateFadt), "duplicate");
+    for error in [
+        Error::InvalidRange,
+        Error::UnreservedMemory,
+        Error::OutOfMemory,
+    ] {
+        assert_eq!(reset_reason(&error), "read");
+    }
+    // A second FACP makes the register ambiguous, even if both are valid.
+    let mut reset = None;
+    unique_table(
+        &mut reset,
+        FadtReset::parse(&qemu).map_err(Error::Table),
+        Error::DuplicateFadt,
+    );
+    assert!(matches!(reset, Some(Ok(_))));
+    unique_table(
+        &mut reset,
+        FadtReset::parse(&qemu).map_err(Error::Table),
+        Error::DuplicateFadt,
+    );
+    assert!(matches!(reset, Some(Err(Error::DuplicateFadt))));
 }

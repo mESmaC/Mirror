@@ -9,11 +9,15 @@ fn repair_checksum(bytes: &mut [u8], offset: usize) {
 }
 
 fn sdt(signature: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    sdt_revision(signature, 1, body)
+}
+
+fn sdt_revision(signature: &[u8; 4], revision: u8, body: &[u8]) -> Vec<u8> {
     let length = SDT_HEADER_SIZE + body.len();
     let mut bytes = vec![0; length];
     bytes[..4].copy_from_slice(signature);
     bytes[4..8].copy_from_slice(&(length as u32).to_le_bytes());
-    bytes[8] = 1;
+    bytes[8] = revision;
     bytes[SDT_HEADER_SIZE..].copy_from_slice(body);
     repair_checksum(&mut bytes, 9);
     bytes
@@ -242,6 +246,227 @@ fn arbitrary_checksummed_hpet_payloads_remain_bounded() {
             }
             repair_checksum(&mut bytes, 9);
             let _ = Hpet::parse(&bytes);
+        }
+    }
+}
+
+/// A 244-byte FADT (ACPI 2.0 to 4.0) with RESET_REG_SUP and the other flags
+/// QEMU's q35 sets, and the reset register {space, width, offset, access}
+/// at `address` with `value`.
+fn fadt(revision: u8, register: [u8; 4], address: u64, value: u8) -> Vec<u8> {
+    let mut body = vec![0; 244 - SDT_HEADER_SIZE];
+    let flags: u32 = (1 << 0) | (1 << 2) | (1 << 5) | (1 << 7) | (1 << 10) | (1 << 15);
+    body[112 - SDT_HEADER_SIZE..116 - SDT_HEADER_SIZE].copy_from_slice(&flags.to_le_bytes());
+    body[116 - SDT_HEADER_SIZE..120 - SDT_HEADER_SIZE].copy_from_slice(&register);
+    body[120 - SDT_HEADER_SIZE..128 - SDT_HEADER_SIZE].copy_from_slice(&address.to_le_bytes());
+    body[128 - SDT_HEADER_SIZE] = value;
+    sdt_revision(b"FACP", revision, &body)
+}
+
+/// QEMU 11.1's q35 FADT: revision 3, RESET_REG {I/O, 8, 0, 0} at 0xCF9, 0x0F.
+fn qemu_fadt() -> Vec<u8> {
+    fadt(3, [1, 8, 0, 0], 0xcf9, 0x0f)
+}
+
+/// Set one byte of a table and repair its checksum.
+fn with_byte(mut bytes: Vec<u8>, offset: usize, value: u8) -> Vec<u8> {
+    bytes[offset] = value;
+    repair_checksum(&mut bytes, 9);
+    bytes
+}
+
+#[test]
+fn fadt_reset_accepts_vmware_and_qemu_registers() {
+    // VMware 26.0.1's two layouts (spec 0058a, platform facts): revision 4,
+    // byte access, 0xCF9 with 0x06 or, without acpi.exposeHardReset, the
+    // i8042 command port with its pulse command.
+    assert_eq!(
+        FadtReset::parse(&fadt(4, [1, 8, 0, 1], 0xcf9, 0x06)),
+        Ok(FadtReset {
+            revision: 4,
+            port: 0xcf9,
+            value: 0x06
+        })
+    );
+    assert_eq!(
+        FadtReset::parse(&fadt(4, [1, 8, 0, 1], 0x64, 0xfe)),
+        Ok(FadtReset {
+            revision: 4,
+            port: 0x64,
+            value: 0xfe
+        })
+    );
+    assert_eq!(
+        FadtReset::parse(&qemu_fadt()),
+        Ok(FadtReset {
+            revision: 3,
+            port: 0xcf9,
+            value: 0x0f
+        })
+    );
+    // Bits 0 and 3 are the firmware's choice; bits 1 and 2 must be set.
+    for value in [0x06, 0x07, 0x0e, 0x0f] {
+        assert_eq!(
+            FadtReset::parse(&fadt(2, [1, 8, 0, 0], 0xcf9, value)).map(|reset| reset.value),
+            Ok(value)
+        );
+    }
+    // A 6.x-sized table, and the shortest one that holds RESET_VALUE.
+    let mut long = fadt(6, [1, 8, 0, 1], 0xcf9, 0x06);
+    long.resize(276, 0);
+    long[4..8].copy_from_slice(&276_u32.to_le_bytes());
+    repair_checksum(&mut long, 9);
+    assert_eq!(FadtReset::parse(&long).map(|reset| reset.revision), Ok(6));
+    let mut short = qemu_fadt();
+    short.truncate(FADT_RESET_MIN_LENGTH);
+    short[4..8].copy_from_slice(&(FADT_RESET_MIN_LENGTH as u32).to_le_bytes());
+    repair_checksum(&mut short, 9);
+    assert_eq!(FadtReset::parse(&short), FadtReset::parse(&qemu_fadt()));
+    // Mapped bytes beyond the declared length take no part.
+    let mut mapped = qemu_fadt();
+    mapped.extend_from_slice(&[0xff; 32]);
+    assert_eq!(FadtReset::parse(&mapped), FadtReset::parse(&qemu_fadt()));
+}
+
+#[test]
+fn fadt_reset_rejects_header_failures() {
+    let bytes = qemu_fadt();
+    let mut other = bytes.clone();
+    other[..4].copy_from_slice(b"APIC");
+    repair_checksum(&mut other, 9);
+    assert_eq!(FadtReset::parse(&other), Err(Error::Signature));
+    // A slice shorter than the header, or than the length it declares.
+    for length in [
+        0,
+        SDT_HEADER_SIZE - 1,
+        SDT_HEADER_SIZE,
+        200,
+        bytes.len() - 1,
+    ] {
+        assert_eq!(FadtReset::parse(&bytes[..length]), Err(Error::Truncated));
+    }
+    for length in [0, 35, MAX_TABLE_SIZE + 1] {
+        let mut invalid = bytes.clone();
+        invalid[4..8].copy_from_slice(&(length as u32).to_le_bytes());
+        assert_eq!(FadtReset::parse(&invalid), Err(Error::Length));
+    }
+    // A declared length that stops short of RESET_VALUE, checksummed.
+    for length in [SDT_HEADER_SIZE, 116, FADT_RESET_MIN_LENGTH - 1] {
+        let mut short = bytes[..length].to_vec();
+        short[4..8].copy_from_slice(&(length as u32).to_le_bytes());
+        repair_checksum(&mut short, 9);
+        assert_eq!(FadtReset::parse(&short), Err(Error::Length));
+    }
+    let mut corrupt = bytes.clone();
+    corrupt[200] ^= 1;
+    assert_eq!(FadtReset::parse(&corrupt), Err(Error::Checksum));
+    for revision in [0, 1] {
+        assert_eq!(
+            FadtReset::parse(&with_byte(bytes.clone(), 8, revision)),
+            Err(Error::Revision)
+        );
+    }
+}
+
+#[test]
+fn fadt_reset_rejects_unusable_registers_with_the_first_failure() {
+    let bytes = qemu_fadt();
+    // RESET_REG_SUP is flags bit 10, in byte 113.
+    let unsupported = with_byte(bytes.clone(), 113, bytes[113] & !(1 << 2));
+    assert_eq!(FadtReset::parse(&unsupported), Err(Error::Unsupported));
+    for space in [0, 2, 3, 0x7f, 0xff] {
+        assert_eq!(
+            FadtReset::parse(&with_byte(bytes.clone(), 116, space)),
+            Err(Error::AddressSpace)
+        );
+    }
+    for width in [0, 1, 16, 32, 64] {
+        assert_eq!(
+            FadtReset::parse(&with_byte(bytes.clone(), 117, width)),
+            Err(Error::Width)
+        );
+    }
+    for offset in [1, 7, 8] {
+        assert_eq!(
+            FadtReset::parse(&with_byte(bytes.clone(), 118, offset)),
+            Err(Error::Offset)
+        );
+    }
+    for access in [2, 3, 4, 0xff] {
+        assert_eq!(
+            FadtReset::parse(&with_byte(bytes.clone(), 119, access)),
+            Err(Error::AccessSize)
+        );
+    }
+    for address in [0, 0x1_0000, 0x1_0000_0cf9, u64::MAX] {
+        assert_eq!(
+            FadtReset::parse(&fadt(3, [1, 8, 0, 0], address, 0x0f)),
+            Err(Error::Address)
+        );
+    }
+    for port in [0x20, 0x60, 0x92, 0x3f8, 0xcf8, 0xcfc, 0xffff] {
+        assert_eq!(
+            FadtReset::parse(&fadt(3, [1, 8, 0, 0], port, 0x0f)),
+            Err(Error::Port)
+        );
+    }
+    for value in [0x00, 0x02, 0x04, 0x08, 0x0b, 0x16, 0x86, 0xfe] {
+        assert_eq!(
+            FadtReset::parse(&fadt(3, [1, 8, 0, 0], 0xcf9, value)),
+            Err(Error::Value)
+        );
+    }
+    for value in [0x00, 0x06, 0xfd, 0xff] {
+        assert_eq!(
+            FadtReset::parse(&fadt(4, [1, 8, 0, 1], 0x64, value)),
+            Err(Error::Value)
+        );
+    }
+    // The checks run in order, so the earliest failure wins.
+    let everything_wrong = fadt(1, [0, 16, 1, 4], 0x92, 0);
+    assert_eq!(FadtReset::parse(&everything_wrong), Err(Error::Revision));
+    let mut later = with_byte(everything_wrong, 8, 2);
+    later = with_byte(later.clone(), 113, later[113] & !(1 << 2));
+    assert_eq!(FadtReset::parse(&later), Err(Error::Unsupported));
+    let later = with_byte(later.clone(), 113, later[113] | (1 << 2));
+    assert_eq!(FadtReset::parse(&later), Err(Error::AddressSpace));
+    let later = with_byte(later, 116, 1);
+    assert_eq!(FadtReset::parse(&later), Err(Error::Width));
+    let later = with_byte(later, 117, 8);
+    assert_eq!(FadtReset::parse(&later), Err(Error::Offset));
+    let later = with_byte(later, 118, 0);
+    assert_eq!(FadtReset::parse(&later), Err(Error::AccessSize));
+    let later = with_byte(later, 119, 1);
+    assert_eq!(FadtReset::parse(&later), Err(Error::Port));
+    let later = with_byte(with_byte(later, 120, 0xf9), 121, 0x0c);
+    assert_eq!(FadtReset::parse(&later), Err(Error::Value));
+    let later = with_byte(later, 128, 0x06);
+    assert_eq!(
+        FadtReset::parse(&later),
+        Ok(FadtReset {
+            revision: 2,
+            port: 0xcf9,
+            value: 0x06
+        })
+    );
+}
+
+#[test]
+fn arbitrary_checksummed_fadt_payloads_remain_bounded() {
+    let mut state = 0x2718_2818_u32;
+    for length in (SDT_HEADER_SIZE..280).step_by(7) {
+        for _ in 0..64 {
+            let mut bytes = sdt_revision(b"FACP", 3, &vec![0; length - SDT_HEADER_SIZE]);
+            for byte in &mut bytes[SDT_HEADER_SIZE..] {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                *byte = state as u8;
+            }
+            repair_checksum(&mut bytes, 9);
+            if let Ok(reset) = FadtReset::parse(&bytes) {
+                assert!(matches!(reset.port, RESET_CONTROL_PORT | KBC_COMMAND_PORT));
+            }
         }
     }
 }
