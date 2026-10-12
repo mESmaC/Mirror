@@ -2,7 +2,7 @@
 
 Status: draft; every choice here is proposed. This document does not authorize implementation or VM runs.
 Depends on: confirmed and implemented 0019a and 0019c; merged 0017c. Implement before 0030a.
-Ledger: S7a/S7b, S4, S10, G7; roadmap Phase 1 and RD8 amendments require confirmation.
+Ledger: S7a/S7b, S4, S10, G7; proposed amendments to roadmap Phase 1 item 1 and its exit. RD8 and RD24 are confirmed.
 
 ## Goal
 
@@ -16,7 +16,7 @@ CPU saturation, AP scheduling, a new syscall, a new module, telemetry, scheduler
 
 | ID | Decision | Status |
 | --- | --- | --- |
-| 0019-D13 | Recommend one private app-module process with its own existing Application policy, launched and stopped by the kernel as below. It costs one app slot but measures cross-process contention before and after 0030a. Stage per-online-CPU load and AP-safe instrumentation with 0051, then repeat after 0052. Amend RD8 and Phase 1 item 1/exit accordingly. | proposed |
+| 0019-D13 | Recommend one private app-module process with its own existing Application policy, launched and stopped by the kernel as below. It costs one app slot but measures cross-process contention before and after 0030a. Stage per-online-CPU load and AP-safe instrumentation with 0051, then repeat after 0052. Amend roadmap Phase 1 item 1 and its exit, which currently describe a spinning thread inside an existing module on every CPU. RD8 settled the Phase 1/telemetry split and no daily pin; it does not decide this burn design. | proposed |
 
 Alternatives are choices for Cameron, not additional implementations:
 
@@ -78,7 +78,7 @@ Strict burn-plus-key acceptance requires reason=1, completed=reclaimed=created=1
 
 ### Later schedulers
 
-0030a must preserve this private child's independent policy, identity, deadlines and deferred cleanup while moving it into global tables. Keep the one-slot cost for the before/after comparison. It does not introduce AP userspace or remove throttling.
+0030a's spec is confirmed and merged; its implementation must preserve this private child's policy, identity, deadlines and cleanup while moving it into global tables. After D7/D13 confirmation, Claude updates `0030a-process-thread-table.md:34,56` at `8e43e55`: replace the idle-point D7 flush with 0019c's live and shell-teardown drains, carry the private child, and retain the before/after loaded checks. Keep the one-slot cost for that comparison. This does not add AP userspace or remove throttling. RS6 retires AgentDemo when 0030a is implemented; input and burn skip it until then.
 
 0051 owns one runnable burn context per online userspace CPU, replacing the two-app-slot restriction using the new process/thread tables. It must also make perf stamps/state and clock access safe on AP execution paths, or explicitly retain a BSP-pinned measured owner while providing AP-safe worker timing. Simply removing `clock::snapshot`'s BSP assertion is insufficient. 0055a owns calibrated TSC source selection; no AP is allowed to call today's BSP-only snapshot before an approved replacement. 0052 owns policy changes; reports identify which policy actually ran. Claude's roadmap handoff must name these prerequisites and 0019c's host oracle before claiming the Phase 1 exit.
 
@@ -100,7 +100,7 @@ No external crate, tool or download. The app adds the existing in-tree `mirror-c
 
 At immutable `3c87bcb`: `kernel/src/userspace.rs:1418-1486` implements app launch, own policy and rollback; `1489-1580` reclaims/closes it; `2037-2110` schedules shell and children; `3279-3283` rejects public kinds above 1. `userspace/app/src/main.rs:306-326` contains finite busy work and exact current kind validation. `kernel/src/windows.rs:15-17` accounts 120 surface pages. `userspace/desktop/src/shell.rs:1098` is the non-returning smoke path. The proposed private mode/launch function does not exist yet.
 
-At baseline `58461e0`, `kernel/src/userspace.rs:35,43-44,214-219,3441-3485` establishes the unchanged budgets/preemption; `clock.rs:314-334` requires BSP/IF clear. Proposed 0030a at `94461d0`, lines 10/13/55, preserves those limits and requests before/after burn reports.
+At baseline `58461e0`, `kernel/src/userspace.rs:35,43-44,214-219,3441-3485` establishes the unchanged budgets/preemption; `clock.rs:314-334` requires BSP/IF clear. Confirmed, merged `0030a-process-thread-table.md` at `8e43e55`, lines 10, 13 and 56, preserves those limits and requests before/after burn reports. Its lines 34 and 56 need the explicit handoff above once these proposed contracts are confirmed.
 
 ## Open questions
 
