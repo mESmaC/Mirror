@@ -46,7 +46,7 @@ Limine scans the El Torito image first, which has no config, and then the whole 
   - Attach `build/mirror.iso` instead of the disk image: `-drive if=none,id=mirror-iso,media=cdrom,format=raw,readonly=on,...` with `-device ide-cd,drive=mirror-iso,bus=ide.2,bootindex=0` on q35's built-in AHCI controller. `ide.2` leaves `ide.0` free for the AHCI fixture. No SMBIOS config is passed.
   - `-Iso` requires `-DeviceProfile LegacyVirtio`. With no modern virtio-blk boot disk, the legacy fixture is the only device that satisfies the smoke assert (`kernel/src/main.rs:262-265`). 0014 already rejects `LegacyVirtio` with `-NoTestDisk`.
   - `-Iso` rejects any `-Fault` other than `None`, plus `-LegacyPic` and `-PitTimer`, because those need a kernel command line.
-  - The kernel skips ATAPI ports (`ahci.rs:238-245`), so AHCI reports `MIRROR_AHCI_SKIPPED reason=no_disk` (`main.rs:959`).
+  - The kernel skips ATAPI ports (`ahci.rs:238-245`), so AHCI reports `MIRROR_AHCI_SKIPPED reason=no_disk` (`main.rs:971`).
 - `common.ps1`: `Assert-MirrorDriverCatalog` gets a parameter for the expected number of modern VirtIO devices, which today is fixed at 1 (`common.ps1:115-127`). `run.ps1:595` passes 0 for `-Iso` and 1 otherwise. `run.ps1:751-753` is unchanged, because the legacy fixture satisfies it.
 - `test.ps1`: adds one `-Iso` smoke case per build profile under `LegacyVirtio`, two boots in all. 0014's computed boot count includes them.
 - `package.ps1` (0015a): also copies `mirror.iso` to `build/dist/`.

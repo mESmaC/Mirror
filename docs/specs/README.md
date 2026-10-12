@@ -25,7 +25,7 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 - Docs-only: the G11 daily VM (12 vCPUs, 20 GB, NAT) in `docs/vm-settings.md` (RD16)
 - 0016a Hardening: guarded boot-CPU stacks, NMI/#MC stacks. Done (2026-10-11)
 - 0016b Hardening: SMEP/SMAP/UMIP, EFER.SCE, CPU vulnerability reporting (S9). Done (2026-10-11)
-- 0017a PS/2: separate keyboard and mouse loss handling, mouse coalescing and resync
+- 0017a PS/2: separate keyboard and mouse loss handling, mouse coalescing and resync. Implemented (2026-10-11); manual check after 0017b
 - 0017b PS/2: time-based init timeouts and init order
 - 0017c Absolute pointing on VMware: vmmouse protocol (S1a, S1d)
 - 0058a (split): reboot without AML (FADT reset register, then 8042, then 0xCF9, then triple fault) and a console `restart` command
@@ -170,7 +170,7 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 - 0015b Live ISO and its test case (S5, S5a). Moved here on 2026-10-11 (RD1); re-drafted and re-confirmed before this phase
 - 0199 Performance gates and daily-drive checklist; local-inference floors and input latency under inference (G7, G7a, I15)
 
-Execution order (confirmed 2026-10-11): Phase 0 runs 0015a (done), then 0013 (done), then 0016a (done), 0016b (done), 0017a, 0017b and 0017c, one at a time, each updating the AGENTS.md lines it changes in the same commit (P9). The vmrun lane, the G11 docs commit and 0058a join Phase 0 once confirmed (RD1, RD16). 0018's baseline track runs in parallel. Later phases run in the order listed, except where a line's own note orders it after a later line (0095 runs after 0098). Done earlier: 0012, 0011, 0014, 0010 and side spec 0029.
+Execution order (confirmed 2026-10-11): Phase 0 runs 0015a (done), then 0013 (done), then 0016a (done), 0016b (done), 0017a (implemented), 0017b and 0017c, one at a time, each updating the AGENTS.md lines it changes in the same commit (P9). The vmrun lane, the G11 docs commit and 0058a join Phase 0 once confirmed (RD1, RD16). 0018's baseline track runs in parallel. Later phases run in the order listed, except where a line's own note orders it after a later line (0095 runs after 0098). Done earlier: 0012, 0011, 0014, 0010 and side spec 0029.
 
 **Specs the re-plan splits**, with their original scope (split specs keep their decision IDs, rule 1):
 - 0019 Mirror perf instrumentation and telemetry: kernel side of 0018-D9 and device/link telemetry (S7b, C3)
@@ -210,6 +210,7 @@ Deferred work with no phase yet, kept here so it is not lost. This list replaces
 - The live ISO root filesystem
 - `clippy --tests`
 - The hygiene capture's launcher-click retry (`capture.ps1 -Hygiene`): when Notes' start marker arrives after the 3 s retry window, the retry launches a second Notes and the probe fails. Seen intermittently on 2026-10-11 with kernels from before and after 0016a (5 of 6 runs once, 0 of 3 another time), so it is a harness timing issue, not a kernel one.
+- The agent-demo capture's reply timeout (`capture.ps1 -AgentDemo` at 4 CPUs, debug): the demo agent gives up after its 100-tick IPC receive timeout while the throttled debug desktop (32 of every 100 ticks) is still painting, so "agent complete" never arrives. It failed in interleaved A/B runs on the trees before and after 0017a alike (2026-10-11), when other heavy processes were running on the host.
 
 Removed from the old deferred list on 2026-10-09: VirtualBox baselines (VirtualBox dropped), a default-build destination for user-program diagnostics (now 0034), and the disk update path and build identity (now 0067).
 

@@ -1,6 +1,13 @@
 # 0017a: PS/2 loss domains, mouse coalescing and resync
 
-Status: confirmed (2026-10-09)
+Status: implemented (2026-10-11, branch `claude/0017a-ps2-loss-domains`: b4500bd, review fixes in 844ada2); manual check 6 waits for 0017b, because VMware's keyboard needs 0017b-D9's 0x41 readback. Acceptance tests 1-5 pass. The self-tests cover acceptance tests 1-4 as written, plus a drain test: a full keyboard and mouse backlog, each with its loss marker, leaves nothing after the session's initial `Lost{3}` record. Both suites passed unmodified on 844ada2: `scripts/test.ps1` in 885 s (132 smoke boots) and `-AgentDemo` in 1166 s. Two pre-existing, host-load-dependent flakes needed reruns, and both fail the same way on the tree before 0017a: the hygiene capture's launcher-click retry, and the agent-demo capture's agent reply timeout (see README, unscheduled follow-ups). The Interfaces keep their HEAD 4614249 line numbers. (Confirmed 2026-10-09.)
+
+Implementation notes (2026-10-11):
+- The handoff drains in `input::Session::new` and the kernel console's `run_console` loop to `ps2::MAX_BACKLOG` (130): 64 events plus one loss marker per device. The 128 they used before would leave 2 stale items, the case the review found.
+- D7's 500 ms gap also drops the pending tail of a corrupt packet, not only an ordinary partial packet. It is tested.
+- On a pointer loss the shell sends apps Reset only. The Focus it used to send after Reset existed only because the queue was being cleared, and the Interfaces list Reset alone.
+- A pointer-only loss no longer redraws the kernel console, since nothing visible changes.
+- `MIRROR_CONSOLE_INPUT_LOST` gains `device=keyboard|pointer`. `capture.ps1`'s two matches still match it, and no script checks its exact text.
 Depends on: 0013 and 0015a, only for the manual VMware check (it boots 0015a's disk image); the QEMU tests need neither. In the M0 order this spec lands before 0017b, and both edit `kernel/src/ps2.rs`. 0017c (absolute pointing) follows both.
 Ledger: S1a, G1, G3a, G7 (related: S7b, S1d)
 

@@ -73,7 +73,7 @@ Each `MIRROR_PERF_T` event prints at most once, in this order. A milestone that 
 3. `input`: after PS/2 init and IRQ enabling (`main.rs:316-342`).
 4. `userspace`: the kernel first resumes the shell, or the agent-demo desktop. In default and trace builds this is the first user process (0010-D3).
 5. `frame`: that process's first successful display-surface present (`userspace.rs:2802-2807`).
-6. `shell_ready`: that process's first input syscall after `frame` (15 or 16 on the Input object, `userspace.rs:3229-3255`). Shell: `shell.rs:1028-1032`. Desktop: `userspace/desktop/src/main.rs:333-343`; its input checks at `:151-174` precede `frame` and do not count.
+6. `shell_ready`: that process's first input syscall after `frame` (15 or 16 on the Input object, `userspace.rs:3229-3255`). Shell: `shell.rs:1032-1036`. Desktop: `userspace/desktop/src/main.rs:350-360`; its input checks at `:161-184` precede `frame` and do not count.
 
 ### Memory samples (0018-D6)
 
@@ -97,7 +97,7 @@ After the `after_userspace` heap growth (`main.rs:382-388`) and before the first
 - `MIRROR_PERF_TEL v=1 src= dst= op=<copy|read> pattern=<seq|rand> request_bytes= depth= span_bytes= count= elapsed_ns= min_ns= p50_ns= p95_ns= max_ns=`
   - Copies are `src=0 dst=0`; reads are `src=1 dst=0`. Throughput is count × request_bytes / elapsed_ns. Copies are too short to time singly, so their per-request fields are `none`. Consumers reject an unknown `v`.
 - **Memory benchmark**, just before `probe_ahci_device` (`main.rs:280`), with one CPU running. It copies 4 KiB pages through the direct map from source to destination frames, allocated one at a time and listed in the source frames themselves, so it uses no heap; all are freed afterwards. Two spans: 32 KiB, and min(64 MiB, free memory / 8). Each span gets one untimed warm-up pass, then is copied repeatedly until 256 MiB have been copied or 1 s has passed.
-- **Storage benchmark**, in the AHCI probe after its existing reads succeed and before shutdown (`main.rs:974-989`): 256 sequential reads from LBA 0, then 256 reads at fixed-seed xorshift64 LBAs over the capacity, each timed. Each pattern stops at 2 s, and `count` records the reads done. Reads go to a stack buffer and allocate no frame, so the DMA accounting assert (`main.rs:994-998`) holds.
+- **Storage benchmark**, in the AHCI probe after its existing reads succeed and before shutdown (`main.rs:986-1001`): 256 sequential reads from LBA 0, then 256 reads at fixed-seed xorshift64 LBAs over the capacity, each timed. Each pattern stops at 2 s, and `count` records the reads done. Reads go to a stack buffer and allocate no frame, so the DMA accounting assert (`main.rs:1006-1010`) holds.
 - **Without HPET**, both benchmarks print `SKIPPED item=telemetry reason=no_clock`; DEV records still print. Without `telemetry`, each site costs one branch.
 
 ### Files
