@@ -1,6 +1,6 @@
 # Roadmap re-plan: a modern OS first
 
-Status: proposed 2026-10-10. Adopted 2026-10-11 in part (Cameron): RS1 (phases 0-11 replace M0-M9), RS2 (storage and network before Kimi's shell), RS3 (0029-D9's geometry withdrawn; 0029 part 1 to be merged as committed), RS4 (HD Audio in v1, ledger S22) and the first part of RD1 (0015b moves to Phase 11, so 0013 follows 0015a; 0015b is re-drafted and re-confirmed before Phase 11). The ledger (decisions.md, Phases) and README.md's spec map now carry the order. Every other RS and RD decision here stays proposed and is decided when its Due column says. NEW specs and splits are confirmed and numbered when their phase comes up (RD24).
+Status: proposed 2026-10-10. Adopted 2026-10-11 in part (Cameron): RS1 (phases 0-11 replace M0-M9), RS2 (storage and network before Kimi's shell), RS3 (0029-D9's geometry withdrawn; 0029 part 1 to be merged as committed), RS4 (HD Audio in v1, ledger S22) and the first part of RD1 (0015b moves to Phase 11, so 0013 follows 0015a; 0015b is re-drafted and re-confirmed before Phase 11). The ledger (decisions.md, Phases) and README.md's spec map now carry the order. Confirmed 2026-10-12 (Cameron): RS6 (the agent-demo build retires at 0030a), the rest of RD1 (the vmrun lane, the G11 docs commit and 0058a join Phase 0), RD2 (the harness's kernel primitives land early; its product layer goes to Phase 10), RD6 (0053 in Phase 1, before 0028; 0054a carries the S18 reserve and OOM order; 0054b keeps only pressure notifications), RD7 (0058a, reboot without AML, in Phase 0; each other clock, power and crash piece lands where its parts exist), RD8 (0019a opens Phase 1 and 0019b follows 0062, with no daily resolution pin), RD16 (the G11 VM enters `docs/vm-settings.md` in Phase 0), RD21 (0021 is written per-CPU from the start, after 0050, and 0050 drops its rework clause) and RD24 for the vmrun lane and three Phase 1 items (the vmrun lane becomes 0015c, the host lane, and 0015d, the VMware cases; 0019's Phase 1 part becomes 0019a, 0019c and 0019d, and 0019b stays C3 telemetry; 0030a keeps its name; kernel heap v2 is 0059). Every other RS and RD decision here stays proposed and is decided when its Due column says. The other NEW specs and splits are confirmed and numbered when their phase comes up (RD24).
 
 ## 1. Summary
 
@@ -19,7 +19,7 @@ Status: proposed 2026-10-10. Adopted 2026-10-11 in part (Cameron): RS1 (phases 0
   - Merge 0029 part 1 as committed (it already carries 0029-D9's frame colors).
   - Start 0015a, then 0013, both built as confirmed.
   - Draft NEW 0030a as a docs-only task.
-  - RS1-RS4 were confirmed on 2026-10-11. RS5 and RS6 are decided when due, as each row in 6.1 says. Neither blocks 0015a or 0013.
+  - RS1-RS4 were confirmed on 2026-10-11, and RS6 on 2026-10-12. RS5 is decided when due, as its row in 6.1 says. It does not block 0015a or 0013.
 
 ## 2. Where Mirror stands
 
@@ -55,7 +55,7 @@ No. Each row is either a kernel or platform limit or a spec nobody owns, so shel
 | Alpha, antialiasing, rounded corners, shadows, gradients | 8-bit palette scene; rectangle occlusion | NEW 0027c renderer |
 | Motion and frame pacing | 100 Hz tick; the shell polls once per tick (shell.rs:1048) | NEW high-resolution timers with tickless idle; NEW 0027d |
 | CPU for software composition | Boot CPU only, 32% per process, soft-float, no AVX | 0051, 0052, 0028, 0053 |
-| Memory for full-screen buffers | 2 MiB images, 32 MiB commit, about 3 MiB of kernel heap | 0054a, NEW ELF loader v2, NEW kernel heap v2 |
+| Memory for full-screen buffers | 2 MiB images, 32 MiB commit, about 3 MiB of kernel heap | 0054a, NEW ELF loader v2, NEW 0059 kernel heap v2 |
 | Kernel substrate | Stack-local processes, one kernel stack, polled wakeups | NEW 0030a, 0050 |
 | Text and icons | 5x7 ASCII bitmap; no icons | 0086a (fonts and icons on 0027c's shared path rasterizer), 0086b |
 | Input the design assumes | No Up/Down, PgUp/PgDn, F-keys or Super; no wheel; ASCII-only events | 0084a, 0084b |
@@ -75,23 +75,23 @@ No. Each row is either a kernel or platform limit or a spec nobody owns, so shel
 ## 4. Proposed phases 0-11
 
 Conventions:
-- Counts are approximate and cumulative from today, with 0015a as spec 1.
+- Counts are approximate and cumulative from today, with 0015a as spec 1. The cumulative counts after Phase 0 predate the 2026-10-12 numbering, which made the vmrun lane two specs (0015c, 0015d): add 1 to each, and 2 more from Phase 1 on if 0019-D15 divides 0019's Phase 1 part in three.
 - "(proposed)" marks a starting threshold. Cameron sets the final number in the owning spec.
-- VMware checks run on the G11 VM unless noted. The vmrun lane runs them where it can script them; the rest are by hand (S1a).
+- VMware checks run by hand on the G11 VM unless noted (S1a). The vmrun lane (0015c, 0015d) scripts its own checks on a separate VM with the 0015a reference profile, not G11's (VMR-D2, confirmed 2026-10-12).
 - RS and RD numbers are this proposal's decisions (section 6). Spec decisions are always written in full, for example 0029-D9.
 
-### Phase 0: Mirror boots well in VMware (9 specs, about 9)
+### Phase 0: Mirror boots well in VMware (10 specs, about 10)
 
 Goal: the VMDK boots in VMware on every vCPU, and the pointer is not grabbed. The guest can restart itself, and a script can boot, restart and suspend the VM headless.
 
 Specs, in order:
 1. Close 0029: Cameron merges part 1 as committed (it already carries 0029-D9's frame colors).
 2. 0015a, as confirmed.
-3. NEW vmrun lane.
+3. NEW vmrun lane, as two specs (RD24): 0015c, the host lane, and 0015d, the VMware cases.
    - It boots `build/dist/mirror.vmdk` headless (`vmrun -T ws start <vmx> nogui`) and reads the serial file.
    - It checks the boot markers, power-off and `vmrun suspend`/`start`.
    - Its typed checks use 0018's perf-probe over VMware's VNC server, so the lane depends on perf-probe, and its VM carries 0018's RemoteDisplay.vnc keys. A `restart` check joins when 0058a lands.
-   - It goes right after 0015a if confirmed by then, otherwise right after 0013. It never holds up 0013.
+   - It joined Phase 0 on 2026-10-12 (RD1), after 0013 was done, so it lands at the end of Phase 0 with the G11 docs commit and 0058a.
 4. 0013, as confirmed. If its tests 14 and 16 show VMware handing off in x2APIC mode (unsettled, 0013:134), 0055a with x2APIC handoff follows here.
 5. A docs-only commit adds the G11 daily VM (12 vCPUs, 20 GB, NAT) to `docs/vm-settings.md`, with every reference-VM key and 0018's RemoteDisplay.vnc keys, and rewords the lines that give it to 0067 (RD16).
 6. 0016a, 0016b, 0017a, 0017b, 0017c. If 0017c check 7 fails without VMware Tools, 0087a moves here from Phase 4.
@@ -117,10 +117,10 @@ Honest limits: the screen is VMware's GOP default mode with a centered 1280x800 
 Goal: replace the boot-CPU-only, run-to-trap kernel before anything else is built on it.
 
 Specs, in order:
-1. 0019a, split from 0019: boot milestones, idle memory and the input-to-present trace. It also adds a `burn` perf item: one spinning thread per online CPU inside an existing module, content-free and opt-in through 0019-D12's perf image. It goes first, so this phase is measured before and after. It also carries the optional daily resolution pin (RD8). The agent-demo build retires with the next spec (RS6).
+1. 0019a, 0019c and 0019d, split from 0019 (RD24 numbers them as the perf configuration, input-capture and burn slices; their own decisions are still proposed): boot milestones, idle memory and the input-to-present trace. They also add a `burn` perf item: one spinning thread per online CPU inside an existing module, content-free and opt-in through 0019-D12's perf image. They go first, so this phase is measured before and after. RD8 was confirmed on 2026-10-12 without the daily resolution pin, so daily images keep pinning no mode, as 0015a confirms. The agent-demo build retires with the next spec (RS6).
 2. NEW 0030a: a global process and thread table, run queues, wait queues instead of `wake_threads` polling, wakeup preemption, and MAX_THREADS above 4.
 3. 0050, plus a kernel VA allocator for mappings made after the paging seal.
-4. NEW kernel heap v2: grows on demand, adds a slab allocator, and charges kernel memory to the owning process.
+4. NEW 0059 kernel heap v2: grows on demand, adds a slab allocator, and charges kernel memory to the owning process.
 5. 0054a, split from 0054: frame allocator v2 with per-frame refcounts, dynamic per-process limits, and S18's fixed reserve and OOM victim order (an OOM class set at spawn).
 6. 0051: user processes on all CPUs, locking, user TLB shootdowns, and an NMI stop on panic. It also brings S17's crash screen: the reason and a backtrace; development builds halt, and release builds reboot through 0058a.
 7. 0052, then 0053.
@@ -128,7 +128,7 @@ Specs, in order:
 
 Exits:
 - On the G11 VM, `MIRROR_SMP_READY` reports `userspace_cpus=` equal to `online=`. `status` shows user time on every CPU and each process's CPU time and committed memory.
-- 200 keys are pressed while 0019a's `burn` item spins on every CPU. 0019a's trace shows p99 key-to-present under 30 ms (proposed) on the G11 VM; in QEMU `-smp 4` the p99 is reported, not gated. Today's allowance permits stalls of up to 680 ms. That figure is derived from userspace.rs:44-45 and has never been measured.
+- 200 keys are pressed while 0019d's `burn` item spins on every CPU. 0019c's trace shows p99 key-to-present under 30 ms (proposed) on the G11 VM; in QEMU `-smp 4` the p99 is reported, not gated. Today's allowance permits stalls of up to 680 ms. That figure is derived from userspace.rs:44-45 and has never been measured.
 - `MIRROR_FPU_READY ... avx=1 ... osxsave=1` prints on VMware (expected, since the host has AVX2) and under QEMU `-ExtendedCpu`. The default QEMU CPU (qemu64) keeps `avx=0`, and that path stays tested.
 - QEMU smoke cases pass, each with frame counts restored afterwards:
   - the thread battery under `-smp 4` with 16 threads in one process;
@@ -415,7 +415,7 @@ The map grows from about 88 remaining specs to about 126. 23 NEW specs fill gaps
 | Spec | Confirmed place | Proposed place |
 | --- | --- | --- |
 | 0015b | M0 | Phase 11, re-drafted (RD1) |
-| 0019 | M0, last | 0019a opens Phase 1; frame hooks in 0027c; 0019b after 0062 in Phase 6 |
+| 0019 | M0, last | 0019a, 0019c and 0019d open Phase 1; frame hooks in 0027c; 0019b after 0062 in Phase 6 |
 | 0050, 0051, 0052, 0053, 0055a | M4 | Phase 1 |
 | 0054 | M4 | 0054a in Phase 1 (with the S18 reserve and OOM order); 0054b in Phase 11 |
 | 0021 | M1, before 0050 | Phase 2, after 0050, per-CPU from the start |
@@ -453,8 +453,8 @@ The map grows from about 88 remaining specs to about 126. 23 NEW specs fill gaps
 
 | NEW spec | Phase | Owns |
 | --- | --- | --- |
-| vmrun lane | 0 | Headless VMware boot, restart, and suspend/resume checks |
-| Kernel heap v2 | 1 | On-demand growth, slab allocator, kernel memory charged to its owner |
+| vmrun lane: 0015c host lane and 0015d VMware cases | 0 | Headless VMware boot, restart, and suspend/resume checks |
+| 0059 kernel heap v2 | 1 | On-demand growth, slab allocator, kernel memory charged to its owner |
 | High-resolution timers | 2 | One-shot or TSC-deadline LAPIC, tickless idle, timer objects |
 | ELF loader v2 | 3 | Images over 2 MiB, PT_TLS, stack size, shared text, room for PIE |
 | Driver placement and display object note | 4 | RD12 |
@@ -479,7 +479,7 @@ The map grows from about 88 remaining specs to about 126. 23 NEW specs fill gaps
 
 | Split | Parts |
 | --- | --- |
-| 0019 | 0019a perf markers (Phase 1); 0019b C3 telemetry (Phase 6) |
+| 0019 | 0019a perf configuration, milestones, memory and delivery (Phase 1); 0019c finite input capture (Phase 1); 0019d burn (Phase 1); 0019b C3 telemetry (Phase 6) |
 | 0030 | 0030a table and scheduler core (Phase 1); 0030 process model (Phase 3) |
 | 0034 (staged, not split) | log in memory (Phase 3); crash-record path (Phase 6, after 0062) |
 | 0044 | 0044a element-tree contract (Phase 4); 0044b registry, streaming, cancel (Phase 9) |
@@ -496,31 +496,31 @@ The map grows from about 88 remaining specs to about 126. 23 NEW specs fill gaps
 
 ## 6. Decisions for Cameron
 
-RS and RD are this proposal's numbers. They are not ledger IDs.
+RS and RD are this proposal's numbers. They are not ledger IDs. A row Cameron has confirmed says so in its Due cell, with the date. Every other row stays proposed.
 
 ### 6.1 Strategic
 
 | # | Decision | Recommended | Why | Due |
 | --- | --- | --- | --- | --- |
-| RS1 | Foundations before the harness product layer: replace M1-M9, the README spec map and the preamble "The harness follows the process model (A15)" (decisions.md:165) with Phases 0-11 | Yes. v1's contents in 0000-north-star do not change, except as RS4 and RD18 record (detail in RD2). Ledger S6 is reworded: the ABI reset (0020-0025) follows the Phase 1 kernel core. Phase 1 adds no syscall and changes only the thread-protocol and vm-protocol limits. Its new test code extends init's existing battery | Otherwise the M1-M3 harness UI is built on a 5x7 font and the demo input path, and is likely redone in M7 | Before Phase 1 |
-| RS2 | Storage (Phase 6) and network (Phase 7) before Kimi's shell (Phase 8) | Yes. If Cameron wants the shell sooner, Phase 8 items 1-3, 6 and 7 can follow Phase 5, with the start menu and dock reading manifests from the boot bundle and the palette covering apps and commands only. Items 4, 5, 8 and 9 (app registry, chooser, 0040 and first-run setup) still follow Phases 6 and 7, because 0040 needs 0036 (S14) and the chooser needs 0066a | Matches G4 and readme.md:5. The shell and apps are then written once, against real files and settings | Before Phase 6 |
-| RS3 | Withdraw 0029-D9's geometry | Yes. Merge part 1 as committed. Withdraw the 38 px titlebar, the 38x28 caption buttons, the app tile, the drag region and the moved click points, and move the titlebar geometry to 0027e. Its frame colors (border-strong focused, border-subtle unfocused) stay, since part 1 ships them. Update 0029's tests 2, 4 and 6 and the D9 geometry lines of its Interfaces | 0029-D9's geometry restyles a renderer that Phase 4 replaces, and it ties the demo shell into 0017c's and 0018's captures | Now, with the 0029 merge |
-| RS4 | Audio and the other unowned G12 basics | Schedule NEW HD Audio output, mixer and volume after 0060b (Phase 9). Multiple monitors, screen reader, IME and non-English UI go to After v1 (RD18). Drop the brightness slider. Alternative for audio: an explicit G12 exception under "Not in v1" | G12 says Mirror provides what every modern OS has. VMware's HD Audio and QEMU's `intel-hda` make audio testable | Before Phase 8 |
+| RS1 | Foundations before the harness product layer: replace M1-M9, the README spec map and the preamble "The harness follows the process model (A15)" (decisions.md:165) with Phases 0-11 | Yes. v1's contents in 0000-north-star do not change, except as RS4 and RD18 record (detail in RD2). Ledger S6 is reworded: the ABI reset (0020-0025) follows the Phase 1 kernel core. Phase 1 adds no syscall and changes only the thread-protocol and vm-protocol limits. Its new test code extends init's existing battery | Otherwise the M1-M3 harness UI is built on a 5x7 font and the demo input path, and is likely redone in M7 | Before Phase 1; confirmed (2026-10-11) |
+| RS2 | Storage (Phase 6) and network (Phase 7) before Kimi's shell (Phase 8) | Yes. If Cameron wants the shell sooner, Phase 8 items 1-3, 6 and 7 can follow Phase 5, with the start menu and dock reading manifests from the boot bundle and the palette covering apps and commands only. Items 4, 5, 8 and 9 (app registry, chooser, 0040 and first-run setup) still follow Phases 6 and 7, because 0040 needs 0036 (S14) and the chooser needs 0066a | Matches G4 and readme.md:5. The shell and apps are then written once, against real files and settings | Before Phase 6; confirmed (2026-10-11) |
+| RS3 | Withdraw 0029-D9's geometry | Yes. Merge part 1 as committed. Withdraw the 38 px titlebar, the 38x28 caption buttons, the app tile, the drag region and the moved click points, and move the titlebar geometry to 0027e. Its frame colors (border-strong focused, border-subtle unfocused) stay, since part 1 ships them. Update 0029's tests 2, 4 and 6 and the D9 geometry lines of its Interfaces | 0029-D9's geometry restyles a renderer that Phase 4 replaces, and it ties the demo shell into 0017c's and 0018's captures | Now, with the 0029 merge; confirmed (2026-10-11) |
+| RS4 | Audio and the other unowned G12 basics | Schedule NEW HD Audio output, mixer and volume after 0060b (Phase 9). Multiple monitors, screen reader, IME and non-English UI go to After v1 (RD18). Drop the brightness slider. Alternative for audio: an explicit G12 exception under "Not in v1" | G12 says Mirror provides what every modern OS has. VMware's HD Audio and QEMU's `intel-hda` make audio testable | Before Phase 8; confirmed (2026-10-11) |
 | RS5 | Runtime target for system code | The compositor, toolkit, text stack and services are `no_std` + alloc on mirror-rt. 0089's std core stage opens Phase 9, before the tools (S8 holds). Alternative: the std core stage in Phase 3 | `no_std` crates link into std programs unchanged, so nothing is rewritten. Porting std means adding a Mirror platform layer to std's source, which is XL work, and this keeps it off the desktop's critical path | Before Phase 3 |
-| RS6 | Retire the agent-demo build | Yes, when 0030a replaces `run_desktop` (Phase 1). AGENTS.md drops `test.ps1 -AgentDemo` (P9) until Phase 10 brings agents back. Alternative: keep it until 0023 (Phase 2) | 0030a rewrites the session loop it runs in, 0023 replaces its two fixed channels, and each run costs 15-20 minutes | Before Phase 1 |
+| RS6 | Retire the agent-demo build | Yes, when 0030a replaces `run_desktop` (Phase 1). AGENTS.md drops `test.ps1 -AgentDemo` (P9) until Phase 10 brings agents back. Alternative: keep it until 0023 (Phase 2) | 0030a rewrites the session loop it runs in, 0023 replaces its two fixed channels, and each run costs 15-20 minutes | Before Phase 1; confirmed (2026-10-12) |
 
 ### 6.2 Detailed
 
 | # | Decision | Recommended | Why | Due |
 | --- | --- | --- | --- | --- |
-| RD1 | M0 order (README.md:28) | Keep 0015a, 0013 and 0016a-0017c as confirmed. Move 0015b to Phase 11, and split 0019 (RD8). Add the vmrun lane after 0015a (it yields to 0013 if not yet confirmed), the G11 doc commit, and NEW 0058a after 0017c. Drop the README's "its D9 lands with 0017c". Moving 0015b past 0062 re-opens it: before Phase 11, 0015b is re-drafted and re-confirmed. Its `-Iso` case runs under V1, with 0062 relaxing the VirtIO smoke assert (kernel/src/main.rs:206-209) as 0014's follow-up says. It also states which RD14 assets (root store, tzdata, CJK fonts) the live ISO carries, or that the live system runs without them. Alternative: keep 0015b in Phase 0 right after 0013, before 0062 | 0015b is not needed for daily VMware use. 0013 is needed for every multi-CPU VMware boot | The 0015b move before 0015a ends; the rest before 0013 ends |
-| RD2 | A15, A9a | Split them. The kernel primitives stay early: S6e grants (0022), suspend and a principal field (0030), seat and provenance (0027a), and the trusted layer reserved in 0027a and 0027c. The product layer goes to Phase 10, and 0043 is persisted from the start. A21 is handled in RD25 | The harness's kernel hooks are designed once, and its UI is built once | Before Phase 1 |
+| RD1 | M0 order (README.md:28) | Keep 0015a, 0013 and 0016a-0017c as confirmed. Move 0015b to Phase 11, and split 0019 (RD8). Add the vmrun lane after 0015a (it yields to 0013 if not yet confirmed), the G11 doc commit, and NEW 0058a after 0017c. Drop the README's "its D9 lands with 0017c". Moving 0015b past 0062 re-opens it: before Phase 11, 0015b is re-drafted and re-confirmed. Its `-Iso` case runs under V1, with 0062 relaxing the VirtIO smoke assert (kernel/src/main.rs:206-209) as 0014's follow-up says. It also states which RD14 assets (root store, tzdata, CJK fonts) the live ISO carries, or that the live system runs without them. Alternative: keep 0015b in Phase 0 right after 0013, before 0062 | 0015b is not needed for daily VMware use. 0013 is needed for every multi-CPU VMware boot | The 0015b move before 0015a ends; the rest before 0013 ends. The move was confirmed (2026-10-11). The vmrun lane, the G11 doc commit and 0058a were confirmed (2026-10-12), and the 0019 split was confirmed with RD8. 0015b's re-draft content (`-Iso` under V1, the RD14 assets) is decided with the re-draft |
+| RD2 | A15, A9a | Split them. The kernel primitives stay early: S6e grants (0022), suspend and a principal field (0030), seat and provenance (0027a), and the trusted layer reserved in 0027a and 0027c. The product layer goes to Phase 10, and 0043 is persisted from the start. A21 is handled in RD25 | The harness's kernel hooks are designed once, and its UI is built once | Before Phase 1; confirmed (2026-10-12) |
 | RD3 | S6f | 0027a as in Phase 4, item 2. It retires syscalls 13-16 and the 1280x800 cap, as S1c already says. 0027b retires 17-22. New 0027c, 0027d and 0027e. 0084a lands right after 0027a and before 0027b and any toolkit code, and replaces the envelope payload. Only the ported shell ever uses the old payload | No protocol revision is needed for scaling or drag and drop, and the shell keeps a working screen path at every step | Before Phase 4 |
 | RD4 | Toolkit before the window manager | 0039 and 0044a move to Phase 4. The NEW toolkit core comes before 0027e, and the rest of the widgets come in Phase 8 | Phase 4's apps and window chrome are written once | Before Phase 4 |
 | RD5 | S11 | Split 0086 into 0086a (Phase 4) and 0086b (Phase 9), both before 0082, 0083 and 0085. 0086a owns icons, drawn on 0027c's path rasterizer | Real text and icons exist before any chrome is built | Before Phase 4 |
-| RD6 | S12, I6, S18 | 0053 goes in Phase 1, before 0028. 0054a carries the S18 reserve and OOM order. 0054b keeps only pressure notifications | Phase 1 lifts the limits, so a runaway app could otherwise starve the compositor | Before Phase 1 |
-| RD7 | S15, S16, S17 | 0056a in Phase 2 and 0056b in Phase 6. 0058a in Phase 0. 0057 and 0058 in Phase 5, before storage, with 0063 and 0064 owning the sync and clean-pool tests. The S17 crash screen in 0051. The app-crash notice and its log entry in 0027e | Reboot needs no AML, and each piece lands where its parts exist | Before Phase 0's 0058a |
-| RD8 | 0019 split (Pending item 1) and a daily resolution pin | 0019a opens Phase 1, and 0019b follows 0062. If a daily pin is wanted, 0019a pins 1280x800 (0019's draft already plans to write Limine's `resolution:` for the perf image, 0019:109), 0027a moves the pin to 1920x1080, and 0069 removes it. Limine falls back to another mode when the requested one is missing, and `MIRROR_FRAMEBUFFER_READY` shows which. 0015a builds as confirmed. If the pin is taken, 0019a amends 0015a's confirmed lines "The default image pins no mode" and "Daily boots keep the default image, which pins no mode", re-confirmed with 0019a's decisions | Every latency, jitter and frame-time exit has its instrumentation in place before it is measured | Before Phase 1 |
+| RD6 | S12, I6, S18 | 0053 goes in Phase 1, before 0028. 0054a carries the S18 reserve and OOM order. 0054b keeps only pressure notifications | Phase 1 lifts the limits, so a runaway app could otherwise starve the compositor | Before Phase 1; confirmed (2026-10-12) |
+| RD7 | S15, S16, S17 | 0056a in Phase 2 and 0056b in Phase 6. 0058a in Phase 0. 0057 and 0058 in Phase 5, before storage, with 0063 and 0064 owning the sync and clean-pool tests. The S17 crash screen in 0051. The app-crash notice and its log entry in 0027e | Reboot needs no AML, and each piece lands where its parts exist | Before Phase 0's 0058a; confirmed (2026-10-12) |
+| RD8 | 0019 split (Pending item 1) and a daily resolution pin | 0019a opens Phase 1, and 0019b follows 0062. If a daily pin is wanted, 0019a pins 1280x800 (0019's draft already plans to write Limine's `resolution:` for the perf image, 0019:109), 0027a moves the pin to 1920x1080, and 0069 removes it. Limine falls back to another mode when the requested one is missing, and `MIRROR_FRAMEBUFFER_READY` shows which. 0015a builds as confirmed. If the pin is taken, 0019a amends 0015a's confirmed lines "The default image pins no mode" and "Daily boots keep the default image, which pins no mode", re-confirmed with 0019a's decisions | Every latency, jitter and frame-time exit has its instrumentation in place before it is measured | Before Phase 1; confirmed (2026-10-12) without the daily pin |
 | RD9 | S14 | 0035 and 0036 go to Phase 7, still before 0040 and 0043 | Nothing consumes them before the network and login | Before Phase 7 |
 | RD10 | S1c, Pending item 4 | Option (a): 0087a, with reset and ping, `tools.set.version` and capability registration, comes before 0069. 0069 then depends on 0060a only. If 0017c check 7 needs a Tools-running state for the ungrab, 0087a moves into Phase 0 | VMware sends resize requests only over TCLO and may expect Tools to be running first (expected, unverified) | Before Phase 4, or at 0017c check 7 |
 | RD11 | x2APIC handoff | If 0013's tests 14 and 16 show an x2APIC handoff, 0055a takes it and moves into Phase 0, after 0013 | Mirror fails closed on `x2apic_active` (apic.rs:338-339), which would keep VMware on one CPU | At 0013's VMware checks |
@@ -528,15 +528,15 @@ RS and RD are this proposal's numbers. They are not ledger IDs.
 | RD13 | 0015-D10 | 0015a is built as confirmed. The NEW AHCI boot image supersedes 0015-D10 in Phase 6 | Mirror cannot read its own disk in QEMU until then | Before Phase 6 |
 | RD14 | System assets and the purpose of the ext2 root (G9) | Latin fonts and icons ship in 0031's boot bundle. CJK and emoji fonts, tzdata and the root store live on the boot disk's ext2 system partition. Mirror reads them after 0064, and 0067's tool replaces them along with the kernel | Gives 0015a's ext2 root a job, and keeps large fonts out of boot RAM (gates 1 and 2) | Before Phase 6 |
 | RD15 | G8d vs S2a | 0067's host tool copies the ESP and the ext2 system partition to every pool member, so any disk boots with RD14's assets and Mirror never writes FAT32. Reword G8d to match | Removes a conflict between two confirmed entries before 0063 | Before Phase 6 |
-| RD16 | Where G11's profile lives | The G11 VM, with `rtc.diffFromUTC = "0"`, enters `docs/vm-settings.md` in Phase 0. It carries every reference-VM key (`hpet0.present`, no USB controller, `uuid.action`, `msg.autoAnswer`, the serial-file answer) and 0018's RemoteDisplay.vnc keys. 0067 keeps the pool disks. G11's "(0067)", S15's "later 0067's daily-drive profile", 0015a's non-goal at 0015a:18 and 0015-D14's "and, later, 0067's daily-drive profile" are reworded to match (docs-only) | Phases 0, 1 and 4 check their exits on it | With RD1 |
+| RD16 | Where G11's profile lives | The G11 VM, with `rtc.diffFromUTC = "0"`, enters `docs/vm-settings.md` in Phase 0. It carries every reference-VM key (`hpet0.present`, no USB controller, `uuid.action`, `msg.autoAnswer`, the serial-file answer) and 0018's RemoteDisplay.vnc keys. 0067 keeps the pool disks. G11's "(0067)", S15's "later 0067's daily-drive profile", 0015a's non-goal at 0015a:18 and 0015-D14's "and, later, 0067's daily-drive profile" are reworded to match (docs-only) | Phases 0, 1 and 4 check their exits on it | With RD1; confirmed (2026-10-12) |
 | RD17 | G7 | No change. The frame-time and idle budgets are acceptance budgets in the Phase 4 spec, and 0199 checks them again | The gates stay as confirmed | Before Phase 4 |
 | RD18 | Unowned basics, on the record | Screen reader after v1 (the A19 element tree serves as the accessibility tree). IME after v1. English-only UI for v1. Locale formats (12/24-hour, date order) in 0068. Section 7's items join README's lists | Under G12, silence counts as a gap | Before Phase 8 |
 | RD19 | 0048 and A18 | Tasks, task grants and paused resume in Phase 10. Conversation persistence with 0098 | CLM context objects do not exist before 0098 | Before Phase 10 |
 | RD20 | Kimi's Ctrl+Alt shortcuts | 0084a adds a manual VMware check. If VMware's Ctrl+Alt hot-key prefix takes them, the defaults move to Super | Whether they reach the guest is unverified | Before Phase 4 |
-| RD21 | README lines for 0050 and 0021 | 0021 is written per-CPU from the start, after 0050, and 0050 drops its rework clause | 0021 is built once | Before Phase 2 |
+| RD21 | README lines for 0050 and 0021 | 0021 is written per-CPU from the start, after 0050, and 0050 drops its rework clause | 0021 is built once | Before Phase 2; confirmed (2026-10-12) |
 | RD22 | User exception delivery | Joins 0089's core stage (Phase 9, or Phase 3 under RS5's alternative) | std needs it to detect stack overflow, and nothing earlier does | With RS5 |
 | RD23 | Kimi's pages | Drop the brightness slider. Update "Where each part lands" in `docs/design/README.md` to the new owners (docs-only, P2a) | A VM has no backlight, and the page names the old owners | After confirmation |
-| RD24 | NEW G12 owners | Approve the NEW specs and splits in 5.3. Cameron assigns the numbers | Each one fills a gap no spec owned | Phase by phase |
+| RD24 | NEW G12 owners | Approve the NEW specs and splits in 5.3. Cameron assigns the numbers | Each one fills a gap no spec owned | Phase by phase; confirmed (2026-10-12) for the vmrun lane as 0015c and 0015d, 0019's Phase 1 part as 0019a, 0019c and 0019d, 0030a, and kernel heap v2 as 0059; RD6 and RD7, confirmed the same day, confirm the 0054, 0056 and 0058 splits by name |
 | RD25 | A21 | 0068 lands in Phase 6, before principals, the operation registry and seats. It ships a human-seat write interface whose changes go to the system log. 0044b registers those writes as typed operations and 0043 audits them, in Phases 9-10. Alternative: move 0068 after 0044b | Confirmed A21 requires human-seat typed operations and an audit of every change, and neither exists in Phase 6 | Before Phase 6 |
 
 ## 7. Explicitly after v1 or unscheduled
@@ -564,18 +564,18 @@ Unscheduled (add to README.md:139-150):
 ## 8. Next steps
 
 1. **Close 0029.** Both suites passed on `claude/0029-ui-tokens` (2654a75, 7c32fdb). Cameron reviews 0029's test 6 screenshots and merges the branch as committed. RS3 was confirmed on 2026-10-11. The 0029 update that withdraws D9's geometry (its status, tests 2, 4 and 6, and an implementation note in its Interfaces) goes to `main` with the `claude/0029-ui-tokens` merge, so no separate docs-only commit is needed. Local `main` (a8a2581, with the 0010 stack merged) is not pushed yet; push it when Cameron asks.
-2. **Start 0015a now**, on `claude/0015a-disk-image`. It depends only on 0014 and 0010, which are both merged. 0015a builds as confirmed. After it merges, the Phase 0 G11 docs commit (RD16) also rewrites 0015a's Non-goals G11 bullet, 0015-D14's "and, later, 0067's daily-drive profile" and S15's "later 0067's daily-drive profile".
+2. **Start 0015a now**, on `claude/0015a-disk-image`. It depends only on 0014 and 0010, which are both merged. 0015a builds as confirmed. After it merges, the Phase 0 G11 docs commit (RD16) also rewrites 0015a's Non-goals G11 bullet and 0015-D14's "and, later, 0067's daily-drive profile". The ledger's G11 and S15 rows were reworded on 2026-10-12.
 3. **Then 0013, as confirmed.**
    - The first part of RD1, confirmed on 2026-10-11, moved 0015b to Phase 11 (re-drafted and re-confirmed before then), so 0013 follows 0015a directly.
    - 0013 comes next because Mirror has never booted on VMware. Static analysis predicts one CPU on the PIC until 0013 lands, and every later exit is checked in VMware.
 4. **In parallel, as docs-only tasks:**
-   - Draft NEW 0030a, so Phase 1 starts on a confirmed spec.
-   - Draft the vmrun lane and 0058a if Cameron wants them in Phase 0.
+   - Draft NEW 0030a, so Phase 1 starts on a confirmed spec. Kimi drafted it, and Cameron confirmed its decisions on 2026-10-12.
+   - Draft the vmrun lane and 0058a if Cameron wants them in Phase 0. Cameron confirmed both for Phase 0 on 2026-10-12 (RD1, RD7). Codex drafted the lane, which becomes 0015c and 0015d (RD24), and Cameron confirmed its decisions the same day.
 5. **What waits for Cameron:**
-   - Before 0013 ends: the rest of RD1 (the vmrun lane, the G11 doc commit, 0058a and the 0019 split) and RD16. The lane, 0058a and the G11 doc commit can then slot into Phase 0.
-   - Before Phase 1: RS6, RD2, RD6 and RD8, 0019a's proposed decisions (Pending item 1), and the 0030a draft.
+   - Before 0013 ends: the rest of RD1 (the vmrun lane, the G11 doc commit, 0058a and the 0019 split) and RD16. The lane, 0058a and the G11 doc commit can then slot into Phase 0. Cameron confirmed the rest of RD1 and RD16 on 2026-10-12, with RD7, so all three join Phase 0.
+   - Before Phase 1: RS6, RD2, RD6 and RD8, 0019a's proposed decisions (Pending item 1), and the 0030a draft. Cameron confirmed RS6, RD2, RD6, RD8 (without the daily resolution pin) and 0030a's decisions on 2026-10-12, with 0050's and kernel heap v2's decisions and RD24's numbers for the vmrun lane (0015c, 0015d), 0019a, 0019c, 0019d, 0030a and kernel heap v2 (0059). The 0019a, 0019c and 0019d drafts' own decisions are still proposed, and so are 0054a's.
    - Settled by checks rather than discussion: RD11 by 0013's tests 14 and 16, and 0087a's placement (RD10) by 0017c check 7.
-   - Everything else is decided when its phase comes up, as the Due column says.
+   - RD21, due before Phase 2, was confirmed early, on 2026-10-12. Everything else is decided when its phase comes up, as the Due column says.
 
 ## 9. Critic items not taken
 

@@ -7,9 +7,9 @@ Small, self-contained specs. Each one covers one bounded piece of work that a si
 
 ## Spec map (v1)
 
-The former M0's specs are drafted in this folder (see each file's Status), as is side spec 0029: most sit in Phase 0, 0015b now sits in Phase 11, and 0019 is proposed to split across Phases 1 and 6. Phase 0's NEW vmrun lane and 0058a, and the specs of later phases, are planned, not yet drafted. Each one is sized for one agent and cites the ledger IDs it implements.
+The former M0's specs are drafted in this folder (see each file's Status), as is side spec 0029: most sit in Phase 0, 0015b now sits in Phase 11, and 0019 splits across Phases 1 and 6 (RD8). Phase 1's 0030a, 0050 and 0059 are confirmed and on `main` (2026-10-12). The vmrun lane (0015c, 0015d) and Phase 1's 0019a, 0019c, 0019d and 0054a, with 0054a's unnumbered reserve and OOM follow-up (review item C8, awaiting Cameron), are drafted on author branches, not yet on `main`. 0058a and the rest of the specs of Phases 1-11 are planned, not yet drafted. Each one is sized for one agent and cites the ledger IDs it implements.
 
-The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-10-11 (decisions.md, Phases). Items marked NEW or split are the re-plan's proposals: each is confirmed, and numbered or lettered, when its phase comes up (RD24). The re-plan's other RS and RD decisions are taken when its Due column says.
+The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-10-11 (decisions.md, Phases). Items marked NEW or split are the re-plan's proposals: each is confirmed, and numbered or lettered, when its phase comes up (RD24). On 2026-10-12 Cameron confirmed RS6, RD1's Phase 0 items (the vmrun lane, the G11 docs commit and 0058a), RD2, RD6, RD7, RD8, RD16 and RD21, and RD24's numbers for the vmrun lane and three Phase 1 items: 0015c and 0015d (the vmrun lane), 0019a, 0019c and 0019d (0019's Phase 1 slices), 0030a, and 0059 (kernel heap v2). RD6 and RD7 confirm the 0054, 0056 and 0058 splits by name. The re-plan's other RS and RD decisions are taken when its Due column says.
 
 **Done**
 - 0012 AGENTS.md, CLAUDE.md, and the readme references wording (P5b, P6, P7, P7a, P8, P9)
@@ -20,23 +20,26 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 
 **Phase 0: Mirror boots well in VMware**
 - 0015a Disk image: GPT, FAT32 ESP, minimal ext2 root, VMDK, QEMU boot switch, VM settings doc (S5, S2, S1b). Done (2026-10-11)
-- NEW: vmrun lane: headless VMware boot, restart and suspend/resume checks (right after 0015a if confirmed by then, otherwise after 0013)
+- 0015c vmrun lane, host library and packaging: the lane's Rust library in `tools/perf-probe` and lane packaging; it can land before the VMware investigation. Confirmed (2026-10-12: RD1, RD24 and the lane's VMR decisions); drafted on `astra/vmrun-lane-spec`, where codex split the one lane draft into `0015c-host-lane.md` and `0015d-vmware-cases.md`, both keeping the VMR-Dn IDs
+- 0015d vmrun lane, VMware cases: headless boot and suspend/resume cases, plus a console `restart` case after 0058a. Confirmed (2026-10-12); implemented after the manual VMware investigation (VMR-D11)
 - 0013 Firmware and PCI tolerance for VMware: per-slot MADT capacity, the 32-function PCI cap, IOAPIC ID tolerance (0013-D9) and per-entry root-table handling; duplicate-NMI and HPET-descriptor leniency (0013-D3, D5) as general hardening. Done (2026-10-11)
-- Docs-only: the G11 daily VM (12 vCPUs, 20 GB, NAT) in `docs/vm-settings.md` (RD16)
+- Docs-only: the G11 daily VM (12 vCPUs, 20 GB, NAT) in `docs/vm-settings.md`, with `rtc.diffFromUTC = "0"`, every reference-VM key and 0018's RemoteDisplay.vnc keys; 0067 keeps the pool disks (RD16). Confirmed (2026-10-12); not yet written
 - 0016a Hardening: guarded boot-CPU stacks, NMI/#MC stacks. Done (2026-10-11)
 - 0016b Hardening: SMEP/SMAP/UMIP, EFER.SCE, CPU vulnerability reporting (S9). Done (2026-10-11)
 - 0017a PS/2: separate keyboard and mouse loss handling, mouse coalescing and resync. Done (2026-10-12)
 - 0017b PS/2: time-based init timeouts and init order. Done (2026-10-12)
 - 0017c Absolute pointing on VMware: vmmouse protocol (S1a, S1d). Implemented (2026-10-12); the GUI half of check 7 is deferred (Cameron, 2026-10-12)
-- 0058a (split): reboot without AML (FADT reset register, then 8042, then 0xCF9, then triple fault) and a console `restart` command
+- 0058a (split): reboot without AML (FADT reset register, then 8042, then 0xCF9, then triple fault) and a console `restart` command. Confirmed (2026-10-12: RD1, RD7); not yet drafted
 - 0018 Performance baseline harness: the four gates, measured on Linux and Windows VMs in the host's ULM monitor mode (G7, G7a, O3). Its Linux and Windows baseline track runs in parallel; its Mirror rows follow Phase 4
 - 0013 showed VMware handing off in xAPIC mode (2026-10-11), so 0055a stays in Phase 1 (RD11). If 0017c check 7 needs a Tools-running state, 0087a moves here (RD10).
 
 **Phase 1: Kernel core, built once**
-- 0019a (split): perf markers: boot milestones, idle memory, the input-to-present trace and a `burn` perf item (0019 split, Pending item 1 and RD8)
-- NEW: 0030a: a global process and thread table, run queues, wait queues instead of polling, wakeup preemption, more than 4 threads per process
-- 0050 Per-CPU data and per-thread kernel stacks; per-CPU SYSCALL entry rework (swapgs, KERNEL_GS_BASE); it now lands before 0021, so this clause is reworded under RD21 (proposed, before Phase 2). Adds a kernel VA allocator for mappings made after the paging seal
-- NEW: kernel heap v2: grows on demand, slab allocator, kernel memory charged to the owning process
+- 0019a (split): perf configuration, boot milestones, idle memory and token delivery; no daily resolution pin (RD8). The split (RD8) and the letters (RD24) were confirmed on 2026-10-12; dividing the Phase 1 part into three specs and its order are 0019-D15, in review with the drafts' other decisions on `astra/0019a-perf-markers`
+- 0019c (split): finite input capture, the bounded input-to-present trace. Drafted on `astra/0019a-perf-markers`, its decisions still in review
+- 0019d (split): the `burn` perf item, a CPU load that runs while input response is measured. Drafted on `astra/0019a-perf-markers`, its decisions still in review (0019-D13 proposes a separate process on the boot CPU)
+- 0030a Process and thread table: a global process and thread table, run queues, wait queues instead of polling, wakeup preemption, up to 16 threads per process. Confirmed (2026-10-12: RD24, 0030-D1 to D6); on `main`. The agent-demo build retires when 0030a replaces `run_desktop`, and AGENTS.md drops `test.ps1 -AgentDemo` until Phase 10 brings agents back (RS6)
+- 0050 Per-CPU data and per-thread kernel stacks. Adds a kernel VA allocator for mappings made after the paging seal. Confirmed (2026-10-12: 0050-D1 to D4; RD21 dropped its SYSCALL rework clause); on `main`
+- 0059 Kernel heap v2: grows on demand, slab allocator, kernel memory charged to the owning process. Confirmed (2026-10-12: RD24, 0059-D1 to D4); on `main` as `0059-kernel-heap-v2.md`
 - 0054a (split): frame allocator v2, per-frame refcounts, dynamic per-process limits, and the S18 reserve and OOM order
 - 0051 Userspace on all CPUs: locking, user TLB shootdowns; NMI stop of all CPUs on panic (S17). Adds the S17 crash screen
 - 0052 Scheduler v2: work-conserving, priority classes, accounting (S4)
@@ -46,7 +49,7 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 **Phase 2: ABI, kernel objects and timers**
 - 0020 `mirror-sys`: one syscall and error table (S8); UTF-8 strings (S11); reserves realtime-clock and random-bytes calls (S14, S15)
 - 0056a (split): the RTC read as UTC (Mirror's VMs set `rtc.diffFromUTC = "0"`) and the realtime syscall
-- 0021 SYSCALL entry and personality selector (S6a). It now lands after 0050 (Phase 1), so its old plan, a boot-CPU-only kernel stack that 0050 reworks, no longer fits; RD21 proposes writing it per-CPU from the start and dropping 0050's rework clause, decided before Phase 2
+- 0021 SYSCALL entry and personality selector (S6a), written per-CPU from the start, after 0050 (RD21, confirmed 2026-10-12)
 - 0022 Kernel objects, rights and handles (S6b); revocable grant objects (S6e)
 - 0023 Channels v2: creation and handle transfer (S6b)
 - 0024 Waiting on many objects (S6b)
@@ -57,7 +60,7 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 - 0026 `mirror-rt`: entry, allocator, handles, threads, panic output (S8)
 - 0028 Userspace target: hard-float, SSE2 baseline, AVX2 by runtime dispatch, build-std on the pinned compiler (S12, S8)
 - NEW: ELF loader v2: images over 2 MiB, PT_TLS, a configurable main stack, shared read-only text, room for PIE
-- 0030 Process model: spawn from image, wait, kill, exit status; suspend and resume for pause (S6e). The process table is proposed for NEW 0030a in Phase 1; if 0030a is not confirmed, 0030 keeps it
+- 0030 Process model: spawn from image, wait, kill, exit status; suspend and resume for pause (S6e); a principal field (RD2). The process table moved to 0030a in Phase 1 (confirmed 2026-10-12)
 - 0031 Boot bundle as the source of program images
 - 0032 Service manager with restart policy. Includes the session model: the desktop restarts, and Esc stops being one-way
 - 0033 Service directory: per-process namespaces at spawn, restart and reconnect rules (S13)
@@ -65,10 +68,10 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 
 **Phase 4: A modern desktop at the VM window's size**
 - NEW: design note: driver placement and the display object (RD12)
-- 0027a Compositor protocol: shared-memory surfaces, any display size and live resize, clipboard object, versioned input envelope with seat and provenance (S6d, S6f, S1c, S11, A20; coordinate with Kimi). Protocol only, with output and buffer scale, a drag-and-drop data offer, cursor-shape requests and a human-seat capture API from day one; lands with a scanout object and an input object, retiring syscalls 13-16 and the 1280x800 cap
+- 0027a Compositor protocol: shared-memory surfaces, any display size and live resize, clipboard object, versioned input envelope with seat and provenance (S6d, S6f, S1c, S11, A20; coordinate with Kimi). Protocol only, with output and buffer scale, a drag-and-drop data offer, cursor-shape requests, a human-seat capture API and a reserved trusted top layer (A9a, RD2) from day one; lands with a scanout object and an input object, retiring syscalls 13-16 and the 1280x800 cap
 - 0084a (split): keycodes and the full PS/2 key set, the IntelliMouse and vmmouse wheel, LEDs and shortcut routing; defines the 0027a envelope payload
 - 0027b App launch out of the kernel, completing S6d (S6d, S6f; after 0030 and 0031). Moves here, right after 0027a and 0084a, and retires syscalls 17-22
-- NEW: 0027c renderer: premultiplied RGBA, antialiased shapes, soft shadows, gradients, clipping, a shared path rasterizer, compositor frame-time hooks
+- NEW: 0027c renderer: premultiplied RGBA, antialiased shapes, soft shadows, gradients, clipping, a shared path rasterizer, compositor frame-time hooks, the reserved trusted top layer (A9a, RD2)
 - NEW: 0027d frame clock: easing, reduced motion, event-driven frames
 - 0086a (split): OpenType outlines on the shared rasterizer, a Latin UI font and a mono font, the type roles, and the icon set
 - 0039 Screen/input fallback design note, design-only (A1a; before 0044 and 0047)
@@ -83,7 +86,7 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 
 **Phase 5: Power**
 - 0057 ACPI namespace: AML interpreter, `_S5`, `_PRT`, power button (S16)
-- 0058 Shutdown and reboot: service stop order, filesystem sync, clean-pool marker, reset methods (S16). Filesystem sync and the clean-pool marker are hooks here; 0063 and 0064 own their tests
+- 0058 Shutdown and reboot: service stop order, filesystem sync, clean-pool marker, and reboot through 0058a's reset sequence (S16). Filesystem sync and the clean-pool marker are hooks here; 0063 and 0064 own their tests
 - 0087c (split): VMware OS_Halt, OS_Reboot and OS_Resume (clock resync, timer rearm, DHCP renewal), heartbeat, guest info
 
 **Phase 6: Files that survive reboot**
@@ -92,8 +95,8 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 - 0061 Block layer; read-throughput floor for expert streaming (I12)
 - 0062 AHCI read/write at runtime; read-throughput floor for expert streaming (I12)
 - NEW: AHCI QEMU boot image: QEMU boots from AHCI, so Mirror reads its own disk in tests (supersedes 0015-D10, RD13)
-- 0019b (split): C3 telemetry
-- 0067 Daily VM layout and host-side updates: data on the pool, update tool, previous-kernel fallback, format versions, build identity, daily-drive profile with `rtc.diffFromUTC = "0"` (G9, G11, S15; before 0064). Before 0063
+- 0019b (split): C3 telemetry, after 0062 (RD8, confirmed 2026-10-12)
+- 0067 Daily VM layout and host-side updates: data on the pool, update tool, previous-kernel fallback, format versions, build identity, and the pool disks of the G11 daily VM, whose profile Phase 0 adds to `docs/vm-settings.md` (G9, G11, RD16; before 0064). Before 0063
 - 0066a (split): the VFS and file-capability interface, before 0064
 - 0063 Mirrored pool (G8, G8a, G8b, G8d)
 - 0064 ext2 read/write; boot-time checker after an unclean shutdown (S2, S2b); after 0067
@@ -170,10 +173,11 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 - 0015b Live ISO and its test case (S5, S5a). Moved here on 2026-10-11 (RD1); re-drafted and re-confirmed before this phase
 - 0199 Performance gates and daily-drive checklist; local-inference floors and input latency under inference (G7, G7a, I15)
 
-Execution order (confirmed 2026-10-11): Phase 0 runs 0015a (done), then 0013 (done), then 0016a (done), 0016b (done), 0017a (done), 0017b (done) and 0017c (implemented), one at a time, each updating the AGENTS.md lines it changes in the same commit (P9). The vmrun lane, the G11 docs commit and 0058a join Phase 0 once confirmed (RD1, RD16). 0018's baseline track runs in parallel. Later phases run in the order listed, except where a line's own note orders it after a later line (0095 runs after 0098). Done earlier: 0012, 0011, 0014, 0010 and side spec 0029.
+Execution order (confirmed 2026-10-11): Phase 0 runs 0015a (done), then 0013 (done), then 0016a (done), 0016b (done), 0017a (done), 0017b (done) and 0017c (implemented), one at a time, each updating the AGENTS.md lines it changes in the same commit (P9). The vmrun lane (0015c, then 0015d), the G11 docs commit and 0058a joined Phase 0 on 2026-10-12 (RD1, RD7, RD16); 0015d's `restart` case waits for 0058a. 0018's baseline track runs in parallel. Phase 1 opens with 0019's Phase 1 part (RD8), drafted as 0019a, 0019c and 0019d (RD24; the three-way split and its order are 0019-D15, in review), so the phase is measured before and after its kernel changes. Later phases run in the order listed, except where a line's own note orders it after a later line (0095 runs after 0098). Done earlier: 0012, 0011, 0014, 0010 and side spec 0029.
 
 **Specs the re-plan splits**, with their original scope (split specs keep their decision IDs, rule 1):
 - 0019 Mirror perf instrumentation and telemetry: kernel side of 0018-D9 and device/link telemetry (S7b, C3)
+- 0030 Process model: table, spawn from image, wait, kill, exit status; suspend and resume for pause (S6e)
 - 0044 Typed operation registry (A1, A17); element trees, streaming and cancel (A19)
 - 0054 Large memory: frame allocator v2, per-frame metadata, dynamic limits (I6); memory reserve, pressure notifications, OOM order (S18)
 - 0055 Interrupt robustness: catch-all vector handlers, boot-CPU-only external NMI, PCAT_COMPAT=0, HPET-based timer calibration, x2APIC handoff, non-HPET time source (S10)

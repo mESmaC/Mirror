@@ -1,6 +1,6 @@
 # 0019: Mirror perf instrumentation and telemetry
 
-Status: draft
+Status: draft; split by the roadmap re-plan (Cameron, 2026-10-12, RD8 and RD24), with no daily resolution pin. Its Phase 1 part opens Phase 1, drafted as 0019a, 0019c and 0019d on `astra/0019a-perf-markers`; dividing it in three and ordering it before 0030a is 0019-D15, which is in review with the drafts' other decisions. 0019b, C3 telemetry, follows 0062 in Phase 6.
 Depends on: 0010 (flavors, silent Console WRITE, hygiene probe), 0011 (lints), 0012 (AGENTS.md), 0014 (`V1` profile, AHCI fixture), 0015a (SMBIOS config, `package.ps1`, `mirror-image`), 0017a, 0017b and 0017c (the PS/2 and vmmouse paths the input trace hooks; see Open question 7); 0013 only for acceptance 6. Because it builds on 0017c, it lands last in the M0 sequence. Consumers: 0018's Mirror rows, 0027a (which keeps D6's `frame` and `shell_ready` hooks when it replaces the present and input syscalls, ledger S6f), 0045, C2's placement policy (post-v1).
 Ledger: S7b, C3, G7 (related: S1, S1a, S6f, S7, S7a, C1, C2, C4). Implements 0018-D9 and 0010-D4's exception.
 
