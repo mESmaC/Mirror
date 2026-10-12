@@ -2,9 +2,11 @@
 
 Status: draft (2026-10-12); split from reviewed `draft-vmrun-lane.md` at `8cd8eb0`. Implementation and VM operations are separate work.
 
-Depends on: [0015c](0015c-host-lane.md), 0010, 0011, 0013, 0015a and merged 0017b/0017c. D10 provisioning and D11's separately authorized platform investigation must pass before VMware implementation. Guest restart additionally requires confirmed, merged 0058a. Uses 0018-D10's library without resuming benchmarks.
+Depends on: [0015c](0015c-host-lane.md), 0010, 0011, 0013, 0015a and merged 0017b/0017c. D10 provisioning and D11's platform investigation, authorized by their 2026-10-12 confirmations, must pass before VMware implementation. Guest restart additionally requires confirmed, merged 0058a. Uses 0018-D10's library without resuming benchmarks.
 
-Ledger: G3a, S1a, S1c, S1d, S3, S7, S7a, S7b, S10, S15, P3, P5a, P8, P9; related G11 and S16. Claude owns the corresponding ledger, roadmap and spec-map update.
+Ledger: G3a (uses S1a, S1c, S1d, S3, S7, S7a, S7b, S10, S15, P3, P5a, P8, P9; related G11, S16).
+
+Roadmap: RD1 (rest) and RD24, confirmed 2026-10-12. Claude owns the corresponding ledger, roadmap and spec-map update.
 
 ## Goal
 
@@ -53,9 +55,9 @@ Implementation scope: real VMware adapters and oracles in `tools/perf-probe`, ac
 
 ### VM profile and prerequisite investigation
 
-D10 confirms Codex as the provisioning owner; coordinate this separate work with Claude, using the wizard or `vmcli VM Create ... -c other-64`. D11's investigation scope is confirmed separately from implementation and requires that provisioned VM. The confirmed profile requires hardware 22, UEFI/Secure Boot off, 1 GiB/1 vCPU, SATA/e1000, HPET, no USB and reference 3D/RTC/unattended-start settings. Require exactly `monitor_control.restrict_backdoor = "TRUE"` under 0017-D19; preflight rejects an absent, false or conflicting value. D11's vmmouse checks use that setting. Adoption is confirmed; acceptance under ULM and working kernel vmmouse are not a CPL3-enforcement probe. Require `pciBridge0.present`, and bridges 4–7 present with `virtualDev=pcieRootPort`, `functions=8`. Record creation method. Add VNC enabled, loopback IP, a reserved port 5901–6001, no password/key and no keyMap override. Initial oracle supports recorded 1024x768; another mode needs a reviewed oracle.
+Cameron's 2026-10-12 D10/D11 confirmations authorize Codex to create the lane VM and perform D11's VM operations. Codex coordinates each operation with Claude and acquires the shared machine lock. D10 provisioning uses the wizard or `vmcli VM Create ... -c other-64`; D11's investigation requires that provisioned VM and remains separate from implementation. The confirmed profile requires hardware 22, UEFI/Secure Boot off, 1 GiB/1 vCPU, SATA/e1000, HPET, no USB and reference 3D/RTC/unattended-start settings. Require exactly `monitor_control.restrict_backdoor = "TRUE"` under 0017-D19; preflight rejects an absent, false or conflicting value. D11's vmmouse checks use that setting. Adoption is confirmed; acceptance under ULM and working kernel vmmouse are not a CPL3-enforcement probe. Require `pciBridge0.present`, and bridges 4–7 present with `virtualDev=pcieRootPort`, `functions=8`. Record creation method. Add VNC enabled, loopback IP, a reserved port 5901–6001, no password/key and no keyMap override. Initial oracle supports recorded 1024x768; another mode needs a reviewed oracle.
 
-Reject contradictory/duplicate configuration, occupied port, unexpected devices, encrypted/unreadable configuration or escaping paths. Verify the listener belongs to this VM and binds only loopback before connecting. Bound VMX to 1 MiB, manifests/journals to 256 KiB and owner records to 16 KiB; lane-generated records have versioned schemas. No automatic firewall change.
+Reject contradictory/duplicate configuration, occupied port, unexpected devices, encrypted/unreadable configuration or escaping paths. Verify the listener belongs to this VM and binds only loopback before connecting. Apply [0015c's canonical record limits and schemas](0015c-host-lane.md#packaging-and-fixed-vm-binding). No automatic firewall change.
 
 Before guest implementation, D11 must verify the following under the team lock; failed prerequisites block the cases until a reviewed choice resolves them:
 
@@ -116,7 +118,7 @@ Send key-up immediately after each successful key-down write, without an interve
 
 The suspend history grows 2→5→7→10 rows, below capacity 12. Continuity preserves the original boot gate after resume; a reboot fails this case. No clock, timer-rearm or Tools support is inferred.
 
-Apply all [0015c operation/transport bounds](0015c-host-lane.md#operation-and-transport-bounds), including the 900 s active case, separate 105 s failure cleanup, 120/300 s recovery caps, eight connection attempts and one pending RFB request. Its evidence/finalization section owns checkpoint counts, storage caps and the durable verdict. No progress, reconnect or repeated polling resets a deadline.
+Apply all [0015c operation/transport bounds](0015c-host-lane.md#operation-and-transport-bounds). Its evidence/finalization section owns checkpoint counts, storage caps and the durable verdict. No progress, reconnect or repeated polling resets a deadline.
 
 ### Recovery prerequisite and activation
 
@@ -124,7 +126,7 @@ D11 proves the [0015c recovery contract](0015c-host-lane.md#acquire-only-lock-an
 
 ## Acceptance tests
 
-1. Extend the production Rust controller host tests from 0015c with fake VMware adapters and exact oracle fixtures: required D19 configuration; capability/marker schemas and IPI order; repeated RFB updates, >200 ms key-up, resize and caps. Priming fixtures cover dropped/delivered center moves, D5's confirmed live fence and rejection of an unselected fallback policy, one buttons-up packet per boot epoch, none on resume/reconnect, and write failure without retry. Reject PS/2-only packages. Exact pointer/glyph/sentinel fixtures reject movement, stale frames and malformed input. Reject VMMOUSE_FALLBACK anywhere in a complete epoch, including after resume. Use 0015c's fmt/clippy/host-test commands and retain its lifecycle/lock/package fixtures.
+1. Extend the production Rust controller host tests from 0015c with fake VMware adapters and exact oracle fixtures: required D19 configuration; capability/marker schemas and IPI order. Priming fixtures cover dropped/delivered center moves, D5's confirmed live fence and rejection of an unselected fallback policy, one buttons-up packet per boot epoch, none on resume/reconnect, and write failure without retry. Reject PS/2-only packages. Exact pointer/glyph/sentinel fixtures reject movement, stale frames and malformed input. Reject VMMOUSE_FALLBACK anywhere in a complete epoch, including after resume. Use [0015c's acceptance commands and generic controller fixtures](0015c-host-lane.md#acceptance-tests).
 
 2. After D10 provisioning under its confirmed scope, first perform D11 manually under the current team rules: verify real job membership, completion/cancellation evidence and interrupted-intent injections, running and suspended PowerOff procedures, serial preservation, and suspended release/fresh reacquisition. The owner retains a manual stop/release route throughout the experiment; no unproved controller recovery is used. Check both RFB request types repeatedly on static/changing screens and vmmouse stability with D19 set. Only after these prerequisites pass may guest cases and their recovery be enabled together. Then run boot and suspend-resume once each for debug/release with ancestry-validated 0017b/0017c packages. Preserve exact frames, complete epochs, actual settings, off proof and unchanged artifacts. Failed prerequisites keep guest cases blocked; reconnect changes need confirmation. Do not manufacture captured resize evidence.
 

@@ -4,13 +4,15 @@ Status: draft (2026-10-12); split from reviewed `draft-vmrun-lane.md` at `8cd8eb
 
 Depends on: 0010, 0011, 0013 and 0015a. Uses 0018-D10's `tools/perf-probe` library without resuming benchmarks. Package capability checks require merged 0017b/0017c code tips. Host implementation and acceptance can land before 0015d's VMR-D11 investigation; this spec does not depend on successful VMware experiments.
 
-Ledger: G3a, S1a, S1c, S1d, S3, S7, S7a, S7b, S10, S15, P3, P5a, P8, P9; related G11 and S16. Claude owns the corresponding ledger, roadmap and spec-map update.
+Ledger: G3a (uses S1a, S1c, S1d, S3, S7, S7a, S7b, S10, S15, P3, P5a, P8, P9; related G11, S16).
+
+Roadmap: RD1 (rest) and RD24, confirmed 2026-10-12. Claude owns the corresponding ledger, roadmap and spec-map update.
 
 ## Goal
 
 Provide the testable Rust controllers, package provenance, bounded operations, durable recovery records and shared machine leases for an opt-in headless check lane. [0015d](0015d-vmware-cases.md) supplies the actual VMware adapters, profile, guest oracles and cases. Functional results are not performance measurements.
 
-The dependency order is **0015c host work → separately authorized D10/D11 provisioning and investigation → 0015d VMware implementation/acceptance**. Host tests use fake VM adapters; they do not prove VMware completion or recovery. Package recovery is usable after its own host acceptance. Actual VM cases and VM recovery remain disabled together until 0015d proves D11, even if the host library has merged.
+The dependency order is **0015c host work → D10/D11 provisioning and investigation authorized by their 2026-10-12 confirmations → 0015d VMware implementation/acceptance**. Host tests use fake VM adapters; they do not prove VMware completion or recovery. Package recovery is usable after its own host acceptance. Actual VM cases and VM recovery remain disabled together until 0015d proves D11, even if the host library has merged.
 
 ## Non-goals
 
@@ -87,7 +89,7 @@ All operation deadlines are monotonic totals, capped by remaining case time; pro
 
 Suspend-resume uses 37 key pairs, the longest case; allow one emergency key-up. Keep one RFB request outstanding across timeout, invalidate coverage/geometry on resize and require complete frames. Readiness polling may request non-incremental full frames when no request is pending. Cap connection attempts at eight/case, ≤3 s each within the case deadline. This is not a reconnect-per-checkpoint policy. Review the WIP primitives' caps of 4096 pixels/dimension, 4096 rectangles/update, 128 MiB/message and 1 MiB/string; malformed input fails.
 
-The case sequences, immediate down/up contract, setup priming and exact checkpoint meanings are owned by [0015d](0015d-vmware-cases.md#pixel-and-input-contract). These bounds also constrain its adapters; D11's per-injection observation is distinct from a reported case.
+The [case sequences](0015d-vmware-cases.md#cases) and [immediate down/up contract, setup priming and exact checkpoint meanings](0015d-vmware-cases.md#pixel-and-input-contract) are owned by 0015d. These bounds also constrain its adapters; D11's per-injection observation is distinct from a reported case.
 
 ### Acquire-only lock and same-run recovery
 
@@ -137,7 +139,7 @@ No new third-party crates/test framework. Existing pinned Rust 1.99.0/std, MSVC/
 
 ## Open prerequisites and handoff
 
-- Claude owns the confirmation ledger/map update; use its merged record and record the eventual merged D19 documentation revision before implementation. The structural split does not confer permission to start VM operations.
+- Claude owns the confirmation ledger/map update; use its merged record and record the eventual merged D19 documentation revision before implementation. Cameron's D10/D11 confirmations authorize their VM work; this structural split adds no further authorization. Coordinate each operation with Claude under the shared machine lock as 0015d requires.
 
 - [0015d](0015d-vmware-cases.md) owns D10/D11 and all external VMware facts. A failed fact returns for a reviewed choice; never weaken this host contract or silently fall back. The actual adapter and VM recovery stay disabled together pending that evidence.
 
