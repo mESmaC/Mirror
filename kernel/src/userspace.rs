@@ -12,14 +12,18 @@ mod sched;
 use core::sync::atomic::AtomicBool;
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
+#[cfg(feature = "boot-smoke")]
+use crate::boot;
+#[cfg(feature = "boot-smoke")]
+use crate::memory;
 use crate::{
-    arch, boot,
+    arch,
     capability::{self, CapError, Capability, HandleTable, Object},
     context::Context,
     elf, framebuffer, heap, input,
     interrupts::{self, TrapFrame},
     ipc::{Ipc, IpcError, MESSAGE_SIZE},
-    memory::{self, FrameAllocator, PAGE_SIZE},
+    memory::{FrameAllocator, PAGE_SIZE},
     paging::{PageTables, PagingError, UserAddressSpace, UserPermissions},
     ps2, serial, surface, timer, vm, windows,
 };
