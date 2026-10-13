@@ -666,6 +666,7 @@ pub fn run_init(
     vm::self_test(kernel, frames, direct_map);
     table_bounds_self_test(kernel, frames, bytes, &image, direct_map);
     sched::selection_self_test(kernel, frames, bytes, &image, direct_map);
+    trim_recovery_test(kernel, frames, bytes, &image, direct_map);
     run_pair(
         kernel,
         frames,
@@ -1909,7 +1910,9 @@ fn run_oom_pair(
         }
     }
     // The budget caps only this scenario's net allocations; it lifts before
-    // the drain below.
+    // the drain below. The pool drains first, so the requester's failure
+    // cannot be covered by reclaiming pooled stacks — the kill must happen.
+    drain_stacks(kernel, frames);
     memory::arm_frame_budget(8);
     let mut session = sched::Session {
         ipc,
@@ -2002,6 +2005,65 @@ fn run_oom_pair(
         "MIRROR_HEAP_CHARGE_OK tables_peak={} surfaces_peak=0",
         tables_peak
     );
+}
+
+/// 0054-D5: a frame failure the stack pool's trim covers retries without a
+/// kill — no MIRROR_OOM_KILL prints, and the scripts reject one. Pools two
+/// kernel stacks, arms the frame budget at zero, and demand-materializes a
+/// page: the trim reclaims the pool and the retry succeeds.
+#[cfg(feature = "boot-smoke")]
+fn trim_recovery_test(
+    kernel: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    bytes: &[u8],
+    image: &elf::Image,
+    direct_map: u64,
+) {
+    let baseline = FrameBaseline::take(frames);
+    let slot = load_process(
+        kernel,
+        frames,
+        bytes,
+        image,
+        direct_map,
+        0,
+        MemoryClass::Test,
+    )
+    .expect("trim-recovery process");
+    // SAFETY: the fresh entry has never run and nothing else references it.
+    let process = unsafe { sched::process(slot) };
+    let base = process
+        .vm
+        .reserve(0, PAGE_SIZE, vm_abi::PROT_READ_WRITE)
+        .unwrap();
+    // SAFETY: BSP with IF=0, the kernel root active, and no trap handler;
+    // nothing runs on either stack.
+    let first = build_stack(kernel, frames, direct_map).expect("first stack");
+    let second = build_stack(kernel, frames, direct_map).expect("second stack");
+    release_stack(first);
+    release_stack(second);
+    memory::arm_frame_budget(0);
+    let mut ipc = Ipc::new();
+    assert_eq!(
+        materialize_or_kill(kernel, process, frames, &mut ipc, base, 1, true),
+        Ok(()),
+        "the trim must cover the failure without a kill"
+    );
+    memory::lift_frame_budget();
+    // SAFETY: the process never ran; release returns the page's frame.
+    unsafe {
+        process
+            .vm
+            .release(&mut process.space, frames, base, PAGE_SIZE)
+    }
+    .unwrap();
+    // SAFETY: it never ran and nothing references it.
+    let mut process = unsafe { sched::discard(slot) };
+    // SAFETY: its root was never active, and nothing references its tree.
+    unsafe { process.space.destroy(frames) }.expect("trim-recovery teardown");
+    drain_stacks(kernel, frames);
+    sched::assert_drained();
+    baseline.assert_kept(frames, "trim-recovery frame leak");
 }
 
 /// Validate a finished init pair's zombies, which stay in the table until
@@ -2377,10 +2439,12 @@ fn materialize_or_kill(
         match result {
             Err(vm::VmError::NoFrames) => {
                 // 0050-D2's trim points (0054-D5): reclaim the pooled kernel
-                // stacks before choosing a victim and again after each kill,
-                // before the retry. A withheld shootdown transport just skips
-                // the reclaim.
-                let _ = drain_stacks(kernel, frames);
+                // stacks and retry before choosing a victim; a trim that frees
+                // nothing falls through to selection. A withheld shootdown
+                // transport just skips the reclaim.
+                if drain_stacks(kernel, frames).stacks > 0 {
+                    continue;
+                }
                 let requester = Some((sched::slot_of(process), process.memory_class));
                 let Some(victim) = sched::select_victim(requester) else {
                     return Err(vm::VmError::NoFrames);
