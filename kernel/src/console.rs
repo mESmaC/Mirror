@@ -4,7 +4,8 @@
 //! These commands inspect counters or change console text; they do not execute
 //! programs, interpret shell syntax, or access files/storage. `restart` only
 //! marks the console; its caller redraws, then restarts the machine (spec
-//! 0058a, D9).
+//! 0058a, D9). `status` adds each CPU's user and total ticks and the last
+//! ended processes' CPU time and peak commit (spec 0052, point 8).
 
 use core::fmt::{self, Write};
 
@@ -17,6 +18,10 @@ use crate::{
 pub const LINE_CAPACITY: usize = 96;
 const HISTORY_ROWS: usize = 12;
 const DEVICES_PER_PAGE: usize = 4;
+/// `status` shows the CPUs on at most this many lines, then a count of the
+/// rest, and at most this many ended processes (spec 0052, point 8).
+const CPU_LINES: usize = 3;
+const ENDED_LINES: usize = 4;
 const EDIT_NOTICE: &str =
     "Enter runs a command. Escape clears input. Click or arrow keys move the caret.";
 const LOST_NOTICE: &str = "Input lost. Current line discarded; type the command again.";
@@ -303,7 +308,7 @@ impl<'a> Console<'a> {
         let (name, text) = match operation {
             Operation::Help => {
                 self.output("help       Show these commands.");
-                self.output("status     Show live timer and keyboard IRQ counters.");
+                self.output("status     Show tick and IRQ counters, CPU time and ended processes.");
                 self.output("devices N  Show PCI IDs and driver candidates; first page is devices or devices 1.");
                 self.output("echo TEXT  Print text without interpreting it.");
                 self.output("clear      Clear console history and current input.");
@@ -319,6 +324,8 @@ impl<'a> Console<'a> {
                     prompt: false,
                     text: Text::counter("Keyboard IRQs: ", crate::keyboard::irq_count()),
                 });
+                self.cpu_time();
+                self.ended_processes();
                 ("status", Text::EMPTY)
             }
             Operation::Echo(text) => {
@@ -358,6 +365,69 @@ impl<'a> Console<'a> {
         self.input = Text::EMPTY;
         self.cursor = 0;
         self.notice = EDIT_NOTICE;
+    }
+
+    /// `status`'s CPU lines: each installed CPU's user ticks of all its
+    /// ticks, as `slot:user/all`, wrapped at the line width on at most
+    /// `CPU_LINES` lines, the last of which counts the CPUs left out.
+    fn cpu_time(&mut self) {
+        const MORE: usize = " +64 more".len();
+        let slots =
+            || (0..crate::cpudata::MAX_CPUS).filter(|&slot| crate::cpudata::is_installed(slot));
+        let total = slots().count();
+        let mut line = Text::new("CPU user/all ticks:").expect("short static label");
+        let mut lines = 1;
+        for (shown, slot) in slots().enumerate() {
+            let (ticks, user) = crate::cpudata::tick_counts(slot);
+            let entry = Text::formatted(format_args!(
+                " {}:{}/{}",
+                slot,
+                user.iter().sum::<u64>(),
+                ticks
+            ));
+            let room = LINE_CAPACITY - if lines == CPU_LINES { MORE } else { 0 };
+            if line.length + entry.length > room {
+                if lines == CPU_LINES {
+                    line.write_fmt(format_args!(" +{} more", total - shown))
+                        .expect("room reserved for the count");
+                    break;
+                }
+                self.push(HistoryLine {
+                    prompt: false,
+                    text: line,
+                });
+                lines += 1;
+                line = Text::EMPTY;
+            }
+            line.write_str(entry.as_str())
+                .expect("an entry fits a fresh line");
+        }
+        self.push(HistoryLine {
+            prompt: false,
+            text: line,
+        });
+    }
+
+    /// `status`'s process lines: the last `ENDED_LINES` processes that ran
+    /// and ended, newest first, with their CPU ticks and peak commit.
+    fn ended_processes(&mut self) {
+        self.output("Last ended processes:");
+        let mut shown = 0;
+        crate::userspace::ended_processes(|record| {
+            if shown < ENDED_LINES {
+                self.output_formatted(format_args!(
+                    "pid {} {}: {} ticks, peak {} KiB",
+                    record.pid,
+                    record.class,
+                    record.ticks,
+                    record.committed_peak / 1024
+                ));
+                shown += 1;
+            }
+        });
+        if shown == 0 {
+            self.output("  none yet");
+        }
     }
 
     fn device_page(&mut self, page: u8) {
@@ -708,16 +778,29 @@ pub fn self_test() {
             .any(|line| { line.text.as_str() == "No retained PCI devices." })
     );
     console.dispatch(Operation::Help);
+    console.dispatch(Operation::Clear);
     console.dispatch(Operation::Status);
-    assert!(
-        console
-            .history()
-            .last()
-            .unwrap()
-            .text
-            .as_str()
-            .starts_with("Keyboard IRQs: ")
-    );
+    // Before any session: the tick lines, every CPU's time from the BSP's
+    // `0:` entry on, and no ended process (spec 0052, point 8).
+    let lines = console.history();
+    assert!(lines[0].text.as_str().starts_with("Timer ticks: "));
+    assert!(lines[1].text.as_str().starts_with("Keyboard IRQs: "));
+    assert!(lines[2].text.as_str().starts_with("CPU user/all ticks: 0:"));
+    assert_eq!(lines.len(), 5, "status before any session");
+    assert_eq!(lines[3].text.as_str(), "Last ended processes:");
+    assert_eq!(lines[4].text.as_str(), "  none yet");
+    // The widest entries still fit: 64 CPUs' worst lines wrap, and the
+    // count of the rest fits its reserved room.
+    let widest = Text::formatted(format_args!(" {}:{}/{}", 63, u64::MAX, u64::MAX));
+    assert!(widest.length + "CPU user/all ticks:".len() <= LINE_CAPACITY);
+    let ended = Text::formatted(format_args!(
+        "pid {} {}: {} ticks, peak {} KiB",
+        u64::MAX,
+        "interactive",
+        u64::MAX,
+        u64::MAX / 1024
+    ));
+    assert!(ended.length <= LINE_CAPACITY);
     assert!(matches!(
         console.dispatch(Operation::Unknown(Text::new("nope").unwrap())),
         Action::Submitted {

@@ -22,9 +22,13 @@
 
 use core::arch::asm;
 use core::mem::{offset_of, size_of};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 pub(crate) const MAX_CPUS: usize = 64;
+/// The scheduling classes whose user ticks each CPU counts (spec 0052).
+pub(crate) const CLASSES: usize = 3;
+/// `running_rank` while this CPU runs no user thread.
+const NO_RANK: u8 = u8::MAX;
 const IA32_GS_BASE: u32 = 0xc000_0101;
 const IA32_KERNEL_GS_BASE: u32 = 0xc000_0102;
 /// Canonical kernel-half addresses have bit 63 set.
@@ -64,6 +68,11 @@ pub(crate) struct CpuData {
     /// start while it is set (spec 0051, open point 3).
     sched_held: AtomicBool,
     installed: AtomicBool,
+    /// The rank at which this CPU's scheduler dispatched the user thread it
+    /// runs, from dispatch until the thread is back, or `NO_RANK`: another
+    /// CPU's pass preempts it for a queued thread of a better class (spec
+    /// 0052, point 5).
+    running_rank: AtomicU8,
     /// This CPU's scheduler pass statistics: dispatches that changed process,
     /// and timer ticks spent halted.
     switches: AtomicU64,
@@ -72,6 +81,12 @@ pub(crate) struct CpuData {
     /// source, and reschedule IPIs (vector 242) it took (spec 0051, point 3).
     local_ticks: AtomicU64,
     reschedules: AtomicU64,
+    /// Selected-source timer ticks this CPU took since its install, and the
+    /// ones that charged a user thread, by the thread's class rank (spec
+    /// 0052, point 7). A user tick is counted where its process is charged,
+    /// under the scheduler lock.
+    ticks: AtomicU64,
+    user_ticks: [AtomicU64; CLASSES],
 }
 
 /// Marks no process or thread slot in a `CpuData` slot field.
@@ -92,10 +107,13 @@ impl CpuData {
             idle: AtomicBool::new(false),
             sched_held: AtomicBool::new(false),
             installed: AtomicBool::new(false),
+            running_rank: AtomicU8::new(NO_RANK),
             switches: AtomicU64::new(0),
             idle_ticks: AtomicU64::new(0),
             local_ticks: AtomicU64::new(0),
             reschedules: AtomicU64::new(0),
+            ticks: AtomicU64::new(0),
+            user_ticks: [const { AtomicU64::new(0) }; CLASSES],
         }
     }
 }
@@ -205,10 +223,15 @@ pub(crate) unsafe fn install(slot: usize) -> bool {
     data.user_active.store(false, Ordering::Relaxed);
     data.idle.store(false, Ordering::Relaxed);
     data.sched_held.store(false, Ordering::Relaxed);
+    data.running_rank.store(NO_RANK, Ordering::Relaxed);
     data.switches.store(0, Ordering::Relaxed);
     data.idle_ticks.store(0, Ordering::Relaxed);
     data.local_ticks.store(0, Ordering::Relaxed);
     data.reschedules.store(0, Ordering::Relaxed);
+    data.ticks.store(0, Ordering::Relaxed);
+    for ticks in &data.user_ticks {
+        ticks.store(0, Ordering::Relaxed);
+    }
     // SAFETY: CPL0 with IF clear per the caller. The entry is a static and so
     // a canonical kernel address. Nothing reads through GS before this, and
     // the order keeps the D1 invariant at every instruction.
@@ -371,6 +394,47 @@ pub(crate) fn count_local_tick() {
 /// Count a reschedule IPI on this CPU.
 pub(crate) fn count_reschedule() {
     current().reschedules.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count a selected-source timer tick on this CPU, whatever it interrupted
+/// (spec 0052, point 7).
+pub(crate) fn count_tick() {
+    current().ticks.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count a tick that charged a user thread of class `rank` on this CPU. The
+/// caller charges the thread's process in the same scheduler-lock hold.
+pub(crate) fn count_user_tick(rank: usize) {
+    current().user_ticks[rank].fetch_add(1, Ordering::Relaxed);
+}
+
+/// CPU `slot`'s ticks and its user ticks by class rank since its install,
+/// read from any CPU (spec 0052, point 7). Panics for a slot outside the
+/// table.
+pub(crate) fn tick_counts(slot: usize) -> (u64, [u64; CLASSES]) {
+    let data = &CPU_DATA[slot];
+    let user = core::array::from_fn(|rank| data.user_ticks[rank].load(Ordering::Relaxed));
+    (data.ticks.load(Ordering::Relaxed), user)
+}
+
+/// Record the rank at which this CPU dispatched the user thread it is about
+/// to run, or `None` once the thread is back (spec 0052, point 5). Only the
+/// scheduler calls it, under the scheduler lock.
+pub(crate) fn set_running_rank(rank: Option<u8>) {
+    let rank = rank.unwrap_or(NO_RANK);
+    assert!(
+        rank == NO_RANK || usize::from(rank) < CLASSES,
+        "dispatch rank out of range"
+    );
+    current().running_rank.store(rank, Ordering::Relaxed);
+}
+
+/// The dispatch rank of the user thread CPU `slot` runs, if any, read under
+/// the scheduler lock, which orders it with that CPU's updates. Panics for a
+/// slot outside the table.
+pub(crate) fn running_rank(slot: usize) -> Option<u8> {
+    let rank = CPU_DATA[slot].running_rank.load(Ordering::Relaxed);
+    (rank != NO_RANK).then_some(rank)
 }
 
 /// The LAPIC timer ticks CPU `slot` has taken since its install, read from

@@ -729,7 +729,7 @@ try {
     $markers += @('MIRROR_CONTIGUOUS_TESTS_OK', 'MIRROR_DMA_TESTS_OK', 'MIRROR_BLOCK_TESTS_OK')
     $markers += @('MIRROR_KEYBOARD_TESTS_OK', 'MIRROR_CONSOLE_TESTS_OK')
     $markers += @('MIRROR_PS2_TESTS_OK', 'MIRROR_MOUSE_TESTS_OK', 'MIRROR_POINTER_TESTS_OK', 'MIRROR_VMMOUSE_TESTS_OK')
-    $markers += @('MIRROR_INPUT_TESTS_OK', 'MIRROR_SERVICE_POLICY_TESTS_OK')
+    $markers += 'MIRROR_INPUT_TESTS_OK'
     $markers += @('MIRROR_USER_VM_PAGING_OK', 'MIRROR_VM_TESTS_OK', 'MIRROR_USER_VM_OK', 'MIRROR_VM_CLEANUP_OK')
     $markers += @('MIRROR_FPU_READY', 'MIRROR_FPU_TESTS_OK', 'MIRROR_USER_FPU_OK')
     $markers += @('MIRROR_TLS_READY', 'MIRROR_TLS_KERNEL_OK', 'MIRROR_USER_TLS_OK')
@@ -889,6 +889,16 @@ try {
     if ($bounds.Count -ne 1 -or $boundsValid.Count -ne 1 -or -not $firstSession.Success -or
         $boundsValid[0].Index -le $schedReady.Index -or $boundsValid[0].Index -ge $firstSession.Index) {
         throw "Mirror must report MIRROR_SCHED_BOUNDS_OK processes=64 threads=256 exactly once, after MIRROR_SCHED_READY and before the first session. See $serialLog."
+    }
+    # The class self-test (spec 0052): selection by class and age, and the
+    # placement of leftover work, on synthetic entries after the table-bounds
+    # test and before the SMP battery. Its fields are the policy's constants.
+    $classTests = @([regex]::Matches($serial, '(?m)^MIRROR_SCHED_CLASS_TESTS_OK(?:\s|$)'))
+    $classTestsValid = @([regex]::Matches($serial, '(?m)^MIRROR_SCHED_CLASS_TESTS_OK quanta=2,2,4 age_ticks=20\r?$'))
+    $smpUser = [regex]::Match($serial, '(?m)^MIRROR_SMP_USER_OK(?:\s|$)')
+    if ($classTests.Count -ne 1 -or $classTestsValid.Count -ne 1 -or -not $smpUser.Success -or
+        $classTestsValid[0].Index -le $boundsValid[0].Index -or $classTestsValid[0].Index -ge $smpUser.Index) {
+        throw "Mirror must report MIRROR_SCHED_CLASS_TESTS_OK quanta=2,2,4 age_ticks=20 exactly once, after MIRROR_SCHED_BOUNDS_OK and before MIRROR_SMP_USER_OK. See $serialLog."
     }
     if ($serial -notmatch '(?m)^MIRROR_TLS_READY[^\r\n]* fsgsbase=0(?:\s|$)') {
         throw 'Mirror must keep direct user FS/GS base instructions disabled.'

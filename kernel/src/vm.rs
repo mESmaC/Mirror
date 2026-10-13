@@ -160,6 +160,9 @@ pub struct Vm {
     regions: Regions,
     reserved: u64,
     committed: u64,
+    /// The most bytes ever committed at once, for the console's `status`
+    /// (spec 0052, point 7).
+    committed_peak: u64,
     /// 0054-D2: this process's limits, set from its memory class at creation.
     reserved_limit: u64,
     committed_limit: u64,
@@ -177,6 +180,7 @@ impl Vm {
             regions: Regions::new(),
             reserved: 0,
             committed: 0,
+            committed_peak: 0,
             reserved_limit,
             committed_limit,
             may_draw_reserve,
@@ -193,6 +197,11 @@ impl Vm {
             reserved_limit: self.reserved_limit,
             committed_limit: self.committed_limit,
         }
+    }
+
+    /// The most bytes this VM ever had committed at once (spec 0052).
+    pub fn committed_peak(&self) -> u64 {
+        self.committed_peak
     }
 
     /// Reserve promises only. A nonzero hint requests an exact address and
@@ -556,6 +565,7 @@ impl Vm {
         }
         assert!(reserve.is_empty(), "a page-in reserved unused frames");
         self.committed += count * PAGE_SIZE;
+        self.committed_peak = self.committed_peak.max(self.committed);
         Ok(())
     }
 

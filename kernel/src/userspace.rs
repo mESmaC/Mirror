@@ -16,6 +16,8 @@
 #[path = "sched.rs"]
 mod sched;
 
+/// The console's `status` lists the last ended processes (spec 0052).
+pub(crate) use sched::ended_processes;
 #[cfg(feature = "boot-smoke")]
 pub(crate) use sched::{
     hold_scheduler_lock_for_test, scheduler_lock_contended_for_test,
@@ -59,7 +61,6 @@ const SURFACE_CHECKS_PASSED: &[u8] = b"Mirror init: surface checks passed\n";
 const SURFACE_DENIED_CHECKS: &[u8] = b"Mirror init: surface denied\n";
 #[cfg(feature = "boot-smoke")]
 const PROCESS_COUNT: usize = 2;
-const QUANTUM_TICKS: u64 = 2;
 // Finite init probes include register/preemption loops and 20 thread creations,
 // plus 15 more in role 0's capacity check and 8 in its wait-queue check (spec
 // 0030a). Leave headroom for the complete debug workload, including IRQs
@@ -81,8 +82,6 @@ const ANY_CPU: u64 = u64::MAX;
 const BSP_ONLY: u64 = 1;
 const MAX_SLEEP_TICKS: u64 = 1000;
 const RECEIVE_TIMEOUT: u64 = 100;
-const SERVICE_ALLOWANCE: u64 = 32;
-const SERVICE_PERIOD: u64 = 100;
 /// The deepest high-water mark, in pages, of the thread stacks used since the
 /// current init-pair session began (0050-D2, boot-smoke).
 #[cfg(feature = "boot-smoke")]
@@ -223,7 +222,8 @@ impl Thread {
             joiner: None,
             charged_ticks: 0,
             sleep_charge: 0,
-            quantum_left: QUANTUM_TICKS,
+            // Its first dispatch starts a quantum of its process's class.
+            quantum_left: 0,
             displaced: false,
             on_cpu: false,
             cpu: 0,
@@ -313,6 +313,60 @@ impl MemoryClass {
     }
 }
 
+/// A process's CPU scheduling class (spec 0052, S4), set at creation:
+/// interactive above normal above background. The scheduler runs the best
+/// class first on every CPU, and an aged thread counts one class better per
+/// `sched::AGE_TICKS` it has waited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CpuClass {
+    /// The shell, which is the desktop.
+    Interactive,
+    /// Apps and init's probes.
+    Normal,
+    /// Work that must not delay input: 0019d's burn, the engine and the
+    /// indexer (S18), and the class battery's loads.
+    Background,
+}
+
+impl CpuClass {
+    /// Every class, by rank.
+    const ALL: [Self; crate::cpudata::CLASSES] =
+        [Self::Interactive, Self::Normal, Self::Background];
+
+    /// 0 for the best class.
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Interactive => 0,
+            Self::Normal => 1,
+            Self::Background => 2,
+        }
+    }
+
+    /// The class of rank `rank`, which must be below `cpudata::CLASSES`.
+    fn of_rank(rank: u8) -> Self {
+        Self::ALL[usize::from(rank)]
+    }
+
+    /// A dispatch's quantum in charged ticks (spec 0052, point 3). Normal
+    /// keeps the two ticks that init's checks assume; background work, which
+    /// every better class preempts on wake, runs longer slices.
+    const fn quantum(self) -> u64 {
+        match self {
+            Self::Interactive | Self::Normal => 2,
+            Self::Background => 4,
+        }
+    }
+
+    /// The `status` and marker name.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Normal => "normal",
+            Self::Background => "background",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MemoryRequest {
     Operation,
@@ -359,53 +413,6 @@ impl PendingWait {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ServicePolicy {
-    window_start: u64,
-    used: u64,
-}
-
-impl ServicePolicy {
-    fn new(now: u64) -> Self {
-        Self {
-            window_start: now,
-            used: 0,
-        }
-    }
-
-    fn refresh(&mut self, now: u64) {
-        let elapsed = now.wrapping_sub(self.window_start);
-        if (SERVICE_PERIOD..(1_u64 << 63)).contains(&elapsed) {
-            // Advance complete anchored periods. Sleeping through many periods
-            // earns one allowance, never accumulated credit or a shifted window.
-            self.window_start = now.wrapping_sub(elapsed % SERVICE_PERIOD);
-            self.used = 0;
-        }
-    }
-
-    fn eligible(&mut self, now: u64) -> bool {
-        self.refresh(now);
-        self.used < SERVICE_ALLOWANCE
-    }
-
-    /// Charge one tick and report whether the window's allowance is spent.
-    /// It saturates there: once userspace runs on several CPUs, a tick can
-    /// charge a sibling that was dispatched before the allowance ran out
-    /// (spec 0051, point 9).
-    fn charge(&mut self, now: u64) -> bool {
-        self.refresh(now);
-        self.used = (self.used + 1).min(SERVICE_ALLOWANCE);
-        self.used == SERVICE_ALLOWANCE
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum CpuPolicy {
-    Probe,
-    Shell(ServicePolicy),
-    Application(ServicePolicy),
-}
-
 // Fields gated on `boot-smoke` are bookkeeping that only init's self-test
 // battery reads. Fields gated on `test-trace` feed only trace markers. Neither
 // exists in a default kernel (spec 0010).
@@ -418,8 +425,11 @@ struct Process {
     /// The CPUs its threads may run on, as a mask of slots: `ANY_CPU`, or
     /// `BSP_ONLY` for a surface or input holder (spec 0051, point 6).
     cpus: u64,
-    /// A `CpuPolicy::Probe` process's lifetime tick allowance.
-    tick_budget: u64,
+    /// Its CPU scheduling class (spec 0052, point 1).
+    class: CpuClass,
+    /// A test probe's lifetime tick allowance, across all its threads and
+    /// CPUs; the shell and apps have none (spec 0052, point 6).
+    tick_budget: Option<u64>,
     /// The SMP battery role, for an SMP battery process (spec 0051, step 5).
     #[cfg(feature = "boot-smoke")]
     battery: Option<Battery>,
@@ -512,6 +522,17 @@ struct Process {
     /// displaced it.
     #[cfg(feature = "boot-smoke")]
     spin_kept_quantum: bool,
+    /// The class battery times every sleep of this process's threads, from
+    /// its deadline to the thread's dispatch (spec 0052): how many, how many
+    /// within a tick, and the worst lateness in ticks.
+    #[cfg(feature = "boot-smoke")]
+    timed_sleeps: bool,
+    #[cfg(feature = "boot-smoke")]
+    sleep_wakes: u64,
+    #[cfg(feature = "boot-smoke")]
+    sleep_prompt: u64,
+    #[cfg(feature = "boot-smoke")]
+    sleep_worst: u64,
     outcome: Option<Outcome>,
     #[cfg(feature = "boot-smoke")]
     checks_passed: bool,
@@ -524,9 +545,11 @@ struct Process {
     yields: usize,
     #[cfg(feature = "boot-smoke")]
     sleeps: usize,
+    /// User ticks charged to its threads: the sum of `retired_ticks` and its
+    /// live threads' ticks (spec 0052, point 7).
     charged_ticks: u64,
-    policy: CpuPolicy,
-    throttles: u64,
+    /// The charged ticks of member threads already removed from the table.
+    retired_ticks: u64,
     preemptions: usize,
     #[cfg(feature = "boot-smoke")]
     post_checks_preemptions: usize,
@@ -599,8 +622,14 @@ impl Process {
         (0..thread_abi::MAX_THREADS).filter_map(|index| self.member(index))
     }
 
-    /// Remove the member at `index` from this process and the thread table.
+    /// Remove the member at `index` from this process and the thread table,
+    /// keeping its charged ticks in the process's account (spec 0052).
     fn remove_member(&mut self, index: usize) {
+        let ticks = self
+            .member(index)
+            .expect("removed an empty member")
+            .charged_ticks;
+        self.retired_ticks += ticks;
         let slot = core::mem::replace(&mut self.members[index], sched::NO_SLOT);
         assert_ne!(slot, sched::NO_SLOT, "removed an empty member");
         // SAFETY: The slot was this process's member, and no reference to
@@ -715,6 +744,16 @@ impl Process {
     fn zombie(&self) -> bool {
         self.finished() && self.members.iter().all(|&slot| slot == sched::NO_SLOT)
     }
+
+    /// The charged ticks of its removed and live threads, which must equal
+    /// `charged_ticks` (spec 0052, point 7).
+    fn thread_ticks(&self) -> u64 {
+        self.retired_ticks
+            + self
+                .threads()
+                .map(|thread| thread.charged_ticks)
+                .sum::<u64>()
+    }
 }
 
 /// Print `MIRROR_SCHED_READY` once, before the first session, in every
@@ -743,7 +782,6 @@ pub fn run_init(
     let image = elf::parse(bytes).expect("invalid native init ELF");
     capability::self_test();
     crate::ipc::self_test();
-    service_policy_self_test();
     assert!(!deadline_reached(4, 5));
     assert!(deadline_reached(5, 5));
     assert!(deadline_reached(6, 5));
@@ -754,6 +792,7 @@ pub fn run_init(
     vm::self_test(kernel, frames, direct_map);
     table_bounds_self_test(kernel, frames, bytes, &image, direct_map);
     sched::selection_self_test(kernel, frames, bytes, &image, direct_map);
+    sched::class_self_test(kernel, frames, bytes, &image, direct_map);
     trim_recovery_test(kernel, frames, bytes, &image, direct_map);
     // Spec 0051, step 5: threads of one process on every CPU that runs
     // userspace, before the pair, whose first session builds its stacks from
@@ -991,7 +1030,7 @@ fn run_battery(
             ipc.grant(Capability { object, rights });
         }
         process.battery = Some(battery);
-        process.tick_budget = BATTERY_TICK_BUDGET;
+        process.tick_budget = Some(BATTERY_TICK_BUDGET);
     }
     let mut session = sched::Session {
         ipc,
@@ -1733,7 +1772,10 @@ fn load_process(
         direct_map,
         access: Access::default(),
         cpus: ANY_CPU,
-        tick_budget: USER_TICK_BUDGET,
+        // A test probe until its caller seeds a session role: the shell and
+        // apps set their class and drop the budget (spec 0052, point 6).
+        class: CpuClass::Normal,
+        tick_budget: Some(USER_TICK_BUDGET),
         #[cfg(feature = "boot-smoke")]
         battery: None,
         #[cfg(feature = "boot-smoke")]
@@ -1809,6 +1851,14 @@ fn load_process(
         ipc_lateness: None,
         #[cfg(feature = "boot-smoke")]
         spin_kept_quantum: false,
+        #[cfg(feature = "boot-smoke")]
+        timed_sleeps: false,
+        #[cfg(feature = "boot-smoke")]
+        sleep_wakes: 0,
+        #[cfg(feature = "boot-smoke")]
+        sleep_prompt: 0,
+        #[cfg(feature = "boot-smoke")]
+        sleep_worst: 0,
         outcome: None,
         #[cfg(feature = "boot-smoke")]
         checks_passed: false,
@@ -1822,8 +1872,7 @@ fn load_process(
         #[cfg(feature = "boot-smoke")]
         sleeps: 0,
         charged_ticks: 0,
-        policy: CpuPolicy::Probe,
-        throttles: 0,
+        retired_ticks: 0,
         preemptions: 0,
         #[cfg(feature = "boot-smoke")]
         post_checks_preemptions: 0,
@@ -2792,8 +2841,8 @@ fn resume_on_ap(kernel: &PageTables, owner: usize, slot: u16) {
     }
 }
 
-/// Start a dispatched thread's slice: it runs now, with a new quantum or, if
-/// a wake displaced it, the rest of its old one.
+/// Start a dispatched thread's slice: it runs now, with a new quantum of its
+/// process's class or, if a wake displaced it, the rest of its old one.
 fn begin_slice(owner: usize, slot: u16) {
     assert!(!arch::interrupts_enabled());
     assert!(!interrupts::user_context_active());
@@ -2804,6 +2853,7 @@ fn begin_slice(owner: usize, slot: u16) {
     let process = unsafe { sched::process(owner) };
     assert!(!process.finished());
     assert_eq!(process.thread().state, State::Ready);
+    let quantum = process.class.quantum();
     let thread = process.thread_mut();
     assert!(thread.on_cpu, "dispatch did not claim the thread");
     thread.state = State::Running;
@@ -2812,11 +2862,11 @@ fn begin_slice(owner: usize, slot: u16) {
     let resumed = core::mem::take(&mut thread.displaced);
     if resumed {
         assert!(
-            (1..=QUANTUM_TICKS).contains(&thread.quantum_left),
+            (1..=quantum).contains(&thread.quantum_left),
             "displaced thread has no quantum left"
         );
     } else {
-        thread.quantum_left = QUANTUM_TICKS;
+        thread.quantum_left = quantum;
     }
     #[cfg(feature = "boot-smoke")]
     {
@@ -2951,13 +3001,16 @@ fn enter_user(kernel: &PageTables, owner: usize) {
 
 /// At a dispatch, record a flagged wake's latency, or that a flagged spinner
 /// resumed with the rest of its quantum (spec 0030a, acceptance 4). Each
-/// flag times one event and is then cleared.
+/// flag times one event and is then cleared. A process whose sleeps the
+/// class battery times counts every sleep's lateness instead (spec 0052).
 #[cfg(feature = "boot-smoke")]
 fn record_latency(process: &mut Process, resumed: bool) {
     let now = timer::ticks();
+    let quantum = process.class.quantum();
+    let timed = process.timed_sleeps;
     let thread = process.thread_mut();
     let probe = thread.probe;
-    if probe == Some(LatencyProbe::Spin) && resumed && thread.quantum_left < QUANTUM_TICKS {
+    if probe == Some(LatencyProbe::Spin) && resumed && thread.quantum_left < quantum {
         thread.probe = None;
         process.spin_kept_quantum = true;
         return;
@@ -2965,8 +3018,15 @@ fn record_latency(process: &mut Process, resumed: bool) {
     let Some(due) = thread.due.take() else {
         return;
     };
+    let lateness = now.saturating_sub(due);
+    if timed {
+        assert!(probe.is_none(), "a timed sleeper flagged a probe");
+        process.sleep_wakes += 1;
+        process.sleep_prompt += u64::from(lateness <= 1);
+        process.sleep_worst = process.sleep_worst.max(lateness);
+        return;
+    }
     thread.probe = None;
-    let lateness = now.wrapping_sub(due);
     let slot = match probe {
         Some(LatencyProbe::Sleep) => &mut process.wake_lateness,
         Some(LatencyProbe::Receive) => &mut process.ipc_lateness,
@@ -3460,11 +3520,14 @@ impl ShellRuntime<'_> {
         self.surfaces_peak = self.surfaces_peak.max(desktop.surface_frames);
     }
 
+    /// Launch an app of window kind `kind` in CPU class `class` (spec 0052:
+    /// apps are normal unless their launch marks another class).
     fn launch(
         &mut self,
         frames: &mut FrameAllocator<'_>,
         desktop: &mut Process,
         kind: u64,
+        class: CpuClass,
     ) -> Result<u64, i64> {
         let index = self
             .windows
@@ -3541,7 +3604,10 @@ impl ShellRuntime<'_> {
             child.space.root_physical_address(),
             desktop.space.root_physical_address()
         );
-        child.policy = CpuPolicy::Application(ServicePolicy::new(timer::ticks()));
+        // Apps run work-conserving in their class, with no lifetime budget
+        // (spec 0052, points 4 and 6).
+        child.class = class;
+        child.tick_budget = None;
         child.access.windows = true;
         self.children[index] = Some(slot);
         self.windows.applications[index] = Some(application);
@@ -3850,15 +3916,19 @@ fn complete_wait(
         _ => panic!("signaled a thread that is not waiting: {state:?}"),
     };
     sched::release(slot);
+    #[cfg(feature = "boot-smoke")]
+    let timed = process.timed_sleeps;
     let thread = process.thread_mut();
     if let Some(result) = result {
         thread.context.frame.rax = result as u64;
     }
     // A flagged sleep is due at its deadline; a flagged receive that got a
-    // message, at the sending syscall's trap exit, when it was signaled.
+    // message, at the sending syscall's trap exit, when it was signaled. The
+    // class battery times every sleep of its timed process (spec 0052).
     #[cfg(feature = "boot-smoke")]
     {
         thread.due = match (thread.probe, state) {
+            (None, State::Sleeping(deadline)) if timed => Some(deadline),
             (Some(LatencyProbe::Sleep), State::Sleeping(deadline)) => Some(deadline),
             (Some(LatencyProbe::Receive), State::Receiving(_)) if result.is_some_and(|r| r > 0) => {
                 Some(at)
@@ -4205,7 +4275,10 @@ pub fn run_shell(
     {
         // SAFETY: Seeding holds the only reference to the shell's entry.
         let desktop = unsafe { sched::process(shell) };
-        desktop.policy = CpuPolicy::Shell(ServicePolicy::new(timer::ticks()));
+        // The shell is the interactive class, with no lifetime budget (spec
+        // 0052, points 1 and 6).
+        desktop.class = CpuClass::Interactive;
+        desktop.tick_budget = None;
         desktop.access = Access {
             surface: true,
             input: true,
@@ -4383,7 +4456,10 @@ fn app_load_rollback_test<'a>(
     // with -12 and the frame and window baselines are exact. It runs first:
     // a later launch would reuse the stack the next one pools.
     kernel_va::arm_frame_failure(kernel_va::STACK_PAGES / 2);
-    assert_eq!(runtime.launch(frames, desktop, 0), Err(-12));
+    assert_eq!(
+        runtime.launch(frames, desktop, 0, CpuClass::Normal),
+        Err(-12)
+    );
     let failed = FrameBaseline::take(frames);
     assert_eq!(
         (failed.allocated, failed.stacks),
@@ -4392,7 +4468,10 @@ fn app_load_rollback_test<'a>(
     );
     // The child's stack is built before the handle insert fails, and the
     // rollback pools it: D2's rule holds with a pool delta of 16 frames.
-    assert_eq!(runtime.launch(frames, desktop, 0), Err(-24));
+    assert_eq!(
+        runtime.launch(frames, desktop, 0, CpuClass::Normal),
+        Err(-24)
+    );
     baseline.assert_kept(frames, "application-load rollback leaked");
     assert_eq!(
         kernel_va::stats().expect("kernel VA stats").pooled,
@@ -4410,37 +4489,6 @@ fn app_load_rollback_test<'a>(
     }
     serial::println!("MIRROR_APP_LOAD_ROLLBACK_OK");
     runtime
-}
-
-#[cfg(feature = "boot-smoke")]
-fn service_policy_self_test() {
-    for start in [0, 17, u64::MAX - 20] {
-        let mut policy = ServicePolicy::new(start);
-        for tick in 1..=SERVICE_ALLOWANCE {
-            assert!(policy.eligible(start.wrapping_add(tick)));
-            assert_eq!(
-                policy.charge(start.wrapping_add(tick)),
-                tick == SERVICE_ALLOWANCE
-            );
-        }
-        // Repeated scheduling attempts, including wakes/yields, cannot refill.
-        for tick in SERVICE_ALLOWANCE..SERVICE_PERIOD {
-            assert!(!policy.eligible(start.wrapping_add(tick)));
-            assert_eq!(policy.used, SERVICE_ALLOWANCE);
-        }
-        // A tick past the allowance, charged to a sibling dispatched before
-        // it ran out, saturates instead of failing (spec 0051, point 9).
-        assert!(policy.charge(start.wrapping_add(SERVICE_PERIOD - 1)));
-        assert_eq!(policy.used, SERVICE_ALLOWANCE);
-        assert!(policy.eligible(start.wrapping_add(SERVICE_PERIOD)));
-        assert_eq!(policy.used, 0);
-        assert!(!policy.charge(start.wrapping_add(SERVICE_PERIOD)));
-        assert_eq!(policy.used, 1);
-        assert!(policy.eligible(start.wrapping_add(3 * SERVICE_PERIOD + 7)));
-        assert_eq!(policy.window_start, start.wrapping_add(3 * SERVICE_PERIOD));
-        assert_eq!(policy.used, 0); // Sleeping earns no stacked allowance.
-    }
-    serial::println!("MIRROR_SERVICE_POLICY_TESTS_OK");
 }
 
 fn deadline_reached(now: u64, deadline: u64) -> bool {
@@ -5016,7 +5064,8 @@ fn match_init_oracles(process: &mut Process, message: &[u8]) {
 /// match console text (spec 0010-D4).
 #[cfg(feature = "test-trace")]
 fn service_message(process: &mut Process, message: &[u8]) {
-    if !matches!(process.policy, CpuPolicy::Shell(_)) {
+    // The shell is the one process that holds physical input.
+    if !process.access.input {
         return;
     }
     if message == b"Mirror shell: ready\n" && !process.desktop_ready {
@@ -5808,7 +5857,11 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
 
 /// Runs after the selected timer's acknowledgement, only for interrupted CPL3.
 /// A tick charges the interrupted user only; kernel and sleeping time are not
-/// charged. This bounds delivered user IRQ ticks, not exact CPU or wall time.
+/// charged. This counts delivered user IRQ ticks, not exact CPU or wall time.
+/// The charge lands on the thread, its process and this CPU's count for the
+/// process's class, in one scheduler-lock hold (spec 0052, point 7). Only a
+/// test probe's lifetime budget can end a process here; nothing throttles
+/// (point 4).
 pub(crate) fn timer_tick(frame: &mut TrapFrame) {
     if exit_if_finished(frame) {
         return;
@@ -5819,21 +5872,14 @@ pub(crate) fn timer_tick(frame: &mut TrapFrame) {
         process.charged_ticks += 1;
         process.thread_mut().charged_ticks += 1;
         process.thread_mut().quantum_left -= 1;
-        let throttled = match &mut process.policy {
-            CpuPolicy::Probe => false,
-            CpuPolicy::Shell(policy) | CpuPolicy::Application(policy) => {
-                policy.charge(timer::ticks())
-            }
-        };
-        if matches!(process.policy, CpuPolicy::Probe)
-            && process.charged_ticks >= process.tick_budget
+        crate::cpudata::count_user_tick(usize::from(process.class.rank()));
+        if process
+            .tick_budget
+            .is_some_and(|budget| process.charged_ticks >= budget)
         {
             process.finish(Outcome::BudgetExhausted);
             expired = true;
-        } else if throttled || process.thread().quantum_left == 0 {
-            if throttled {
-                process.throttles += 1;
-            }
+        } else if process.thread().quantum_left == 0 {
             process.preemptions += 1;
             #[cfg(feature = "boot-smoke")]
             {

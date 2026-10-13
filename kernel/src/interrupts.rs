@@ -1406,9 +1406,13 @@ fn dispatch(frame: &mut TrapFrame) {
         // The timer driver acknowledges before permitting a scheduler tick.
         // Kernel interrupts advance time without charging a suspended user.
         // On an AP the tick charges the user it interrupted and never
-        // advances the BSP's clock (spec 0051, point 3).
-        if timer::handle_local_timer() && frame.cs & 3 == 3 {
-            crate::userspace::timer_tick(frame);
+        // advances the BSP's clock (spec 0051, point 3). Every CPU counts
+        // its own ticks (spec 0052, point 7).
+        if timer::handle_local_timer() {
+            crate::cpudata::count_tick();
+            if frame.cs & 3 == 3 {
+                crate::userspace::timer_tick(frame);
+            }
         }
         return;
     }
@@ -1432,6 +1436,9 @@ fn dispatch(frame: &mut TrapFrame) {
             crate::ps2::handle_irq(frame.vector as u8);
         }
         let tick = timer::handle_irq(frame.vector as u8);
+        if tick {
+            crate::cpudata::count_tick();
+        }
         if tick && frame.cs & 3 == 3 {
             // Only the selected clock source may charge a user; a stale PIT
             // IRQ after switching to LAPIC is acknowledged without scheduling.

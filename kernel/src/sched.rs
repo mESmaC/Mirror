@@ -2,10 +2,14 @@
 //! (spec 0030a).
 //!
 //! Processes and threads live in fixed-capacity `.bss` tables, not in the
-//! stack frames of per-session loops. One FIFO run queue holds every ready
-//! thread. `run` dispatches threads, not processes: it takes the first queued
-//! thread whose process its CPU policy allows to run, and it idles in HLT when
-//! none may. Sessions stay sequential, and each ends by its own rule.
+//! stack frames of per-session loops. One run queue holds every ready thread.
+//! `run` dispatches threads, not processes, by class (spec 0052): it takes the
+//! queued thread of the best effective rank that may run on its CPU, where a
+//! thread's rank is its process's class (interactive, normal, background),
+//! one better for each `AGE_TICKS` it has waited ready. Within a rank the
+//! order below holds. A CPU idles in HLT only when no queued thread may run
+//! on it: nothing else gates a thread, so no CPU idles while it could work.
+//! Sessions stay sequential, and each ends by its own rule.
 //!
 //! A blocked thread sits on the FIFO queue of the event that completes it
 //! (its process's address waits, an IPC channel, device input or one app's
@@ -24,10 +28,13 @@
 //! completed input while a thread waits for it. The interrupted thread then
 //! returns to the scheduler still ready, keeping the rest of its quantum.
 //! Each completion pass appends the threads it wakes to the run queue, and
-//! the next dispatch takes the first eligible one. The interrupted thread
-//! rejoins at the head of the queue, so it resumes right after that woken
-//! thread, or first when none is eligible, ahead of every entry queued before
-//! it ran (0030-D3).
+//! the next dispatch takes the first eligible one of the best rank. The
+//! interrupted thread rejoins at the head of the queue, so it resumes right
+//! after that woken thread, or first when none is eligible, ahead of every
+//! entry of its rank queued before it ran (0030-D3). After each pass the CPU
+//! places the work it left: each queued thread on an idle CPU it may use, or
+//! on one running a worse class, which a reschedule IPI then preempts (spec
+//! 0052, points 4 and 5).
 //!
 //! One lock, `SCHED`, covers all of it: the tables, the run queue, the wait
 //! queues, every process and thread, and the published session (spec 0051,
@@ -66,14 +73,16 @@ use core::{
 };
 
 use super::{
-    CpuPolicy, MemoryClass, Outcome, Process, ShellRuntime, State, Thread, complete_wait,
+    CpuClass, MemoryClass, Outcome, Process, ShellRuntime, State, Thread, complete_wait,
     deadline_reached, finish_slice, release_handles, resume_on_ap, resume_process, thread_abi,
     vm_abi,
 };
 #[cfg(feature = "boot-smoke")]
 use crate::elf;
 use crate::{
-    arch, clock, cpudata, heap, input, interrupts,
+    arch, clock,
+    cpudata::{self, CLASSES},
+    heap, input, interrupts,
     ipc::{self, Ipc},
     memory::FrameAllocator,
     paging::PageTables,
@@ -101,6 +110,11 @@ const CLOSED: u8 = 0;
 const OPEN: u8 = 1;
 /// `PHASE`: the session's end rule holds; no AP joins, and each AP leaves.
 const CLOSING: u8 = 2;
+/// The starvation guard (spec 0052, point 2): a ready thread counts one
+/// class better for each 20 ticks (200 ms) it has waited, down to rank 0.
+pub(super) const AGE_TICKS: u64 = 20;
+/// How many ended processes `status` can list (spec 0052, point 7).
+const ENDED: usize = 8;
 
 /// The scheduler lock (spec 0051, point 1): a ticket spinlock taken with IF
 /// clear, which records the slot of the CPU that holds it.
@@ -320,7 +334,7 @@ impl<T, const N: usize, const W: usize> Table<T, N, W> {
 /// Scheduler state that `SCHED` protects (spec 0051, point 1). The busy flag
 /// still turns an accidental reentrant use on the holding CPU into a panic
 /// instead of aliased references.
-struct Locked<T> {
+pub(super) struct Locked<T> {
     busy: AtomicBool,
     value: UnsafeCell<T>,
 }
@@ -330,14 +344,14 @@ struct Locked<T> {
 unsafe impl<T> Sync for Locked<T> {}
 
 impl<T> Locked<T> {
-    const fn new(value: T) -> Self {
+    pub(super) const fn new(value: T) -> Self {
         Self {
             busy: AtomicBool::new(false),
             value: UnsafeCell::new(value),
         }
     }
 
-    fn with<R>(&self, operation: impl FnOnce(&mut T) -> R) -> R {
+    pub(super) fn with<R>(&self, operation: impl FnOnce(&mut T) -> R) -> R {
         assert!(!arch::interrupts_enabled());
         assert_held();
         assert!(
@@ -363,8 +377,12 @@ struct RunQueue {
     /// The scheduler's current completion pass, counted from 1.
     pass: u64,
     /// The pass that queued each thread as just woken, or 0. Dispatch takes
-    /// the current pass's threads first (0030-D3).
+    /// the current pass's threads first within a rank (0030-D3).
     woken_in: [u64; THREAD_SLOTS],
+    /// The tick from which each thread has waited ready, for the starvation
+    /// guard (spec 0052, point 2). A displaced thread keeps its own, so a
+    /// promoted thread finishes its quantum at its promoted rank.
+    ready_since: [u64; THREAD_SLOTS],
 }
 
 static PROCESSES: Table<Process, PROCESS_SLOTS, { PROCESS_SLOTS / 64 }> = Table::new();
@@ -377,7 +395,15 @@ static RUN_QUEUE: Locked<RunQueue> = Locked::new(RunQueue {
     queued: [false; THREAD_SLOTS],
     pass: 0,
     woken_in: [0; THREAD_SLOTS],
+    ready_since: [0; THREAD_SLOTS],
 });
+/// The last `ENDED` processes that ran, by reap order: pid, class rank,
+/// charged ticks and peak committed bytes (spec 0052, point 7). Only the BSP
+/// writes them, at reap; the console reads them on the BSP after the shell's
+/// session, so no read races a write.
+static ENDED_RECORDS: [[AtomicU64; 4]; ENDED] = [const { [const { AtomicU64::new(0) }; 4] }; ENDED];
+/// How many processes have been recorded, the ring's write position.
+static ENDED_COUNT: AtomicU64 = AtomicU64::new(0);
 static WAITS: Locked<Waits> = Locked::new(Waits::new());
 static BSP_WORK: Locked<BspWork> = Locked::new(BspWork {
     list: List::EMPTY,
@@ -877,7 +903,9 @@ unsafe fn remove_process(slot: usize) -> Process {
 }
 
 /// Take a finished process out of the tables once its session has validated
-/// it. Every remaining thread was finished with it.
+/// it. Every remaining thread was finished with it. Its charged ticks must
+/// equal its threads' (spec 0052, point 7), and a process that ran is
+/// recorded for `status`.
 ///
 /// # Safety
 /// As for `remove_process`.
@@ -893,9 +921,61 @@ pub(super) unsafe fn reap(slot: usize) -> Process {
                 .all(|thread| thread.state == State::Finished),
             "reaped a process with an unfinished thread"
         );
+        assert_eq!(
+            process.thread_ticks(),
+            process.charged_ticks,
+            "a process's charged ticks differ from its threads'"
+        );
+        if process.dispatches != 0 {
+            record_ended(process);
+        }
     }
     // SAFETY: The caller's guarantee, and the borrow above has ended.
     unsafe { remove_process(slot) }
+}
+
+/// Record an ended process for `status`, over the oldest record.
+fn record_ended(process: &Process) {
+    assert_eq!(cpudata::current_cpu(), 0, "an AP recorded an ended process");
+    let count = ENDED_COUNT.load(Ordering::Relaxed);
+    let record = &ENDED_RECORDS[(count % ENDED as u64) as usize];
+    let fields = [
+        process.pid,
+        u64::from(process.class.rank()),
+        process.charged_ticks,
+        process.vm.committed_peak(),
+    ];
+    for (field, value) in record.iter().zip(fields) {
+        field.store(value, Ordering::Relaxed);
+    }
+    ENDED_COUNT.store(count + 1, Ordering::Release);
+}
+
+/// One ended process, as `status` lists it (spec 0052, point 8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EndedProcess {
+    pub(crate) pid: u64,
+    pub(crate) class: &'static str,
+    pub(crate) ticks: u64,
+    pub(crate) committed_peak: u64,
+}
+
+/// Visit the recorded ended processes, newest first, at most `ENDED`. Call
+/// on the BSP while no session runs, as the console does.
+pub(crate) fn ended_processes(mut visit: impl FnMut(EndedProcess)) {
+    let count = ENDED_COUNT.load(Ordering::Acquire);
+    for age in 0..count.min(ENDED as u64) {
+        let record = &ENDED_RECORDS[((count - 1 - age) % ENDED as u64) as usize];
+        let [pid, rank, ticks, committed_peak] =
+            core::array::from_fn(|field| record[field].load(Ordering::Relaxed));
+        let rank = u8::try_from(rank).expect("recorded class rank");
+        visit(EndedProcess {
+            pid,
+            class: CpuClass::of_rank(rank).name(),
+            ticks,
+            committed_peak,
+        });
+    }
 }
 
 /// Roll back a process that has never run, after its creation failed partway.
@@ -1086,6 +1166,212 @@ pub(super) fn selection_self_test(
     baseline.assert_kept(frames, "selection test frame leak");
 }
 
+/// Spec 0052's class self-test (boot-smoke): the selection order and the
+/// starvation guard on queued threads of synthetic processes, which never
+/// run, and the placement of leftover work on synthetic CPU states. Restores
+/// the frame baseline, then prints `MIRROR_SCHED_CLASS_TESTS_OK`.
+#[cfg(feature = "boot-smoke")]
+pub(super) fn class_self_test(
+    kernel: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    bytes: &[u8],
+    image: &elf::Image,
+    direct_map: u64,
+) {
+    assert_drained();
+    assert_eq!(
+        cpudata::current_cpu(),
+        0,
+        "the class self-test runs on the BSP"
+    );
+    assert_eq!(CpuClass::ALL.map(CpuClass::rank), [0, 1, 2]);
+    assert_eq!(CpuClass::ALL.map(CpuClass::quantum), [2, 2, 4]);
+    assert!(
+        CpuClass::ALL
+            .iter()
+            .all(|&class| CpuClass::of_rank(class.rank()) == class)
+    );
+    // Aging: one class better per AGE_TICKS waited, never below 0, and no
+    // credit for a thread queued after the pass began.
+    for (class, waited, rank) in [
+        (2, 0, 2),
+        (2, AGE_TICKS - 1, 2),
+        (2, AGE_TICKS, 1),
+        (2, 2 * AGE_TICKS - 1, 1),
+        (2, 2 * AGE_TICKS, 0),
+        (2, 50 * AGE_TICKS, 0),
+        (1, AGE_TICKS, 0),
+        (0, 3 * AGE_TICKS, 0),
+    ] {
+        assert_eq!(effective_rank(class, 1000, 1000 + waited), rank);
+    }
+    assert_eq!(effective_rank(2, 1001, 1000), 2);
+    assert_eq!(effective_rank(2, 0, u64::MAX), 0);
+    placement_self_test();
+
+    let baseline = super::FrameBaseline::take(frames);
+    // Background, normal, interactive, and a normal process pinned away from
+    // this CPU; the normal process gets a second thread. Each main thread is
+    // queued at its load, so the queue reads B, N0, I, P, N1.
+    const CLASSES_LOADED: [CpuClass; 4] = [
+        CpuClass::Background,
+        CpuClass::Normal,
+        CpuClass::Interactive,
+        CpuClass::Normal,
+    ];
+    let mut slots = [0usize; 4];
+    for (index, class) in CLASSES_LOADED.into_iter().enumerate() {
+        slots[index] = super::load_process(
+            kernel,
+            frames,
+            bytes,
+            image,
+            direct_map,
+            0,
+            MemoryClass::Test,
+        )
+        .expect("class test process");
+        // SAFETY: The fresh entry has never run and nothing else references it.
+        let process = unsafe { process(slots[index]) };
+        process.class = class;
+    }
+    // SAFETY: As above.
+    unsafe { process(slots[3]) }.cpus = !1;
+    let start = thread_abi::ThreadStart {
+        entry: image.entry,
+        stack: super::STACK_TOP - 8,
+        argument: 0,
+        fs: 0,
+        gs: 0,
+    };
+    {
+        // SAFETY: As above.
+        let process = unsafe { process(slots[1]) };
+        super::add_thread(kernel, frames, process, slots[1], &start).expect("class test thread");
+    }
+    let main = |slot: usize| {
+        // SAFETY: As above; this read of one field ends at once.
+        unsafe { process(slot) }.members[0]
+    };
+    let (b, n0, i, n1) = (
+        main(slots[0]),
+        main(slots[1]),
+        main(slots[2]),
+        // SAFETY: As above.
+        unsafe { process(slots[1]) }.members[1],
+    );
+    let base = 1000;
+    let order = |now: u64| -> [(u16, u8); 4] {
+        let order = core::array::from_fn(|_| select(now).expect("a queued class test thread"));
+        // The pinned process's thread is never this CPU's.
+        assert_eq!(select(now), None, "selected a thread pinned away");
+        order
+    };
+    // Strict priority, FIFO within a rank.
+    stamp_queue_for_test(base);
+    assert_eq!(order(base), [(i, 0), (n0, 1), (n1, 1), (b, 2)]);
+    // One age step: background counts as normal, and normal as interactive,
+    // which keeps queue order within rank 0.
+    for slot in [b, n0, n1, i] {
+        enqueue(slot);
+    }
+    stamp_queue_for_test(base);
+    assert_eq!(order(base + AGE_TICKS), [(n0, 0), (n1, 0), (i, 0), (b, 1)]);
+    // Two steps: every class at rank 0, in queue order.
+    for slot in [b, n0, n1, i] {
+        enqueue(slot);
+    }
+    stamp_queue_for_test(base);
+    assert_eq!(
+        order(base + 2 * AGE_TICKS),
+        [(b, 0), (n0, 0), (n1, 0), (i, 0)]
+    );
+    // A woken thread goes first within its rank, never ahead of a better
+    // rank; a displaced one goes ahead of older entries of its rank.
+    begin_pass();
+    enqueue(n0);
+    enqueue(i);
+    enqueue_woken(n1);
+    enqueue_woken(b);
+    stamp_queue_for_test(base);
+    assert_eq!(order(base), [(i, 0), (n1, 1), (n0, 1), (b, 2)]);
+    begin_pass();
+    for slot in [b, n0, i] {
+        enqueue(slot);
+    }
+    requeue_displaced(n1);
+    stamp_queue_for_test(base);
+    assert_eq!(order(base), [(i, 0), (n1, 1), (n0, 1), (b, 2)]);
+    for slot in slots {
+        // SAFETY: The process never ran, and nothing references it; discard
+        // takes its threads off the run queue.
+        let mut process = unsafe { discard(slot) };
+        // SAFETY: Its root has never been active, and nothing references its
+        // tree.
+        unsafe { process.space.destroy(frames) }.expect("class test teardown");
+    }
+    super::drain_stacks(kernel, frames);
+    assert_drained();
+    baseline.assert_kept(frames, "class test frame leak");
+    serial::println!(
+        "MIRROR_SCHED_CLASS_TESTS_OK quanta={},{},{} age_ticks={}",
+        CpuClass::Interactive.quantum(),
+        CpuClass::Normal.quantum(),
+        CpuClass::Background.quantum(),
+        AGE_TICKS
+    );
+}
+
+/// Placement on synthetic CPU states (spec 0052, point 4): an idle CPU
+/// first, then the CPU running the worst rank strictly worse than the
+/// thread's class, never one at an equal rank, never a CPU twice, and only
+/// CPUs in the thread's mask.
+#[cfg(feature = "boot-smoke")]
+fn placement_self_test() {
+    // CPU 1 idle; CPUs 2 and 4 run background, CPU 3 normal.
+    let mut placement = Placement::new(0b10, [0, 0b1000, 0b1_0100]);
+    let all = 0b1_1110;
+    assert!(!placement.full());
+    for (class, targets) in [
+        (1, 0b10),
+        (1, 0b110),
+        (2, 0b110),
+        (1, 0b1_0110),
+        (1, 0b1_0110),
+        (0, 0b1_1110),
+        (0, 0b1_1110),
+    ] {
+        placement.offer(all, class);
+        assert_eq!(placement.targets, targets);
+    }
+    assert!(placement.full());
+    // An interactive thread prefers the CPU running background to the one
+    // running normal, and a mask confines it.
+    let mut placement = Placement::new(0, [0, 0b10, 0b100]);
+    placement.offer(0b110, 0);
+    assert_eq!(placement.targets, 0b100);
+    placement.offer(0b100, 0);
+    assert_eq!(placement.targets, 0b100);
+    placement.offer(0b110, 0);
+    assert_eq!(placement.targets, 0b110);
+    // A CPU running the thread's own class or a better one is never taken.
+    let mut placement = Placement::new(0, [0b10, 0, 0]);
+    placement.offer(0b10, 0);
+    assert_eq!(placement.targets, 0);
+}
+
+/// Set every queued thread's ready tick to `tick` (class self-test).
+#[cfg(feature = "boot-smoke")]
+fn stamp_queue_for_test(tick: u64) {
+    RUN_QUEUE.with(|queue| {
+        let mut current = queue.head;
+        for _ in 0..queue.length {
+            queue.ready_since[usize::from(current)] = tick;
+            current = queue.next[usize::from(current)];
+        }
+    });
+}
+
 /// Append a ready thread to the run queue.
 pub(super) fn enqueue(slot: u16) {
     append(slot, false);
@@ -1122,6 +1408,7 @@ fn requeue_displaced(slot: u16) {
 
 fn append(slot: u16, woken: bool) {
     let index = usize::from(slot);
+    let now = timer::ticks();
     RUN_QUEUE.with(|queue| {
         assert!(!queue.queued[index], "thread queued twice");
         if queue.length == 0 {
@@ -1132,8 +1419,17 @@ fn append(slot: u16, woken: bool) {
         queue.tail = slot;
         queue.queued[index] = true;
         queue.woken_in[index] = if woken { queue.pass } else { 0 };
+        queue.ready_since[index] = now;
         queue.length += 1;
     });
+}
+
+/// A queued thread's rank for selection (spec 0052, point 2): its class's
+/// rank, one better for each `AGE_TICKS` it has waited ready, and never
+/// better than 0. A thread queued after `now` has not waited.
+fn effective_rank(class: u8, ready_since: u64, now: u64) -> u8 {
+    let levels = now.saturating_sub(ready_since) / AGE_TICKS;
+    class.saturating_sub(u8::try_from(levels).unwrap_or(u8::MAX))
 }
 
 /// Start a completion pass: threads woken earlier lose their precedence.
@@ -1197,30 +1493,39 @@ fn unlink(queue: &mut RunQueue, previous: Option<u16>, slot: u16) {
     queue.length -= 1;
 }
 
-/// Dequeue the first thread for which `runnable` holds, preferring those
-/// that the current pass queued as woken. One scan of at most the whole
-/// queue (THREAD_SLOTS entries); `runnable` sees each entry at most once.
-fn dequeue_first(mut runnable: impl FnMut(u16) -> bool) -> Option<u16> {
+/// Dequeue the best thread that may run here, and return it with its
+/// effective rank (spec 0052, point 2). `class_rank` gives a queued thread's
+/// class rank, or `None` when it may not run on this CPU now. The best has
+/// the least effective rank; within a rank, one the current pass queued as
+/// woken, then the first in queue order (0030-D3). One scan of at most the
+/// whole queue (THREAD_SLOTS entries), and `class_rank` sees each entry at
+/// most once.
+fn dequeue_first(now: u64, mut class_rank: impl FnMut(u16) -> Option<u8>) -> Option<(u16, u8)> {
     RUN_QUEUE.with(|queue| {
-        // The first runnable older entry and its predecessor.
-        let mut fallback = None;
+        // The best key so far, (rank, not woken), with its entry and that
+        // entry's predecessor.
+        let mut best: Option<((u8, bool), Option<u16>, u16)> = None;
         let mut previous = None;
         let mut current = queue.head;
         for _ in 0..queue.length {
-            let woken = queue.woken_in[usize::from(current)] == queue.pass;
-            if (woken || fallback.is_none()) && runnable(current) {
-                if woken {
-                    unlink(queue, previous, current);
-                    return Some(current);
+            let index = usize::from(current);
+            if let Some(class) = class_rank(current) {
+                let rank = effective_rank(class, queue.ready_since[index], now);
+                let key = (rank, queue.woken_in[index] != queue.pass);
+                if best.is_none_or(|(best_key, _, _)| key < best_key) {
+                    best = Some((key, previous, current));
+                    // Nothing beats a woken entry of rank 0.
+                    if key == (0, false) {
+                        break;
+                    }
                 }
-                fallback = Some((previous, current));
             }
             previous = Some(current);
-            current = queue.next[usize::from(current)];
+            current = queue.next[index];
         }
-        let (previous, slot) = fallback?;
+        let ((rank, _), previous, slot) = best?;
         unlink(queue, previous, slot);
-        Some(slot)
+        Some((slot, rank))
     })
 }
 
@@ -1722,8 +2027,8 @@ pub(super) fn run(
             }
         }
         let selected = select(now);
-        kick_idle(now);
-        let Some(slot) = selected else {
+        kick_work(now);
+        let Some((slot, rank)) = selected else {
             // Work an AP handed over while a release dropped SCHED, and a
             // process whose last thread left another CPU meanwhile, wait for
             // the next pass and loop top instead of a halt.
@@ -1735,7 +2040,7 @@ pub(super) fn run(
         // SAFETY: The thread is occupied and nothing references it here.
         let owner = usize::from(unsafe { (*thread_entry(slot)).process });
         cpudata::note_dispatch(owner as u32);
-        returned = dispatch(kernel, Some(&mut *frames), owner, slot);
+        returned = dispatch(kernel, Some(&mut *frames), owner, slot, rank);
         #[cfg(feature = "boot-smoke")]
         if let End::Pair {
             first,
@@ -1848,15 +2153,15 @@ pub(super) fn run_ap() {
             requeue(thread);
         }
         let selected = select(now);
-        kick_idle(now);
-        let Some(slot) = selected else {
+        kick_work(now);
+        let Some((slot, rank)) = selected else {
             idle();
             continue;
         };
         // SAFETY: The thread is occupied and nothing references it here.
         let owner = usize::from(unsafe { (*thread_entry(slot)).process });
         cpudata::note_dispatch(owner as u32);
-        returned = dispatch(kernel, None, owner, slot);
+        returned = dispatch(kernel, None, owner, slot, rank);
     }
     if let Some(thread) = returned.take() {
         requeue(thread);
@@ -2007,8 +2312,9 @@ fn complete_shell_requests(
         }
         set_current(shell_slot, slot);
         let result = match state {
+            // The shell's apps are normal (spec 0052, point 1).
             State::Launching(kind) => runtime
-                .launch(frames, shell, kind)
+                .launch(frames, shell, kind, CpuClass::Normal)
                 .unwrap_or_else(|error| error as u64),
             // A close whose app still has a thread on a CPU stays pending;
             // the close kicked that CPU, which kicks this one back once the
@@ -2031,12 +2337,13 @@ fn complete_shell_requests(
     }
 }
 
-/// Dequeue the first ready thread whose process may run on this CPU now and
-/// which is on no CPU. The CPU policy stays the gate, so a throttled service
-/// never resumes, and the process's CPU mask pins it (spec 0051, point 6).
-fn select(now: u64) -> Option<u16> {
+/// Dequeue the best ready thread that may run on this CPU and is on no CPU,
+/// with its effective rank (spec 0052, point 2). Its process's CPU mask pins
+/// it (spec 0051, point 6); nothing else gates it, so the scheduler is
+/// work-conserving (spec 0052, point 4).
+fn select(now: u64) -> Option<(u16, u8)> {
     let me = 1 << cpudata::current_cpu();
-    dequeue_first(|slot| {
+    dequeue_first(now, |slot| {
         // SAFETY: Queued slots are occupied, and the scheduler holds no
         // reference to this thread or its process; both borrows end here.
         let (state, owner, on_cpu) = unsafe {
@@ -2045,48 +2352,64 @@ fn select(now: u64) -> Option<u16> {
         };
         // Its CPU has not stored its context yet (spec 0051, point 2).
         if on_cpu {
-            return false;
+            return None;
         }
         assert_eq!(state, State::Ready, "queued thread is not ready");
         // SAFETY: As above.
         let process = unsafe { process(owner) };
         assert!(!process.finished(), "finished process left a queued thread");
-        process.cpus & me != 0
-            && match &mut process.policy {
-                CpuPolicy::Probe => true,
-                CpuPolicy::Shell(policy) | CpuPolicy::Application(policy) => policy.eligible(now),
-            }
+        (process.cpus & me != 0).then_some(process.class.rank())
     })
 }
 
-/// The CPUs that could take work this pass left (spec 0051, point 3): those
-/// a queued, eligible thread's process may run on, and those that may
-/// complete a signaled wait that this CPU had to leave.
-fn waiting_work(now: u64) -> (u64, u64) {
-    let ready = RUN_QUEUE.with(|queue| {
-        let mut cpus = 0;
-        let mut current = queue.head;
-        for _ in 0..queue.length {
-            // SAFETY: Queued slots and their processes are occupied, and
-            // these reads of single fields hold no reference past them. The
-            // policy is copied, so the eligibility check changes nothing.
-            let (on_cpu, process_cpus, mut policy) = unsafe {
-                let thread = thread_entry(current);
-                let process = PROCESSES.entry(usize::from((*thread).process));
-                ((*thread).on_cpu, (*process).cpus, (*process).policy)
-            };
-            let eligible = match &mut policy {
-                CpuPolicy::Probe => true,
-                CpuPolicy::Shell(policy) | CpuPolicy::Application(policy) => policy.eligible(now),
-            };
-            if !on_cpu && eligible {
-                cpus |= process_cpus;
-            }
-            current = queue.next[usize::from(current)];
+/// Where a pass's leftover work goes (spec 0052, point 4). Each queued thread,
+/// offered in selection order, takes at most one CPU it may run on: the
+/// lowest idle one, else the one whose running thread has the worst dispatch
+/// rank strictly worse than the thread's class. No CPU is taken twice.
+#[derive(Clone, Copy, Debug)]
+struct Placement {
+    idle: u64,
+    /// The CPUs running a user thread dispatched at each rank.
+    running: [u64; CLASSES],
+    targets: u64,
+}
+
+impl Placement {
+    const fn new(idle: u64, running: [u64; CLASSES]) -> Self {
+        Self {
+            idle,
+            running,
+            targets: 0,
         }
-        cpus
-    });
-    let signaled = WAITS.with(|waits| {
+    }
+
+    /// Place one queued thread that may run on `cpus`, of class rank `class`.
+    fn offer(&mut self, cpus: u64, class: u8) {
+        let free = cpus & !self.targets;
+        let idle = free & self.idle;
+        if idle != 0 {
+            self.targets |= idle.isolate_lowest_one();
+            return;
+        }
+        for rank in (usize::from(class) + 1..CLASSES).rev() {
+            let busy = free & self.running[rank];
+            if busy != 0 {
+                self.targets |= busy.isolate_lowest_one();
+                return;
+            }
+        }
+    }
+
+    /// Whether every CPU that could take work is taken.
+    fn full(&self) -> bool {
+        (self.idle | self.running.iter().fold(0, |cpus, &rank| cpus | rank)) & !self.targets == 0
+    }
+}
+
+/// The CPUs that may complete a signaled wait that this CPU had to leave:
+/// those its process may run on, for each wait whose thread is on no CPU.
+fn signaled_work() -> u64 {
+    WAITS.with(|waits| {
         let signals = &waits.signals;
         signals
             .links
@@ -2097,15 +2420,18 @@ fn waiting_work(now: u64) -> (u64, u64) {
                 (*PROCESSES.entry(usize::from((*thread_entry(slot)).process))).cpus
             })
             .fold(0, |cpus, process| cpus | process)
-    });
-    (ready, signaled)
+    })
 }
 
-/// After a pass, kick each idle CPU that could take the work it left, and
-/// one CPU that may complete a signaled wait this CPU could not, even a busy
-/// one when none is idle: its slice yields to the wake, as on one CPU
-/// (0030-D3). An AP that has not joined the open session counts as idle.
-fn kick_idle(now: u64) {
+/// After a pass, kick the CPUs that should take the work it left (spec 0052,
+/// points 4 and 5). The queued threads are placed in selection order, the
+/// better ranks first: on idle CPUs, or on CPUs that run a worse class, which
+/// the kick preempts. Each idle CPU that may complete a signaled wait this
+/// CPU could not is kicked too, and so is one CPU that may complete one, even
+/// a busy one when none is idle: its slice yields to the wake, as on one CPU
+/// (0030-D3). An AP that has not joined the open session counts as idle; a
+/// CPU in its own pass is neither idle nor running, and selects for itself.
+fn kick_work(now: u64) {
     let cpus = smp::userspace_mask();
     let me = cpudata::current_cpu();
     let others = cpus & !(1 << me);
@@ -2113,11 +2439,40 @@ fn kick_idle(now: u64) {
         return;
     }
     let participants = PARTICIPANTS.load(Ordering::SeqCst);
-    let idle = cpus_in(others)
-        .filter(|&cpu| cpudata::is_idle(cpu) || (cpu != 0 && participants & 1 << cpu == 0))
-        .fold(0, |mask, cpu| mask | 1 << cpu);
-    let (ready, signaled) = waiting_work(now);
-    let mut targets = (ready | signaled) & idle;
+    let mut idle = 0;
+    let mut running = [0; CLASSES];
+    for cpu in cpus_in(others) {
+        if cpudata::is_idle(cpu) || (cpu != 0 && participants & 1 << cpu == 0) {
+            idle |= 1 << cpu;
+        } else if let Some(rank) = cpudata::running_rank(cpu) {
+            running[usize::from(rank)] |= 1 << cpu;
+        }
+    }
+    let mut placement = Placement::new(idle, running);
+    RUN_QUEUE.with(|queue| {
+        for rank in 0..CLASSES as u8 {
+            let mut current = queue.head;
+            for _ in 0..queue.length {
+                if placement.full() {
+                    return;
+                }
+                let index = usize::from(current);
+                // SAFETY: Queued slots and their processes are occupied, and
+                // these reads of single fields hold no reference past them.
+                let (on_cpu, process_cpus, class) = unsafe {
+                    let thread = thread_entry(current);
+                    let process = PROCESSES.entry(usize::from((*thread).process));
+                    ((*thread).on_cpu, (*process).cpus, (*process).class.rank())
+                };
+                if !on_cpu && effective_rank(class, queue.ready_since[index], now) == rank {
+                    placement.offer(process_cpus & others, class);
+                }
+                current = queue.next[index];
+            }
+        }
+    });
+    let signaled = signaled_work();
+    let mut targets = placement.targets | signaled & idle;
     let urgent = signaled & others;
     if urgent != 0 && urgent & idle == 0 {
         targets |= 1 << urgent.trailing_zeros();
@@ -2127,17 +2482,20 @@ fn kick_idle(now: u64) {
     }
 }
 
-/// Run one thread until it returns to the scheduler. A thread that comes back
-/// still ready is returned, for the next pass to queue again. Only slot
-/// indices cross the user entry; no process reference is held across it
-/// (spec 0051, point 2). The BSP passes its frame allocator and completes
-/// the thread's request itself; an AP passes none and hands requests that
-/// need it to the BSP (point 5).
+/// Run one thread, selected at effective rank `rank`, until it returns to
+/// the scheduler. A thread that comes back still ready is returned, for the
+/// next pass to queue again. Only slot indices cross the user entry; no
+/// process reference is held across it (spec 0051, point 2). The BSP passes
+/// its frame allocator and completes the thread's request itself; an AP
+/// passes none and hands requests that need it to the BSP (point 5). While
+/// it runs, this CPU publishes the rank for other CPUs' placement (spec
+/// 0052, point 5).
 fn dispatch(
     kernel: &PageTables,
     frames: Option<&mut FrameAllocator<'_>>,
     owner: usize,
     slot: u16,
+    rank: u8,
 ) -> Option<Returned> {
     {
         // SAFETY: The selected thread is occupied, and the scheduler holds no
@@ -2155,10 +2513,12 @@ fn dispatch(
     // this clear, so neither is lost.
     let _ = cpudata::take_need_resched();
     set_current(owner, slot);
+    cpudata::set_running_rank(Some(rank));
     match frames {
         Some(frames) => resume_process(kernel, frames, owner, slot),
         None => resume_on_ap(kernel, owner, slot),
     }
+    cpudata::set_running_rank(None);
     clear_current();
     // A preempted, yielding, displaced or completed thread rejoins the queue
     // after the next completion pass, behind the threads it wakes. Until then
@@ -2179,8 +2539,8 @@ fn dispatch(
 }
 
 /// Halt until an interrupt when no queued thread may run, with SCHED
-/// released. On the BSP some thread must be waiting on time or input, be
-/// throttled or run on another CPU, or a finished process must still have a
+/// released. On the BSP some thread must be waiting on time or input, or be
+/// pinned to or run on another CPU, or a finished process must still have a
 /// thread on another CPU, whose scheduler kicks the BSP once it has left;
 /// otherwise nothing could wake. An AP halts whenever it has no thread it
 /// may run. Only while this is the one CPU that runs user threads must
