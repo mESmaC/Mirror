@@ -36,7 +36,7 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
    - `SCHED` is an IRQ-off ticket spinlock that records its owner slot. It replaces `Exclusive` (sched.rs:150-178), which today panics on contention, and the `Table` `Sync` argument (sched.rs:77-81).
    - It covers the tables, the run queue, `Waits`, every `Process` and `Thread`, `Ipc` and `windows::Session`. The session is published once, replacing `ACTIVE_IPC/SURFACE/INPUT/WINDOWS` (userspace.rs:65-71).
    - Each CPU holds it for its whole scheduler pass, and for the whole CPL3 handler, from the first `with_active` until the frame returns (userspace.rs:3255-3278). The handler-wide hold is needed because `wait_word` checks the futex word and then parks in a second step (userspace.rs:2429-2432, :4229-4234); locking per step would lose wakeups.
-   - It is never held across `resume_user`, HLT, `heap::ensure`, `kernel_va` work or any IPI ACK wait (smp.rs:1125-1147).
+   - It is never held across `resume_user`, HLT, `heap::ensure`, `kernel_va` work or any IPI ACK wait (smp.rs:1125-1147). 2026-10-12, step 1: "`kernel_va` work" means the pool trim, whose batches wait for ACKs; a stack build or free never waits and runs under `SCHED` in the pass, and session setup and teardown hold `SCHED` except across `heap::ensure` and the trim.
    - The spin is bounded at about 1 s and then panics with "scheduler lock wait exceeded".
    - Lock order is `SCHED`, then serial. Nothing is taken while serial is held.
 
@@ -103,7 +103,7 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
    - **Join.** A joiner is signalled only after the BSP has freed the exited thread's stack (userspace.rs:2253-2257, :2378-2383).
 
 9. **Serial, clock, accounting and session end.**
-   - `serial::print` (serial.rs:64-70) takes an owner-aware spinlock after `cli`. Re-entry on the same CPU prints without waiting. The crash owner bypasses the lock after the stop and starts with `\r\n`.
+   - `serial::print` (serial.rs:64-70) takes an owner-aware spinlock after `cli`. Re-entry on the same CPU prints without waiting. The crash owner bypasses the lock after the stop and starts with `\r\n`. 2026-10-12, step 1: the wait is bounded (at least 2.5 s), after which the CPU prints unlocked, so a CPU stopped mid-print can garble a line but never hang a report.
    - `clock::snapshot` drops its BSP assert. It loads `LAST_COUNTER` before reading the counter, then asserts the counter did not go backwards, then calls `fetch_max` (clock.rs:314-335).
    - `ServicePolicy::charge` saturates instead of asserting (userspace.rs:301-306).
    - `idle()`'s single-CPU asserts are relaxed (sched.rs:1283-1315).
@@ -141,6 +141,7 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
       - `MIRROR_CRASH_ACTION action=<exit|halt|reboot> delay_ms=`;
       - `MIRROR_CRASH_NESTED depth=2`.
     - **Boot-smoke only:**
+      - `MIRROR_SMP_PRINT cpu= line= text=`, eight per printing CPU, then `MIRROR_SMP_TESTS_OK print_cpus=<n> print_lines=8` (step 1);
       - `MIRROR_SMP_USER_OK cpus= threads=16 ran_on= cross_wakes= flushes= stale=0`;
       - `MIRROR_USER_FLUSH_TESTS_OK`;
       - `MIRROR_TEST_EXPECT_PANIC cpu=`;
@@ -151,7 +152,7 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
 ## Implementation steps
 Each step is one commit and must pass its targeted smoke cases.
 
-1. **Lock and per-CPU state, userspace still on the BSP only.** Points 1, 2 and 9. Pass gate: the existing 1-CPU and `-CpuCount 4` cases pass unchanged, and `MIRROR_SMP_TESTS_OK` gains a check that APs and the BSP print at the same time without breaking lines.
+1. **Lock and per-CPU state, userspace still on the BSP only.** Points 1, 2 and 9. Pass gate: the existing 1-CPU and `-CpuCount 4` cases pass unchanged, and `MIRROR_SMP_TESTS_OK` gains a check that APs and the BSP print at the same time without breaking lines. 2026-10-12: the check runs after the boot rendezvous (the BSP alone with `-LegacyPic` or one CPU). Each CPU prints a first line, waits for every CPU's first, then prints seven more; run.ps1 requires whole lines and every CPU's last line after every CPU's first, before `MIRROR_SMP_TESTS_OK print_cpus= print_lines=8`.
 2. **User address-space concurrency and the shootdown.** Points 7 and 8: atomic publication, materialize taking frames up front, the CPU mask, `OP_FLUSH_USER`, two-phase removal, killed-process teardown, and join after the stack free. A boot-smoke self-test flushes a scratch root on every AP and prints `MIRROR_USER_FLUSH_TESTS_OK`. Add `UserFlushTimeout`.
 3. **AP plumbing.** Points 3 and 4: AP timers, vector 242, `send_ipi` from any CPU, and AP trap routing with `expect_fault`. `MIRROR_SMP_TESTS_OK` gains checks that every AP ticks and answers a 242 round trip.
 4. **NMI stop and backtrace.** Frame pointers, `crash.rs`, `send_nmi`, `STOPPED`, the paranoid hook and the routing. Add the STOP, FRAME, BACKTRACE, ACTION and NESTED markers, `Assert-MirrorCrash`, and the Panic, ApPanic, DoublePanic, NestedPanic and SchedStall cases. This lands before step 5, so that failures on APs in step 5 are visible rather than silent.

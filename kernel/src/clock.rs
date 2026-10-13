@@ -310,28 +310,68 @@ pub fn is_available() -> bool {
 /// The counter is never reset after publication. Conversion saturates at u64::MAX
 /// instead of wrapping (~584 years). A raw counter reset/regression is fatal
 /// (except to `restart_counter_ns`); suspend/resume and extending a full 64-bit rollover are not yet supported.
-/// Current consumers are BSP-only with IF clear, serializing sample observation.
+/// Any CPU may read it with IF clear (spec 0051, point 9). The highest value
+/// read so far is loaded before the counter: every read it records came
+/// earlier, so a counter below it really went backwards, however reads on
+/// other CPUs interleave. `fetch_max` then keeps the highest.
 pub fn snapshot() -> Option<ClockSnapshot> {
     assert!(!arch::interrupts_enabled(), "clock read requires IF clear");
-    assert!(
-        !crate::smp::is_secondary(),
-        "clock read requires BSP ownership"
-    );
     let period = PERIOD_FS.load(Ordering::Acquire);
     if period == 0 {
         return None;
     }
+    // Acquire keeps the counter read below after this load, and pairs with
+    // the Release of the fetch_max that stored the value.
+    let last = LAST_COUNTER.load(Ordering::Acquire);
     // SAFETY: Acquire observed the permanent UC mapping and enabled 64-bit
     // counter. Reads do not mutate device state; no later writer is permitted.
     let counter = unsafe { read(COUNTER) };
-    assert!(
-        LAST_COUNTER.fetch_max(counter, Ordering::Relaxed) <= counter,
-        "HPET main counter regressed or was reset"
-    );
+    assert!(counter >= last, "HPET main counter regressed or was reset");
+    // Release keeps the counter read above before the store.
+    LAST_COUNTER.fetch_max(counter, Ordering::Release);
     Some(ClockSnapshot {
         monotonic_ns: nanoseconds(counter, period),
         resolution_ns: resolution_ns(period),
     })
+}
+
+/// A bound for a spin with IF clear on any CPU (spec 0051): elapsed HPET time
+/// when the clock is published, sampled every `SPIN_SAMPLE` polls, else a poll
+/// count at 2 ns per poll. Each poll executes a PAUSE, which alone takes
+/// longer, so the count never ends a wait early; it may end one late.
+pub(crate) struct SpinBound {
+    start_ns: Option<u64>,
+    limit_ns: u64,
+    polls: u64,
+}
+
+const SPIN_SAMPLE: u64 = 64;
+const SPIN_MIN_POLL_NS: u64 = 2;
+
+impl SpinBound {
+    pub(crate) fn new(limit_ns: u64) -> Self {
+        Self {
+            start_ns: snapshot().map(|now| now.monotonic_ns),
+            limit_ns,
+            polls: 0,
+        }
+    }
+
+    /// Count one poll and report whether the bound has passed.
+    pub(crate) fn expired(&mut self) -> bool {
+        self.polls = self.polls.saturating_add(1);
+        match self.start_ns {
+            Some(start_ns) => {
+                self.polls.is_multiple_of(SPIN_SAMPLE)
+                    && snapshot()
+                        .expect("published HPET clock")
+                        .monotonic_ns
+                        .saturating_sub(start_ns)
+                        >= self.limit_ns
+            }
+            None => self.polls >= self.limit_ns / SPIN_MIN_POLL_NS,
+        }
+    }
 }
 
 /// The HPET counter in nanoseconds for the restart path only (spec 0058a,

@@ -42,9 +42,39 @@ function Assert-MirrorSmpMarkers {
     if ($Serial -match '(?m)^MIRROR_SMP_CPU_FAILED(?:\s|$)') {
         throw 'The SMP regression reported an unexpected CPU failure.'
     }
-    if ([regex]::Matches($Serial, '(?m)^MIRROR_SMP_TESTS_OK\r?$').Count -ne 1 -or
+    # The concurrent print check (spec 0051, step 1): each printing CPU prints
+    # eight whole lines through the serial lock, and every CPU's last line
+    # follows every CPU's first, so they printed at the same time. A line that
+    # another CPU's bytes broke fails the whole-line match, and its fragments
+    # no longer pair up.
+    $printCpus = if ($UseLegacyPic) { 1 } else { $RequestedCpus }
+    $testsOk = [regex]::Matches($Serial, ('(?m)^MIRROR_SMP_TESTS_OK print_cpus={0} print_lines=8\r?$' -f $printCpus))
+    if ($testsOk.Count -ne 1 -or
         [regex]::Matches($Serial, '(?m)^MIRROR_SMP_TESTS_OK(?:\s|$)').Count -ne 1) {
-        throw 'Mirror must complete the SMP policy and mailbox checks exactly once.'
+        throw 'Mirror must complete the SMP policy, mailbox and print checks exactly once.'
+    }
+    $printText = '0123456789abcdefghijklmnopqrstuvwxyz'
+    $printLines = [regex]::Matches($Serial, "(?m)^MIRROR_SMP_PRINT cpu=(\d+) line=(\d+) text=$printText\r?$")
+    $printFragments = [regex]::Matches($Serial, "MIRROR_SMP_PRINT|$printText").Count
+    if ($printLines.Count -ne 8 * $printCpus -or $printFragments -ne 2 * $printLines.Count) {
+        throw "Each of $printCpus CPU(s) must print eight whole SMP check lines."
+    }
+    $firstLine = @{}
+    $lastLine = @{}
+    $nextLine = @{}
+    foreach ($line in $printLines) {
+        $cpu = [int]$line.Groups[1].Value
+        $number = [int]$line.Groups[2].Value
+        if ($cpu -ge $printCpus -or $number -ne [int]$nextLine[$cpu] -or $line.Index -ge $testsOk[0].Index) {
+            throw 'Each CPU must print its SMP check lines once each, in order, before MIRROR_SMP_TESTS_OK.'
+        }
+        if ($number -eq 0) { $firstLine[$cpu] = $line.Index }
+        $lastLine[$cpu] = $line.Index
+        $nextLine[$cpu] = $number + 1
+    }
+    if ($firstLine.Count -ne $printCpus -or @($nextLine.Values | Where-Object { $_ -ne 8 }).Count -ne 0 -or
+        ($lastLine.Values | Measure-Object -Minimum).Minimum -le ($firstLine.Values | Measure-Object -Maximum).Maximum) {
+        throw 'Every CPU must print an SMP check line after every CPU printed its first.'
     }
     $sharedCpus = if ($UseLegacyPic) { 1 } else { $RequestedCpus }
     $sharedPattern = '(?m)^MIRROR_SHARED_VM_READY pages=512 cpus={0} rounds=4 reclaimed=3 borrowed_root=1\r?$' -f $sharedCpus
@@ -128,6 +158,9 @@ function Assert-MirrorSmpMarkers {
         if (($phase.Name -eq 'boot' -and $shared[0].Index -le $phaseRecords[0].Index) -or
             ($phase.Name -eq 'after_userspace' -and $shared[0].Index -ge $phaseRecords[0].Index)) {
             throw 'Shared mapping reuse checks must follow CPU startup and precede the completed userspace rendezvous.'
+        }
+        if ($phase.Name -eq 'boot' -and $firstLine[0] -le $phaseRecords[0].Index) {
+            throw 'The SMP print check must follow the boot rendezvous, with every AP online.'
         }
         $previousPhase = $phaseRecords[0].Index
     }

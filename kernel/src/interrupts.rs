@@ -1,4 +1,5 @@
-//! Per-CPU exception descriptors and BSP synchronous ring-3 entry/return delivery.
+//! Per-CPU exception descriptors and synchronous ring-3 entry/return delivery
+//! on the calling CPU.
 //!
 //! Descriptors, TLS bases and frames follow Intel SDM vol. 3A, §§3.4.4, 6.14, 7.7:
 //! https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
@@ -195,11 +196,10 @@ static mut SECONDARY_TSS: [TaskStateSegment; MAX_CPUS - 1] =
     [const { TaskStateSegment::EMPTY }; MAX_CPUS - 1];
 static mut SECONDARY_GDT: [[u64; 7]; MAX_CPUS - 1] = [[0; 7]; MAX_CPUS - 1];
 
-// Assembly saves the BSP's suspended kernel stack in its CpuData, with IF
-// clear (spec 0050-D1). APs do not execute userspace yet. The BSP scheduler
-// resumes after each yield or preemption; it retains user trap frames rather
-// than suspended Rust handler stacks.
-static USER_ACTIVE: AtomicBool = AtomicBool::new(false);
+// Assembly saves each CPU's suspended kernel stack in its CpuData, with IF
+// clear (spec 0050-D1), and CpuData's user flag marks an entered user context
+// (spec 0051). The scheduler resumes after each yield or preemption; it
+// retains user trap frames rather than suspended Rust handler stacks.
 
 #[cfg(feature = "boot-smoke")]
 static BREAKPOINT_ARMED: AtomicBool = AtomicBool::new(false);
@@ -296,14 +296,26 @@ pub(crate) fn valid_user_tls(frame: &TrapFrame) -> bool {
         && valid_selector(frame.gs_selector)
 }
 
-/// Kernel Rust must never inherit user TLS, and on the BSP it runs with its
+/// Kernel Rust must never inherit user TLS, and it runs with this CPU's
 /// CpuData in GS once installed (0050-D1). Reading the actual MSRs also
 /// catches selector loads that changed a base without a TLS syscall.
 fn assert_kernel_tls_clean() {
     assert!(
-        kernel_tls_clean(cpudata::expected_bsp_gs_base(), true),
+        kernel_tls_clean(expected_gs_base(), true),
         "kernel FS/GS state is not clean"
     );
+}
+
+/// The IA32_GS_BASE this CPU must hold in kernel mode: its own CpuData once
+/// installed, 0 before (0050-D1 (e)). The CPU is identified by its CPUID APIC
+/// ID, not through GS, so a base that names another CPU's entry fails the
+/// check (spec 0051, point 2). Before SMP startup only the BSP runs.
+fn expected_gs_base() -> u64 {
+    match crate::smp::cpuid_slot() {
+        Some(slot) if cpudata::is_installed(slot) => cpudata::address(slot),
+        Some(_) => 0,
+        None => cpudata::expected_bsp_gs_base(),
+    }
 }
 
 /// The kernel TLS state on this CPU: a zero FS base, IA32_GS_BASE equal to
@@ -730,39 +742,64 @@ pub(crate) unsafe fn installed_ists(cpu: usize) -> [u64; IST_COUNT] {
     core::array::from_fn(|index| fields[index])
 }
 
-/// The BSP's TSS.RSP0: the running thread's kernel stack top during a
+/// This CPU's TSS: the BSP's static one, or its AP slot's own (spec 0051,
+/// point 2). Only that CPU writes it after install, and only its RSP0.
+fn current_tss() -> *mut TaskStateSegment {
+    let cpu = cpudata::current_cpu();
+    if cpu == 0 {
+        return addr_of_mut!(TSS);
+    }
+    assert!(
+        SECONDARY_CLAIMED[cpu - 1].load(Ordering::Acquire),
+        "secondary descriptors not installed"
+    );
+    // SAFETY: current_cpu bounds the slot below MAX_CPUS, so the index is in
+    // bounds, and no reference to the array is formed.
+    unsafe {
+        addr_of_mut!(SECONDARY_TSS)
+            .cast::<TaskStateSegment>()
+            .add(cpu - 1)
+    }
+}
+
+/// This CPU's TSS.RSP0: the running thread's kernel stack top during a
 /// dispatch, the placeholder otherwise (0050-D2).
 pub(crate) fn kernel_stack() -> u64 {
-    // SAFETY: Only the BSP writes RSP0, with IF clear, and this unaligned read
-    // of the packed field forms no reference.
+    // SAFETY: Only this CPU writes its RSP0, with IF clear, and this unaligned
+    // read of the packed field forms no reference.
     unsafe {
-        addr_of!(TSS.privilege_stacks)
+        addr_of!((*current_tss()).privilege_stacks)
             .cast::<u64>()
             .read_unaligned()
     }
 }
 
-/// Set the kernel stack used by hardware on CPL3 -> CPL0 entry: the running
-/// thread's own stack at each dispatch, and the BSP's placeholder stack while
-/// no thread runs (0050-D2).
+/// Whether a user context is entered on this CPU: from user entry until the
+/// suspended scheduler resumes, its trap handlers included.
+pub(crate) fn user_context_active() -> bool {
+    cpudata::user_active()
+}
+
+/// Set the kernel stack used by hardware on CPL3 -> CPL0 entry on this CPU:
+/// the running thread's own stack at each dispatch, and this CPU's
+/// placeholder stack while no thread runs (0050-D2).
 ///
 /// # Safety
-/// Only the BSP may call, with interrupts disabled and no active user context.
-/// `top` must be 16-byte aligned and immediately above a writable, supervisor
-/// stack large enough for hardware frames, handlers, and nested exceptions.
-/// The stack must stay mapped in every address space until replaced.
+/// Only the CPU that owns the TSS calls this, after its CpuData install, with
+/// interrupts disabled and no active user context on it. `top` must be
+/// 16-byte aligned and immediately above a writable, supervisor stack large
+/// enough for hardware frames, handlers, and nested exceptions. The stack
+/// must stay mapped in every address space until replaced.
 pub(crate) unsafe fn set_kernel_stack(top: u64) {
     assert!(is_initialized(), "IDT not initialized");
     assert!(!arch::interrupts_enabled(), "RSP0 update requires IF=0");
-    assert!(
-        !USER_ACTIVE.load(Ordering::SeqCst),
-        "user context is active"
-    );
+    assert!(!user_context_active(), "user context is active");
     assert!(top != 0 && top.is_multiple_of(16), "invalid RSP0");
-    // SAFETY: Caller supplies exclusive BSP access and a persistent stack.
-    // TSS is packed, so the RSP0 field requires an unaligned raw-pointer write.
+    // SAFETY: The caller supplies this CPU's exclusive TSS access and a
+    // persistent stack. TSS is packed, so the RSP0 field requires an unaligned
+    // raw-pointer write.
     unsafe {
-        addr_of_mut!(TSS.privilege_stacks)
+        addr_of_mut!((*current_tss()).privilege_stacks)
             .cast::<u64>()
             .write_unaligned(top);
     }
@@ -810,7 +847,8 @@ pub(crate) fn user_frame(entry: u64, stack: u64, argument: u64) -> TrapFrame {
 /// and the extended state saved before restoring clean kernel register state.
 ///
 /// # Safety
-/// Only the BSP may call; interrupts must be disabled. The active page tables
+/// The calling CPU enters its own user context, after its CpuData install;
+/// interrupts must be disabled. The active page tables
 /// must isolate user mappings from kernel mappings and belong to this context.
 /// The frame must contain the intended user's state; set_kernel_stack must have
 /// installed a mapped kernel stack. IRQ handlers and scheduling state must be
@@ -843,10 +881,7 @@ pub(crate) unsafe fn resume_user(frame: &TrapFrame, extended: *mut fpu::State) {
     let mut prepared = *frame;
     prepared.rflags = (prepared.rflags & USER_RFLAGS_MASK) | 0x202;
     assert_ne!(kernel_stack(), 0, "user entry requires a kernel stack");
-    assert!(
-        !USER_ACTIVE.swap(true, Ordering::SeqCst),
-        "nested user entry"
-    );
+    assert!(!cpudata::swap_user_active(true), "nested user entry");
     // SAFETY: Caller guarantees this context's address space and kernel stacks.
     // The validated copy has only CPL3 selectors and unprivileged flags. Assembly
     // copies it before restoring registers, preserves kernel callee-saved GPRs,
@@ -858,7 +893,7 @@ pub(crate) unsafe fn resume_user(frame: &TrapFrame, extended: *mut fpu::State) {
     assert_kernel_tls_clean();
     // Assembly has returned to the saved stack with IF clear.
     cpudata::clear_user_kernel_rsp();
-    assert!(USER_ACTIVE.swap(false, Ordering::SeqCst));
+    assert!(cpudata::swap_user_active(false));
 }
 
 /// Request a return to the suspended kernel caller after this handler unwinds.
@@ -866,10 +901,9 @@ pub(crate) unsafe fn resume_user(frame: &TrapFrame, extended: *mut fpu::State) {
 pub(crate) fn return_from_user(frame: &mut TrapFrame) {
     assert_eq!(frame.cs & 3, 3, "kernel return requires a user frame");
     assert!(!arch::interrupts_enabled(), "user handler requires IF=0");
-    assert!(USER_ACTIVE.load(Ordering::SeqCst), "no active user context");
-    // Only the BSP runs, and IF is clear. The entry assembly recorded this
-    // trusted supervisor-only stack pointer in this CPU's CpuData before
-    // enabling user execution.
+    assert!(user_context_active(), "no active user context");
+    // IF is clear. The entry assembly recorded this trusted supervisor-only
+    // stack pointer in this CPU's CpuData before enabling user execution.
     let kernel_rsp = cpudata::user_kernel_rsp();
     assert_ne!(kernel_rsp, 0, "no suspended kernel stack");
     frame.rip = mirror_resume_kernel as *const () as u64;
@@ -1221,12 +1255,19 @@ extern "C" fn mirror_exception_dispatch(frame: &mut TrapFrame) {
     }
     #[cfg(feature = "boot-smoke")]
     assert_kernel_tls_clean();
+    let from_user = frame.cs & 3 == 3;
     dispatch(frame);
     // User RSP is arbitrary even when the interrupt came from a valid RIP.
     // Validate every user return, including IRQs, before assembly reaches IRETQ.
     // Exit/fault handlers already rewrite CS to the trusted kernel continuation.
     if frame.cs & 3 == 3 {
         crate::userspace::prepare_return(frame);
+    }
+    // A CPL3 handler holds the scheduler lock from its first process access
+    // until here, whether its frame resumes the user or the suspended
+    // scheduler (spec 0051, point 1).
+    if from_user {
+        crate::userspace::end_trap();
     }
 }
 
@@ -1248,7 +1289,7 @@ extern "C" fn mirror_paranoid_dispatch(frame: &mut TrapFrame) {
     // selector checks are skipped (0050-D1 (c)).
     #[cfg(feature = "boot-smoke")]
     assert!(
-        kernel_tls_clean(cpudata::expected_bsp_gs_base(), false),
+        kernel_tls_clean(expected_gs_base(), false),
         "paranoid entry left a user TLS state"
     );
     dispatch(frame);

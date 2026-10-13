@@ -22,7 +22,7 @@
 
 use core::arch::asm;
 use core::mem::{offset_of, size_of};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 pub(crate) const MAX_CPUS: usize = 64;
 const IA32_GS_BASE: u32 = 0xc000_0101;
@@ -32,7 +32,8 @@ const IA32_KERNEL_GS_BASE: u32 = 0xc000_0102;
 const KERNEL_HALF: u64 = 0xffff_8000_0000_0000;
 
 /// One CPU's data. Its first four words have fixed offsets that the entry
-/// assembly uses through GS.
+/// assembly uses through GS. The scheduler's per-CPU state follows them
+/// (spec 0051, point 2).
 #[repr(C, align(64))]
 pub(crate) struct CpuData {
     /// This entry's own address, so assembly can name it through GS.
@@ -44,8 +45,32 @@ pub(crate) struct CpuData {
     user_kernel_rsp: AtomicU64,
     /// The ID of the thread running in user mode on this CPU, 0 for none.
     current_thread: AtomicU64,
+    /// The process and thread table slots that this CPU runs, or whose wait
+    /// or request its scheduler pass completes; `NO_SLOT` for none.
+    process: AtomicU32,
+    thread: AtomicU32,
+    /// The process this CPU's scheduler dispatched last, for its switch count.
+    last_process: AtomicU32,
+    /// Set when an event signals a wait during this CPU's user slice, so the
+    /// syscall that signaled returns to the scheduler (0030-D3).
+    need_resched: AtomicBool,
+    /// A user context is entered on this CPU: from user entry until the
+    /// suspended scheduler resumes, its trap handlers included.
+    user_active: AtomicBool,
+    /// This CPU's scheduler halts for want of an eligible thread.
+    idle: AtomicBool,
+    /// This CPU holds the scheduler lock. No IPI acknowledgement wait may
+    /// start while it is set (spec 0051, open point 3).
+    sched_held: AtomicBool,
     installed: AtomicBool,
+    /// This CPU's scheduler pass statistics: dispatches that changed process,
+    /// and timer ticks spent halted.
+    switches: AtomicU64,
+    idle_ticks: AtomicU64,
 }
+
+/// Marks no process or thread slot in a `CpuData` slot field.
+pub(crate) const NO_SLOT: u32 = u32::MAX;
 
 impl CpuData {
     const fn new() -> Self {
@@ -54,7 +79,16 @@ impl CpuData {
             slot: AtomicU64::new(0),
             user_kernel_rsp: AtomicU64::new(0),
             current_thread: AtomicU64::new(0),
+            process: AtomicU32::new(NO_SLOT),
+            thread: AtomicU32::new(NO_SLOT),
+            last_process: AtomicU32::new(NO_SLOT),
+            need_resched: AtomicBool::new(false),
+            user_active: AtomicBool::new(false),
+            idle: AtomicBool::new(false),
+            sched_held: AtomicBool::new(false),
             installed: AtomicBool::new(false),
+            switches: AtomicU64::new(0),
+            idle_ticks: AtomicU64::new(0),
         }
     }
 }
@@ -67,7 +101,8 @@ const SLOT_OFFSET: usize = offset_of!(CpuData, slot);
 const _: () = assert!(SELF_OFFSET == 0);
 const _: () = assert!(SLOT_OFFSET == 8);
 const _: () = assert!(USER_KERNEL_RSP_OFFSET == 16);
-const _: () = assert!(size_of::<CpuData>() == 64);
+// The entry words and the scheduler state take two cache lines (spec 0051).
+const _: () = assert!(size_of::<CpuData>() == 128);
 
 static CPU_DATA: [CpuData; MAX_CPUS] = [const { CpuData::new() }; MAX_CPUS];
 
@@ -156,6 +191,15 @@ pub(crate) unsafe fn install(slot: usize) -> bool {
     data.slot.store(slot as u64, Ordering::Relaxed);
     data.user_kernel_rsp.store(0, Ordering::Relaxed);
     data.current_thread.store(0, Ordering::Relaxed);
+    data.process.store(NO_SLOT, Ordering::Relaxed);
+    data.thread.store(NO_SLOT, Ordering::Relaxed);
+    data.last_process.store(NO_SLOT, Ordering::Relaxed);
+    data.need_resched.store(false, Ordering::Relaxed);
+    data.user_active.store(false, Ordering::Relaxed);
+    data.idle.store(false, Ordering::Relaxed);
+    data.sched_held.store(false, Ordering::Relaxed);
+    data.switches.store(0, Ordering::Relaxed);
+    data.idle_ticks.store(0, Ordering::Relaxed);
     // SAFETY: CPL0 with IF clear per the caller. The entry is a static and so
     // a canonical kernel address. Nothing reads through GS before this, and
     // the order keeps the D1 invariant at every instruction.
@@ -169,6 +213,12 @@ pub(crate) unsafe fn install(slot: usize) -> bool {
 /// Whether the BSP has installed its entry.
 pub(crate) fn bsp_installed() -> bool {
     CPU_DATA[0].installed.load(Ordering::Acquire)
+}
+
+/// Whether `slot` has installed its entry. Panics for a slot outside the
+/// table.
+pub(crate) fn is_installed(slot: usize) -> bool {
+    CPU_DATA[slot].installed.load(Ordering::Acquire)
 }
 
 /// The IA32_GS_BASE value the BSP must hold now: its entry once installed,
@@ -249,6 +299,95 @@ pub(crate) fn current_thread() -> u64 {
     current().current_thread.load(Ordering::Relaxed)
 }
 
+/// Record the process and thread slots this CPU runs or completes for, or
+/// `None` once it is done with them (spec 0051, point 2).
+pub(crate) fn set_running(slots: Option<(u32, u32)>) {
+    let (process, thread) = slots.unwrap_or((NO_SLOT, NO_SLOT));
+    let data = current();
+    data.process.store(process, Ordering::Relaxed);
+    data.thread.store(thread, Ordering::Relaxed);
+}
+
+/// The process and thread slots this CPU runs or completes for, if any.
+pub(crate) fn running() -> Option<(u32, u32)> {
+    let data = current();
+    let process = data.process.load(Ordering::Relaxed);
+    let thread = data.thread.load(Ordering::Relaxed);
+    assert_eq!(
+        process == NO_SLOT,
+        thread == NO_SLOT,
+        "per-CPU running slots disagree"
+    );
+    (process != NO_SLOT).then_some((process, thread))
+}
+
+/// Ask this CPU's running syscall to return to the scheduler (0030-D3).
+pub(crate) fn set_need_resched() {
+    current().need_resched.store(true, Ordering::Relaxed);
+}
+
+/// Whether this CPU was asked to reschedule since the last take, clearing it.
+pub(crate) fn take_need_resched() -> bool {
+    current().need_resched.swap(false, Ordering::Relaxed)
+}
+
+/// Set or clear this CPU's user-context flag, returning its previous value.
+pub(crate) fn swap_user_active(active: bool) -> bool {
+    current().user_active.swap(active, Ordering::Relaxed)
+}
+
+/// Whether a user context is entered on this CPU.
+pub(crate) fn user_active() -> bool {
+    current().user_active.load(Ordering::Relaxed)
+}
+
+/// Mark this CPU's scheduler halted for want of work, or running again.
+pub(crate) fn set_idle(idle: bool) {
+    current().idle.store(idle, Ordering::Relaxed);
+}
+
+/// Record whether this CPU holds the scheduler lock. Only the lock calls it.
+pub(crate) fn set_sched_held(held: bool) {
+    current().sched_held.store(held, Ordering::Relaxed);
+}
+
+/// Whether this CPU holds the scheduler lock. Safe before install, when no
+/// CPU can hold it: it identifies the CPU from IA32_GS_BASE, without GS.
+pub(crate) fn sched_held() -> bool {
+    try_current_slot().is_some_and(|slot| CPU_DATA[slot].sched_held.load(Ordering::Relaxed))
+}
+
+/// Start this CPU's scheduler pass statistics from zero.
+pub(crate) fn reset_pass_stats() {
+    let data = current();
+    data.switches.store(0, Ordering::Relaxed);
+    data.idle_ticks.store(0, Ordering::Relaxed);
+    data.last_process.store(NO_SLOT, Ordering::Relaxed);
+}
+
+/// Count a dispatch of `process` by this CPU's scheduler, as a switch when
+/// it differs from the last one.
+pub(crate) fn note_dispatch(process: u32) {
+    let data = current();
+    if data.last_process.swap(process, Ordering::Relaxed) != process {
+        data.switches.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Add timer ticks this CPU's scheduler spent halted.
+pub(crate) fn add_idle_ticks(ticks: u64) {
+    current().idle_ticks.fetch_add(ticks, Ordering::Relaxed);
+}
+
+/// This CPU's switches and idle ticks since its last reset.
+pub(crate) fn pass_stats() -> (u64, u64) {
+    let data = current();
+    (
+        data.switches.load(Ordering::Relaxed),
+        data.idle_ticks.load(Ordering::Relaxed),
+    )
+}
+
 /// Whether `base` is a kernel-half address, as the paranoid entries test it.
 #[cfg(feature = "boot-smoke")]
 pub(crate) fn kernel_half(base: u64) -> bool {
@@ -263,11 +402,13 @@ pub(crate) fn self_test() {
     assert_eq!(current_cpu(), 0);
     assert_eq!(slot_of(address(0)), Some(0));
     assert_eq!(slot_of(0), None);
+    let stride = size_of::<CpuData>() as u64;
     assert_eq!(slot_of(address(0) + 8), None);
-    assert_eq!(slot_of(address(0) - 64), None);
-    assert_eq!(slot_of(address(MAX_CPUS - 1) + 64), None);
+    assert_eq!(slot_of(address(0) + 64), None);
+    assert_eq!(slot_of(address(0) - stride), None);
+    assert_eq!(slot_of(address(MAX_CPUS - 1) + stride), None);
     for (slot, data) in CPU_DATA.iter().enumerate().skip(1) {
-        assert_eq!(address(slot) - address(slot - 1), 64);
+        assert_eq!(address(slot) - address(slot - 1), stride);
         // No AP has installed yet, and an uninstalled entry never resolves.
         assert!(!data.installed.load(Ordering::Acquire));
         assert_eq!(slot_of(address(slot)), None);

@@ -2,9 +2,11 @@
 //!
 //! APs own guarded kernel stacks, GDT/TSS/IST, local APIC and CPU controls. They
 //! only execute this module and the AP exception path: no allocator, scheduler,
-//! userspace, device queues or serial access. Shared mapping changes use bounded
-//! synchronous shootdowns; retired frames remain owned until every target ACKs.
-//! This establishes CPU ownership and interrupt delivery, not SMP scheduling.
+//! userspace or device queues. Serial output from any CPU goes through its
+//! owner-aware lock (spec 0051); only the boot-smoke print check prints on an
+//! AP so far. Shared mapping changes use bounded synchronous shootdowns;
+//! retired frames remain owned until every target ACKs. This establishes CPU
+//! ownership and interrupt delivery, not SMP scheduling.
 //! https://github.com/Limine-Bootloader/limine-protocol/blob/trunk/PROTOCOL.md#mp-multiprocessor-feature
 
 use crate::{
@@ -50,6 +52,19 @@ const OP_GUARD_FAULT: u32 = 4;
 const OP_UNMAPPED_FAULT: u32 = 5;
 #[cfg(feature = "boot-smoke")]
 const OP_READ_CPU_DATA: u32 = 6;
+/// Print `PRINT_LINES` check lines at the same time as the BSP and every other
+/// AP (spec 0051, step 1). The argument is the mask of printing slots.
+#[cfg(feature = "boot-smoke")]
+const OP_PRINT: u32 = 7;
+#[cfg(feature = "boot-smoke")]
+const PRINT_LINES: u64 = 8;
+/// Fixed text that makes each check line long enough for a broken one to show.
+#[cfg(feature = "boot-smoke")]
+const PRINT_TEXT: &str = "0123456789abcdefghijklmnopqrstuvwxyz";
+/// How long a printing CPU waits for the others' first lines: the IPI waits'
+/// own bound (WAIT_TICKS).
+#[cfg(feature = "boot-smoke")]
+const PRINT_BARRIER_NS: u64 = WAIT_TICKS * 10_000_000;
 
 #[repr(align(64))]
 struct Slot {
@@ -125,6 +140,9 @@ static TIMEOUT_ARMED: AtomicBool = AtomicBool::new(false);
 static TIMEOUT_TARGET: AtomicUsize = AtomicUsize::new(MAX_CPUS);
 #[cfg(feature = "boot-smoke")]
 static TIMEOUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// The slots that have printed their first check line.
+#[cfg(feature = "boot-smoke")]
+static PRINT_STARTED: AtomicU64 = AtomicU64::new(0);
 
 /// The BSP is the sole command producer. Reject reentry instead of spinning:
 /// interrupts are briefly enabled during waits and receivers never take this
@@ -247,6 +265,8 @@ pub fn init(
     self_test();
     if !apic::is_enabled() {
         serial::println!("MIRROR_SMP_SKIPPED reason=legacy_pic online=1");
+        #[cfg(feature = "boot-smoke")]
+        print_self_test();
         return;
     }
     let result = prepare(boot, topology, tables, frames);
@@ -254,6 +274,8 @@ pub fn init(
         Ok(value) => value,
         Err(reason) => {
             serial::println!("MIRROR_SMP_SKIPPED reason={} online=1", reason);
+            #[cfg(feature = "boot-smoke")]
+            print_self_test();
             return;
         }
     };
@@ -291,15 +313,24 @@ pub fn init(
         }
     }
     serial::println!(
-        "MIRROR_SMP_READY discovered={} online={} bsp={} aps={} userspace_cpus=1",
+        "MIRROR_SMP_READY discovered={} online={} bsp={} aps={} userspace_cpus={}",
         count,
         online,
         BSP_ID.load(Ordering::Relaxed),
-        online - 1
+        online - 1,
+        userspace_cpus()
     );
     #[cfg(feature = "boot-smoke")]
     assert_eq!(online, count, "not every secondary reached kernel idle");
     rendezvous("boot", 8);
+    #[cfg(feature = "boot-smoke")]
+    print_self_test();
+}
+
+/// How many CPUs run user threads. Until spec 0051's step 5 lets the APs run
+/// them, userspace stays on the BSP.
+pub(crate) fn userspace_cpus() -> usize {
+    1
 }
 
 /// After startup, report every online CPU's stacks, the BSP first, as
@@ -614,9 +645,12 @@ pub fn is_secondary() -> bool {
 /// This CPU's slot: its installed CpuData's, or before install the CPUID
 /// scan, which finds a slot only once SMP startup has published them.
 fn current_slot() -> Option<usize> {
-    if let Some(slot) = cpudata::try_current_slot() {
-        return Some(slot);
-    }
+    cpudata::try_current_slot().or_else(cpuid_slot)
+}
+
+/// This CPU's slot by its CPUID APIC ID, without GS. None until SMP startup
+/// has published the slots; until then only the BSP runs.
+pub(crate) fn cpuid_slot() -> Option<usize> {
     if !PUBLISHED.load(Ordering::Acquire) {
         return None;
     }
@@ -702,6 +736,14 @@ fn operation_valid(operation: u32, argument: u64, payload: u64, index: usize) ->
         OP_UNMAPPED_FAULT => index != 0 && shared_page_valid(argument),
         #[cfg(feature = "boot-smoke")]
         OP_READ_CPU_DATA => argument == 0 && payload == 0,
+        #[cfg(feature = "boot-smoke")]
+        OP_PRINT => {
+            index != 0
+                && index < MAX_CPUS
+                && argument & 1 != 0
+                && argument & (1 << index) != 0
+                && payload == 0
+        }
         _ => {
             let _ = index;
             false
@@ -810,6 +852,12 @@ fn wait_exact(
 /// Every configured AP must be online; cancelled, late or failed CPUs keep the
 /// hierarchy sealed rather than being silently omitted from reclamation proof.
 pub(crate) fn prepare_kernel_update() -> Result<KernelUpdate, &'static str> {
+    // No holder of the scheduler lock waits for another CPU (spec 0051, open
+    // point 3): that CPU may be spinning on the lock with IF clear.
+    assert!(
+        !cpudata::sched_held(),
+        "kernel update under the scheduler lock"
+    );
     let guard = CommandGuard::acquire()?;
     let cr3: u64;
     // SAFETY: This is a CPL0-only kernel API; reading CR3 changes no CPU state.
@@ -1001,6 +1049,19 @@ pub fn handle_ipi() {
         slot.acknowledgement.store(sequence, Ordering::Release);
         return;
     }
+    #[cfg(feature = "boot-smoke")]
+    if operation == OP_PRINT {
+        if !print_lines(index, argument) {
+            fail(index, 14);
+        }
+        slot.result.store(
+            proof(PRINT_LINES, initial_apic_id(), sequence),
+            Ordering::Relaxed,
+        );
+        slot.completed.fetch_add(1, Ordering::Relaxed);
+        slot.acknowledgement.store(sequence, Ordering::Release);
+        return;
+    }
     let value = if operation == OP_INVALIDATE_RANGE {
         // SAFETY: BSP published the PTE before the command release; operation
         // validation checked the entire canonical range and bounded page count.
@@ -1120,7 +1181,82 @@ fn read_cpu_data_self_test() -> usize {
     update.count
 }
 
+/// The concurrent print check (spec 0051, step 1): the BSP and every online
+/// AP print `PRINT_LINES` lines each at the same time, through the serial
+/// lock. Each CPU prints its first line, waits until every CPU has printed
+/// its first, then prints the rest, so every CPU's last line follows every
+/// CPU's first. The run script checks that every line is whole and that the
+/// CPUs interleave that way. Without published SMP only the BSP prints. Then
+/// `MIRROR_SMP_TESTS_OK` reports the printing CPUs.
+#[cfg(feature = "boot-smoke")]
+fn print_self_test() {
+    assert!(!arch::interrupts_enabled() && !is_secondary());
+    let update = prepare_kernel_update().expect("print check preflight");
+    let cpus = update.count.max(1);
+    let participants = u64::MAX >> (64 - cpus);
+    PRINT_STARTED.store(0, Ordering::Release);
+    for index in 1..update.count {
+        publish_command(index, update.sequences[index], OP_PRINT, participants, 0)
+            .expect("print check delivery failed");
+    }
+    assert!(
+        print_lines(0, participants),
+        "SMP print check barrier timeout"
+    );
+    wait_exact(
+        update.count,
+        &update.targets,
+        &update.sequences,
+        "SMP print check acknowledgement timeout",
+    );
+    for (index, slot) in SLOTS[..update.count].iter().enumerate().skip(1) {
+        assert_eq!(
+            slot.result.load(Ordering::Relaxed),
+            proof(
+                PRINT_LINES,
+                slot.apic_id.load(Ordering::Relaxed),
+                update.sequences[index]
+            ),
+            "an AP did not finish its print check"
+        );
+    }
+    serial::println!(
+        "MIRROR_SMP_TESTS_OK print_cpus={} print_lines={}",
+        cpus,
+        PRINT_LINES
+    );
+}
+
+/// Print this CPU's check lines as slot `index`: the first, a bounded wait
+/// for every slot in `participants` to print its first, then the rest.
+/// Returns false, after the first line only, if the wait timed out.
+#[cfg(feature = "boot-smoke")]
+fn print_lines(index: usize, participants: u64) -> bool {
+    let print = |line: u64| {
+        serial::println!(
+            "MIRROR_SMP_PRINT cpu={} line={} text={}",
+            index,
+            line,
+            PRINT_TEXT
+        );
+    };
+    print(0);
+    PRINT_STARTED.fetch_or(1 << index, Ordering::AcqRel);
+    let mut bound = crate::clock::SpinBound::new(PRINT_BARRIER_NS);
+    while PRINT_STARTED.load(Ordering::Acquire) & participants != participants {
+        if bound.expired() {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    (1..PRINT_LINES).for_each(print);
+    true
+}
+
 fn wait_until(mut done: impl FnMut() -> bool) -> bool {
+    // As in prepare_kernel_update: never wait for another CPU while holding
+    // the scheduler lock (spec 0051, open point 3).
+    assert!(!cpudata::sched_held(), "IPI wait under the scheduler lock");
     let start = timer::ticks();
     let elapsed_start = crate::clock::snapshot().map(|clock| clock.monotonic_ns);
     while !done() {
@@ -1558,6 +1694,12 @@ fn self_test() {
         1
     ));
     assert!(!operation_valid(OP_READ_CPU_DATA, 0, 1, 1));
+    assert!(operation_valid(OP_PRINT, 0b11, 0, 1));
+    assert!(operation_valid(OP_PRINT, u64::MAX, 0, MAX_CPUS - 1));
+    assert!(!operation_valid(OP_PRINT, 0b11, 0, 0));
+    assert!(!operation_valid(OP_PRINT, 0b10, 0, 1));
+    assert!(!operation_valid(OP_PRINT, 0b101, 0, 1));
+    assert!(!operation_valid(OP_PRINT, 0b11, 1, 1));
     assert!(!operation_valid(
         OP_UNMAPPED_FAULT,
         paging::SHARED_BASE,
@@ -1599,5 +1741,5 @@ fn self_test() {
     );
     drop(guard);
     drop(CommandGuard::acquire().expect("command guard released"));
-    serial::println!("MIRROR_SMP_TESTS_OK");
+    // MIRROR_SMP_TESTS_OK follows the print check, once the APs are online.
 }
