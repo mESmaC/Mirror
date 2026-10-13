@@ -106,19 +106,83 @@ pub fn utc_now() -> String {
     )
 }
 fn unique(prefix: &str) -> io::Result<String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     Ok(format!(
-        "{prefix}-{}-{}",
+        "{prefix}-{}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(io::Error::other)?
-            .as_nanos()
+            .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ))
 }
 fn text(path: &Path) -> io::Result<String> {
     path.to_str()
         .map(str::to_owned)
         .ok_or_else(|| record::invalid("non-Unicode path cannot be journaled"))
+}
+/// Render already-validated local-drive identities for external programs that
+/// do not understand Win32 verbatim prefixes. Internal paths stay canonical.
+fn tool_path(path: &Path) -> io::Result<PathBuf> {
+    use std::path::{Component, Prefix};
+    let mut components = path.components();
+    let drive = match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => drive,
+            _ => {
+                return Err(record::invalid(
+                    "external tool path must name a local drive",
+                ));
+            }
+        },
+        _ => return Err(record::invalid("external tool path must be absolute")),
+    };
+    if components.next() != Some(Component::RootDir) {
+        return Err(record::invalid("drive-relative tool path is forbidden"));
+    }
+    let mut result = PathBuf::from(format!("{}:\\", char::from(drive)));
+    for component in components {
+        match component {
+            Component::Normal(name) => result.push(name),
+            _ => return Err(record::invalid("ambiguous external tool path")),
+        }
+    }
+    Ok(result)
+}
+fn tool_arg(path: &Path) -> io::Result<OsString> {
+    Ok(tool_path(path)?.into_os_string())
+}
+fn tool_environment(environment: &[(OsString, OsString)]) -> io::Result<Vec<(OsString, OsString)>> {
+    use std::path::{Component, Prefix};
+    fn normal(value: &std::ffi::OsStr) -> io::Result<OsString> {
+        let path = Path::new(value);
+        if matches!(path.components().next(),Some(Component::Prefix(prefix)) if matches!(prefix.kind(),Prefix::VerbatimDisk(_)))
+        {
+            tool_arg(path)
+        } else {
+            Ok(value.to_owned())
+        }
+    }
+    environment
+        .iter()
+        .map(|(key, value)| {
+            let value = match key.to_string_lossy().to_ascii_uppercase().as_str() {
+                "PATH" | "INCLUDE" | "LIB" | "LIBPATH" => {
+                    let paths = std::env::split_paths(value)
+                        .map(|p| normal(p.as_os_str()).map(PathBuf::from))
+                        .collect::<io::Result<Vec<_>>>()?;
+                    std::env::join_paths(paths)
+                        .map_err(|e| record::invalid(format!("invalid path environment: {e}")))?
+                }
+                "CARGO_HOME" | "RUSTUP_HOME" | "SYSTEMROOT" | "WINDIR" | "COMSPEC"
+                | "USERPROFILE" | "APPDATA" | "LOCALAPPDATA" | "PROGRAMFILES"
+                | "PROGRAMFILES(X86)" | "PROGRAMW6432" | "TEMP" | "TMP" => normal(value)?,
+                _ => value.clone(),
+            };
+            Ok((key.clone(), value))
+        })
+        .collect()
 }
 fn identity(p: ProcessIdentity) -> Value {
     Value::object([
@@ -293,7 +357,7 @@ impl NativePackage {
         } else {
             options.cargo_home = paths::canonical_no_reparse(&options.cargo_home)?;
             reject_cargo_config(&scratch, &options.cargo_home)?;
-            environment_from(std::env::vars_os(), &options.cargo_home)
+            tool_environment(&environment_from(std::env::vars_os(), &options.cargo_home))?
         };
         let (nick, task) = parse_operator(&options.operator)?;
         let owner = Owner {
@@ -449,9 +513,9 @@ impl NativePackage {
             stderr: self.run_dir.join(format!("command-{n:03}.stderr")),
         };
         let spec = CommandSpec {
-            program: executable(program)?,
+            program: tool_path(&executable(program)?)?,
             args,
-            cwd: cwd.to_owned(),
+            cwd: tool_path(cwd)?,
             env: self.environment.clone(),
         };
         let mut commands = self.journal.get("commands")?.array()?.to_vec();
@@ -517,6 +581,40 @@ impl NativePackage {
         String::from_utf8(out)
             .map(|s| s.trim().into())
             .map_err(|_| record::invalid("Git returned non-UTF8"))
+    }
+    fn archive_source(&mut self, end: Instant) -> io::Result<PathBuf> {
+        let archive = self.run_dir.join("source.zip");
+        let cwd = self.options.checkout.clone();
+        self.checked(
+            "git.exe",
+            vec![
+                "archive".into(),
+                "--format=zip".into(),
+                format!("--output={}", text(&tool_path(&archive)?)?).into(),
+                self.commit.clone().into(),
+            ],
+            &cwd,
+            end,
+        )?;
+        // Paths are data in a script argument array; never interpolated into code.
+        let script = self.run_dir.join("expand.ps1");
+        record::atomic_write(&script,b"param([string]$Archive,[string]$Destination)\n$ErrorActionPreference='Stop'\nExpand-Archive -LiteralPath $Archive -DestinationPath $Destination\n")?;
+        self.checked(
+            "powershell.exe",
+            vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-File".into(),
+                tool_arg(&script)?,
+                tool_arg(&archive)?,
+                tool_arg(&self.scratch)?,
+            ],
+            &cwd,
+            end,
+        )?;
+        Ok(archive)
     }
     fn inventory(&self, end: Instant) -> io::Result<Vec<SourceFile>> {
         source_inventory(&self.scratch, &self.source_paths, end)
@@ -908,37 +1006,7 @@ impl Backend for NativePackage {
         Ok(())
     }
     fn export(&mut self, end: Instant) -> io::Result<()> {
-        let archive = self.run_dir.join("source.zip");
-        let cwd = self.options.checkout.clone();
-        self.checked(
-            "git.exe",
-            vec![
-                "archive".into(),
-                "--format=zip".into(),
-                format!("--output={}", text(&archive)?).into(),
-                self.commit.clone().into(),
-            ],
-            &cwd,
-            end,
-        )?;
-        // Paths are data in a script argument array; never interpolated into code.
-        let script = self.run_dir.join("expand.ps1");
-        record::atomic_write(&script,b"param([string]$Archive,[string]$Destination)\n$ErrorActionPreference='Stop'\nExpand-Archive -LiteralPath $Archive -DestinationPath $Destination\n")?;
-        self.checked(
-            "powershell.exe",
-            vec![
-                "-NoProfile".into(),
-                "-NonInteractive".into(),
-                "-ExecutionPolicy".into(),
-                "Bypass".into(),
-                "-File".into(),
-                script.into_os_string(),
-                archive.clone().into_os_string(),
-                self.scratch.clone().into_os_string(),
-            ],
-            &cwd,
-            end,
-        )?;
+        let archive = self.archive_source(end)?;
         paths::canonical_no_reparse(&self.scratch)?;
         reject_cargo_config(&self.scratch, &self.options.cargo_home)?;
         self.inventory = self.inventory(end)?;
@@ -978,7 +1046,7 @@ impl Backend for NativePackage {
             "-ExecutionPolicy".into(),
             "Bypass".into(),
             "-File".into(),
-            cwd.join("scripts/build.ps1").into_os_string(),
+            tool_arg(&cwd.join("scripts/build.ps1"))?,
         ];
         if self.options.release {
             args.push("-Release".into());
@@ -1939,6 +2007,105 @@ mod tests {
                 .unwrap()
                 .starts_with("cargo 1.99.0 ")
         );
+        p.lease
+            .as_mut()
+            .unwrap()
+            .publish_release(&utc_now())
+            .unwrap();
+        p.lease.take();
+    }
+    #[test]
+    fn external_tool_paths_are_dos_only_and_keep_canonical_identity() {
+        let f = Fixture::new();
+        let canonical = f.dir("space directory");
+        let normal = tool_path(&canonical).unwrap();
+        assert!(!normal.as_os_str().to_string_lossy().starts_with(r"\\?\"));
+        assert_eq!(paths::canonical_no_reparse(&normal).unwrap(), canonical);
+        assert!(tool_path(Path::new(r"C:relative")).is_err());
+        assert!(tool_path(Path::new(r"\\server\share\file")).is_err());
+        assert!(tool_path(Path::new(r"\\?\UNC\server\share\file")).is_err());
+        let path_list = std::env::join_paths([canonical.clone(), f.0.clone()]).unwrap();
+        let env = tool_environment(&[
+            ("CARGO_HOME".into(), canonical.as_os_str().into()),
+            ("PATH".into(), path_list),
+        ])
+        .unwrap();
+        assert_eq!(env[0].1, normal.as_os_str());
+        assert!(
+            std::env::split_paths(&env[1].1)
+                .all(|p| !p.as_os_str().to_string_lossy().starts_with(r"\\?\"))
+        );
+    }
+    #[test]
+    fn contained_git_archive_and_powershell_expand_accept_canonical_paths() {
+        let f = Fixture::new();
+        let locks = f.dir("locks");
+        let mut options = f.options();
+        options.checkout = f.dir("synthetic repository");
+        options.lane_root = f.dir("lane records");
+        let mut p = NativePackage::open_at(options, &locks).unwrap();
+        let cwd = p.options.checkout.clone();
+        p.checked(
+            "git.exe",
+            vec!["init".into(), "-b".into(), "fixture".into()],
+            &cwd,
+            end(),
+        )
+        .unwrap();
+        let nested = cwd.join("directory with spaces");
+        fs::create_dir(&nested).unwrap();
+        let content = b"archive fixture content\n";
+        fs::write(nested.join("file.txt"), content).unwrap();
+        p.checked(
+            "git.exe",
+            vec![
+                "add".into(),
+                "--".into(),
+                "directory with spaces/file.txt".into(),
+            ],
+            &cwd,
+            end(),
+        )
+        .unwrap();
+        p.checked(
+            "git.exe",
+            vec![
+                "-c".into(),
+                "user.name=Lane Fixture".into(),
+                "-c".into(),
+                "user.email=fixture@example.invalid".into(),
+                "-c".into(),
+                "commit.gpgsign=false".into(),
+                "commit".into(),
+                "-m".into(),
+                "archive fixture".into(),
+            ],
+            &cwd,
+            end(),
+        )
+        .unwrap();
+        p.commit = p.git(&["rev-parse", "HEAD"], end()).unwrap();
+        let archive = p.archive_source(end()).unwrap();
+        assert!(archive.is_file());
+        assert_eq!(
+            fs::read(p.scratch.join("directory with spaces/file.txt")).unwrap(),
+            content
+        );
+        assert_eq!(paths::canonical_no_reparse(&p.scratch).unwrap(), p.scratch);
+        for command in p.journal.get("commands").unwrap().array().unwrap() {
+            assert!(
+                !command
+                    .get("program")
+                    .unwrap()
+                    .string()
+                    .unwrap()
+                    .starts_with(r"\\?\")
+            );
+            for arg in command.get("args").unwrap().array().unwrap() {
+                assert!(!arg.string().unwrap().contains(r"\\?\"));
+            }
+        }
+        p.prove_no_live_build(false, end()).unwrap();
         p.lease
             .as_mut()
             .unwrap()
