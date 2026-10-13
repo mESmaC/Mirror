@@ -131,6 +131,8 @@ pub fn rasterize_into(mask: &mut Mask, path: &Path, tx: i32, ty: i32) {
             });
         }
         if spans.is_empty() {
+            // Clear the row: rasterize_into may write over a used mask.
+            mask.row_mut(row as u32).fill(0);
             continue;
         }
         // Split the row at every span endpoint and every edge crossing, so
@@ -202,19 +204,26 @@ impl EdgeSpan {
 }
 
 /// The y where two row-clipped edges cross, if they cross strictly inside
-/// both spans.
+/// both spans. Both edges are reparametrized on their shared y range, so
+/// every intermediate stays small (review: absolute-coordinate products
+/// could overflow i64 on tall geometry).
 fn intersection_y(a: &EdgeSpan, b: &EdgeSpan) -> Option<Fixed> {
-    let (na, da) = ((a.xb - a.xa) as i64, (a.yb - a.ya) as i64);
-    let (nb, db) = ((b.xb - b.xa) as i64, (b.yb - b.ya) as i64);
-    let denom = na * db - nb * da;
+    let lo = a.ya.max(b.ya);
+    let hi = a.yb.min(b.yb);
+    if lo >= hi {
+        return None;
+    }
+    let den = (hi - lo) as i64;
+    // x(y) = x_lo + num * (y - lo) / den on the shared range.
+    let (ax0, ax1) = (a.x_at(lo), a.x_at(hi));
+    let (bx0, bx1) = (b.x_at(lo), b.x_at(hi));
+    let (na, nb) = ((ax1 - ax0) as i64, (bx1 - bx0) as i64);
+    let denom = na - nb;
     if denom == 0 {
         return None;
     }
-    // Solve xa + na*(y-ya)/da = xb + nb*(y-yb)/db for y.
-    let num = (b.xa - a.xa) as i64 * da * db + na * a.ya as i64 * db - nb * b.ya as i64 * da;
-    let y = (num / denom) as i32;
-    let lo = a.ya.max(b.ya);
-    let hi = a.yb.min(b.yb);
+    let t = (bx0 - ax0) as i64 * den / denom;
+    let y = lo + t as i32;
     if y > lo && y < hi { Some(y) } else { None }
 }
 

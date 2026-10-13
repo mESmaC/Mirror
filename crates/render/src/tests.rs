@@ -625,9 +625,50 @@ fn shadow_spreads_beyond_the_shape() {
         &mut cache,
         &mut probe,
     );
-    // Outside the shape's own bounds (which end at y=100): blurred tail.
-    assert!(s.get(80, 106).a > 0, "shadow tail below the shape");
-    assert!(s.get(56, 80).a > 0, "shadow tail left of the shape");
+    // Outside the shape's own bounds (which end at y=100): the blurred
+    // tail darkens the base. (Alpha proves nothing over an opaque base.)
+    let base = DARK.base;
+    assert!(
+        s.get(80, 106).r < base.r,
+        "shadow tail below the shape darkens the base"
+    );
+    assert!(
+        s.get(56, 80).r < base.r,
+        "shadow tail left of the shape darkens the base"
+    );
+    // Far past the blur's support the base is untouched.
+    assert_eq!(s.get(80, 180).r, base.r, "no shadow past the tail");
+}
+
+#[test]
+fn tall_triangle_does_not_overflow() {
+    // Review: a (0,0)-(128,256)-(0,257) triangle overflowed i64 in the
+    // crossing computation.
+    let mut b = PathBuilder::new();
+    b.move_to(0, 0)
+        .line_to(fixed::px(128), fixed::px(256))
+        .line_to(0, fixed::px(257))
+        .close();
+    let (mask, _) = raster::rasterize(&b.build());
+    let sum: u64 = mask.data().iter().map(|&v| v as u64).sum();
+    // Area = 128 * 257 / 2 = 16448 px^2.
+    let area = sum as f64 / 255.0;
+    assert!(
+        (16448.0 * 0.98..=16448.0 * 1.02).contains(&area),
+        "triangle area {area}"
+    );
+}
+
+#[test]
+fn rasterize_into_clears_stale_rows() {
+    // Review: an empty-span row must zero a reused mask, not keep it.
+    let mut mask = Mask::new(2, 2);
+    mask.set(1, 1, 255);
+    let mut b = PathBuilder::new();
+    b.rect(0, 0, fixed::ONE, fixed::ONE);
+    raster::rasterize_into(&mut mask, &b.build(), 0, 0);
+    assert_eq!(mask.get(1, 1), 0, "stale pixel cleared");
+    assert_eq!(mask.get(0, 0), 255);
 }
 
 #[test]
