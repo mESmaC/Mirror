@@ -11,6 +11,7 @@ use mirror_vm_protocol::{
 
 mod clock;
 mod fpu;
+mod smp;
 mod sync;
 mod threads;
 mod tls;
@@ -1219,9 +1220,19 @@ fn class_limits_protected() -> ! {
 extern "C" fn init_main(launch: u64) -> ! {
     let probe = launch & 0xff;
     let role = launch >> 8;
-    // 0054-D5: roles 2 and 3 are the OomOrder scenario's requester and victim;
-    // roles 4 and 5 are the class-limits pair. The probe bound is unchanged.
-    require(role <= 5 && probe <= 22 && (role == 0 || probe == 0), 33);
+    // Roles 0 and 1 are the smoke pair. 0054-D5: roles 2 and 3 are the
+    // OomOrder scenario's requester and victim, and roles 4 and 5 the
+    // class-limits pair. Roles 6 and 7 are the SMP battery (spec 0051, step
+    // 5), whose probe 1 only spins.
+    require(
+        match role {
+            0 => probe <= 22,
+            1..=5 | 7 => probe == 0,
+            6 => probe <= 1,
+            _ => false,
+        },
+        33,
+    );
     if role == 2 {
         oom_requester();
     }
@@ -1246,6 +1257,9 @@ extern "C" fn init_main(launch: u64) -> ! {
     let console = syscall(SYS_BOOT_HANDLE, 0, 0, 0);
     require(console > 0, 60);
     let console = console as u64;
+    if role >= 6 {
+        smp::battery(console, role, probe);
+    }
     write(console, b"Mirror init: running Rust in ring 3\n");
     let pid = syscall(SYS_PID, 0, 0, 0);
     require(pid > 0, 34);

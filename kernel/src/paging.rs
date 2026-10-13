@@ -645,8 +645,13 @@ impl PageTables {
     /// Read and clear the dirty bit of one mapped kernel VA leaf, for the
     /// thread stacks' high-water mark (0050-D2, boot-smoke). A cleared bit
     /// also drops this CPU's cached translation, so the next write through it
-    /// sets the bit again. Only the BSP writes thread stacks: no other CPU
-    /// holds a translation that could write without setting the bit.
+    /// sets the bit again. Every CPU that runs userspace writes the stack of
+    /// the thread it runs, but window leaves are not global and PCID is off,
+    /// so the root switch that ends each slice drops that CPU's translations
+    /// of the window. A stack is sampled only while pooled, after its last
+    /// thread's last slice, or after a session's barrier (spec 0051, step
+    /// 5): then no CPU holds a translation that could write without setting
+    /// the bit.
     ///
     /// # Safety
     /// Run on the BSP with IF=0 and this kernel root active. The leaf belongs
@@ -712,10 +717,10 @@ impl PageTables {
     /// Restore the kernel root after executing an isolated user address space.
     ///
     /// # Safety
-    /// Run at CPL0 on the BSP with interrupts disabled. The current code, stack,
-    /// and all live kernel data must belong to the shared upper half. APs may
-    /// retain the kernel root with pinned table paths; this changes only the
-    /// BSP's translations.
+    /// Run at CPL0 with interrupts disabled, on the BSP or on an AP, which
+    /// runs on this same sealed root (spec 0051, point 5). The current code,
+    /// stack, and all live kernel data must belong to the shared upper half.
+    /// This changes only the calling CPU's translations.
     pub unsafe fn activate(&self) -> Result<(), PagingError> {
         self.check_physical(self.root)?;
         // SAFETY: The caller preserves the common supervisor mappings that
@@ -1121,6 +1126,21 @@ impl Withdrawal {
     #[cfg(feature = "boot-smoke")]
     pub fn frames(&self) -> &[u64] {
         &self.frames[..self.count]
+    }
+
+    /// Take `frame` out of the batch, if the batch holds it, so that its
+    /// release leaves it allocated (the SMP battery's canary, boot-smoke).
+    #[cfg(feature = "boot-smoke")]
+    pub fn take(&mut self, frame: u64) -> bool {
+        let Some(index) = self.frames[..self.count]
+            .iter()
+            .position(|&held| held == frame)
+        else {
+            return false;
+        };
+        self.count -= 1;
+        self.frames[index] = self.frames[self.count];
+        true
     }
 
     /// Whether one more page fits, with every table on its path.

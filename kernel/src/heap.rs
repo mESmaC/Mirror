@@ -67,8 +67,10 @@ struct KernelAllocator {
 
 // SAFETY: Every access to the heap is protected by the acquire/release lock.
 // Maskable interrupts are disabled before acquisition. Handler paths do not
-// allocate, including non-maskable exceptions. Only the BSP currently uses the
-// allocator; AP startup, idle and interrupt paths never allocate.
+// allocate, including non-maskable exceptions. Only the BSP uses the
+// allocator, which `alloc` and `dealloc` assert: APs run user threads and
+// their handlers, but every completion that needs the heap runs in the BSP's
+// scheduler pass (spec 0051, point 5).
 unsafe impl Sync for KernelAllocator {}
 
 impl KernelAllocator {
@@ -160,6 +162,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
         // sizes/alignments; our bounded arena cannot service those requests.
         // The allocator deliberately supports alignments up to the arena's
         // capacity even when HEAP_START happens to satisfy a larger alignment.
+        assert!(!crate::smp::is_secondary(), "heap allocation on an AP");
         if layout.size() > HEAP_MAX_SIZE || layout.align() > HEAP_MAX_SIZE {
             return core::ptr::null_mut();
         }
@@ -188,6 +191,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        assert!(!crate::smp::is_secondary(), "heap free on an AP");
         let mut heap = self.lock();
         // The page table decides: a slab-served pointer's page is tracked
         // (0059-D2); a first-fit-served one's is not, even with a slab layout.

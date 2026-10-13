@@ -528,11 +528,15 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
             // (spec 0058a, D11). QEMU's -no-reboot ends the boot.
             boot::SmokeMode::Reset(_) => reset::restart(reset::Cause::Test),
             // The crash cases (spec 0051, step 4) end in the crash path,
-            // which stops the APs, reports and exits with code 35.
-            boot::SmokeMode::Panic => {
-                serial::println!("MIRROR_TEST_EXPECT_PANIC cpu=0");
-                crash::planted_panic();
-            }
+            // which stops the APs, reports and exits with code 35. Panic
+            // panics in the BSP's scheduler pass while battery threads run
+            // on every AP that runs userspace (step 5).
+            boot::SmokeMode::Panic => userspace::run_panic_battery(
+                &tables,
+                &mut frames,
+                boot.init,
+                boot.direct_map_offset,
+            ),
             boot::SmokeMode::NestedPanic => {
                 serial::println!("MIRROR_TEST_EXPECT_PANIC cpu=0");
                 panic!("{}", crash::NestedPanic);

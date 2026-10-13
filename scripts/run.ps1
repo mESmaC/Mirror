@@ -125,10 +125,13 @@ function Assert-MirrorSmpMarkers {
     if ($Serial -match '(?m)^MIRROR_SMP_SKIPPED(?:\s|$)') {
         throw 'The APIC regression unexpectedly skipped secondary-CPU startup.'
     }
-    $readyPattern = '(?m)^MIRROR_SMP_READY discovered={0} online={0} bsp=(\d+) aps={1} userspace_cpus=1\r?$' -f $RequestedCpus, ($RequestedCpus - 1)
+    # Every online CPU runs userspace when each one ticks with its LAPIC;
+    # with the PIT userspace stays on the BSP (spec 0051, point 3).
+    $userspaceCpus = if ($LocalTimer) { $RequestedCpus } else { 1 }
+    $readyPattern = '(?m)^MIRROR_SMP_READY discovered={0} online={0} bsp=(\d+) aps={1} userspace_cpus={2}\r?$' -f $RequestedCpus, ($RequestedCpus - 1), $userspaceCpus
     $ready = [regex]::Matches($Serial, $readyPattern)
     if ($ready.Count -ne 1 -or [regex]::Matches($Serial, '(?m)^MIRROR_SMP_READY(?:\s|$)').Count -ne 1) {
-        throw "Mirror must bring exactly $RequestedCpus processors online while keeping userspace on the BSP."
+        throw "Mirror must bring exactly $RequestedCpus processors online, with userspace on $userspaceCpus of them."
     }
     if ([uint64]$ready[0].Groups[1].Value -ge 255) { throw 'Mirror reported an invalid BSP APIC ID.' }
 
@@ -285,6 +288,35 @@ function Assert-MirrorSmpMarkers {
         if ($offlineRecords[0].Index -le $guard[0].Index) {
             throw 'Shared mutation rejection must be checked after the AP guard fault.'
         }
+    }
+}
+
+function Assert-MirrorSmpUser {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [Parameter(Mandatory = $true)][int]$UserspaceCpus
+    )
+
+    # The SMP battery (spec 0051, step 5) runs once in every smoke boot,
+    # after the table-bounds test and before the first init-pair session:
+    # its threads ran on every CPU that runs userspace, and no CPU wrote the
+    # frame its release kept. With more than one such CPU, a wake crossed
+    # CPUs and a release flushed another CPU's translations; with one, none.
+    $names = [regex]::Matches($Serial, '(?m)^MIRROR_SMP_USER_OK(?:\s|$)')
+    $records = [regex]::Matches($Serial, ('(?m)^MIRROR_SMP_USER_OK cpus={0} threads=16 ran_on={0} cross_wakes=([0-9]+) flushes=([0-9]+) stale=0\r?$' -f $UserspaceCpus))
+    if ($names.Count -ne 1 -or $records.Count -ne 1) {
+        throw "A smoke kernel must report MIRROR_SMP_USER_OK cpus=$UserspaceCpus threads=16 ran_on=$UserspaceCpus cross_wakes= flushes= stale=0 exactly once."
+    }
+    $crossed = [uint64]$records[0].Groups[1].Value -gt 0
+    $flushed = [uint64]$records[0].Groups[2].Value -gt 0
+    if ($crossed -ne ($UserspaceCpus -gt 1) -or $flushed -ne ($UserspaceCpus -gt 1)) {
+        throw 'The SMP battery must cross CPUs with a wake and a flush exactly when more than one CPU runs userspace.'
+    }
+    $bounds = [regex]::Match($Serial, '(?m)^MIRROR_SCHED_BOUNDS_OK(?:\s|$)')
+    $degraded = [regex]::Match($Serial, '(?m)^MIRROR_KVA_DEGRADED(?:\s|$)')
+    if (-not $bounds.Success -or -not $degraded.Success -or
+        $records[0].Index -le $bounds.Index -or $records[0].Index -ge $degraded.Index) {
+        throw 'MIRROR_SMP_USER_OK must follow the table-bounds test and precede the first init-pair session.'
     }
 }
 
@@ -740,6 +772,8 @@ try {
     # its calibration.
     $localTimer = -not $LegacyPic -and -not $PitTimer -and $Fault -ne 'TimerCalibration'
     Assert-MirrorSmpMarkers -Serial $serial -RequestedCpus $CpuCount -UseLegacyPic ([bool]$LegacyPic) -LocalTimer $localTimer -FaultMode $Fault
+    # The SMP battery runs on every CPU that runs userspace (spec 0051, step 5).
+    Assert-MirrorSmpUser -Serial $serial -UserspaceCpus $(if ($localTimer) { $CpuCount } else { 1 })
     # Every online CPU reports its guarded stacks; -LegacyPic keeps the APs
     # offline, so only the BSP reports (spec 0016a).
     $rsp0Guard = Assert-MirrorStacks -Serial $serial -OnlineCpus $(if ($LegacyPic) { 1 } else { $CpuCount }) -Smoke $true

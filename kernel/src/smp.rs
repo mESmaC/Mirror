@@ -1,20 +1,19 @@
 //! Limine-assisted secondary CPU bring-up and bounded IPI rendezvous.
 //!
-//! APs own guarded kernel stacks, GDT/TSS/IST, local APIC and CPU controls. They
-//! only execute this module and the AP trap path: no allocator, scheduler,
-//! userspace or device queues yet. With the LAPIC tick source each AP runs its
-//! own periodic timer, and any CPU may send another the reschedule IPI,
-//! vector 242 (spec 0051, point 3). Once a slot is ONLINE, its command, timer
+//! APs own guarded kernel stacks, GDT/TSS/IST, local APIC and CPU controls.
+//! They never allocate and own no device queue. With the LAPIC tick source
+//! each AP runs its own periodic timer, and any CPU may send another the
+//! reschedule IPI, vector 242 (spec 0051, point 3); every online CPU then
+//! runs user threads (`userspace_mask`), and an AP whose idle loop wakes
+//! while a session is open joins it (point 5). Once a slot is ONLINE, its command, timer
 //! and reschedule interrupts and its CPL3 syscalls and exceptions take the
 //! normal trap dispatch, and any other trap or a panic takes the crash path
 //! (`crash::enter`, point 10). A trap or panic before ONLINE, or a smoke
 //! probe's armed fault, records the slot FAILED (point 4). Serial output from
-//! any CPU goes through its owner-aware lock (spec 0051); only the boot-smoke
-//! print check and a crash print on an AP so far. Shared mapping changes use
-//! bounded
-//! synchronous shootdowns; retired frames remain owned until every target
-//! ACKs. A user root's changes flush the CPUs in its space's mask with
-//! OP_FLUSH_USER (spec 0051, point 8). User threads still run only on the BSP.
+//! any CPU goes through its owner-aware lock (spec 0051). Shared mapping
+//! changes use bounded synchronous shootdowns; retired frames remain owned
+//! until every target ACKs. A user root's changes flush the CPUs in its
+//! space's mask with OP_FLUSH_USER (spec 0051, point 8).
 //! https://github.com/Limine-Bootloader/limine-protocol/blob/trunk/PROTOCOL.md#mp-multiprocessor-feature
 
 use crate::{
@@ -180,6 +179,10 @@ static COUNT: AtomicUsize = AtomicUsize::new(0);
 static ROOT: AtomicU64 = AtomicU64::new(0);
 static PAT: AtomicU64 = AtomicU64::new(0);
 static COMMAND_BUSY: AtomicBool = AtomicBool::new(false);
+/// The CPUs that run user threads, as a mask of slots, fixed at SMP startup
+/// (spec 0051, point 3): every online CPU with the LAPIC tick source, else
+/// the BSP alone.
+static USERSPACE: AtomicU64 = AtomicU64::new(1);
 /// The kernel tables' physical-address mask, which bounds a user root.
 static PHYSICAL_MASK: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "boot-smoke")]
@@ -377,12 +380,14 @@ pub fn init(
     // stacks, mailboxes, topology or the root that a late AP may still observe.
     wait_until(|| (1..count).all(|index| SLOTS[index].state.load(Ordering::Acquire) != STARTING));
     let mut online = 1;
+    let mut online_mask = 1;
     for (index, slot) in SLOTS[..count].iter().enumerate().skip(1) {
         let _ =
             slot.state
                 .compare_exchange(STARTING, CANCELLED, Ordering::AcqRel, Ordering::Acquire);
         if slot.state.load(Ordering::Acquire) == ONLINE {
             online += 1;
+            online_mask |= 1 << index;
             assert_eq!(
                 slot.actual_root.load(Ordering::Relaxed),
                 ROOT.load(Ordering::Relaxed)
@@ -400,6 +405,11 @@ pub fn init(
             report_failure(index);
         }
     }
+    // Every online CPU runs user threads only when each one ticks; with the
+    // PIT the APs have no timer, so userspace stays on the BSP (point 3).
+    if timer::local_timer() {
+        USERSPACE.store(online_mask, Ordering::Release);
+    }
     serial::println!(
         "MIRROR_SMP_READY discovered={} online={} bsp={} aps={} userspace_cpus={}",
         count,
@@ -415,12 +425,34 @@ pub fn init(
     startup_self_test();
 }
 
-/// How many CPUs run user threads. Until spec 0051's step 5 lets the APs run
-/// them, userspace stays on the BSP. Step 5 makes it the online count when
-/// every CPU ticks (`timer::local_timer`), and keeps 1 with the PIT or the
-/// legacy PIC as the tick source (point 3).
+/// The CPUs that run user threads, as a mask of slots (spec 0051, point 3):
+/// the CPUs online at startup when the LAPIC is the tick source, else the
+/// BSP alone, also when SMP startup was skipped. An AP that has failed since
+/// drops out, so no session kicks or waits for it.
+pub(crate) fn userspace_mask() -> u64 {
+    let online = SLOTS[..configured_count()]
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, slot)| slot.state.load(Ordering::Acquire) == ONLINE)
+        .fold(1, |mask, (index, _)| mask | 1 << index);
+    USERSPACE.load(Ordering::Acquire) & online
+}
+
+/// How many CPUs run user threads (`userspace_mask`).
 pub(crate) fn userspace_cpus() -> usize {
-    1
+    userspace_mask().count_ones() as usize
+}
+
+/// The kernel stack this CPU's TSS.RSP0 names while no user thread runs on
+/// it (0050-D2): the BSP's guarded RSP0 stack, or an AP's own kernel stack,
+/// as its descriptors were installed. No CPL3 code runs while it is
+/// installed, so hardware never pushes onto it.
+pub(crate) fn rsp0_placeholder() -> u64 {
+    match cpudata::current_cpu() {
+        0 => stacks::bsp_rsp0_top(),
+        slot => stack_top(slot),
+    }
 }
 
 /// After startup, report every online CPU's stacks, the BSP first, as
@@ -716,6 +748,10 @@ extern "C" fn secondary_main(index: usize) -> ! {
         unsafe {
             asm!("sti", "hlt", "cli", options(nostack));
         }
+        // A wake while a session is open joins it, until its barrier sends
+        // this CPU back here (spec 0051, point 5). Outside one this returns
+        // at once.
+        crate::userspace::join_session();
     }
 }
 
@@ -1319,13 +1355,6 @@ pub fn handle_ipi() {
 /// send it vector 242. Any CPU may kick any ONLINE CPU, itself included, with
 /// IF=0, holding the scheduler lock or not: the send waits only for this
 /// CPU's own ICR, never for the target. A delivery failure is fatal.
-#[cfg_attr(
-    not(feature = "boot-smoke"),
-    expect(
-        dead_code,
-        reason = "the scheduler's kicks come with spec 0051's step 5"
-    )
-)]
 pub(crate) fn kick(slot: usize) {
     assert!(!arch::interrupts_enabled(), "a kick requires IF=0");
     assert!(

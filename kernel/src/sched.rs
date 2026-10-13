@@ -44,8 +44,16 @@
 //! Entries are reached through raw slot pointers, never through a reference
 //! to a whole table. A thread entry belongs to its process: code reaches it
 //! through the process (`Process::member`), except for the scheduler's short
-//! reads while it holds no process reference. So far only the BSP runs user
-//! threads (`smp::userspace_cpus`).
+//! reads while it holds no process reference.
+//!
+//! Every CPU in `smp::userspace_mask` runs user threads (spec 0051, point
+//! 5). The BSP runs `run`, which owns the session: its loop top tears
+//! processes down, and its pass alone reaches deadlines, drains device input
+//! and completes the requests that need the frame allocator, the heap or the
+//! kernel VA window, which an AP hands it on a work list. An AP joins an open
+//! session from its idle loop (`run_ap`), runs and completes threads whose
+//! process's CPU mask allows it, and leaves at the session's end barrier. A
+//! CPU whose pass leaves work that an idle CPU could take kicks that CPU.
 //!
 //! This is a child module of `userspace`, so it shares the private process,
 //! thread and syscall types without widening their visibility.
@@ -54,12 +62,13 @@ use core::{
     cell::UnsafeCell,
     marker::PhantomData,
     mem::MaybeUninit,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering},
 };
 
 use super::{
     CpuPolicy, MemoryClass, Outcome, Process, ShellRuntime, State, Thread, complete_wait,
-    deadline_reached, release_handles, resume_process, thread_abi, vm_abi,
+    deadline_reached, finish_slice, release_handles, resume_on_ap, resume_process, thread_abi,
+    vm_abi,
 };
 #[cfg(feature = "boot-smoke")]
 use crate::elf;
@@ -68,7 +77,7 @@ use crate::{
     ipc::{self, Ipc},
     memory::FrameAllocator,
     paging::PageTables,
-    serial, smp, stacks, surface, timer, windows,
+    serial, smp, surface, timer, windows,
 };
 
 /// Process-table capacity (0030-D4).
@@ -82,6 +91,16 @@ pub(super) const NO_SLOT: u16 = u16::MAX;
 const LOCK_WAIT_NS: u64 = 1_000_000_000;
 /// `SchedLock::owner` while no CPU holds the lock.
 const NO_OWNER: u32 = u32::MAX;
+/// How long the BSP waits at a session's end for every AP to leave it (spec
+/// 0051, point 9). A kicked AP returns its thread at its next trap and never
+/// waits for the BSP on the way out, so a longer wait is a stuck AP.
+const BARRIER_WAIT_NS: u64 = 1_000_000_000;
+/// `PHASE`: no session is published.
+const CLOSED: u8 = 0;
+/// `PHASE`: a session is published, and an AP that runs userspace joins it.
+const OPEN: u8 = 1;
+/// `PHASE`: the session's end rule holds; no AP joins, and each AP leaves.
+const CLOSING: u8 = 2;
 
 /// The scheduler lock (spec 0051, point 1): a ticket spinlock taken with IF
 /// clear, which records the slot of the CPU that holds it.
@@ -360,7 +379,21 @@ static RUN_QUEUE: Locked<RunQueue> = Locked::new(RunQueue {
     woken_in: [0; THREAD_SLOTS],
 });
 static WAITS: Locked<Waits> = Locked::new(Waits::new());
+static BSP_WORK: Locked<BspWork> = Locked::new(BspWork {
+    list: List::EMPTY,
+    links: Links::new(),
+    listed: [false; THREAD_SLOTS],
+});
 static REPORTED: AtomicBool = AtomicBool::new(false);
+/// Where the session is in its life (`CLOSED`, `OPEN`, `CLOSING`). Changed
+/// only by the BSP under SCHED, so a check under SCHED is exact.
+static PHASE: AtomicU8 = AtomicU8::new(CLOSED);
+/// The APs in the open session's loop, as a mask of slots. An AP sets its bit
+/// under SCHED as it joins and clears it once it has left and released SCHED.
+static PARTICIPANTS: AtomicU64 = AtomicU64::new(0);
+/// The kernel tables the published session borrows, which the APs' root
+/// switches restore (spec 0051, point 5). Valid while the session is.
+static KERNEL: AtomicPtr<PageTables> = AtomicPtr::new(core::ptr::null_mut());
 /// The running session, which `run` publishes for its whole run (spec 0051,
 /// point 1). Handlers and deferred completions reach the session objects
 /// through `with_session`, under SCHED.
@@ -599,6 +632,10 @@ struct Signals {
     /// The tick of each signal: for a syscall's event, its trap-exit tick,
     /// since no tick is delivered while the handler runs with IF=0.
     at: [u64; THREAD_SLOTS],
+    /// The CPU that signaled each wait, for the SMP battery's count of wakes
+    /// across CPUs (boot-smoke).
+    #[cfg(feature = "boot-smoke")]
+    from: [u8; THREAD_SLOTS],
 }
 
 /// One signaled wait, taken for completion.
@@ -607,6 +644,9 @@ pub(super) struct Signal {
     pub(super) slot: u16,
     pub(super) preset: Option<i64>,
     pub(super) at: u64,
+    /// The CPU that signaled it (boot-smoke).
+    #[cfg(feature = "boot-smoke")]
+    pub(super) from: u8,
 }
 
 impl Signals {
@@ -618,6 +658,8 @@ impl Signals {
             has_preset: [false; THREAD_SLOTS],
             preset: [0; THREAD_SLOTS],
             at: [0; THREAD_SLOTS],
+            #[cfg(feature = "boot-smoke")]
+            from: [0; THREAD_SLOTS],
         }
     }
 
@@ -635,6 +677,10 @@ impl Signals {
         self.has_preset[index] = preset.is_some();
         self.preset[index] = preset.unwrap_or(0);
         self.at[index] = timer::ticks();
+        #[cfg(feature = "boot-smoke")]
+        {
+            self.from[index] = cpudata::current_cpu() as u8;
+        }
         self.links.push(&mut self.list, slot);
         cpudata::set_need_resched();
     }
@@ -648,8 +694,21 @@ impl Signals {
             slot,
             preset: self.has_preset[index].then_some(self.preset[index]),
             at: self.at[index],
+            #[cfg(feature = "boot-smoke")]
+            from: self.from[index],
         }
     }
+}
+
+/// Threads that came back on an AP with a request only the BSP may complete
+/// (spec 0051, point 5): a page-in or VM call (`Memory`), `Creating`, or an
+/// exit whose kernel stack must be freed. The BSP's pass completes them in
+/// FIFO order. A listed thread is on no CPU; finishing its process takes it
+/// off the list.
+struct BspWork {
+    list: List,
+    links: Links,
+    listed: [bool; THREAD_SLOTS],
 }
 
 /// Every blocked thread's queues. All fields start zero, so the static lands
@@ -736,6 +795,13 @@ pub(super) fn assert_drained() {
         "thread left queued"
     );
     assert!(WAITS.with(|waits| waits.is_empty()), "wait left queued");
+    assert!(!bsp_work_pending(), "thread left on the BSP work list");
+    assert_eq!(PHASE.load(Ordering::SeqCst), CLOSED, "a session is open");
+    assert_eq!(
+        PARTICIPANTS.load(Ordering::SeqCst),
+        0,
+        "an AP is in a session"
+    );
 }
 
 /// Whether both tables can take this many more entries.
@@ -1273,8 +1339,8 @@ pub(super) fn release(slot: u16) {
     });
 }
 
-/// Take a thread off the run queue and every wait queue, as a finishing
-/// process does for each of its threads.
+/// Take a thread off the run queue, every wait queue and the BSP work list,
+/// as a finishing process does for each of its threads.
 pub(super) fn detach(slot: u16) {
     unqueue(slot);
     WAITS.with(|waits| {
@@ -1283,6 +1349,52 @@ pub(super) fn detach(slot: u16) {
         }
         waits.release(slot);
     });
+    BSP_WORK.with(|work| {
+        if core::mem::take(&mut work.listed[usize::from(slot)]) {
+            work.links.remove(&mut work.list, slot);
+        }
+    });
+}
+
+/// Hand a thread that came back on this AP with a request only the BSP may
+/// complete to the BSP's work list (spec 0051, point 5). The caller then
+/// kicks the BSP.
+pub(super) fn push_bsp_work(slot: u16) {
+    assert_ne!(cpudata::current_cpu(), 0, "the BSP handed itself work");
+    BSP_WORK.with(|work| {
+        let index = usize::from(slot);
+        assert!(!work.listed[index], "a thread handed to the BSP twice");
+        work.links.push(&mut work.list, slot);
+        work.listed[index] = true;
+    });
+}
+
+/// The oldest thread on the BSP work list, taken off it.
+fn take_bsp_work() -> Option<u16> {
+    BSP_WORK.with(|work| {
+        if work.list.length == 0 {
+            return None;
+        }
+        let slot = work.list.head;
+        work.links.remove(&mut work.list, slot);
+        work.listed[usize::from(slot)] = false;
+        Some(slot)
+    })
+}
+
+/// Whether a thread waits on the BSP work list.
+fn bsp_work_pending() -> bool {
+    BSP_WORK.with(|work| work.list.length != 0)
+}
+
+/// Whether a finished process waits only for the BSP's loop top to release
+/// its threads: none is on a CPU any more (spec 0051, point 8).
+fn teardown_pending() -> bool {
+    process_slots().any(|slot| {
+        // SAFETY: The scheduler holds no other process reference.
+        let process = unsafe { process(slot) };
+        process.finished() && !process.zombie() && process.quiescent()
+    })
 }
 
 /// Signal every timed wait whose deadline has been reached, earliest first.
@@ -1301,20 +1413,33 @@ fn expire(now: u64) {
     });
 }
 
-/// The oldest signaled wait whose thread is on no CPU, if any. A thread
-/// that parked inside its own handler stays on its CPU until that CPU's
-/// scheduler has stored its context; its signals wait for a later pass
-/// (spec 0051, point 2).
+/// The oldest signaled wait that this CPU may complete, if any: its thread
+/// is on no CPU, and its process may run on this CPU. A thread that parked
+/// inside its own handler stays on its CPU until that CPU's scheduler has
+/// stored its context; its signals wait for a later pass (spec 0051, point
+/// 2). A pinned process's waits are left to the CPUs it may run on (point
+/// 6).
 fn next_signal() -> Option<Signal> {
+    let me = 1 << cpudata::current_cpu();
     WAITS.with(|waits| {
         let signals = &mut waits.signals;
-        let slot = signals.links.slots(signals.list).find(|&slot| {
-            // SAFETY: A signaled thread is occupied, and this read of one
-            // field holds no reference past it.
-            !unsafe { (*thread_entry(slot)).on_cpu }
-        })?;
+        let slot = signals
+            .links
+            .slots(signals.list)
+            .find(|&slot| completable(slot, me))?;
         Some(signals.take(slot))
     })
+}
+
+/// Whether a CPU in `cpus` may complete thread `slot`'s signaled wait: the
+/// thread is on no CPU and its process may run on one of them.
+fn completable(slot: u16, cpus: u64) -> bool {
+    // SAFETY: A signaled thread and its process are occupied, and these
+    // reads of single fields hold no reference past them.
+    unsafe {
+        let thread = thread_entry(slot);
+        !(*thread).on_cpu && (*PROCESSES.entry(usize::from((*thread).process))).cpus & cpus != 0
+    }
 }
 
 /// How one sequential session ends.
@@ -1331,6 +1456,11 @@ pub(super) enum End {
     /// The shell session ends when the shell finishes; its caller then
     /// closes the live apps.
     Shell { shell: usize },
+    /// An SMP battery session (spec 0051, step 5) ends once its process is a
+    /// zombie. With `panic`, the BSP panics in its pass instead, as soon as a
+    /// battery thread runs on every AP that runs userspace (Panic).
+    #[cfg(feature = "boot-smoke")]
+    Battery { process: usize, panic: bool },
 }
 
 /// Everything one session shares, owned by its seeding function. `run`
@@ -1353,6 +1483,11 @@ impl Session<'_, '_> {
             }),
             // SAFETY: As above.
             End::Shell { shell } => unsafe { process(shell) }.finished(),
+            // Its threads ran on every CPU, so it ends once the loop top has
+            // released them, when none is on a CPU any more.
+            // SAFETY: As above.
+            #[cfg(feature = "boot-smoke")]
+            End::Battery { process: slot, .. } => unsafe { process(slot) }.zombie(),
         }
     }
 }
@@ -1370,8 +1505,8 @@ pub(super) struct Stats {
     pub(super) idle_ticks: u64,
 }
 
-/// Publish `session` as the running one.
-fn publish<'a, 'fb>(session: &mut Session<'a, 'fb>) -> *mut Session<'a, 'fb> {
+/// Publish `session` as the running one, with the kernel tables it borrows.
+fn publish<'a, 'fb>(session: &mut Session<'a, 'fb>, kernel: &PageTables) {
     let pointer = core::ptr::from_mut(session);
     assert!(
         SESSION
@@ -1384,7 +1519,14 @@ fn publish<'a, 'fb>(session: &mut Session<'a, 'fb>) -> *mut Session<'a, 'fb> {
             .is_ok(),
         "a session is already published"
     );
-    pointer
+    KERNEL.store(core::ptr::from_ref(kernel).cast_mut(), Ordering::SeqCst);
+}
+
+/// Revoke the published session, once no AP is in it.
+fn unpublish() {
+    assert_eq!(PHASE.load(Ordering::SeqCst), CLOSED);
+    SESSION.store(core::ptr::null_mut(), Ordering::SeqCst);
+    KERNEL.store(core::ptr::null_mut(), Ordering::SeqCst);
 }
 
 /// Whether no session is published.
@@ -1403,17 +1545,18 @@ pub(super) fn with_session<R>(operation: impl FnOnce(&mut Session<'_, '_>) -> R)
         "reentrant session access"
     );
     // SAFETY: `run` published this session from a live exclusive borrow and
-    // revokes it before that borrow ends. SCHED excludes other CPUs, the busy
-    // flag excludes a second loan here, and `run` touches the session only
-    // through its own short reborrows, none live while a handler or deferred
-    // completion runs. The closure cannot retain the borrow.
+    // revokes it before that borrow ends, after every AP left it. SCHED
+    // excludes other CPUs, and the busy flag excludes a second loan here:
+    // `run` itself reaches the session only through this function. The
+    // closure cannot retain the borrow.
     let result = operation(unsafe { &mut *pointer });
     SESSION_BUSY.store(false, Ordering::Release);
     result
 }
 
 /// A thread that came back from user mode still ready, to be queued again
-/// after the next completion pass.
+/// after the next completion pass. This CPU keeps its claim (`on_cpu`)
+/// until then.
 #[derive(Clone, Copy)]
 struct Returned {
     slot: u16,
@@ -1422,8 +1565,58 @@ struct Returned {
     displaced: bool,
 }
 
-/// Run one session until its end rule holds, with SCHED held by the caller.
-/// On return no thread runs, no session is published, and the session's
+/// Release this CPU's claim on a thread that came back ready and queue it: a
+/// displaced one at the head, behind this pass's woken threads by their
+/// precedence, any other at the tail. The BSP may have released SCHED since
+/// the thread came back, and another CPU may have finished its process
+/// meanwhile; the claim kept that process from being torn down, and the
+/// thread now only leaves this CPU, for the BSP's next loop top to tear the
+/// process down (spec 0051, point 8).
+fn requeue(thread: Returned) {
+    if !release_claim(thread.slot) {
+        return;
+    }
+    if thread.displaced {
+        requeue_displaced(thread.slot);
+    } else {
+        enqueue(thread.slot);
+    }
+}
+
+/// Clear this CPU's claim on thread `slot`, which came back ready, and
+/// return whether it is still ready rather than finished.
+fn release_claim(slot: u16) -> bool {
+    let me = cpudata::current_cpu();
+    // SAFETY: The claim keeps the thread's process from looking quiescent, so
+    // its entry is still occupied. The scheduler holds no other reference to
+    // it, and this borrow ends with the function.
+    let thread = unsafe { &mut *thread_entry(slot) };
+    assert!(
+        thread.on_cpu && usize::from(thread.cpu) == me,
+        "released a thread this CPU does not hold"
+    );
+    thread.on_cpu = false;
+    match thread.state {
+        State::Ready => true,
+        State::Finished => {
+            // Only the BSP tears processes down.
+            if me != 0 {
+                smp::kick(0);
+            }
+            false
+        }
+        state => panic!("a held ready thread became {state:?}"),
+    }
+}
+
+/// The CPUs in `mask`, lowest first.
+fn cpus_in(mask: u64) -> impl Iterator<Item = usize> {
+    (0..u64::BITS as usize).filter(move |&cpu| mask & 1 << cpu != 0)
+}
+
+/// Run one session until its end rule holds, on the BSP with SCHED held by
+/// the caller. The APs that run userspace join it (`run_ap`). On return no
+/// thread runs on any CPU, no session is published, and the session's
 /// processes, finished or not, stay in the table for the caller to drain.
 pub(super) fn run(
     session: &mut Session<'_, '_>,
@@ -1434,56 +1627,63 @@ pub(super) fn run(
     assert!(!arch::interrupts_enabled());
     assert_held();
     assert!(!interrupts::user_context_active());
+    assert_eq!(cpudata::current_cpu(), 0, "a session runs on the BSP");
     // SAFETY: IF=0 and no user context is active. The BSP's guarded RSP0
     // stack is mapped in the shared upper half of every process root.
-    unsafe { interrupts::set_kernel_stack(stacks::bsp_rsp0_top()) };
+    unsafe { interrupts::set_kernel_stack(smp::rsp0_placeholder()) };
     cpudata::reset_pass_stats();
-    let published = publish(session);
+    publish(session, kernel);
+    open_session();
     let mut returned: Option<Returned> = None;
     loop {
         assert!(!arch::interrupts_enabled());
         assert_idle_cpu();
         // 0059-D1: the loop top between dispatches is a heap safe point (BSP,
         // IF=0, kernel root active, no IRQ-needed lock held, no syscall frame
-        // live). Growth may wait for other CPUs, so SCHED is released.
+        // live). Growth may wait for other CPUs, so SCHED is released; the
+        // thread in `returned` stays claimed across it (`requeue`).
         unlocked(|| heap::ensure(kernel, frames, direct_map));
-        // SAFETY: The published session outlives this run. This CPU holds
-        // SCHED and lends the session to no handler or completion now, so
-        // this reborrow, which ends before the dispatch below, is the only one.
-        let session = unsafe { &mut *published };
-        // A finished process's endpoints close before any peer's receive is
-        // checked, so a blocked peer observes closure (readme, IPC). Once no
-        // thread of it is on a CPU and no CPU has its root loaded, every
-        // thread context is saved, so the process gives up its thread entries
-        // and stays a zombie until reaped (0030-D5; spec 0051, point 8).
-        for slot in process_slots() {
-            // SAFETY: The scheduler holds no other process reference.
-            let process = unsafe { process(slot) };
-            release_handles(process, &mut session.ipc);
-            if process.finished() && !process.zombie() && process.quiescent() {
-                process.release_threads();
+        let ended = with_session(|session| {
+            // A finished process's endpoints close before any peer's receive
+            // is checked, so a blocked peer observes closure (readme, IPC).
+            // Once no thread of it is on a CPU and no CPU has its root
+            // loaded, every thread context is saved, so the process gives up
+            // its thread entries and stays a zombie until reaped (0030-D5;
+            // spec 0051, point 8).
+            for slot in process_slots() {
+                // SAFETY: The scheduler holds no other process reference.
+                let process = unsafe { process(slot) };
+                release_handles(process, &mut session.ipc);
+                if process.finished() && !process.zombie() && process.quiescent() {
+                    process.release_threads();
+                }
             }
-        }
-        if let Some(runtime) = &mut session.runtime {
-            runtime.reclaim_finished(frames, &mut session.ipc);
-        }
-        // 0059-D4 (boot-smoke): the shell session's charge peaks, sampled one
-        // loop top after any launch, close or reclaim.
-        #[cfg(feature = "boot-smoke")]
-        if let End::Shell { shell } = session.end {
-            let runtime = session.runtime.as_mut().expect("shell runtime");
-            // SAFETY: The scheduler holds no other process reference.
-            runtime.sample_charge_peaks(unsafe { process(shell) });
-        }
-        if session.ended() {
-            crate::perf::end_session();
-            // Only a finished process is reclaimed above, and a ready thread's
-            // process is live, so its slot is still occupied. The caller
-            // finishes the session's remaining processes, which unqueues it.
+            if let Some(runtime) = &mut session.runtime {
+                runtime.reclaim_finished(frames, &mut session.ipc);
+            }
+            // 0059-D4 (boot-smoke): the shell session's charge peaks, sampled
+            // one loop top after any launch, close or reclaim.
+            #[cfg(feature = "boot-smoke")]
+            if let End::Shell { shell } = session.end {
+                let runtime = session.runtime.as_mut().expect("shell runtime");
+                // SAFETY: The scheduler holds no other process reference.
+                runtime.sample_charge_peaks(unsafe { process(shell) });
+            }
+            session.ended()
+        });
+        if ended {
+            // The thread this CPU still holds kept its process from being
+            // torn down above. Queue it, or drop it if its process finished,
+            // and end at the next loop top, after that teardown; its queue
+            // position no longer matters. The caller finishes the session's
+            // remaining processes, which unqueues it.
             if let Some(thread) = returned.take() {
-                enqueue(thread.slot);
+                requeue(thread);
+                continue;
             }
-            SESSION.store(core::ptr::null_mut(), Ordering::SeqCst);
+            crate::perf::end_session();
+            close_session();
+            unpublish();
             let (switches, idle_ticks) = cpudata::pass_stats();
             return Stats {
                 switches: usize::try_from(switches).expect("switch count"),
@@ -1493,35 +1693,49 @@ pub(super) fn run(
         // BSP/IF=0 and the allocator is borrowed only here, outside dispatch.
         // Check the end rule first so a finished session gets no more samples.
         crate::perf::sample_memory(frames);
+        // What the APs handed over completes before the pass begins: a
+        // release may drop SCHED for its shootdowns, and the pass's woken
+        // threads keep their precedence only within one hold (0030-D3).
+        complete_bsp_work(kernel, frames);
         let now = timer::ticks();
         begin_pass();
-        complete_waits(session, now);
+        let end = with_session(|session| {
+            complete_waits(session, now);
+            session.end
+        });
         // Queue the returned thread before a shell close can finish its
-        // process and take it off the queue: a displaced one at the head,
-        // behind this pass's woken threads by their precedence, any other at
-        // the tail.
+        // process and take it off the queue.
         if let Some(thread) = returned.take() {
-            if thread.displaced {
-                requeue_displaced(thread.slot);
-            } else {
-                enqueue(thread.slot);
-            }
+            requeue(thread);
         }
-        match session.end {
+        match end {
             #[cfg(feature = "boot-smoke")]
             End::Pair { .. } => {}
-            End::Shell { shell } => complete_shell_requests(session, frames, shell),
+            End::Shell { shell } => {
+                with_session(|session| complete_shell_requests(session, frames, shell));
+            }
+            #[cfg(feature = "boot-smoke")]
+            End::Battery { process, panic } => {
+                if panic {
+                    panic_while_aps_run(process);
+                }
+            }
         }
-        #[cfg(feature = "boot-smoke")]
-        let end = session.end;
-        let Some(slot) = select(now) else {
-            idle();
+        let selected = select(now);
+        kick_idle(now);
+        let Some(slot) = selected else {
+            // Work an AP handed over while a release dropped SCHED, and a
+            // process whose last thread left another CPU meanwhile, wait for
+            // the next pass and loop top instead of a halt.
+            if !bsp_work_pending() && !teardown_pending() {
+                idle();
+            }
             continue;
         };
         // SAFETY: The thread is occupied and nothing references it here.
         let owner = usize::from(unsafe { (*thread_entry(slot)).process });
         cpudata::note_dispatch(owner as u32);
-        returned = dispatch(kernel, frames, owner, slot);
+        returned = dispatch(kernel, Some(&mut *frames), owner, slot);
         #[cfg(feature = "boot-smoke")]
         if let End::Pair {
             first,
@@ -1532,6 +1746,124 @@ pub(super) fn run(
             check_budget(owner, first, second, scenario);
         }
     }
+}
+
+/// Open the published session to the APs that run userspace, and kick each
+/// so that it joins at once rather than at its next tick (spec 0051, point
+/// 5).
+fn open_session() {
+    assert_eq!(PHASE.load(Ordering::SeqCst), CLOSED, "a session is open");
+    assert_eq!(
+        PARTICIPANTS.load(Ordering::SeqCst),
+        0,
+        "an AP is in a session"
+    );
+    PHASE.store(OPEN, Ordering::SeqCst);
+    for cpu in cpus_in(smp::userspace_mask() & !1) {
+        smp::kick(cpu);
+    }
+}
+
+/// The session-end barrier (spec 0051, point 9): no AP joins any more, each
+/// AP in the session is kicked, and the BSP waits outside SCHED, bounded,
+/// until every one has returned its thread and left for its idle loop. Then
+/// no thread is on any CPU and no CPU has a process root loaded, which the
+/// shell's close, the frame baselines and 0058a's restart rely on.
+fn close_session() {
+    PHASE.store(CLOSING, Ordering::SeqCst);
+    for cpu in cpus_in(PARTICIPANTS.load(Ordering::SeqCst)) {
+        smp::kick(cpu);
+    }
+    // An AP needs SCHED to leave, and never waits for this CPU on its way.
+    let left = unlocked(|| {
+        let mut bound = clock::SpinBound::new(BARRIER_WAIT_NS);
+        while PARTICIPANTS.load(Ordering::Acquire) != 0 {
+            if bound.expired() {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+        true
+    });
+    assert!(
+        left,
+        "session barrier timeout: participants {:#x}",
+        PARTICIPANTS.load(Ordering::SeqCst)
+    );
+    PHASE.store(CLOSED, Ordering::SeqCst);
+    for slot in process_slots() {
+        // SAFETY: The scheduler holds no other process reference.
+        let process = unsafe { process(slot) };
+        assert!(
+            process.threads().all(|thread| !thread.on_cpu),
+            "a thread is on a CPU after the session barrier"
+        );
+        assert_eq!(
+            process.space.loaded_cpus(),
+            0,
+            "a CPU has a process root loaded after the session barrier"
+        );
+    }
+}
+
+/// Join the open session from this AP's idle loop and run its threads until
+/// the session closes (spec 0051, point 5), with IF=0 and no lock held. An
+/// AP outside `smp::userspace_mask`, or a wake outside an open session,
+/// returns at once.
+pub(super) fn run_ap() {
+    let me = cpudata::current_cpu();
+    let bit = 1_u64 << me;
+    assert!(!arch::interrupts_enabled());
+    if me == 0 || smp::userspace_mask() & bit == 0 || PHASE.load(Ordering::Acquire) != OPEN {
+        return;
+    }
+    let guard = lock();
+    // PHASE changes only under SCHED, so this check is exact: once the BSP
+    // starts its barrier, no AP joins.
+    if PHASE.load(Ordering::SeqCst) != OPEN {
+        return;
+    }
+    assert_eq!(
+        PARTICIPANTS.fetch_or(bit, Ordering::SeqCst) & bit,
+        0,
+        "an AP joined a session twice"
+    );
+    let kernel = KERNEL.load(Ordering::SeqCst);
+    assert!(!kernel.is_null(), "an open session without kernel tables");
+    // SAFETY: `run` published these tables with the session from a live
+    // shared borrow, and its barrier waits for this CPU to leave before the
+    // borrow ends. APs only read the root through them.
+    let kernel = unsafe { &*kernel };
+    // SAFETY: IF=0 and no user context is active; the placeholder is this
+    // AP's own kernel stack top, mapped in every process root.
+    unsafe { interrupts::set_kernel_stack(smp::rsp0_placeholder()) };
+    let mut returned: Option<Returned> = None;
+    while PHASE.load(Ordering::SeqCst) == OPEN {
+        assert!(!arch::interrupts_enabled());
+        assert_idle_cpu();
+        let now = timer::ticks();
+        begin_pass();
+        with_session(|session| complete_waits(session, now));
+        if let Some(thread) = returned.take() {
+            requeue(thread);
+        }
+        let selected = select(now);
+        kick_idle(now);
+        let Some(slot) = selected else {
+            idle();
+            continue;
+        };
+        // SAFETY: The thread is occupied and nothing references it here.
+        let owner = usize::from(unsafe { (*thread_entry(slot)).process });
+        cpudata::note_dispatch(owner as u32);
+        returned = dispatch(kernel, None, owner, slot);
+    }
+    if let Some(thread) = returned.take() {
+        requeue(thread);
+    }
+    drop(guard);
+    // Back to the idle loop, holding nothing: the BSP's barrier may end.
+    PARTICIPANTS.fetch_and(!bit, Ordering::SeqCst);
 }
 
 /// Check that this CPU's scheduler runs and completes for no thread and is
@@ -1567,17 +1899,23 @@ pub(super) fn current() -> Option<(usize, u16)> {
     })
 }
 
-/// Complete the signaled waits in signal order (0030-D2), after every return
-/// from user mode and every idle wakeup. Expired deadlines are signaled
-/// first. A completion signals nothing, so each thread is taken at most once.
+/// Complete the signaled waits that this CPU may complete in signal order
+/// (0030-D2), after every return from user mode and every idle wakeup. On
+/// the BSP, expired deadlines and device input are signaled first: only the
+/// BSP's clock reaches deadlines, and only it drains input (spec 0051,
+/// points 3 and 6). A completion signals nothing, so each thread is taken at
+/// most once.
 fn complete_waits(session: &mut Session<'_, '_>, now: u64) {
-    expire(now);
-    // The flag is cleared, with IF=0, before the device-input waiters are
-    // rechecked, so input that arrives later sets it again. Drain work that
-    // a PS/2 or vmmouse bound deferred continues in the waiters' recheck.
-    let arrived = input::take_arrival();
-    if arrived || crate::ps2::drain_pending() {
-        signal_queue(Queue::Input);
+    if cpudata::current_cpu() == 0 {
+        expire(now);
+        // The flag is cleared, with IF=0, before the device-input waiters are
+        // rechecked, so input that arrives later sets it again. Drain work
+        // that a PS/2 or vmmouse bound deferred continues in the waiters'
+        // recheck.
+        let arrived = input::take_arrival();
+        if arrived || crate::ps2::drain_pending() {
+            signal_queue(Queue::Input);
+        }
     }
     for _ in 0..THREAD_SLOTS {
         let Some(signal) = next_signal() else {
@@ -1600,11 +1938,49 @@ fn complete_waits(session: &mut Session<'_, '_>, now: u64) {
         complete_wait(process, signal, &mut session.ipc, input, windows, now);
         clear_current();
     }
-    // Only a thread still on a CPU keeps a signal past the pass.
+    // Only a thread still on a CPU, or one that another CPU must complete,
+    // keeps a signal past the pass.
     assert!(
         next_signal().is_none(),
         "a completion signaled another wait"
     );
+}
+
+/// Complete what the APs handed the BSP (spec 0051, point 5), as each
+/// thread's own scheduler would at the end of its slice: a page-in or VM
+/// call, a creation, or an exit's stack free and its joiner's signal. The
+/// BSP claims each thread for the completion, as a dispatch does. At most
+/// one pass over the table: work handed over while a release dropped SCHED
+/// may wait for the next pass.
+fn complete_bsp_work(kernel: &PageTables, frames: &mut FrameAllocator<'_>) {
+    assert_eq!(cpudata::current_cpu(), 0, "an AP completed BSP work");
+    for _ in 0..THREAD_SLOTS {
+        let Some(slot) = take_bsp_work() else {
+            return;
+        };
+        let owner = {
+            // SAFETY: A listed thread is occupied, and the scheduler holds no
+            // reference to it; this borrow ends with the block.
+            let thread = unsafe { &mut *thread_entry(slot) };
+            assert!(!thread.on_cpu, "a handed-over thread is on a CPU");
+            thread.on_cpu = true;
+            thread.cpu = 0;
+            usize::from(thread.process)
+        };
+        set_current(owner, slot);
+        finish_slice(kernel, frames, owner);
+        clear_current();
+        // finish_slice leaves a ready thread claimed, and a thread whose
+        // process another CPU finished during a release on no CPU.
+        // SAFETY: As above; finish_slice's borrows have ended, and the entry
+        // stays until a later pass reaps it.
+        if unsafe { (*thread_entry(slot)).state } == State::Ready {
+            requeue(Returned {
+                slot,
+                displaced: false,
+            });
+        }
+    }
 }
 
 /// Run the shell's deferred launch and close calls, which create and reap
@@ -1634,7 +2010,9 @@ fn complete_shell_requests(
             State::Launching(kind) => runtime
                 .launch(frames, shell, kind)
                 .unwrap_or_else(|error| error as u64),
-            // A close whose app still has a thread on a CPU stays pending.
+            // A close whose app still has a thread on a CPU stays pending;
+            // the close kicked that CPU, which kicks this one back once the
+            // thread has left (spec 0051, point 8).
             State::Closing(pid) => {
                 match runtime.close(frames, shell, &mut session.ipc, pid, Outcome::Terminated) {
                     Some(result) => result.map_or_else(|error| error as u64, |()| 0),
@@ -1653,10 +2031,11 @@ fn complete_shell_requests(
     }
 }
 
-/// Dequeue the first ready thread whose process may run now and which is on
-/// no CPU. The CPU policy stays the gate, so a throttled service never
-/// resumes.
+/// Dequeue the first ready thread whose process may run on this CPU now and
+/// which is on no CPU. The CPU policy stays the gate, so a throttled service
+/// never resumes, and the process's CPU mask pins it (spec 0051, point 6).
 fn select(now: u64) -> Option<u16> {
+    let me = 1 << cpudata::current_cpu();
     dequeue_first(|slot| {
         // SAFETY: Queued slots are occupied, and the scheduler holds no
         // reference to this thread or its process; both borrows end here.
@@ -1672,20 +2051,91 @@ fn select(now: u64) -> Option<u16> {
         // SAFETY: As above.
         let process = unsafe { process(owner) };
         assert!(!process.finished(), "finished process left a queued thread");
-        match &mut process.policy {
-            CpuPolicy::Probe => true,
-            CpuPolicy::Shell(policy) | CpuPolicy::Application(policy) => policy.eligible(now),
-        }
+        process.cpus & me != 0
+            && match &mut process.policy {
+                CpuPolicy::Probe => true,
+                CpuPolicy::Shell(policy) | CpuPolicy::Application(policy) => policy.eligible(now),
+            }
     })
+}
+
+/// The CPUs that could take work this pass left (spec 0051, point 3): those
+/// a queued, eligible thread's process may run on, and those that may
+/// complete a signaled wait that this CPU had to leave.
+fn waiting_work(now: u64) -> (u64, u64) {
+    let ready = RUN_QUEUE.with(|queue| {
+        let mut cpus = 0;
+        let mut current = queue.head;
+        for _ in 0..queue.length {
+            // SAFETY: Queued slots and their processes are occupied, and
+            // these reads of single fields hold no reference past them. The
+            // policy is copied, so the eligibility check changes nothing.
+            let (on_cpu, process_cpus, mut policy) = unsafe {
+                let thread = thread_entry(current);
+                let process = PROCESSES.entry(usize::from((*thread).process));
+                ((*thread).on_cpu, (*process).cpus, (*process).policy)
+            };
+            let eligible = match &mut policy {
+                CpuPolicy::Probe => true,
+                CpuPolicy::Shell(policy) | CpuPolicy::Application(policy) => policy.eligible(now),
+            };
+            if !on_cpu && eligible {
+                cpus |= process_cpus;
+            }
+            current = queue.next[usize::from(current)];
+        }
+        cpus
+    });
+    let signaled = WAITS.with(|waits| {
+        let signals = &waits.signals;
+        signals
+            .links
+            .slots(signals.list)
+            .filter(|&slot| completable(slot, u64::MAX))
+            // SAFETY: As in `completable`.
+            .map(|slot| unsafe {
+                (*PROCESSES.entry(usize::from((*thread_entry(slot)).process))).cpus
+            })
+            .fold(0, |cpus, process| cpus | process)
+    });
+    (ready, signaled)
+}
+
+/// After a pass, kick each idle CPU that could take the work it left, and
+/// one CPU that may complete a signaled wait this CPU could not, even a busy
+/// one when none is idle: its slice yields to the wake, as on one CPU
+/// (0030-D3). An AP that has not joined the open session counts as idle.
+fn kick_idle(now: u64) {
+    let cpus = smp::userspace_mask();
+    let me = cpudata::current_cpu();
+    let others = cpus & !(1 << me);
+    if others == 0 {
+        return;
+    }
+    let participants = PARTICIPANTS.load(Ordering::SeqCst);
+    let idle = cpus_in(others)
+        .filter(|&cpu| cpudata::is_idle(cpu) || (cpu != 0 && participants & 1 << cpu == 0))
+        .fold(0, |mask, cpu| mask | 1 << cpu);
+    let (ready, signaled) = waiting_work(now);
+    let mut targets = (ready | signaled) & idle;
+    let urgent = signaled & others;
+    if urgent != 0 && urgent & idle == 0 {
+        targets |= 1 << urgent.trailing_zeros();
+    }
+    for cpu in cpus_in(targets) {
+        smp::kick(cpu);
+    }
 }
 
 /// Run one thread until it returns to the scheduler. A thread that comes back
 /// still ready is returned, for the next pass to queue again. Only slot
 /// indices cross the user entry; no process reference is held across it
-/// (spec 0051, point 2).
+/// (spec 0051, point 2). The BSP passes its frame allocator and completes
+/// the thread's request itself; an AP passes none and hands requests that
+/// need it to the BSP (point 5).
 fn dispatch(
     kernel: &PageTables,
-    frames: &mut FrameAllocator<'_>,
+    frames: Option<&mut FrameAllocator<'_>>,
     owner: usize,
     slot: u16,
 ) -> Option<Returned> {
@@ -1697,36 +2147,55 @@ fn dispatch(
         assert!(!thread.on_cpu, "dispatched a thread that is on a CPU");
         // resume_process clears it once the thread's context is stored.
         thread.on_cpu = true;
+        thread.cpu = cpudata::current_cpu() as u8;
     }
     // This pass completed the waits that scheduler work signaled, such as
-    // closing a finished process's endpoints. Only the slice's own signals
-    // may reschedule it.
+    // closing a finished process's endpoints. Only the slice's own signals,
+    // or another CPU's kick, may reschedule it; both come under SCHED after
+    // this clear, so neither is lost.
     let _ = cpudata::take_need_resched();
     set_current(owner, slot);
-    resume_process(kernel, frames, owner, slot);
+    match frames {
+        Some(frames) => resume_process(kernel, frames, owner, slot),
+        None => resume_on_ap(kernel, owner, slot),
+    }
     clear_current();
     // A preempted, yielding, displaced or completed thread rejoins the queue
-    // after the next completion pass, behind the threads it wakes.
-    // SAFETY: The thread stays occupied until its process is torn down or a
-    // joiner reaps it, both in a later pass; resume_process's borrows ended.
+    // after the next completion pass, behind the threads it wakes. Until then
+    // this CPU holds it, still claimed, so its process cannot be torn down
+    // while the BSP releases SCHED at its loop top or for a release.
+    // SAFETY: The thread stays occupied while this CPU holds SCHED: its
+    // process is torn down, or a joiner reaps it, only in a later hold.
     let thread = unsafe { &*thread_entry(slot) };
-    (thread.state == State::Ready).then_some(Returned {
+    let ready = thread.state == State::Ready;
+    assert_eq!(
+        thread.on_cpu, ready,
+        "a returned thread's claim does not match its state"
+    );
+    ready.then_some(Returned {
         slot,
         displaced: thread.displaced,
     })
 }
 
 /// Halt until an interrupt when no queued thread may run, with SCHED
-/// released. Some thread must be waiting on time or input, be throttled or
-/// run on another CPU, or nothing could wake. Only while this is the one CPU
-/// that runs user threads must idling charge no user tick (spec 0051, point 9).
+/// released. On the BSP some thread must be waiting on time or input, be
+/// throttled or run on another CPU, or a finished process must still have a
+/// thread on another CPU, whose scheduler kicks the BSP once it has left;
+/// otherwise nothing could wake. An AP halts whenever it has no thread it
+/// may run. Only while this is the one CPU that runs user threads must
+/// idling charge no user tick (spec 0051, point 9).
 fn idle() {
-    assert!(
-        process_slots().any(|slot| {
-            // SAFETY: The scheduler holds no other process reference.
-            let process = unsafe { process(slot) };
-            !process.finished()
-                && process.threads().any(|thread| {
+    if cpudata::current_cpu() == 0 {
+        assert!(!bsp_work_pending(), "the BSP halted with work handed over");
+        assert!(
+            process_slots().any(|slot| {
+                // SAFETY: The scheduler holds no other process reference.
+                let process = unsafe { process(slot) };
+                if process.finished() {
+                    return !process.quiescent();
+                }
+                process.threads().any(|thread| {
                     thread.on_cpu
                         || matches!(
                             thread.state,
@@ -1738,9 +2207,10 @@ fn idle() {
                                 | State::Waiting(_)
                         )
                 })
-        }),
-        "every live thread is blocked without a waker"
-    );
+            }),
+            "every live thread is blocked without a waker"
+        );
+    }
     let charged = || -> u64 {
         process_slots()
             // SAFETY: As above.
@@ -1750,6 +2220,7 @@ fn idle() {
     let alone = smp::userspace_cpus() == 1;
     let before_charge = alone.then(charged);
     let before = timer::ticks();
+    // Set under SCHED, so a CPU that queues work later sees it and kicks.
     cpudata::set_idle(true);
     unlocked(|| {
         // SAFETY: No user context or lock is live, and the kernel root is
@@ -1762,6 +2233,24 @@ fn idle() {
     cpudata::add_idle_ticks(timer::ticks().wrapping_sub(before));
     if let Some(before_charge) = before_charge {
         assert_eq!(charged(), before_charge, "idle charged user CPU ticks");
+    }
+}
+
+/// Panic (spec 0051, step 5) once a thread of battery process `slot` runs
+/// on every AP that runs userspace, announcing the BSP as the panicking CPU:
+/// the crash must then stop APs that run user code. With no such AP it
+/// panics at once.
+#[cfg(feature = "boot-smoke")]
+fn panic_while_aps_run(slot: usize) {
+    let aps = smp::userspace_mask() & !1;
+    // SAFETY: The scheduler holds no other process reference.
+    let running = unsafe { process(slot) }
+        .threads()
+        .filter(|thread| thread.on_cpu)
+        .fold(0_u64, |cpus, thread| cpus | 1 << thread.cpu);
+    if running & aps == aps {
+        serial::println!("MIRROR_TEST_EXPECT_PANIC cpu=0");
+        crate::crash::planted_panic();
     }
 }
 

@@ -121,7 +121,7 @@ fn store(value: &AtomicU64, data: u64) {
     value.store(data, Ordering::Release);
 }
 
-fn yield_now() {
+pub(super) fn yield_now() {
     require(syscall(SYS_YIELD, 0, 0, 0) == 0, 501);
 }
 
@@ -145,7 +145,7 @@ fn id() -> u64 {
     tid as u64
 }
 
-fn join(tid: u64) -> (i64, u64) {
+pub(super) fn join(tid: u64) -> (i64, u64) {
     let result: i64;
     let value: u64;
     // SAFETY: JOIN is the one native call with a second return register. All
@@ -163,7 +163,7 @@ fn join(tid: u64) -> (i64, u64) {
     (result, value)
 }
 
-fn thread_exit(value: u64) -> ! {
+pub(super) fn thread_exit(value: u64) -> ! {
     syscall(SYS_THREAD_EXIT, value, 0, 0);
     // SAFETY: Returning from thread exit is an ABI failure.
     unsafe { asm!("ud2", options(noreturn, nostack)) }

@@ -618,6 +618,28 @@ pub unsafe fn finish_batch(
     reloaded
 }
 
+/// As `finish_batch`, but `keep`, when the batch withdrew it, stays out of
+/// the allocator for the SMP battery's stale-write canary (spec 0051, step
+/// 5, boot-smoke); the caller then owns it. Returns how many targets had the
+/// root loaded, and whether the batch held `keep`.
+///
+/// # Safety
+/// As for `finish_batch`.
+#[cfg(feature = "boot-smoke")]
+pub unsafe fn finish_batch_keeping(
+    root: u64,
+    targets: u64,
+    batch: &mut Withdrawal,
+    frames: &mut FrameAllocator<'_>,
+    keep: u64,
+) -> (usize, bool) {
+    let reloaded = flush(root, targets);
+    let kept = batch.take(keep);
+    // SAFETY: Every CPU that could translate through the batch has flushed.
+    unsafe { batch.release(frames) };
+    (reloaded, kept)
+}
+
 fn check_protection(protection: u64) -> Result<(), i64> {
     if matches!(protection, 0 | READ | READ_WRITE) {
         Ok(())

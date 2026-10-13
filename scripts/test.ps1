@@ -46,14 +46,14 @@ function Assert-MirrorKernelImage {
         # kernels test the policy, skip methods or suppress writes (0058a).
         # 0059: the auto-phase growth records are test-trace-gated, and the
         # capacity skip record and charge summary exist only in boot-smoke.
-        # Only smoke kernels run the concurrent SMP print check and the user
-        # flush self-test and fault (0051).
+        # Only smoke kernels run the concurrent SMP print check, the user
+        # flush self-test and fault, and the SMP battery (0051).
         $required = @('MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=', 'MIRROR_MEM_RESERVE frames=', 'MIRROR_KVA_READY base=', 'MIRROR_CPU_DATA_READY cpus=') + $resetRequired + $crashRequired
-        $forbidden = @('MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_TRACE_ON', 'MIRROR_CONSOLE_COMMAND operation=', 'MIRROR_POINTER_UPDATED', 'MIRROR_POINTER_CLICK', 'MIRROR_SHELL_FRAME', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'Mirror shell: ready', 'MIRROR_USERSPACE_OK', 'Mirror init: VM checks passed', 'fixture data mismatch', 'unexpected budget exhaustion', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROWN phase=auto', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED', 'MIRROR_SMP_PRINT', 'MIRROR_USER_FLUSH') + $resetForbidden + $crashForbidden
+        $forbidden = @('MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_TRACE_ON', 'MIRROR_CONSOLE_COMMAND operation=', 'MIRROR_POINTER_UPDATED', 'MIRROR_POINTER_CLICK', 'MIRROR_SHELL_FRAME', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'Mirror shell: ready', 'MIRROR_USERSPACE_OK', 'Mirror init: VM checks passed', 'fixture data mismatch', 'unexpected budget exhaustion', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROWN phase=auto', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED', 'MIRROR_SMP_PRINT', 'MIRROR_USER_FLUSH', 'MIRROR_SMP_USER_OK', 'Mirror init: SMP') + $resetForbidden + $crashForbidden
     }
     else {
         $required = @('MIRROR_TRACE_ON', 'MIRROR_SHELL_FRAME', 'MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=', 'MIRROR_HEAP_GROWN phase=auto', 'MIRROR_MEM_RESERVE frames=', 'MIRROR_KVA_READY base=', 'MIRROR_CPU_DATA_READY cpus=') + $resetRequired + $crashRequired
-        $forbidden = @('MIRROR_USERSPACE_OK', 'fixture data mismatch', 'MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED', 'MIRROR_SMP_PRINT', 'MIRROR_USER_FLUSH') + $resetForbidden + $crashForbidden
+        $forbidden = @('MIRROR_USERSPACE_OK', 'fixture data mismatch', 'MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED', 'MIRROR_SMP_PRINT', 'MIRROR_USER_FLUSH', 'MIRROR_SMP_USER_OK') + $resetForbidden + $crashForbidden
     }
     foreach ($text in $required) {
         if ($image.IndexOf($text, [StringComparison]::Ordinal) -lt 0) {
@@ -189,6 +189,19 @@ try {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -ExtendedCpu -CpuCount $cpuCount -Release:$release -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
             Save-MirrorSmokeLogs "$profile-ExtendedCpu-CpuCount$cpuCount"
         }
+        # The thread, IPC, VM and budget faults end init processes whose
+        # siblings and teardown race the APs that run userspace, at four and
+        # eight CPUs (spec 0051, step 5).
+        foreach ($cpuCount in @(4, 8)) {
+            foreach ($fault in @('ThreadFault', 'ThreadProcessExit', 'ThreadLastExit', 'UserBudget', 'VmReleased', 'IpcPeerExit')) {
+                & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -ExtendedCpu:($cpuCount -eq 8) -CpuCount $cpuCount -Fault $fault -Release:$release -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+                Save-MirrorSmokeLogs "$profile-$fault-CpuCount$cpuCount"
+            }
+        }
+        # 0054-D5's OOM kill with userspace on four CPUs: page-ins that APs
+        # hand to the BSP kill the victim through 0051's deferred teardown.
+        & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -CpuCount 4 -Fault OomOrder -Release:$release -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+        Save-MirrorSmokeLogs "$profile-OomOrder-CpuCount4"
         # A removed shared alias must fault on an AP, and a missing kernel or
         # user shootdown ACK must stop the removal before returning a frame
         # for allocator reuse.

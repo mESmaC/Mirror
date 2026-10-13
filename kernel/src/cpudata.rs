@@ -398,8 +398,17 @@ pub(crate) fn user_active() -> bool {
 }
 
 /// Mark this CPU's scheduler halted for want of work, or running again.
+/// Its scheduler sets the flag before it releases the scheduler lock to halt
+/// and clears it after it retakes the lock.
 pub(crate) fn set_idle(idle: bool) {
     current().idle.store(idle, Ordering::Relaxed);
+}
+
+/// Whether CPU `slot`'s scheduler halts for want of work, read from any CPU
+/// under the scheduler lock, which orders the read with that CPU's updates
+/// (spec 0051, point 3). Panics for a slot outside the table.
+pub(crate) fn is_idle(slot: usize) -> bool {
+    CPU_DATA[slot].idle.load(Ordering::Relaxed)
 }
 
 /// Record whether this CPU holds the scheduler lock. Only the lock calls it.

@@ -11,6 +11,12 @@ Interplay with drafts that are not merged yet:
 - 0054a: the frame allocator stays BSP-exclusive here (point 5), so 0054a's reserve check and refcounts stay single-threaded. Its `kill_oom_victim` destroys the victim at once (kimi/0054a-impl userspace.rs:1886-1902); it must use point 8's deferred teardown instead.
 - 0019a: `perf::owner()` asserts the BSP (astra/0019a-perf-impl perf.rs:76-78). That still holds, because its hooks sit in BSP-pinned syscalls and in the BSP's pass (point 6).
 - Whichever of these merges second reconciles the overlap.
+- 2026-10-13, rebase onto both (main af4c853):
+  - `kill_oom_victim` finishes the victim, which kicks the CPUs that have its root loaded. It then waits, with `SCHED` released between checks and bounded at 1 s ("OOM victim teardown timeout"), until no other CPU runs or holds one of its threads and none has its root loaded. Then it closes the victim's handles and destroys its space at once, as 0054-D5 requires. Its thread entries go at once, or at the next loop top if the BSP's scheduler still holds one from its last dispatch.
+  - A starved page-in borrows its process afresh around the stack-pool trims, which release `SCHED`, and stops if a sibling ended the process meanwhile. The reserve preflight uses the page-in's exact frame count, its data pages plus the tables they lack (point 7), instead of 0054-D4's estimate.
+  - The SMP battery's init roles are 6 and 7, since 0054a's scenarios use 2 to 5. OomOrder also runs at four CPUs.
+  - PerfInvalid's command-line panic takes the crash path before the walker self-test and before any AP starts; `Assert-MirrorCrash` checks it with no self-test line and no stop targets.
+  - 0019a's hooks stay on the BSP: the measured shell is pinned there, and its frame and input hooks run under `with_surface` and `with_input`, which assert CPU 0.
 
 Ledger: I6 (userspace on all CPUs is a v1 requirement), S17 (NMI stop, crash screen, halt or reboot), 0016-D4 as amended (the panic-path NMI stop is this spec's).
 
@@ -47,6 +53,7 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
    - Dispatch uses slot indices and holds no `&mut Process` across user entry (sched.rs:1247, userspace.rs:1756-1769).
    - `kernel_stack` and `set_kernel_stack` use this CPU's TSS (interrupts.rs:182, :194, :733-769). The TLS checks expect this CPU's `CpuData` (interrupts.rs:302-307, :857-858).
    - New `Thread.on_cpu` is set at dispatch and cleared at the end of `resume_process`, after the FPU image is stored (userspace.rs:1777). While it is set, `select` skips the thread and its signals stay pending. This stops a thread that parked inside its own handler (userspace.rs:4329-4358) from being dispatched on another CPU while its stack is still live.
+   - 2026-10-13, step 5: a thread that comes back ready keeps `on_cpu` until its CPU's scheduler queues it again after the next completion pass. Before that pass the BSP releases `SCHED` for `heap::ensure` and for a handed-over release's shootdowns, and an unqueued ready thread on no CPU would let another CPU's `finish` make its process quiescent, so the loop top would release its entry while the BSP still meant to queue it. If its process finished meanwhile, the scheduler drops the thread instead of queueing it, and the BSP's next loop top tears the process down; a session ends only at a loop top that holds no such thread.
 
 3. **Ticks and the reschedule IPI.**
    - Each AP starts its LAPIC timer as periodic, reusing the BSP's calibrated reload (timer.rs:134-170). This needs a new "start the calling CPU's timer" path that skips `bsp_local` (apic.rs:649-655, :726-743).
@@ -63,6 +70,10 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
      - `smp::kick` sets the target's `need_resched` with Release and then sends 242. Vector 240 stays BSP-only, since the BSP alone produces commands. The send waits only for the sender's own ICR, so a `SCHED` holder may kick.
      - In the kernel, 242 only acknowledges and leaves the request for the next dispatch, which clears it. From CPL3 it displaces only when the request is set.
      - The senders listed above, the close retry's kick (point 8) and `Process::finish`'s kick come with step 5. Step 5 is the first step that runs threads on APs, so it is the first that can test them.
+   - 2026-10-13, step 5:
+     - Only the BSP's pass expires deadlines, so an AP's tick only charges and preempts; a deadline reached while the BSP runs a thread displaces that thread at the BSP's tick, as on one CPU.
+     - After its selection, a CPU's pass kicks each idle CPU (an AP that has not joined the open session counts as idle) that could take an eligible queued thread or complete a signaled wait this CPU had to leave. A signaled wait that no idle CPU may complete kicks one CPU that may, even a busy one.
+     - A flushed process needs no kick: `OP_FLUSH_USER` itself interrupts the CPUs that run it, and the waits a release cancels reach idle CPUs through the pass's kick.
 
 4. **AP traps.**
    - On an ONLINE AP, these take the normal dispatch instead of `secondary_fault` (interrupts.rs:1203-1221): vector 0x80, CPL3 exceptions, 241, 242, and 240, which can now interrupt CPL3.
@@ -85,11 +96,18 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
      - reclaim, reap and destroy (:2128-2229);
      - `heap::ensure` and stack-pool trimming.
    - An AP that gets a thread back in one of these states puts it on a BSP work list and kicks the BSP. AP scheduler stacks stay 64 KiB (smp.rs:28), because no AP runs these heavy completions.
+   - 2026-10-13, step 5:
+     - A thread on the work list is on no CPU: the AP clears `on_cpu` as it hands the thread over, and the BSP claims it again while it completes the request. Finishing the process takes it off the list.
+     - A join waits while its exited target's stack is not yet freed, as for a target still on its CPU; the BSP's free signals it.
+     - The BSP completes the work list before its pass begins, since a release may drop `SCHED`. When an AP's thread of a finished process leaves its CPU, the AP kicks the BSP, whose loop top tears the process down; the BSP does not halt while such a teardown is pending.
+     - An AP's TSS.RSP0 placeholder between slices is its own kernel stack top, as installed at startup; no CPL3 code runs while it is installed.
+     - `alloc` and `dealloc` both assert the BSP.
 
 6. **Device syscalls.**
    - Processes that hold a surface or input capability get a BSP-only affinity mask, `Process.cpus`, checked in `select` (sched.rs:1217-1234). Today those are the shell (userspace.rs:2729-2733) and init's smoke pair (:1322).
    - As a result, syscall 14 on `Object::Surface`, syscalls 15/16 on `Object::Input` (userspace.rs:3589, :4031-4076) and input-wait completion (:2342-2365) always run on the BSP. `with_surface` and `with_input` assert CPU 0 (userspace.rs:3321-3347).
    - Only the BSP's pass drains PS/2 and input arrivals (sched.rs:1151-1154). An AP's pass leaves those signals queued, so the empty-signal assert at sched.rs:1174-1177 is relaxed.
+   - 2026-10-13, step 5: the mask is `Process.cpus`, `BSP_ONLY` for both processes of init's pair and for the shell. A CPU completes only the signaled waits of processes that may run on it.
    - All other processes run on any CPU. Their `AppSurface`, `AppInput` and IPC syscalls touch only plain memory under `SCHED`.
 
 7. **User address spaces under concurrent walkers.** Hardware on other CPUs may walk a live root while the BSP edits it.
@@ -114,7 +132,7 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
      - A batch releases `SCHED` only when its mask is nonzero. Edits require only that the editing CPU does not run the root; `destroy` requires the mask to be 0.
      - A removed frame goes into a batch (`Withdrawal`, 512 entries) and nothing writes it before the flush, since a stale entry or a walker may still reach it.
      - A shell `close` of an app with a thread still on a CPU stays pending and retries in a later pass. The kicks come with vector 242 in step 3.
-   - **Teardown.** `Process::finish` (userspace.rs:509-530) marks the process killed and kicks the CPUs running its threads. Those threads return to the scheduler at their next trap. `destroy`, `reclaim` and `release_threads` (sched.rs:1069-1071) run only once the mask is 0 and no thread is `on_cpu`.
+   - **Teardown.** `Process::finish` (userspace.rs:509-530) marks the process killed and kicks the CPUs running its threads. Those threads return to the scheduler at their next trap. `destroy`, `reclaim` and `release_threads` (sched.rs:1069-1071) run only once the mask is 0 and no thread is `on_cpu`. 2026-10-13, step 5: the kicks go to the CPUs in the space's mask. Every CPL3 entry (syscall, timer, reschedule, fault) and every return to CPL3 first checks under the handler's hold whether another CPU finished the thread's process; if so the thread returns to its scheduler as `Finished`, so `with_active` keeps requiring a running thread. A shell close of an app whose thread runs on another CPU finishes it, which kicks that CPU, and stays pending.
    - **Join.** A joiner is signalled only after the BSP has freed the exited thread's stack (userspace.rs:2253-2257, :2378-2383). 2026-10-12, step 2: the signal comes at the end of `resume_process`, after the stack free and `on_cpu` cleared; a join that finds its target exited but still on a CPU waits for that signal.
 
 9. **Serial, clock, accounting and session end.**
@@ -123,6 +141,7 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
    - `ServicePolicy::charge` saturates instead of asserting (userspace.rs:301-306).
    - `idle()`'s single-CPU asserts are relaxed (sched.rs:1283-1315).
    - At session end, the BSP stops new dispatches, kicks the APs, and waits outside `SCHED` until every AP is back in smp's idle loop. That keeps these true: `close`'s "no thread Running" (userspace.rs:2205), the frame baselines (:970-1000), and 0058a's "other CPUs idle" restart contract (reset.rs:5-6).
+   - 2026-10-13, step 5: a session's phase (closed, open, closing) changes only under `SCHED`. Publishing opens it and kicks each AP that runs userspace; an AP joins on any wake of its idle loop while it is open, setting its bit in a participant mask under `SCHED`. At the end rule the BSP sets closing, kicks the participants and waits, bounded at 1 s ("session barrier timeout"), until each has requeued the thread it ran, left its loop, released `SCHED` and cleared its bit. It then checks that no thread is `on_cpu` and no CPU has a process root loaded. `close` asserts that a Running thread is on a CPU, which after the barrier means none is. A battery session ends once its process is a zombie, so its threads have left every CPU.
 
 10. **Panic NMI stop** (new `crash.rs`).
     - `crash::enter(cause) -> !` is called from the panic handler (main.rs:1556-1569), the BSP fatal tail (interrupts.rs:1392-1411) and the AP routing in point 4.
@@ -197,6 +216,13 @@ Each step is one commit and must pass its targeted smoke cases.
    - Change `userspace_cpus=` together with its assertions at run.ps1:78 and capture.ps1:92.
    - Add the SMP battery.
    - Sample boot-smoke's `take_kva_dirty` at the barrier (paging.rs:632-658).
+   - 2026-10-13:
+     - A sibling write that faults ends its process, so the battery's two fault checks need two processes: the release battery (init role 6, 16 threads) and the protect battery (role 7, 8 threads), each alone in its own session, after the table-bounds test and before the first init-pair session, whose stacks then start from the empty pool.
+     - The release battery's threads spin for 8 ticks so that every CPU takes one, ping-pong futex words in pairs for 16 rounds, send one IPC message each through a channel whose both ends the process holds and receive one, and meet at futex barriers. Then 8 exit and are joined, the other 7 keep writing one page, and the main thread releases it; the protect battery's 7 writers do the same while the main thread makes the page read-only. Every futex wait and blocking receive loads RBX, R12-R15 and XMM8-12 from a per-thread canary and requires them back unchanged.
+     - The kernel checks each outcome (a #PF at the page with error 6, or 7), the console oracles and the thread counts. The released frame is kept out of the allocator once every CPU with the root loaded has flushed, filled with a pattern and checked at the drain, at least two ticks later (`stale=`), instead of being reallocated, since the allocator does not hand back a chosen frame.
+     - `ran_on=` counts the CPUs that dispatched the release battery's threads, `cross_wakes=` its completed waits signaled by a CPU other than the waiter's, and `flushes=` the CPUs that reloaded CR3 for either battery's removals. With more than one CPU running userspace the kernel requires `cross_wakes` and the release's flushes to be nonzero; with one, both are 0. A battery process's lifetime tick budget is 4096, across all its CPUs.
+     - The battery's drain samples the stack pool's dirty bits after the barrier. Window leaves are not global and PCID is off, so the root switch that ends each slice drops a CPU's translations of the window; a pooled stack, and every stack after the barrier, has no cached translation that could write without setting the bit.
+     - Panic runs a third, spinning release battery at the end of boot; the BSP's pass panics as soon as one of its threads runs on every AP that runs userspace.
 6. **Crash screen and policy.**
    - Points 11 (the screen part) and 12.
    - Add `-PanicReboot`, and a `cause=panic` branch in `Assert-MirrorReset` (scripts/common.ps1:825-916).
@@ -205,7 +231,7 @@ Each step is one commit and must pass its targeted smoke cases.
    - Then run the full `test.ps1` in debug and release.
 
 ## Tests
-**SMP battery.** A new init role runs in every smoke boot, without a CPU pin, with 16 threads in one process. It asserts:
+**SMP battery.** A new init role runs in every smoke boot, without a CPU pin, with 16 threads in one process. 2026-10-13: a second role, with 8 threads, checks the read-only change, since each fault check ends its process (step 5). It asserts:
 - every thread ran, and `ran_on=` equals `userspace_cpus`;
 - futex wakes, IPC and join work across CPUs;
 - with siblings writing on APs, `VM_RELEASE` makes the next sibling write fault, and the released frame, reallocated and filled with a pattern, is unchanged two ticks later (`stale=0`);
@@ -236,7 +262,7 @@ The existing init pair stays pinned to the BSP, because its alternation, budget,
 | SchedStall | `sched-stall` | 4 | An AP holds `SCHED` forever. Another CPU's bounded spin panics with "scheduler lock wait exceeded", and the holder is stopped by NMI. |
 | UserFlushTimeout | `user-flush-timeout` | 4 | One AP withholds its `OP_FLUSH_USER` ACK. The panic names the user shootdown timeout, and the batch's frames never reach the allocator. |
 | Existing: PageFault, SmpTlbTimeout | none | 4 | Today's diagnostics, followed by the crash lines. |
-| Existing: ThreadFault, ThreadProcessExit, ThreadLastExit, UserBudget, VmReleased, IpcPeerExit | none | 4 | The same markers as at 1 CPU, with the victim's siblings on APs, and frames restored. |
+| Existing: ThreadFault, ThreadProcessExit, ThreadLastExit, UserBudget, VmReleased, IpcPeerExit | none | 4, 8 | The same markers as at 1 CPU, and frames restored. 2026-10-13: init's pair is pinned to the BSP, so its siblings stay there while the APs take part in the session and its barrier; the batteries' fault endings exercise teardown with siblings on APs. The 8-CPU runs use `-ExtendedCpu`. |
 
 **Crash marker check.** A new closed-world `Assert-MirrorCrash` in common.ps1 runs on every smoke boot:
 - outside the crash cases, no `MIRROR_CRASH_*` line may appear;

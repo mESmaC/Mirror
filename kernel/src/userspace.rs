@@ -5,6 +5,12 @@
 //! its frame returns. IRQ/syscall handlers return to the scheduler before
 //! another thread resumes on their CPU. User buffers are checked and copied
 //! through the direct map before use.
+//!
+//! Threads run on every CPU that runs userspace (spec 0051, point 5). A
+//! process that holds the surface or physical input runs on the BSP only
+//! (`BSP_ONLY`, point 6), and only the BSP completes a request that needs
+//! the frame allocator, the heap or the kernel VA window: an AP hands such a
+//! thread to the BSP's work list.
 
 // A child module, so the scheduler shares these private types (spec 0030a).
 #[path = "sched.rs"]
@@ -34,7 +40,7 @@ use crate::{
     kernel_va::{self, KernelStack, KvaError},
     memory::{FrameAllocator, PAGE_SIZE},
     paging::{PageTables, PagingError, UserAddressSpace, UserPermissions, Withdrawal},
-    ps2, serial, stacks, surface, timer, vm, windows,
+    ps2, serial, surface, timer, vm, windows,
 };
 use mirror_clock_protocol as clock_abi;
 use mirror_thread_protocol as thread_abi;
@@ -61,6 +67,16 @@ const QUANTUM_TICKS: u64 = 2;
 // its threads; it does not change the independent recurring budgets of
 // ordinary services.
 const USER_TICK_BUDGET: u64 = 128;
+/// The SMP battery's lifetime allowance, across all its threads on every CPU
+/// (spec 0051, step 5): far past its bounded phases on eight CPUs, while a
+/// battery stuck in a spin still ends.
+#[cfg(feature = "boot-smoke")]
+const BATTERY_TICK_BUDGET: u64 = 4096;
+/// A process CPU mask that admits every CPU that runs userspace.
+const ANY_CPU: u64 = u64::MAX;
+/// The CPU mask of a process that holds the surface or physical input: the
+/// BSP alone (spec 0051, point 6).
+const BSP_ONLY: u64 = 1;
 const MAX_SLEEP_TICKS: u64 = 1000;
 const RECEIVE_TIMEOUT: u64 = 100;
 const SERVICE_ALLOWANCE: u64 = 32;
@@ -153,9 +169,14 @@ struct Thread {
     /// keeps `quantum_left` instead of starting a new quantum (0030-D3).
     displaced: bool,
     /// A CPU runs this thread: set at dispatch, cleared once that CPU's
-    /// scheduler has stored its context and completed its request. No other
-    /// CPU may dispatch it or complete its waits meanwhile (spec 0051).
+    /// scheduler has stored its context and completed its request, or handed
+    /// the request to the BSP. A thread that comes back ready stays claimed
+    /// until that scheduler queues it again. No other CPU may dispatch it or
+    /// complete its waits meanwhile, and its process is not torn down
+    /// (spec 0051).
     on_cpu: bool,
+    /// The CPU that dispatched it last, where it runs while `on_cpu`.
+    cpu: u8,
     /// The wake whose latency the kernel times for init's battery.
     #[cfg(feature = "boot-smoke")]
     probe: Option<LatencyProbe>,
@@ -203,6 +224,7 @@ impl Thread {
             quantum_left: QUANTUM_TICKS,
             displaced: false,
             on_cpu: false,
+            cpu: 0,
             #[cfg(feature = "boot-smoke")]
             probe: None,
             #[cfg(feature = "boot-smoke")]
@@ -391,6 +413,26 @@ struct Process {
     vm: vm::Vm,
     direct_map: u64,
     access: Access,
+    /// The CPUs its threads may run on, as a mask of slots: `ANY_CPU`, or
+    /// `BSP_ONLY` for a surface or input holder (spec 0051, point 6).
+    cpus: u64,
+    /// A `CpuPolicy::Probe` process's lifetime tick allowance.
+    tick_budget: u64,
+    /// The SMP battery role, for an SMP battery process (spec 0051, step 5).
+    #[cfg(feature = "boot-smoke")]
+    battery: Option<Battery>,
+    /// The CPUs that dispatched its threads, as a mask of slots.
+    #[cfg(feature = "boot-smoke")]
+    ran_on: u64,
+    /// Completed waits that a CPU other than the waiter's signaled.
+    #[cfg(feature = "boot-smoke")]
+    cross_wakes: u64,
+    /// CPUs that reloaded CR3 for its releases and protection changes.
+    #[cfg(feature = "boot-smoke")]
+    flushes: u64,
+    /// The SMP battery's console oracles seen, one bit each.
+    #[cfg(feature = "boot-smoke")]
+    battery_checks: u8,
     #[cfg(feature = "boot-smoke")]
     vm_checks: bool,
     #[cfg(feature = "boot-smoke")]
@@ -593,12 +635,18 @@ impl Process {
     }
 
     /// Record the outcome and finish every thread, taking each off the run
-    /// queue and every wait queue. Threads keep their slots until the process
-    /// is reaped. A thread still on a CPU returns to its scheduler at its next
-    /// trap; teardown waits for that (`quiescent`, spec 0051 point 8).
+    /// queue, every wait queue and the BSP work list. Threads keep their slots
+    /// until the process is reaped. A thread still on another CPU returns to
+    /// its scheduler at its next trap, which a kick brings at once; teardown
+    /// waits for that (`quiescent`, spec 0051 point 8).
     fn finish(&mut self, outcome: Outcome) {
         assert!(self.outcome.is_none());
         self.outcome = Some(outcome);
+        // The CPUs with this root loaded run its threads.
+        let others = self.space.loaded_cpus() & !(1 << crate::cpudata::current_cpu());
+        for cpu in (0..u64::BITS as usize).filter(|&cpu| others & 1 << cpu != 0) {
+            crate::smp::kick(cpu);
+        }
         for index in 0..thread_abi::MAX_THREADS {
             let Some(thread) = self.member_mut(index) else {
                 continue;
@@ -705,6 +753,12 @@ pub fn run_init(
     table_bounds_self_test(kernel, frames, bytes, &image, direct_map);
     sched::selection_self_test(kernel, frames, bytes, &image, direct_map);
     trim_recovery_test(kernel, frames, bytes, &image, direct_map);
+    // Spec 0051, step 5: threads of one process on every CPU that runs
+    // userspace, before the pair, whose first session builds its stacks from
+    // the empty pool this leaves.
+    run_smp_battery(kernel, frames, bytes, &image, direct_map);
+    // 0059-D1: a session's seeding is a heap safe point.
+    sched::unlocked(|| heap::ensure(kernel, frames, direct_map));
     run_pair(
         kernel,
         frames,
@@ -740,6 +794,399 @@ pub fn run_init(
         run_limits_pair(kernel, frames, bytes, &image, direct_map);
     } else {
         run_pair(kernel, frames, bytes, &image, direct_map, 0, display);
+    }
+}
+
+/// The SMP battery's roles (spec 0051, step 5), launched as init's roles 6
+/// and 7 (0054a's scenarios use 2 to 5). Each runs alone in its own session, unpinned, and ends when a
+/// sibling's write to `BATTERY_PAGE` faults: after a release in `Release`,
+/// after a change to read-only in `Protect`.
+#[cfg(feature = "boot-smoke")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Battery {
+    /// 16 threads: spread over every CPU, ping-pong futex words, pass IPC
+    /// messages, join half, and keep writing the page the main thread then
+    /// releases. The kernel keeps the released frame as a canary.
+    Release,
+    /// 8 threads keep writing the page the main thread then makes read-only.
+    Protect,
+}
+
+#[cfg(feature = "boot-smoke")]
+impl Battery {
+    /// Init's launch role.
+    const fn role(self) -> u64 {
+        match self {
+            Self::Release => 6,
+            Self::Protect => 7,
+        }
+    }
+
+    /// The threads the role creates, its main thread included.
+    const fn threads(self) -> u64 {
+        match self {
+            Self::Release => thread_abi::MAX_THREADS as u64,
+            Self::Protect => 8,
+        }
+    }
+
+    /// The console oracles the role prints, as `Process::battery_checks`.
+    const fn checks(self) -> u8 {
+        match self {
+            Self::Release => 0b1111,
+            Self::Protect => 0b1000,
+        }
+    }
+
+    /// The page fault that ends the role: a write to a page that is gone,
+    /// or present and read-only.
+    const fn fault_error(self) -> u64 {
+        match self {
+            Self::Release => 6,
+            Self::Protect => 7,
+        }
+    }
+}
+
+/// The page every battery writer writes and the main thread releases or
+/// protects (userspace/init/src/smp.rs uses the same address).
+#[cfg(feature = "boot-smoke")]
+const BATTERY_PAGE: u64 = vm_abi::ARENA_START + 0x0300_0000;
+
+/// What one battery session measured.
+#[cfg(feature = "boot-smoke")]
+struct BatteryReport {
+    ran_on: u64,
+    cross_wakes: u64,
+    flushes: u64,
+    stale: usize,
+}
+
+/// Spec 0051, step 5: run the release battery, then the protect battery,
+/// each in its own session, and report `MIRROR_SMP_USER_OK`. With more
+/// than one CPU running userspace, the release battery must have run on
+/// each of them, had a wake cross CPUs, and flushed another CPU's
+/// translations; with one, neither.
+#[cfg(feature = "boot-smoke")]
+fn run_smp_battery(
+    kernel: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    bytes: &[u8],
+    image: &elf::Image,
+    direct_map: u64,
+) {
+    let mut reports = [Battery::Release, Battery::Protect].map(|battery| {
+        // 0059-D1: a session's seeding is a heap safe point.
+        sched::unlocked(|| heap::ensure(kernel, frames, direct_map));
+        run_battery(kernel, frames, bytes, image, direct_map, battery, false)
+    });
+    let [release, protect] = &mut reports;
+    let cpus = crate::smp::userspace_mask();
+    assert_eq!(
+        release.ran_on, cpus,
+        "the SMP battery did not run on every CPU that runs userspace"
+    );
+    assert_eq!(
+        protect.ran_on & !cpus,
+        0,
+        "a battery thread ran on a CPU outside userspace"
+    );
+    if cpus.count_ones() > 1 {
+        assert!(release.cross_wakes > 0, "no battery wake crossed CPUs");
+        assert!(
+            release.flushes > 0,
+            "the battery's release flushed no other CPU"
+        );
+    } else {
+        assert_eq!(
+            (release.cross_wakes, release.flushes + protect.flushes),
+            (0, 0),
+            "a wake or flush crossed CPUs with userspace on one"
+        );
+    }
+    serial::println!(
+        "MIRROR_SMP_USER_OK cpus={} threads={} ran_on={} cross_wakes={} flushes={} stale={}",
+        cpus.count_ones(),
+        Battery::Release.threads(),
+        release.ran_on.count_ones(),
+        release.cross_wakes,
+        release.flushes + protect.flushes,
+        release.stale
+    );
+}
+
+/// The Panic case (spec 0051, step 5): run the release battery's threads,
+/// spinning, until one runs on every AP that runs userspace, and panic in
+/// the BSP's pass then. Never returns.
+#[cfg(feature = "boot-smoke")]
+pub fn run_panic_battery(
+    kernel: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    bytes: &[u8],
+    direct_map: u64,
+) -> ! {
+    assert!(!arch::interrupts_enabled());
+    let _sched = sched::lock();
+    let image = elf::parse(bytes).expect("invalid native init ELF");
+    sched::unlocked(|| heap::ensure(kernel, frames, direct_map));
+    run_battery(
+        kernel,
+        frames,
+        bytes,
+        &image,
+        direct_map,
+        Battery::Release,
+        true,
+    );
+    unreachable!("the panic battery's session ended");
+}
+
+/// Run one battery role in its own session and check it at the drain: its
+/// outcome is the expected write fault, it printed its oracles and created
+/// its threads, the release kept its canary frame unwritten, and the frame
+/// baseline holds once the session's barrier has passed (spec 0051, step
+/// 5). With `panic`, the session never ends.
+#[cfg(feature = "boot-smoke")]
+fn run_battery(
+    kernel: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    bytes: &[u8],
+    image: &elf::Image,
+    direct_map: u64,
+    battery: Battery,
+    panic: bool,
+) -> BatteryReport {
+    sched::assert_drained();
+    let baseline = FrameBaseline::take(frames);
+    let slot = create_process(
+        kernel,
+        frames,
+        bytes,
+        image,
+        direct_map,
+        battery.role() << 8 | u64::from(panic),
+        // Init's probes keep the test class's limits (0054-D2).
+        MemoryClass::Test,
+    )
+    .expect("load the SMP battery");
+    let mut ipc = Ipc::new();
+    {
+        // SAFETY: A fresh slot that nothing else references.
+        let process = unsafe { sched::process(slot) };
+        // Console access, and both ends of channel 0 for the release
+        // battery's message ring.
+        let grants = [
+            (Object::Console, capability::WRITE),
+            (Object::Channel(0), capability::SEND),
+            (Object::Channel(0), capability::RECEIVE),
+        ];
+        let granted = if battery == Battery::Release { 3 } else { 1 };
+        for (index, &(object, rights)) in grants[..granted].iter().enumerate() {
+            process.boot_handles[index] = process
+                .handles
+                .insert(object, rights)
+                .expect("battery capability");
+            ipc.grant(Capability { object, rights });
+        }
+        process.battery = Some(battery);
+        process.tick_budget = BATTERY_TICK_BUDGET;
+    }
+    let mut session = sched::Session {
+        ipc,
+        surface: None,
+        input: None,
+        runtime: None,
+        end: sched::End::Battery {
+            process: slot,
+            panic,
+        },
+    };
+    sched::run(&mut session, kernel, frames, direct_map);
+    assert!(!panic, "the panic battery's session ended");
+    let sched::Session { ipc, .. } = session;
+    assert!(
+        ipc.is_drained(),
+        "battery IPC messages or endpoint references leaked"
+    );
+    let mut report = {
+        // SAFETY: The session has returned past its barrier, and nothing
+        // else references the zombie until this borrow ends.
+        let process = unsafe { sched::process(slot) };
+        validate_battery(process, battery)
+    };
+    // SAFETY: Validation's borrow has ended, no thread is current, and
+    // nothing references the entry; reap checks that it finished.
+    let mut zombie = unsafe { sched::reap(slot) };
+    sched::assert_drained();
+    // SAFETY: Every thread has left every CPU, the kernel root is active, and
+    // no handler retains a reference into the user tree.
+    unsafe { zombie.space.destroy(frames) }.expect("battery address-space cleanup");
+    zombie.check_charges_zero();
+    report.stale = match battery {
+        Battery::Release => canary::check(frames),
+        Battery::Protect => 0,
+    };
+    // The barrier has passed: every battery thread's stack is pooled, and
+    // each CPU that ran one dropped its translations of the kernel VA window
+    // when its slice ended, so the dirty bits hold the whole high-water mark
+    // (spec 0051, step 5).
+    // SAFETY: The BSP with IF=0 and the kernel root active; no thread runs.
+    let watermark = unsafe { kernel_va::take_pool_high_water(kernel) }
+        .expect("battery stack pool high-water mark");
+    assert!(
+        (1..=kernel_va::STACK_PAGES).contains(&watermark),
+        "battery thread stack high-water mark out of range"
+    );
+    let trimmed = drain_stacks(kernel, frames);
+    assert!(trimmed.complete, "the battery drain skipped its trim");
+    baseline.assert_kept(frames, "SMP battery frame leak");
+    report
+}
+
+/// Validate a finished battery's zombie and return its counts.
+#[cfg(feature = "boot-smoke")]
+fn validate_battery(process: &Process, battery: Battery) -> BatteryReport {
+    assert!(
+        process.zombie() && process.handles.is_empty(),
+        "the {battery:?} battery kept its threads or handles"
+    );
+    let Some(Outcome::Fault {
+        vector: 14,
+        error,
+        address,
+        ..
+    }) = process.outcome
+    else {
+        panic!(
+            "the {battery:?} battery ended without its write fault: {:?}",
+            process.outcome
+        );
+    };
+    assert_eq!(
+        (error, address & !(PAGE_SIZE - 1)),
+        (battery.fault_error(), BATTERY_PAGE),
+        "the {battery:?} battery's write faulted wrongly"
+    );
+    assert_eq!(
+        process.battery_checks,
+        battery.checks(),
+        "the {battery:?} battery's checks did not complete"
+    );
+    assert_eq!(
+        process.threads_created,
+        battery.threads(),
+        "the {battery:?} battery created the wrong number of threads"
+    );
+    BatteryReport {
+        ran_on: process.ran_on,
+        cross_wakes: process.cross_wakes,
+        flushes: process.flushes,
+        stale: 0,
+    }
+}
+
+/// The release battery's stale-write canary (spec 0051, step 5). When the
+/// battery releases the page its siblings keep writing, the frame that backed
+/// it stays out of the allocator once every CPU with the root loaded has
+/// flushed, and gets a pattern. After the session, at least two ticks later,
+/// every word must still hold it: a CPU with a stale translation would have
+/// kept writing the frame. Only the BSP runs this, under the scheduler lock.
+#[cfg(feature = "boot-smoke")]
+mod canary {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{BATTERY_PAGE, Battery, PAGE_SIZE, Process, deadline_reached, sched, timer};
+    use crate::memory::FrameAllocator;
+
+    const PATTERN: u64 = 0xc0de_0051_5ca1_ab1e;
+    const WORDS: usize = (PAGE_SIZE / 8) as usize;
+    /// How long the drain waits for the check's tick, in ticks.
+    const WAIT_TICKS: u64 = 1000;
+
+    /// The frame the release in progress keeps, or 0.
+    static ARMED: AtomicU64 = AtomicU64::new(0);
+    /// The kept frame, or 0, and the direct-map offset that reaches it.
+    static KEPT: AtomicU64 = AtomicU64::new(0);
+    static DIRECT_MAP: AtomicU64 = AtomicU64::new(0);
+    /// The tick from which the kept frame may be checked.
+    static DUE: AtomicU64 = AtomicU64::new(0);
+
+    /// Arm the canary for `process`'s release of `length` bytes at
+    /// `address`, if it is the release battery's page, which is resident.
+    pub(super) fn arm(process: &Process, address: u64, length: u64) {
+        if process.battery != Some(Battery::Release)
+            || address != BATTERY_PAGE
+            || length != PAGE_SIZE
+        {
+            return;
+        }
+        let frame = process
+            .space
+            .translate(address)
+            .expect("battery page walk")
+            .expect("the battery page is resident")
+            .physical;
+        assert_eq!(KEPT.load(Ordering::Relaxed), 0, "a second battery canary");
+        DIRECT_MAP.store(process.direct_map, Ordering::Relaxed);
+        ARMED.store(frame, Ordering::Relaxed);
+    }
+
+    /// The frame the release in progress keeps, if any.
+    pub(super) fn armed() -> Option<u64> {
+        Some(ARMED.load(Ordering::Relaxed)).filter(|&frame| frame != 0)
+    }
+
+    /// End the release: a release that kept nothing failed before its batch.
+    pub(super) fn disarm() {
+        ARMED.store(0, Ordering::Relaxed);
+    }
+
+    /// Take ownership of `frame`, which every CPU has flushed, and fill it.
+    pub(super) fn keep(frame: u64) {
+        ARMED.store(0, Ordering::Relaxed);
+        let base = (DIRECT_MAP.load(Ordering::Relaxed) + frame) as *mut u64;
+        for index in 0..WORDS {
+            // SAFETY: The withdrawn frame is this kernel's alone and the
+            // direct map maps it whole; only a stale translation could still
+            // reach it, which is what the pattern detects.
+            unsafe { base.add(index).write_volatile(PATTERN ^ index as u64) };
+        }
+        DUE.store(timer::ticks().wrapping_add(2), Ordering::Relaxed);
+        KEPT.store(frame, Ordering::Relaxed);
+    }
+
+    /// After the battery's session: wait for the check's tick, count the
+    /// words that changed, and free the frame. The caller holds the
+    /// scheduler lock, which ticks need released.
+    pub(super) fn check(frames: &mut FrameAllocator<'_>) -> usize {
+        let frame = KEPT.swap(0, Ordering::Relaxed);
+        assert_ne!(frame, 0, "the battery's release kept no canary frame");
+        let due = DUE.load(Ordering::Relaxed);
+        let reached = sched::unlocked(|| {
+            for _ in 0..WAIT_TICKS {
+                if deadline_reached(timer::ticks(), due) {
+                    return true;
+                }
+                // SAFETY: No lock is held and the kernel root is active; the
+                // timer interrupt wakes the HLT, and CLI restores IF=0 before
+                // the lock is retaken.
+                unsafe { core::arch::asm!("sti", "hlt", "cli", options(nostack)) };
+            }
+            false
+        });
+        assert!(reached, "the battery canary's check tick never came");
+        let base = (DIRECT_MAP.load(Ordering::Relaxed) + frame) as *const u64;
+        let stale = (0..WORDS)
+            .filter(|&index| {
+                // SAFETY: As in `keep`; the frame is still this kernel's.
+                unsafe { base.add(index).read_volatile() != PATTERN ^ index as u64 }
+            })
+            .count();
+        assert_eq!(stale, 0, "a CPU wrote the released battery page");
+        // SAFETY: The frame left its user mapping, every CPU flushed it, and
+        // nothing else reaches it.
+        unsafe { frames.deallocate(frame) }.expect("free the battery canary frame");
+        stale
     }
 }
 
@@ -1119,16 +1566,17 @@ fn release_stack(stack: KernelStack) {
     unsafe { kernel_va::free_stack(stack) };
 }
 
-/// Trim the reuse pool at a session drain (0050-D2): unmap every pooled stack
-/// and return its frames, or keep the pool mapped while the shootdown
-/// transport is unavailable. The trim's shootdowns wait for other CPUs, so
-/// the caller's scheduler lock is released across it (spec 0051).
+/// Trim the reuse pool at a session drain (0050-D2), or around an OOM kill
+/// in a starved page-in (0054-D5): unmap every pooled stack and return its
+/// frames, or keep the pool mapped while the shootdown transport is
+/// unavailable. The trim's shootdowns wait for other CPUs, so the caller's
+/// scheduler lock is released across it (spec 0051).
 fn drain_stacks(kernel: &PageTables, frames: &mut FrameAllocator<'_>) -> kernel_va::TrimReport {
     assert!(!interrupts::user_context_active());
     sched::unlocked(|| {
-        // SAFETY: The session has returned: the BSP with IF=0 and the kernel
-        // root active, the unique allocator, no pooled stack in use and no
-        // lock that an IRQ handler needs held.
+        // SAFETY: The BSP with IF=0 and the kernel root active, outside any
+        // user slice, with the unique allocator: no pooled stack is in use,
+        // and no lock that an IRQ handler needs is held.
         unsafe { kernel_va::trim(kernel, frames) }
     })
     .expect("trim the kernel stack pool")
@@ -1282,6 +1730,18 @@ fn load_process(
         vm: vm::Vm::new(class.limits().0, class.limits().1, class.may_draw_reserve()),
         direct_map,
         access: Access::default(),
+        cpus: ANY_CPU,
+        tick_budget: USER_TICK_BUDGET,
+        #[cfg(feature = "boot-smoke")]
+        battery: None,
+        #[cfg(feature = "boot-smoke")]
+        ran_on: 0,
+        #[cfg(feature = "boot-smoke")]
+        cross_wakes: 0,
+        #[cfg(feature = "boot-smoke")]
+        flushes: 0,
+        #[cfg(feature = "boot-smoke")]
+        battery_checks: 0,
         #[cfg(feature = "boot-smoke")]
         vm_checks: false,
         #[cfg(feature = "boot-smoke")]
@@ -1510,6 +1970,9 @@ fn run_pair(
         assert_eq!(process.handles.len(), 3);
         // Both processes see the surface session; only the handle grants use.
         process.access.surface = surface.is_some();
+        // A surface holder runs on the BSP (spec 0051, point 6), and the
+        // pair's alternation, budget and latency checks assume one CPU.
+        process.cpus = BSP_ONLY;
     }
     if surface.is_some() {
         // SAFETY: Seeding holds one process reference at a time.
@@ -2267,47 +2730,20 @@ fn validate_pair(
 }
 
 /// Run the dispatched thread, in process slot `owner` and thread slot
-/// `slot`, through user execution and its deferred completion. Handlers and
-/// completions reach the session through `sched::with_session`. Only slot
-/// indices cross the user entry: each step borrows the process afresh under
-/// the scheduler lock (spec 0051, point 2).
+/// `slot`, on the BSP through user execution and its deferred completion.
+/// Handlers and completions reach the session through `sched::with_session`.
+/// Only slot indices cross the user entry: each step borrows the process
+/// afresh under the scheduler lock (spec 0051, point 2).
 fn resume_process(kernel: &PageTables, frames: &mut FrameAllocator<'_>, owner: usize, slot: u16) {
-    assert!(!arch::interrupts_enabled());
-    assert!(!interrupts::user_context_active());
-    // The scheduler dequeued this thread and made it current.
-    assert_eq!(sched::current(), Some((owner, slot)));
-    {
-        // SAFETY: The scheduler holds the lock and no other reference to the
-        // process; this borrow ends with the block, before user entry.
-        let process = unsafe { sched::process(owner) };
-        assert!(!process.finished());
-        assert_eq!(process.thread().state, State::Ready);
-        let thread = process.thread_mut();
-        assert!(thread.on_cpu, "dispatch did not claim the thread");
-        thread.state = State::Running;
-        // A thread that a wake displaced resumes its interrupted quantum; any
-        // other dispatch starts a new one (0030-D3).
-        let resumed = core::mem::take(&mut thread.displaced);
-        if resumed {
-            assert!(
-                (1..=QUANTUM_TICKS).contains(&thread.quantum_left),
-                "displaced thread has no quantum left"
-            );
-        } else {
-            thread.quantum_left = QUANTUM_TICKS;
-        }
-        #[cfg(feature = "boot-smoke")]
-        record_latency(process, resumed);
-        process.dispatches += 1;
-    }
+    begin_slice(owner, slot);
     loop {
         enter_user(kernel, owner);
         // A THREAD_CREATE completes here, once its handler has unwound, with
         // the kernel root active (0050-D2). The creator then resumes at once
         // with the rest of its quantum, as when creation ran inside the
         // handler, so the run queue's order is unchanged.
-        // SAFETY: As above; every handler has unwound, and this borrow ends
-        // before the next user entry.
+        // SAFETY: As in begin_slice; every handler has unwound, and this
+        // borrow ends before the next user entry.
         let process = unsafe { sched::process(owner) };
         let State::Creating(start) = process.thread().state else {
             break;
@@ -2315,18 +2751,102 @@ fn resume_process(kernel: &PageTables, frames: &mut FrameAllocator<'_>, owner: u
         complete_create(kernel, frames, process, start);
         process.thread_mut().state = State::Running;
     }
+    finish_slice(kernel, frames, owner);
+}
+
+/// Run the dispatched thread on this AP through user execution (spec 0051,
+/// point 5). A request that needs the frame allocator, the heap or the
+/// kernel VA window goes to the BSP's work list instead of completing here:
+/// a page-in or VM call, a creation, or an exit, whose stack the BSP frees.
+/// The thread is then on no CPU, and the BSP is kicked; so it is when the
+/// thread's process has finished, since only the BSP tears processes down.
+fn resume_on_ap(kernel: &PageTables, owner: usize, slot: u16) {
+    begin_slice(owner, slot);
+    enter_user(kernel, owner);
+    // SAFETY: As in begin_slice; every handler has unwound.
+    let process = unsafe { sched::process(owner) };
+    let thread = process.thread_mut();
+    let state = thread.state;
+    assert_ne!(state, State::Running, "process returned without transition");
+    // Only the shell, pinned to the BSP, launches and closes apps.
+    assert!(
+        !matches!(state, State::Launching(_) | State::Closing(_)),
+        "a supervisor request on an AP"
+    );
+    // Its FPU image is stored: another CPU may complete its waits or, for
+    // the requests below, its request. A ready thread stays claimed until
+    // this CPU's scheduler queues it again (`sched::requeue`).
+    if state != State::Ready {
+        thread.on_cpu = false;
+    }
+    if matches!(
+        state,
+        State::Memory(_) | State::Creating(_) | State::Exited(_)
+    ) {
+        sched::push_bsp_work(slot);
+        crate::smp::kick(0);
+    } else if process.finished() {
+        crate::smp::kick(0);
+    }
+}
+
+/// Start a dispatched thread's slice: it runs now, with a new quantum or, if
+/// a wake displaced it, the rest of its old one.
+fn begin_slice(owner: usize, slot: u16) {
+    assert!(!arch::interrupts_enabled());
+    assert!(!interrupts::user_context_active());
+    // The scheduler dequeued this thread and made it current.
+    assert_eq!(sched::current(), Some((owner, slot)));
+    // SAFETY: The scheduler holds the lock and no other reference to the
+    // process; this borrow ends with the function, before user entry.
+    let process = unsafe { sched::process(owner) };
+    assert!(!process.finished());
+    assert_eq!(process.thread().state, State::Ready);
+    let thread = process.thread_mut();
+    assert!(thread.on_cpu, "dispatch did not claim the thread");
+    thread.state = State::Running;
+    // A thread that a wake displaced resumes its interrupted quantum; any
+    // other dispatch starts a new one (0030-D3).
+    let resumed = core::mem::take(&mut thread.displaced);
+    if resumed {
+        assert!(
+            (1..=QUANTUM_TICKS).contains(&thread.quantum_left),
+            "displaced thread has no quantum left"
+        );
+    } else {
+        thread.quantum_left = QUANTUM_TICKS;
+    }
+    #[cfg(feature = "boot-smoke")]
+    {
+        process.ran_on |= 1 << crate::cpudata::current_cpu();
+        record_latency(process, resumed);
+    }
+    process.dispatches += 1;
+}
+
+/// End the current thread's slice on the BSP, with the kernel root active:
+/// complete its deferred page-in, VM call or creation, free an exited
+/// thread's stack, and only then let another CPU take the thread and a
+/// joiner reap it (spec 0051, point 8). The BSP runs this at the end of its
+/// own dispatch and for each thread an AP handed it (point 5).
+fn finish_slice(kernel: &PageTables, frames: &mut FrameAllocator<'_>, owner: usize) {
+    assert!(!arch::interrupts_enabled());
+    assert!(!interrupts::user_context_active());
+    assert_eq!(crate::cpudata::current_cpu(), 0, "an AP finished a slice");
     // Deferred copy/syscall work completes with the session still published.
     // A release or protection change may release the scheduler lock for its
     // shootdowns, so it borrows the process afresh for each step.
-    // SAFETY: As above; no user context or interrupt handler is active here,
-    // and this borrow ends at once.
+    // SAFETY: The scheduler holds the lock and no other process reference;
+    // no user context or interrupt handler is active here, and this borrow
+    // ends at once.
     if let State::Memory(request) = unsafe { sched::process(owner) }.thread().state {
         complete_memory(kernel, owner, frames, request);
     }
     // SAFETY: As above.
     let process = unsafe { sched::process(owner) };
-    // A creation deferred through a syscall-buffer page-in completes here,
-    // and the creator rejoins the run queue, as after any page-in.
+    // A creation deferred through a syscall-buffer page-in, or handed over
+    // by an AP, completes here, and the creator rejoins the run queue, as
+    // after any page-in.
     if let State::Creating(start) = process.thread().state {
         complete_create(kernel, frames, process, start);
     }
@@ -2344,8 +2864,14 @@ fn resume_process(kernel: &PageTables, frames: &mut FrameAllocator<'_>, owner: u
         "process returned without transition"
     );
     // Its FPU image is stored and its request completed: another CPU may
-    // dispatch it, or complete its waits, from now on (spec 0051, point 2).
-    thread.on_cpu = false;
+    // complete its waits from now on (spec 0051, point 2). A ready thread
+    // stays claimed until the BSP queues it again (`sched::requeue`), after
+    // lock releases that let other CPUs finish its process: the claim keeps
+    // the process from looking quiescent, so its entry cannot be released
+    // or reused meanwhile.
+    if thread.state != State::Ready {
+        thread.on_cpu = false;
+    }
     // Only now, with its stack freed and the thread off this CPU, may a
     // joiner reap an exited thread's entry (spec 0051, point 8).
     if let (State::Exited(_), Some(tid)) = (thread.state, thread.joiner) {
@@ -2406,13 +2932,15 @@ fn enter_user(kernel: &PageTables, owner: usize) {
     });
     crate::cpudata::set_current_thread(0);
     // SAFETY: The user is suspended and IF remains clear. The placeholder is
-    // the BSP's guarded RSP0 stack, mapped in every root (0050-D2).
-    unsafe { interrupts::set_kernel_stack(stacks::bsp_rsp0_top()) };
+    // this CPU's own: the BSP's guarded RSP0 stack or an AP's kernel stack,
+    // both mapped in every root (0050-D2).
+    unsafe { interrupts::set_kernel_stack(crate::smp::rsp0_placeholder()) };
     // SAFETY: As above; every handler has unwound.
     let process = unsafe { sched::process(owner) };
     // SAFETY: All handlers returned, the user is suspended, and IF remains
     // clear. This CPU's bit in the mask clears once the kernel root has
-    // replaced the user's (spec 0051, point 8).
+    // replaced the user's (spec 0051, point 8); `kernel` is the hierarchy
+    // every process root borrows, which each CPU runs on.
     unsafe { process.space.deactivate(kernel) }.expect("restore kernel root");
     process.thread_mut().context.extended = extended;
     #[cfg(feature = "boot-smoke")]
@@ -2445,28 +2973,61 @@ fn record_latency(process: &mut Process, resumed: bool) {
     assert!(slot.replace(lateness).is_none(), "wake timed twice");
 }
 
-/// Kill the selected OOM victim at once (0054-D5): finish OutOfMemory, detach
-/// and release its threads, close its handles, and destroy its address space
-/// immediately; the zombie keeps only the outcome, and reap skips the destroy.
+/// How long an OOM kill waits for its victim to leave the other CPUs.
+const OOM_KILL_WAIT_NS: u64 = 1_000_000_000;
+
+/// Kill the selected OOM victim (0054-D5) with spec 0051's deferred teardown
+/// (point 8): finish it OutOfMemory, which kicks every CPU that has its root
+/// loaded, and wait, bounded and with the scheduler lock released between
+/// checks, until no other CPU runs or holds one of its threads and none has
+/// its root loaded. Then close its handles and destroy its address space at
+/// once, so the requester's retry finds the frames; the zombie keeps only the
+/// outcome, and reap skips the destroy. Its thread entries go now, or, if
+/// this CPU's scheduler still holds one of its threads from its last
+/// dispatch, at the loop top after that thread is dropped.
 fn kill_oom_victim(slot: usize, frames: &mut FrameAllocator<'_>) {
-    // SAFETY: The scheduler holds the lock, selected this occupied slot and
-    // holds no other reference to it.
+    assert_eq!(crate::cpudata::current_cpu(), 0, "an AP killed for memory");
+    {
+        // SAFETY: The scheduler holds the lock, selected this occupied slot
+        // and holds no other reference to it; the borrow ends with the block.
+        let process = unsafe { sched::process(slot) };
+        serial::println!(
+            "MIRROR_OOM_KILL class={} pid={}",
+            process.memory_class.name(),
+            process.pid
+        );
+        process.finish(Outcome::OutOfMemory);
+    }
+    let mut bound = crate::clock::SpinBound::new(OOM_KILL_WAIT_NS);
+    loop {
+        let gone = {
+            // SAFETY: As above; the borrow ends with the block, before the
+            // lock is released.
+            let process = unsafe { sched::process(slot) };
+            // A thread this CPU holds is not running: the BSP is here,
+            // completing the requester's request with the kernel root loaded.
+            process.space.loaded_cpus() == 0
+                && process
+                    .threads()
+                    .all(|thread| !thread.on_cpu || thread.cpu == 0)
+        };
+        if gone {
+            break;
+        }
+        assert!(!bound.expired(), "OOM victim teardown timeout");
+        // The victim's CPUs take the scheduler lock to return its threads.
+        sched::unlocked(core::hint::spin_loop);
+    }
+    // SAFETY: As above; a finished process keeps its slot until it is reaped,
+    // which only this CPU does, outside this completion.
     let process = unsafe { sched::process(slot) };
-    serial::println!(
-        "MIRROR_OOM_KILL class={} pid={}",
-        process.memory_class.name(),
-        process.pid
-    );
-    process.finish(Outcome::OutOfMemory);
-    // Only the BSP runs user threads, and it is completing the requester's
-    // request, so the victim is quiescent: no thread of it is on a CPU and no
-    // CPU has its root loaded (spec 0051, point 8). release_threads and
-    // destroy both check this.
-    process.release_threads();
+    if process.quiescent() {
+        process.release_threads();
+    }
     with_ipc(|ipc| release_handles(process, ipc));
-    // SAFETY: No CPU has the victim's root loaded, no thread is current, and
-    // no handler retains a reference into its tree; its frames return to the
-    // pool at once.
+    // SAFETY: No CPU has the victim's root loaded and no thread of it runs;
+    // no handler retains a reference into its tree, so its frames return to
+    // the pool at once.
     unsafe { process.space.destroy(frames) }.expect("OOM victim address space");
     process.space_destroyed = true;
 }
@@ -2557,9 +3118,23 @@ fn complete_memory(
             .reserve(frame.rdi, frame.rsi, frame.rdx)
             .map(|address| address as i64),
         vm_abi::SYS_VM_RELEASE if frame.rdx != 0 => Err(-22),
-        vm_abi::SYS_VM_RELEASE => complete_removal(owner, frames, |process| {
-            process.vm.begin_release(frame.rdi, frame.rsi)
-        }),
+        vm_abi::SYS_VM_RELEASE => {
+            // The SMP battery's release of its written page keeps that page's
+            // frame for the stale-write canary (spec 0051, step 5).
+            #[cfg(feature = "boot-smoke")]
+            canary::arm(
+                // SAFETY: As above; this borrow ends with the statement.
+                unsafe { sched::process(owner) },
+                frame.rdi,
+                frame.rsi,
+            );
+            let result = complete_removal(owner, frames, |process| {
+                process.vm.begin_release(frame.rdi, frame.rsi)
+            });
+            #[cfg(feature = "boot-smoke")]
+            canary::disarm();
+            result
+        }
         vm_abi::SYS_VM_PROTECT => complete_removal(owner, frames, |process| {
             process
                 .vm
@@ -2628,20 +3203,54 @@ fn complete_removal(
             };
             (process.space.root_physical_address(), targets)
         };
-        if targets == 0 {
+        let reloaded = if targets == 0 {
             // SAFETY: No CPU had the root loaded after the batch's changes.
-            unsafe { vm::finish_batch(root, 0, &mut batch, frames) };
+            unsafe { finish_removal_batch(root, 0, &mut batch, frames) }
         } else {
             // The flush waits for other CPUs, which may spin on the lock.
             sched::unlocked(|| {
                 // SAFETY: The targets were read after the batch's changes. The
                 // process stays in its slot: it is torn down only once no
                 // thread is on a CPU, and this one is on this CPU.
-                unsafe { vm::finish_batch(root, targets, &mut batch, frames) }
-            });
+                unsafe { finish_removal_batch(root, targets, &mut batch, frames) }
+            })
+        };
+        #[cfg(feature = "boot-smoke")]
+        {
+            // SAFETY: As above; this borrow ends with the statement.
+            unsafe { sched::process(owner) }.flushes += reloaded as u64;
         }
+        #[cfg(not(feature = "boot-smoke"))]
+        let _ = reloaded;
     }
     Ok(0)
+}
+
+/// End one removal batch: `vm::finish_batch`, except that a boot-smoke
+/// kernel keeps the SMP battery's canary frame out of the allocator once
+/// every CPU has flushed (spec 0051, step 5). Returns how many targets had
+/// the root loaded.
+///
+/// # Safety
+/// As for `vm::finish_batch`.
+unsafe fn finish_removal_batch(
+    root: u64,
+    targets: u64,
+    batch: &mut Withdrawal,
+    frames: &mut FrameAllocator<'_>,
+) -> usize {
+    #[cfg(feature = "boot-smoke")]
+    if let Some(frame) = canary::armed() {
+        // SAFETY: The caller's contract, which this forwards.
+        let (reloaded, kept) =
+            unsafe { vm::finish_batch_keeping(root, targets, batch, frames, frame) };
+        if kept {
+            canary::keep(frame);
+        }
+        return reloaded;
+    }
+    // SAFETY: The caller's contract, which this forwards.
+    unsafe { vm::finish_batch(root, targets, batch, frames) }
 }
 
 /// Complete a deferred page-in for the current thread of process slot
@@ -3032,8 +3641,17 @@ impl ShellRuntime<'_> {
             // SAFETY: The child's slot is distinct from the shell's, and this
             // borrow ends before reclaim removes the entry.
             let child = unsafe { sched::process(slot) };
-            assert!(child.threads().all(|thread| thread.state != State::Running));
+            // Only a thread on another CPU runs while the shell's request
+            // completes; after the session's barrier none does (spec 0051,
+            // point 9).
+            assert!(
+                child
+                    .threads()
+                    .all(|thread| thread.state != State::Running || thread.on_cpu),
+                "a closed app's thread runs on no CPU"
+            );
             if !child.finished() {
+                // Kicks the CPUs that run the child's threads.
                 child.finish(reason);
             }
             if !child.quiescent() {
@@ -3111,8 +3729,15 @@ fn complete_wait(
     windows: Option<&mut windows::Session>,
     now: u64,
 ) {
-    let sched::Signal { slot, preset, at } = signal;
+    let sched::Signal {
+        slot, preset, at, ..
+    } = signal;
     assert!(!interrupts::user_context_active());
+    // A wake that another CPU than the waiter's signaled (spec 0051, step 5).
+    #[cfg(feature = "boot-smoke")]
+    if signal.from != process.thread().cpu {
+        process.cross_wakes += 1;
+    }
     // The scheduler made the signaled thread current.
     assert_eq!(
         process.thread().slot,
@@ -3497,13 +4122,13 @@ fn join_thread(process: &mut Process, frame: &mut TrapFrame) -> Result<Option<St
     if target.joiner.is_some() {
         return Err(-16);
     }
-    // An exited thread still on its CPU keeps its stack until that CPU's
-    // scheduler frees it; the join then waits for that scheduler's signal
-    // (spec 0051, point 8).
+    // An exited thread still on its CPU, or handed to the BSP, keeps its
+    // stack until the BSP frees it; the join then waits for the signal that
+    // follows the free (spec 0051, points 5 and 8).
     if let State::Exited(status) = target.state
         && !target.on_cpu
+        && target.stack.is_none()
     {
-        assert!(target.stack.is_none(), "an exited thread kept its stack");
         frame.rdx = status;
         process.remove_member(index);
         #[cfg(feature = "boot-smoke")]
@@ -3584,6 +4209,9 @@ pub fn run_shell(
             input: true,
             windows: true,
         };
+        // The surface and input holder runs on the BSP; its apps run on
+        // every CPU (spec 0051, point 6).
+        desktop.cpus = BSP_ONLY;
         for (slot, object, rights) in [
             (0, Object::Console, capability::WRITE),
             (3, Object::Surface, capability::WRITE),
@@ -4152,6 +4780,13 @@ pub(crate) fn end_trap() {
     sched::end_trap();
 }
 
+/// Join an open session from this AP's idle loop and run its threads until
+/// the session's end barrier (spec 0051, point 5); outside an open session,
+/// or on a CPU that runs no userspace, return at once.
+pub(crate) fn join_session() {
+    sched::run_ap();
+}
+
 /// Spec 0050, acceptance test 3: every trap from a thread lands on that
 /// thread's own kernel stack, which TSS.RSP0 names while it runs. The frame,
 /// or a handler's copy of it, lies inside that stack. Count the traps that
@@ -4196,6 +4831,12 @@ fn with_surface<T>(
     access: Access,
     operation: impl FnOnce(&mut surface::Session<'_, '_>) -> T,
 ) -> T {
+    // Its holders run on the BSP alone (spec 0051, point 6).
+    assert_eq!(
+        crate::cpudata::current_cpu(),
+        0,
+        "the surface session used on an AP"
+    );
     sched::with_session(|session| {
         operation(
             session
@@ -4210,6 +4851,12 @@ fn with_surface<T>(
 /// The session's staged device input, for a process whose `access` allows
 /// it. Device IRQs mutate queues, never this staged session.
 fn with_input<T>(access: Access, operation: impl FnOnce(&mut input::Session<'_>) -> T) -> T {
+    // As for the surface (spec 0051, point 6).
+    assert_eq!(
+        crate::cpudata::current_cpu(),
+        0,
+        "the input session used on an AP"
+    );
     sched::with_session(|session| {
         operation(
             session
@@ -4335,6 +4982,17 @@ fn match_init_oracles(process: &mut Process, message: &[u8]) {
         process.fpu_preemptions = process
             .fpu_preemption_start
             .map_or(0, |start| process.preemptions.saturating_sub(start));
+    }
+    // The SMP battery's checks (spec 0051, step 5), one bit each.
+    for (bit, oracle) in [
+        (1, b"Mirror init: SMP futex checks passed\n".as_slice()),
+        (2, b"Mirror init: SMP IPC checks passed\n"),
+        (4, b"Mirror init: SMP join checks passed\n"),
+        (8, b"Mirror init: SMP writers running\n"),
+    ] {
+        if message == oracle {
+            process.battery_checks |= bit;
+        }
     }
     process.ipc_checks |= message == IPC_CHECKS_PASSED;
     process.surface_checks |= message == SURFACE_CHECKS_PASSED;
@@ -4705,6 +5363,9 @@ struct SyscallResult {
 }
 
 pub(crate) fn syscall(frame: &mut TrapFrame) {
+    if exit_if_finished(frame) {
+        return;
+    }
     // Reserve/protect/release always run after handler frames have unwound.
     if (vm_abi::SYS_VM_RESERVE..=vm_abi::SYS_VM_PROTECT).contains(&frame.rax) {
         suspend(frame, State::Memory(MemoryRequest::Operation));
@@ -5147,6 +5808,9 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
 /// A tick charges the interrupted user only; kernel and sleeping time are not
 /// charged. This bounds delivered user IRQ ticks, not exact CPU or wall time.
 pub(crate) fn timer_tick(frame: &mut TrapFrame) {
+    if exit_if_finished(frame) {
+        return;
+    }
     let mut expired = false;
     let mut preempt = false;
     with_active(frame, |process| {
@@ -5159,7 +5823,9 @@ pub(crate) fn timer_tick(frame: &mut TrapFrame) {
                 policy.charge(timer::ticks())
             }
         };
-        if matches!(process.policy, CpuPolicy::Probe) && process.charged_ticks >= USER_TICK_BUDGET {
+        if matches!(process.policy, CpuPolicy::Probe)
+            && process.charged_ticks >= process.tick_budget
+        {
             process.finish(Outcome::BudgetExhausted);
             expired = true;
         } else if throttled || process.thread().quantum_left == 0 {
@@ -5188,9 +5854,11 @@ pub(crate) fn timer_tick(frame: &mut TrapFrame) {
         interrupts::return_from_user(frame);
     } else if preempt {
         suspend(frame, State::Ready);
-    } else if sched::deadline_due(timer::ticks()) {
+    } else if crate::cpudata::current_cpu() == 0 && sched::deadline_due(timer::ticks()) {
         // The deadline's own tick hands the CPU to the waits it ends, and the
-        // charged thread keeps the rest of its quantum (0030-D3).
+        // charged thread keeps the rest of its quantum (0030-D3). Only the
+        // BSP's clock reaches deadlines (spec 0051, point 3), so an AP's tick
+        // only charges and preempts.
         displace(frame);
     }
 }
@@ -5211,9 +5879,35 @@ pub(crate) fn input_interrupt(frame: &mut TrapFrame) {
 /// returns to the scheduler still ready, with no tick charged and the rest of
 /// its quantum kept, as for a wake (0030-D3). Dispatch clears the request.
 pub(crate) fn reschedule_interrupt(frame: &mut TrapFrame) {
+    if exit_if_finished(frame) {
+        return;
+    }
     if crate::cpudata::need_resched() {
         displace(frame);
     }
+}
+
+/// Return the trapping thread to its scheduler when another CPU finished its
+/// process while it ran (spec 0051, point 8): its state is `Finished`, and
+/// nothing of it runs again. This takes the handler's hold of the scheduler
+/// lock, so no CPU can finish the process later in the same handler. Every
+/// CPL3 entry checks this first, and so does every return to user mode.
+fn exit_if_finished(frame: &mut TrapFrame) -> bool {
+    assert_eq!(frame.cs & 3, 3, "userspace handler requires CPL3");
+    sched::hold_for_trap();
+    let (owner, _) = sched::current().expect("no active process");
+    // SAFETY: As in with_active; this borrow ends with the function.
+    let process = unsafe { sched::process(owner) };
+    if !process.finished() {
+        return false;
+    }
+    assert_eq!(
+        process.thread().state,
+        State::Finished,
+        "a finished process kept a running thread"
+    );
+    interrupts::return_from_user(frame);
+    true
 }
 
 fn suspend(frame: &mut TrapFrame, state: State) {
@@ -5260,6 +5954,9 @@ fn park_current(frame: &mut TrapFrame, state: State, displaced: bool) {
 }
 
 pub(crate) fn fault(frame: &mut TrapFrame, cr2: u64) {
+    if exit_if_finished(frame) {
+        return;
+    }
     let mut recoverable = false;
     with_active(frame, |process| {
         recoverable = frame.vector == 14 && process.vm.permits_fault(cr2, frame.error);
@@ -5301,6 +5998,10 @@ fn record_fault(process: &mut Process, frame: &TrapFrame, cr2: u64) {
 /// contexts on the trusted continuation. Unmapped canonical user addresses may
 /// return safely; subsequent user accesses produce ordinary contained faults.
 pub(crate) fn prepare_return(frame: &mut TrapFrame) {
+    // A thread whose process another CPU finished never resumes.
+    if exit_if_finished(frame) {
+        return;
+    }
     let invalid = if !(PAGE_SIZE..(1_u64 << 47)).contains(&frame.rsp) {
         Some(Outcome::InvalidStack(frame.rsp))
     } else if !(PAGE_SIZE..(1_u64 << 47)).contains(&frame.rip)

@@ -2,7 +2,9 @@
 //!
 //! Hooks run on the BSP with IF clear. Atomics avoid mutable static references;
 //! they do not make the multi-field session or HPET observation AP-safe. 0051
-//! must retain BSP ownership for measured sessions or migrate this contract.
+//! retains BSP ownership: the measured shell is pinned to the BSP, the frame
+//! and input hooks run under `with_surface` and `with_input`, which assert
+//! CPU 0, and the memory sample and session end run in the BSP's pass.
 
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use mirror_perf_protocol::{Config, Context, Event, Item, Record};
