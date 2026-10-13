@@ -6,4 +6,6 @@ See [lane packaging and recovery](../../docs/lane-recovery.md) for commands, pro
 
 The root workspace excludes this tool. Use explicit `--manifest-path` and `--target x86_64-pc-windows-msvc` for host tests and clippy. The root `scripts/test.ps1` runs those checks and the PowerShell entry fixtures.
 
+The lane packaging wrapper always runs the host controller with Cargo's `--release`, including recovery, so image hashing stays within the fixed phase deadline. The wrapper's `-Release` switch independently selects the guest build profile.
+
 The `job_fixture` binary is a synthetic containment-test helper. It cannot operate a VM or a real team lease.

@@ -57,16 +57,21 @@ New-Item -ItemType Directory -Path $build -Force | Out-Null
     # Check the actual thin dispatch with paths containing spaces. Cargo itself
     # remains synthetic; no compiler or real lease is started by these fixtures.
     $global:MirrorLaneFixtureCargoAllowed = $true
-    foreach ($recover in @($false, $true)) {
+    foreach ($mode in @('debug', 'release', 'recover')) {
         $entryArguments = @{ Lane = $true; LaneRoot = (Join-Path $fixtureRoot 'lane with spaces'); LockOwner = 'fixture/task'; LaneSlot = 'qemu' }
-        if ($recover) { $entryArguments.Recover = 'package-123' } else { $entryArguments.Release = $true }
+        if ($mode -eq 'recover') { $entryArguments.Recover = 'package-123' }
+        if ($mode -eq 'release') { $entryArguments.Release = $true }
         & (Join-Path $fixtureScripts 'package.ps1') @entryArguments
         $actual = $global:MirrorLaneFixtureCargoArguments
         $separator = [Array]::IndexOf($actual, '--')
+        if ($separator -le 0) { throw 'Lane entry omitted the Cargo/controller argument separator.' }
+        $hostArguments = @($actual[0..($separator - 1)])
+        if (@($hostArguments | Where-Object { $_ -ceq '--release' }).Count -ne 1) { throw "Lane $mode must use an optimized host controller before '--'." }
         $expected = @('package', '--checkout', $fixtureRoot, '--lane-root', $entryArguments.LaneRoot, '--owner', 'fixture/task')
-        if ($recover) { $expected += @('--recover','package-123') } else { $expected += '--release' }
+        if ($mode -eq 'recover') { $expected += @('--recover','package-123') }
+        if ($mode -eq 'release') { $expected += '--release' }
         $expected += @('--slot', 'qemu')
-        if ($separator -lt 0 -or ($actual[($separator + 1)..($actual.Length - 1)] -join "`n") -cne ($expected -join "`n") -or -not ($actual -contains '--locked') -or -not ($actual -contains '--offline')) { throw 'Lane entry changed the bounded controller argument array.' }
+        if (($actual[($separator + 1)..($actual.Length - 1)] -join "`n") -cne ($expected -join "`n") -or -not ($hostArguments -contains '--locked') -or -not ($hostArguments -contains '--offline')) { throw 'Lane entry changed the bounded controller argument array or guest profile.' }
         $cases++
     }
     $global:MirrorLaneFixtureCargoAllowed = $false

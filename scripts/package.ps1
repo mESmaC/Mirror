@@ -25,12 +25,14 @@ if ($Lane) {
         throw 'Lane requires -LaneRoot and -LockOwner nick/task.'
     }
     if ($Recover -and $Release) { throw 'Recover cannot select a build profile.' }
-    $laneArguments = @('run', '--locked', '--offline', '--target', 'x86_64-pc-windows-msvc', '--manifest-path', (Join-Path $repositoryRoot 'tools/perf-probe/Cargo.toml'), '--bin', 'perf-probe', '--', 'package', '--checkout', $repositoryRoot, '--lane-root', $LaneRoot, '--owner', $LockOwner)
+    $laneArguments = @('run', '--release', '--locked', '--offline', '--target', 'x86_64-pc-windows-msvc', '--manifest-path', (Join-Path $repositoryRoot 'tools/perf-probe/Cargo.toml'), '--bin', 'perf-probe', '--', 'package', '--checkout', $repositoryRoot, '--lane-root', $LaneRoot, '--owner', $LockOwner)
     if ($Release) { $laneArguments += '--release' }
     if ($Recover) { $laneArguments += @('--recover', $Recover) }
     if ($CargoHome) { $laneArguments += @('--cargo-home', $CargoHome) }
     if ($LimineArchive) { $laneArguments += @('--limine-archive', $LimineArchive) }
     if ($LaneSlot) { $laneArguments += @('--slot', $LaneSlot) }
+    # Optimize the host controller's bounded image hashing in every guest profile
+    # and recovery. The guest -Release choice is forwarded only after '--'.
     # Host-only bootstrap; the Rust controller acquires its own machine lease.
     Push-Location -LiteralPath $repositoryRoot
     try {
