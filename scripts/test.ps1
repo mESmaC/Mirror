@@ -34,18 +34,20 @@ function Assert-MirrorKernelImage {
         # speculative-execution exposure; only smoke kernels probe the NMI and
         # #MC IST stacks (specs 0016a, 0016b). Every flavor reports PS/2 init
         # and its timeouts; only smoke kernels inject PS/2 faults (spec 0017b).
-        # Every flavor reports its process and thread tables (spec 0030a).
+        # Every flavor reports its process and thread tables (spec 0030a), its
+        # kernel VA window and its per-CPU data; only smoke kernels test the
+        # window, probe the per-CPU data and report thread stacks (spec 0050).
         # Every flavor reports the FADT reset register and each restart step,
         # failures included, which no default or trace run prints; only smoke
         # kernels test the policy, skip methods or suppress writes (0058a).
         # 0059: the auto-phase growth records are test-trace-gated, and the
         # capacity skip record and charge summary exist only in boot-smoke.
-        $required = @('MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=', 'MIRROR_MEM_RESERVE frames=') + $resetRequired
-        $forbidden = @('MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_TRACE_ON', 'MIRROR_CONSOLE_COMMAND operation=', 'MIRROR_POINTER_UPDATED', 'MIRROR_POINTER_CLICK', 'MIRROR_SHELL_FRAME', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'Mirror shell: ready', 'MIRROR_USERSPACE_OK', 'Mirror init: VM checks passed', 'fixture data mismatch', 'unexpected budget exhaustion', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROWN phase=auto', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK') + $resetForbidden
+        $required = @('MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=', 'MIRROR_MEM_RESERVE frames=', 'MIRROR_KVA_READY base=', 'MIRROR_CPU_DATA_READY cpus=') + $resetRequired
+        $forbidden = @('MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_TRACE_ON', 'MIRROR_CONSOLE_COMMAND operation=', 'MIRROR_POINTER_UPDATED', 'MIRROR_POINTER_CLICK', 'MIRROR_SHELL_FRAME', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'Mirror shell: ready', 'MIRROR_USERSPACE_OK', 'Mirror init: VM checks passed', 'fixture data mismatch', 'unexpected budget exhaustion', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROWN phase=auto', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED') + $resetForbidden
     }
     else {
-        $required = @('MIRROR_TRACE_ON', 'MIRROR_SHELL_FRAME', 'MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=', 'MIRROR_HEAP_GROWN phase=auto', 'MIRROR_MEM_RESERVE frames=') + $resetRequired
-        $forbidden = @('MIRROR_USERSPACE_OK', 'fixture data mismatch', 'MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK') + $resetForbidden
+        $required = @('MIRROR_TRACE_ON', 'MIRROR_SHELL_FRAME', 'MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=', 'MIRROR_HEAP_GROWN phase=auto', 'MIRROR_MEM_RESERVE frames=', 'MIRROR_KVA_READY base=', 'MIRROR_CPU_DATA_READY cpus=') + $resetRequired
+        $forbidden = @('MIRROR_USERSPACE_OK', 'fixture data mismatch', 'MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED') + $resetForbidden
     }
     foreach ($text in $required) {
         if ($image.IndexOf($text, [StringComparison]::Ordinal) -lt 0) {
@@ -114,7 +116,7 @@ try {
         # with SMEP and SMAP on (0016-D6).
         # UserSimd remains a strict manual #XM probe: current QEMU TCG does not
         # deliver that unmasked SSE arithmetic exception (QEMU issue 215).
-        foreach ($fault in @('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'OomOrder')) {
+        foreach ($fault in @('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'ThreadStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'OomOrder')) {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Release:$release -Fault $fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
             Save-MirrorSmokeLogs "$profile-$fault"
         }

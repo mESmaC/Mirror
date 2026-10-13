@@ -9,7 +9,7 @@
 mod sched;
 
 #[cfg(feature = "boot-smoke")]
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicUsize};
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 #[cfg(feature = "boot-smoke")]
@@ -23,9 +23,10 @@ use crate::{
     elf, framebuffer, heap, input,
     interrupts::{self, TrapFrame},
     ipc::{Ipc, IpcError, MESSAGE_SIZE},
+    kernel_va::{self, KernelStack, KvaError},
     memory::{FrameAllocator, PAGE_SIZE},
     paging::{PageTables, PagingError, UserAddressSpace, UserPermissions},
-    ps2, serial, surface, timer, vm, windows,
+    ps2, serial, stacks, surface, timer, vm, windows,
 };
 use mirror_clock_protocol as clock_abi;
 use mirror_thread_protocol as thread_abi;
@@ -56,6 +57,14 @@ const MAX_SLEEP_TICKS: u64 = 1000;
 const RECEIVE_TIMEOUT: u64 = 100;
 const SERVICE_ALLOWANCE: u64 = 32;
 const SERVICE_PERIOD: u64 = 100;
+/// The deepest high-water mark, in pages, of the thread stacks used since the
+/// current init-pair session began (0050-D2, boot-smoke).
+#[cfg(feature = "boot-smoke")]
+static SESSION_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
+/// Set when the first init-pair session starts with the kernel VA window's
+/// shootdown transport withheld (0050 test 4, boot-smoke).
+#[cfg(feature = "boot-smoke")]
+static KVA_DEGRADED_RUN: AtomicBool = AtomicBool::new(false);
 
 // Only the BSP accesses this slot, with IF=0. It is populated immediately before
 // entry and cleared after the synchronous return; it never owns the context.
@@ -111,6 +120,10 @@ enum State {
     Launching(u64),
     Closing(u64),
     Memory(MemoryRequest),
+    /// A validated THREAD_CREATE, which the scheduler completes once the
+    /// handler has unwound: it builds the new thread's kernel stack and
+    /// returns the TID or -11 (0050-D2).
+    Creating(thread_abi::ThreadStart),
     Joining(u64),
     Waiting(PendingWait),
     Exited(u64),
@@ -126,6 +139,10 @@ struct Thread {
     /// This thread's own table slot, its run-queue key.
     slot: u16,
     context: Context,
+    /// The guarded kernel stack this thread traps onto (0050-D2), from its
+    /// creation until the scheduler frees it into the reuse pool: at the
+    /// thread's exit, or when its process is torn down.
+    stack: Option<KernelStack>,
     state: State,
     joiner: Option<u64>,
     charged_ticks: u64,
@@ -158,7 +175,14 @@ enum LatencyProbe {
 }
 
 impl Thread {
-    fn new(entry: u64, stack: u64, argument: u64, process: usize, slot: u16) -> Self {
+    fn new(
+        entry: u64,
+        stack: u64,
+        argument: u64,
+        process: usize,
+        slot: u16,
+        kernel_stack: KernelStack,
+    ) -> Self {
         let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
         assert!((1..=i64::MAX as u64).contains(&id), "thread IDs exhausted");
         Self {
@@ -166,6 +190,7 @@ impl Thread {
             process: u16::try_from(process).expect("process slot"),
             slot,
             context: Context::new(entry, stack, argument),
+            stack: Some(kernel_stack),
             state: State::Ready,
             joiner: None,
             charged_ticks: 0,
@@ -375,6 +400,15 @@ struct Process {
     threads_created: u64,
     #[cfg(feature = "boot-smoke")]
     threads_peak: usize,
+    /// The most kernel stacks this process's threads held at once (0050-D4).
+    #[cfg(feature = "boot-smoke")]
+    stacks_peak: usize,
+    /// The kernel stack bottom of the thread that last trapped, and how often
+    /// a trap came from another thread's stack (0050, acceptance test 3).
+    #[cfg(feature = "boot-smoke")]
+    trap_stack: u64,
+    #[cfg(feature = "boot-smoke")]
+    trap_stack_switches: u64,
     #[cfg(feature = "boot-smoke")]
     capacity_checks: bool,
     #[cfg(feature = "boot-smoke")]
@@ -401,6 +435,12 @@ struct Process {
     sync_cancelled: u64,
     #[cfg(feature = "boot-smoke")]
     tls_checks: bool,
+    /// Preemptions while init held non-null user FS/GS selectors (0050,
+    /// acceptance test 1), counted between its two TLS preemption markers.
+    #[cfg(feature = "boot-smoke")]
+    tls_preemption_start: Option<usize>,
+    #[cfg(feature = "boot-smoke")]
+    tls_preemptions: usize,
     #[cfg(feature = "boot-smoke")]
     clock_checks: bool,
     #[cfg(feature = "boot-smoke")]
@@ -699,7 +739,86 @@ fn test_load_rollback(
         before,
         "partial load leaked"
     );
+    test_create_rollback(kernel, frames, bytes, image, direct_map);
     serial::println!("MIRROR_USER_LOAD_ROLLBACK_OK");
+}
+
+/// Spec 0050, acceptance test 5, the create half: with an empty pool, so
+/// every build allocates, a thread creation whose stack build fails at its
+/// Nth frame returns EAGAIN and restores the frame and window baselines
+/// exactly, since every frame is acquired before the first PTE write. A
+/// final creation succeeds, and teardown and a trim restore the baseline
+/// from before the process.
+#[cfg(feature = "boot-smoke")]
+fn test_create_rollback(
+    kernel: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    bytes: &[u8],
+    image: &elf::Image,
+    direct_map: u64,
+) {
+    let empty = kernel_va::stats().expect("kernel VA stats");
+    assert_eq!(
+        (empty.spans, empty.live, empty.pooled),
+        (0, 0, 0),
+        "the create rollback test needs an empty kernel VA window"
+    );
+    let baseline = FrameBaseline::take(frames);
+    let slot = load_process(
+        kernel,
+        frames,
+        bytes,
+        image,
+        direct_map,
+        0,
+        MemoryClass::Test,
+    )
+    .expect("create-rollback process");
+    // SAFETY: A fresh slot that nothing else references.
+    let process = unsafe { sched::process(slot) };
+    let start = thread_abi::ThreadStart {
+        entry: image.entry,
+        stack: STACK_TOP - 8,
+        argument: 0,
+        fs: 0,
+        gs: 0,
+    };
+    let built = FrameBaseline::take(frames);
+    assert_eq!(
+        (built.stacks.live, built.stacks.pooled),
+        (1, 0),
+        "the main thread's stack came from an empty pool"
+    );
+    for index in [0, kernel_va::STACK_PAGES / 2, kernel_va::STACK_PAGES - 1] {
+        kernel_va::arm_frame_failure(index);
+        assert_eq!(
+            add_thread(kernel, frames, process, slot, &start),
+            Err(-11),
+            "a failed stack build must refuse the thread"
+        );
+        let now = FrameBaseline::take(frames);
+        assert_eq!(
+            (now.allocated, now.stacks),
+            (built.allocated, built.stacks),
+            "a failed stack build left frames or window state behind"
+        );
+        assert_eq!(process.threads().count(), 1);
+    }
+    add_thread(kernel, frames, process, slot, &start).expect("thread after stack rollback");
+    let now = FrameBaseline::take(frames);
+    assert_eq!(
+        (now.allocated, now.stacks.live),
+        (built.allocated + kernel_va::STACK_PAGES, 2)
+    );
+    // SAFETY: The process never ran, and nothing references it.
+    let mut process = unsafe { sched::discard(slot) };
+    // SAFETY: Its root has never been active, and nothing references its tree.
+    unsafe { process.space.destroy(frames) }.expect("create-rollback teardown");
+    sched::assert_drained();
+    let trimmed = drain_stacks(kernel, frames);
+    assert!(trimmed.complete && trimmed.stacks == 2);
+    baseline.assert_kept(frames, "create rollback leaked");
+    assert_eq!(kernel_va::stats(), Ok(empty));
 }
 
 /// Fill the process and thread tables, check that both refuse more with
@@ -710,6 +829,10 @@ fn test_load_rollback(
 /// fills only the thread table, with 16 processes of sixteen threads, so a
 /// process create fails for want of a main-thread entry before it allocates
 /// anything. No entry ever runs: threads are created ready and queued.
+///
+/// Each thread holds a kernel stack, so both cases build 256 stacks from an
+/// empty pool and tear down into a full one; a trim precedes each exact
+/// frame check, and the window check holds (spec 0050, acceptance 6).
 #[cfg(feature = "boot-smoke")]
 fn table_bounds_self_test(
     kernel: &PageTables,
@@ -721,6 +844,16 @@ fn table_bounds_self_test(
     let allocated =
         |frames: &FrameAllocator<'_>| frames.stats().expect("recycling required").allocated_frames;
     sched::assert_drained();
+    let window = FrameBaseline::take(frames);
+    assert_eq!(
+        (
+            window.stacks.spans,
+            window.stacks.live,
+            window.stacks.pooled
+        ),
+        (0, 0, 0),
+        "the table-bounds test needs an empty kernel VA window"
+    );
     let baseline = allocated(frames);
     let start = thread_abi::ThreadStart {
         entry: image.entry,
@@ -746,7 +879,7 @@ fn table_bounds_self_test(
         // SAFETY: A fresh slot that nothing else references.
         let process = unsafe { sched::process(*slot) };
         for _ in 1..sched::THREAD_SLOTS / sched::PROCESS_SLOTS {
-            add_thread(process, *slot, &start).expect("table-bounds thread");
+            add_thread(kernel, frames, process, *slot, &start).expect("table-bounds thread");
         }
     }
     assert!(
@@ -771,11 +904,13 @@ fn table_bounds_self_test(
     // SAFETY: An occupied slot that nothing else references.
     let process = unsafe { sched::process(slots[0]) };
     assert_eq!(
-        add_thread(process, slots[0], &start),
+        add_thread(kernel, frames, process, slots[0], &start),
         Err(-11),
         "a full thread table took a thread"
     );
     assert_eq!(allocated(frames), full, "a refused create allocated frames");
+    let stacks = kernel_va::stats().expect("kernel VA stats");
+    assert_eq!((stacks.live, stacks.pooled), (sched::THREAD_SLOTS, 0));
     for &slot in &slots {
         // SAFETY: As above; one entry is borrowed at a time.
         let process = unsafe { sched::process(slot) };
@@ -810,6 +945,7 @@ fn table_bounds_self_test(
         unsafe { zombie.space.destroy(frames) }.expect("table-bounds teardown");
     }
     sched::assert_drained();
+    trim_bounds_pool(kernel, frames, &window);
     assert_eq!(allocated(frames), baseline, "table-bounds frame leak");
 
     // Case 2: only the thread table full.
@@ -828,10 +964,10 @@ fn table_bounds_self_test(
         // SAFETY: A fresh slot that nothing else references.
         let process = unsafe { sched::process(*slot) };
         for _ in 1..thread_abi::MAX_THREADS {
-            add_thread(process, *slot, &start).expect("table-bounds thread");
+            add_thread(kernel, frames, process, *slot, &start).expect("table-bounds thread");
         }
         assert_eq!(
-            add_thread(process, *slot, &start),
+            add_thread(kernel, frames, process, *slot, &start),
             Err(-11),
             "a full process took a thread"
         );
@@ -865,6 +1001,7 @@ fn table_bounds_self_test(
         unsafe { process.space.destroy(frames) }.expect("table-bounds teardown");
     }
     sched::assert_drained();
+    trim_bounds_pool(kernel, frames, &window);
     assert_eq!(allocated(frames), baseline, "table-bounds frame leak");
     serial::println!(
         "MIRROR_SCHED_BOUNDS_OK processes={} threads={}",
@@ -873,11 +1010,143 @@ fn table_bounds_self_test(
     );
 }
 
+/// After a table-bounds teardown every one of the 256 thread stacks sits in
+/// the reuse pool: the D2 rule and the window check hold with the pool full,
+/// and a trim empties it, restoring the window and the exact frame baseline
+/// (spec 0050, acceptance 6).
+#[cfg(feature = "boot-smoke")]
+fn trim_bounds_pool(kernel: &PageTables, frames: &mut FrameAllocator<'_>, window: &FrameBaseline) {
+    let pooled = kernel_va::stats().expect("kernel VA stats");
+    assert_eq!(
+        (pooled.spans, pooled.live, pooled.pooled),
+        (sched::THREAD_SLOTS, 0, sched::THREAD_SLOTS),
+        "table-bounds teardown must pool every thread stack"
+    );
+    window.assert_kept(frames, "table-bounds frame leak");
+    let trimmed = drain_stacks(kernel, frames);
+    assert!(
+        trimmed.complete && trimmed.stacks == sched::THREAD_SLOTS,
+        "the table-bounds trim must empty the pool"
+    );
+    assert_eq!(kernel_va::stats(), Ok(window.stacks));
+}
+
+/// Build a thread's kernel stack: take the newest from the reuse pool, or map
+/// a fresh guarded one (0050-D2). The scheduler and kernel setup call this
+/// with the kernel root active, never a trap handler. Boot-smoke kernels take
+/// a reused stack's high-water mark, its previous thread's, for the session
+/// and reset it.
+fn build_stack(
+    kernel: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    direct_map: u64,
+) -> Result<KernelStack, KvaError> {
+    assert!(
+        ACTIVE.load(Ordering::SeqCst).is_null(),
+        "a trap handler built a kernel stack"
+    );
+    // SAFETY: The window guard checks for the BSP with IF=0; every caller runs
+    // with the kernel root active, the unique allocator and its writable HHDM,
+    // and holds no allocator guard.
+    let stack = unsafe { kernel_va::allocate_stack(kernel, frames, direct_map) }?;
+    #[cfg(feature = "boot-smoke")]
+    {
+        // SAFETY: As above; the stack was just handed out, and nothing runs
+        // on it yet.
+        let pages = unsafe { kernel_va::take_high_water(kernel, &stack) };
+        SESSION_HIGH_WATER.fetch_max(pages, Ordering::Relaxed);
+    }
+    Ok(stack)
+}
+
+/// Free a thread's kernel stack into the reuse pool (0050-D2). Only the
+/// scheduler and kernel setup free stacks, never a trap handler: the thread
+/// has unwound its last trap and will not run again, and TSS.RSP0 holds the
+/// placeholder or another thread's stack. The stack's high-water mark waits
+/// in its dirty bits until its reuse or the session's drain.
+fn release_stack(stack: KernelStack) {
+    assert!(
+        ACTIVE.load(Ordering::SeqCst).is_null(),
+        "a trap handler freed a kernel stack"
+    );
+    assert_ne!(
+        interrupts::kernel_stack(),
+        stack.top(),
+        "freed the installed RSP0 stack"
+    );
+    // SAFETY: As above: no live frame, reference, RSP0 or IST points into it,
+    // and the window guard checks for the BSP with IF=0.
+    unsafe { kernel_va::free_stack(stack) };
+}
+
+/// Trim the reuse pool at a session drain (0050-D2): unmap every pooled stack
+/// and return its frames, or keep the pool mapped while the shootdown
+/// transport is unavailable.
+fn drain_stacks(kernel: &PageTables, frames: &mut FrameAllocator<'_>) -> kernel_va::TrimReport {
+    assert!(ACTIVE.load(Ordering::SeqCst).is_null());
+    // SAFETY: The session has returned: the BSP with IF=0 and the kernel root
+    // active, the unique allocator, no pooled stack in use and no lock that
+    // an IRQ handler needs held.
+    unsafe { kernel_va::trim(kernel, frames) }.expect("trim the kernel stack pool")
+}
+
+/// A frame baseline under 0050-D2's rule, which heap v2's session checks
+/// share: a check whose interval spans a stack build or free compares deltas,
+/// so pooled stacks and committed heap pages never count as a leak.
+#[derive(Clone, Copy)]
+struct FrameBaseline {
+    allocated: usize,
+    heap_size: usize,
+    stacks: kernel_va::KvaStats,
+}
+
+impl FrameBaseline {
+    fn take(frames: &FrameAllocator<'_>) -> Self {
+        Self {
+            allocated: frames.stats().expect("frame accounting").allocated_frames,
+            heap_size: heap::stats().size,
+            stacks: kernel_va::stats().expect("kernel VA accounting"),
+        }
+    }
+
+    /// Panic with `leak` unless the frames allocated since the baseline are
+    /// exactly the heap's growth plus 16 for each stack the reuse pool gained,
+    /// less 16 for each it lost, with as many live stacks as before. The
+    /// window check of 0050 test 4 holds too: the reserved spans changed by
+    /// the change in live plus pooled stacks.
+    fn assert_kept(&self, frames: &FrameAllocator<'_>, leak: &str) {
+        let now = Self::take(frames);
+        let delta = |now: usize, then: usize| now as i64 - then as i64;
+        assert_eq!(
+            now.stacks.live, self.stacks.live,
+            "{leak}: a kernel stack outlived its thread"
+        );
+        assert_eq!(
+            delta(now.stacks.spans, self.stacks.spans),
+            delta(
+                now.stacks.live + now.stacks.pooled,
+                self.stacks.live + self.stacks.pooled
+            ),
+            "kernel VA window accounting"
+        );
+        let heap = delta(now.heap_size, self.heap_size);
+        assert!(heap >= 0, "the kernel heap shrank");
+        assert_eq!(
+            delta(now.allocated, self.allocated),
+            heap / PAGE_SIZE as i64
+                + delta(now.stacks.pooled, self.stacks.pooled) * kernel_va::STACK_PAGES as i64,
+            "{leak}"
+        );
+    }
+}
+
 #[derive(Debug)]
 enum CreateError {
     /// The process or thread table has no room (EAGAIN, 0030-D4).
     TableFull,
     Paging(#[expect(dead_code, reason = "load panics print it through Debug")] PagingError),
+    /// The main thread's kernel stack could not be built (0050-D2).
+    Stack(#[expect(dead_code, reason = "load panics print it through Debug")] KvaError),
 }
 
 impl CreateError {
@@ -885,15 +1154,17 @@ impl CreateError {
     fn errno(&self) -> i64 {
         match self {
             Self::TableFull => -11,
-            Self::Paging(_) => -12,
+            Self::Paging(_) | Self::Stack(_) => -12,
         }
     }
 }
 
 /// Load a process into the process table, with its main thread queued, and
 /// return its slot. Room for both entries is checked before anything is
-/// allocated; on failure no entry exists and every frame the load took is
-/// released. The caller seeds handles, policy and access before it runs.
+/// allocated, and the main thread's kernel stack is built after the address
+/// space (0050-D2); on failure no entry exists and every frame the load or
+/// the stack took is released. The caller seeds handles, policy and access
+/// before it runs.
 fn create_process(
     kernel: &PageTables,
     frames: &mut FrameAllocator<'_>,
@@ -953,6 +1224,14 @@ fn load_process(
         unsafe { space.destroy(frames) }.expect("failed-load cleanup");
         return Err(CreateError::Paging(error));
     }
+    let kernel_stack = match build_stack(kernel, frames, direct_map) {
+        Ok(stack) => stack,
+        Err(error) => {
+            // SAFETY: As above; the failed build rolled back its own frames.
+            unsafe { space.destroy(frames) }.expect("failed-stack cleanup");
+            return Err(CreateError::Stack(error));
+        }
+    };
     let slot = sched::insert_process(Process {
         pid,
         space,
@@ -973,6 +1252,12 @@ fn load_process(
         threads_created: 1,
         #[cfg(feature = "boot-smoke")]
         threads_peak: 1,
+        #[cfg(feature = "boot-smoke")]
+        stacks_peak: 1,
+        #[cfg(feature = "boot-smoke")]
+        trap_stack: 0,
+        #[cfg(feature = "boot-smoke")]
+        trap_stack_switches: 0,
         #[cfg(feature = "boot-smoke")]
         capacity_checks: false,
         #[cfg(feature = "boot-smoke")]
@@ -999,6 +1284,10 @@ fn load_process(
         sync_cancelled: 0,
         #[cfg(feature = "boot-smoke")]
         tls_checks: false,
+        #[cfg(feature = "boot-smoke")]
+        tls_preemption_start: None,
+        #[cfg(feature = "boot-smoke")]
+        tls_preemptions: 0,
         #[cfg(feature = "boot-smoke")]
         clock_checks: false,
         #[cfg(feature = "boot-smoke")]
@@ -1072,7 +1361,14 @@ fn load_process(
         input_timeouts: 0,
     });
     let thread = sched::insert_thread(|thread| {
-        Thread::new(image.entry, STACK_TOP - 8, argument, slot, thread)
+        Thread::new(
+            image.entry,
+            STACK_TOP - 8,
+            argument,
+            slot,
+            thread,
+            kernel_stack,
+        )
     });
     // SAFETY: The slot was just filled, and nothing else references it.
     let process = unsafe { sched::process(slot) };
@@ -1097,8 +1393,17 @@ fn run_pair(
         .map(surface::Session::new)
         .transpose()
         .expect("surface session");
+    // Spec 0050, acceptance test 4: the first pair session runs with the
+    // kernel VA window's shootdown transport withheld, so its thread stacks
+    // come only from local maps and pool reuse, and its drain skips the trim.
+    let degraded = !KVA_DEGRADED_RUN.swap(true, Ordering::Relaxed);
+    if degraded {
+        kernel_va::withhold_transport_for_test(true);
+        serial::println!("MIRROR_KVA_DEGRADED session=1");
+    }
+    SESSION_HIGH_WATER.store(0, Ordering::Relaxed);
+    let baseline = FrameBaseline::take(frames);
     let before = frames.stats().expect("recycling required").allocated_frames;
-    let heap_before = heap::stats().size;
     let first = create_process(
         kernel,
         frames,
@@ -1126,7 +1431,7 @@ fn run_pair(
             // SAFETY: Its root has never been active, and no handler or
             // other reference reaches its tree.
             unsafe { process.space.destroy(frames) }.expect("peer-load cleanup");
-            assert_eq!(frames.stats().unwrap().allocated_frames, before);
+            baseline.assert_kept(frames, "peer-load cleanup leaked");
             panic!("could not load peer: {error:?}");
         }
     };
@@ -1252,19 +1557,66 @@ fn run_pair(
         heap::test_hold_end(held);
         if held.is_some() {
             assert_eq!(
-                heap::stats().size - heap_before,
+                heap::stats().size - baseline.heap_size,
                 heap::MAX_GROW_PAGES * PAGE_SIZE as usize,
                 "the relaunch pair must grow exactly once"
             );
         }
     }
-    // Each session ends at its own frame baseline.
+    // The drain trims the stack pool (0050-D2). With the transport withheld
+    // the first pair's trim is skipped, and its stacks stay pooled for the
+    // second pair to reuse.
+    let built = kernel_va::stats().expect("kernel VA stats").spans - baseline.stacks.spans;
+    // Every stack the session used is pooled now; their dirty bits hold the
+    // rest of its high-water mark, which this resets for the next session.
+    // SAFETY: The BSP with IF=0 and the kernel root active; no thread runs.
+    let pooled = unsafe { kernel_va::take_pool_high_water(kernel) };
+    SESSION_HIGH_WATER.fetch_max(
+        pooled.expect("kernel stack pool high-water mark"),
+        Ordering::Relaxed,
+    );
+    let trimmed = drain_stacks(kernel, frames);
+    if degraded {
+        assert_eq!(
+            trimmed,
+            kernel_va::TrimReport {
+                stacks: 0,
+                batches: 0,
+                complete: false
+            },
+            "the degraded session trimmed its stack pool"
+        );
+        kernel_va::withhold_transport_for_test(false);
+    } else {
+        assert!(trimmed.complete, "the session drain skipped its trim");
+    }
+    // Each session ends at its own frame baseline, under 0050-D2's rule.
+    baseline.assert_kept(frames, "user frame leak");
+    let pool = kernel_va::stats().expect("kernel VA stats").pooled;
     assert_eq!(
-        frames.stats().unwrap().allocated_frames,
-        // 0050-D2's shared rule, heap term: heap pages committed this session
-        // are not a leak (a mid-session growth is 0059's test 2's case).
-        before + (heap::stats().size - heap_before) / PAGE_SIZE as usize,
-        "user frame leak"
+        pool,
+        if degraded {
+            baseline.stacks.pooled + built
+        } else {
+            0
+        },
+        "the session drain left the wrong stack pool"
+    );
+    let watermark = SESSION_HIGH_WATER.load(Ordering::Relaxed);
+    assert!(
+        (1..=kernel_va::STACK_PAGES).contains(&watermark),
+        "thread stack high-water mark out of range"
+    );
+    serial::println!(
+        "MIRROR_KSTACK_OK threads={} watermark_pages={} built={} pool={}",
+        zombies
+            .iter()
+            .map(|zombie| zombie.stacks_peak)
+            .max()
+            .expect("two zombies"),
+        watermark,
+        built,
+        pool
     );
     serial::println!("MIRROR_USER_CLEANUP_OK allocated={}", before);
     serial::println!("MIRROR_VM_CLEANUP_OK allocated={}", before);
@@ -1299,7 +1651,7 @@ fn run_limits_pair(
     direct_map: u64,
 ) {
     let before = frames.stats().expect("recycling required").allocated_frames;
-    let heap_before = heap::stats().size;
+    let baseline = FrameBaseline::take(frames);
     // Acceptance 4's commit half, in-kernel (no resume cycles): with the
     // normal class's lifted values, commit 256 MiB — past today's cap — then
     // to the 512 MiB bound, and fail one page past it where frames allow (the
@@ -1446,12 +1798,34 @@ fn run_limits_pair(
         }
         zombie.check_charges_zero();
     }
-    assert_eq!(
-        frames.stats().unwrap().allocated_frames,
-        // 0050-D2's shared rule, heap term: heap pages committed this session
-        // are not a leak.
-        before + (heap::stats().size - heap_before) / PAGE_SIZE as usize,
-        "user frame leak"
+    // The drain trims the stack pool (0050-D2), as run_pair's does.
+    let built = kernel_va::stats().expect("kernel VA stats").spans - baseline.stacks.spans;
+    // SAFETY: The BSP with IF=0 and the kernel root active; no thread runs.
+    let pooled = unsafe { kernel_va::take_pool_high_water(kernel) };
+    SESSION_HIGH_WATER.fetch_max(
+        pooled.expect("kernel stack pool high-water mark"),
+        Ordering::Relaxed,
+    );
+    let trimmed = drain_stacks(kernel, frames);
+    assert!(trimmed.complete, "the session drain skipped its trim");
+    baseline.assert_kept(frames, "user frame leak");
+    let pool = kernel_va::stats().expect("kernel VA stats").pooled;
+    assert_eq!(pool, 0, "the session drain left a pooled stack");
+    let watermark = SESSION_HIGH_WATER.load(Ordering::Relaxed);
+    assert!(
+        (1..=kernel_va::STACK_PAGES).contains(&watermark),
+        "thread stack high-water mark out of range"
+    );
+    serial::println!(
+        "MIRROR_KSTACK_OK threads={} watermark_pages={} built={} pool={}",
+        zombies
+            .iter()
+            .map(|zombie| zombie.stacks_peak)
+            .max()
+            .expect("two zombies"),
+        watermark,
+        built,
+        pool
     );
     serial::println!("MIRROR_USER_CLEANUP_OK allocated={}", before);
     serial::println!("MIRROR_VM_CLEANUP_OK allocated={}", before);
@@ -1482,7 +1856,7 @@ fn run_oom_pair(
     direct_map: u64,
 ) {
     let before = frames.stats().expect("recycling required").allocated_frames;
-    let heap_before = heap::stats().size;
+    let baseline = FrameBaseline::take(frames);
     let requester = create_process(
         kernel,
         frames,
@@ -1579,12 +1953,34 @@ fn run_oom_pair(
         }
         zombie.check_charges_zero();
     }
-    assert_eq!(
-        frames.stats().unwrap().allocated_frames,
-        // 0050-D2's shared rule, heap term: heap pages committed this session
-        // are not a leak.
-        before + (heap::stats().size - heap_before) / PAGE_SIZE as usize,
-        "user frame leak"
+    // The drain trims the stack pool (0050-D2), as run_pair's does.
+    let built = kernel_va::stats().expect("kernel VA stats").spans - baseline.stacks.spans;
+    // SAFETY: The BSP with IF=0 and the kernel root active; no thread runs.
+    let pooled = unsafe { kernel_va::take_pool_high_water(kernel) };
+    SESSION_HIGH_WATER.fetch_max(
+        pooled.expect("kernel stack pool high-water mark"),
+        Ordering::Relaxed,
+    );
+    let trimmed = drain_stacks(kernel, frames);
+    assert!(trimmed.complete, "the session drain skipped its trim");
+    baseline.assert_kept(frames, "user frame leak");
+    let pool = kernel_va::stats().expect("kernel VA stats").pooled;
+    assert_eq!(pool, 0, "the session drain left a pooled stack");
+    let watermark = SESSION_HIGH_WATER.load(Ordering::Relaxed);
+    assert!(
+        (1..=kernel_va::STACK_PAGES).contains(&watermark),
+        "thread stack high-water mark out of range"
+    );
+    serial::println!(
+        "MIRROR_KSTACK_OK threads={} watermark_pages={} built={} pool={}",
+        zombies
+            .iter()
+            .map(|zombie| zombie.stacks_peak)
+            .max()
+            .expect("two zombies"),
+        watermark,
+        built,
+        pool
     );
     serial::println!("MIRROR_USER_CLEANUP_OK allocated={}", before);
     serial::println!("MIRROR_VM_CLEANUP_OK allocated={}", before);
@@ -1797,17 +2193,6 @@ fn resume_process(
     #[cfg(feature = "boot-smoke")]
     record_latency(process, resumed);
     process.dispatches += 1;
-    // Save a copy, not a reference into a context that handlers can mutate.
-    let context = process.thread().context.frame;
-    // The assembly continuation retains this pointer across handler calls.
-    // Give it disjoint storage: a pointer derived through Option::as_mut into
-    // the thread would alias handlers' exclusive reborrows of the Process.
-    // The current slot cannot be joined/reaped until this call returns.
-    let mut extended = core::mem::replace(
-        &mut process.thread_mut().context.extended,
-        crate::fpu::State::new(),
-    );
-    let process_pointer = core::ptr::from_mut(process);
     let surface_pointer = surface.map_or(core::ptr::null_mut(), |session| {
         core::ptr::from_mut(session).cast()
     });
@@ -1819,6 +2204,74 @@ fn resume_process(
     ACTIVE_SURFACE.store(surface_pointer, Ordering::SeqCst);
     ACTIVE_INPUT.store(input_pointer, Ordering::SeqCst);
     ACTIVE_IPC.store(core::ptr::from_mut(ipc), Ordering::SeqCst);
+    loop {
+        enter_user(kernel, process);
+        // A THREAD_CREATE completes here, once its handler has unwound, with
+        // the kernel root active (0050-D2). The creator then resumes at once
+        // with the rest of its quantum, as when creation ran inside the
+        // handler, so the run queue's order is unchanged.
+        let State::Creating(start) = process.thread().state else {
+            break;
+        };
+        complete_create(kernel, frames, process, start);
+        process.thread_mut().state = State::Running;
+    }
+    // Session pointers remain exclusively borrowed until deferred copy/syscall
+    // work completes. No user context or interrupt handler is active here.
+    if let State::Memory(request) = process.thread().state {
+        complete_memory(process, frames, ipc, request);
+    }
+    // A creation deferred through a syscall-buffer page-in completes here,
+    // and the creator rejoins the run queue, as after any page-in.
+    if let State::Creating(start) = process.thread().state {
+        complete_create(kernel, frames, process, start);
+    }
+    // An exited thread's handler has unwound and nothing on its stack is
+    // live, so the stack returns to the reuse pool now; the entry waits for
+    // its joiner (0050-D2).
+    if let State::Exited(_) = process.thread().state {
+        let stack = process.thread_mut().stack.take();
+        release_stack(stack.expect("an exiting thread owns a kernel stack"));
+    }
+    ACTIVE_IPC.store(core::ptr::null_mut(), Ordering::SeqCst);
+    ACTIVE_SURFACE.store(core::ptr::null_mut(), Ordering::SeqCst);
+    ACTIVE_INPUT.store(core::ptr::null_mut(), Ordering::SeqCst);
+    ACTIVE_WINDOWS.store(core::ptr::null_mut(), Ordering::SeqCst);
+    assert_ne!(
+        process.thread().state,
+        State::Running,
+        "process returned without transition"
+    );
+}
+
+/// Run the current thread in user mode on its own kernel stack until a handler
+/// returns it to the scheduler. The process is published for its handlers
+/// only across the entry, and the kernel root is active again on return.
+fn enter_user(kernel: &PageTables, process: &mut Process) {
+    // Save a copy, not a reference into a context that handlers can mutate.
+    let context = process.thread().context.frame;
+    // The assembly continuation retains this pointer across handler calls.
+    // Give it disjoint storage: a pointer derived through Option::as_mut into
+    // the thread would alias handlers' exclusive reborrows of the Process.
+    // The current slot cannot be joined/reaped until this call returns.
+    let mut extended = core::mem::replace(
+        &mut process.thread_mut().context.extended,
+        crate::fpu::State::new(),
+    );
+    // The thread traps onto its own kernel stack (0050-D2).
+    let kernel_stack = process
+        .thread()
+        .stack
+        .as_ref()
+        .expect("a dispatched thread owns a kernel stack")
+        .top();
+    // SAFETY: The BSP with IF=0 and no user context active. The stack is
+    // mapped in the kernel VA window, which every process root shares, and
+    // stays allocated until the thread exits, after its last trap unwinds.
+    unsafe { interrupts::set_kernel_stack(kernel_stack) };
+    // This CPU's CpuData names the thread while it runs (0050-D1).
+    crate::cpudata::set_current_thread(process.thread().id);
+    let process_pointer = core::ptr::from_mut(process);
     ACTIVE.store(process_pointer.cast(), Ordering::SeqCst);
     // SAFETY: Single BSP and IF=0, disjoint exclusively owned session objects,
     // and shared upper mappings cover both kernel stacks. The raw pointers are
@@ -1833,25 +2286,15 @@ fn resume_process(
         interrupts::resume_user(&context, &raw mut extended);
     }
     ACTIVE.store(core::ptr::null_mut(), Ordering::SeqCst);
+    crate::cpudata::set_current_thread(0);
+    // SAFETY: The user is suspended and IF remains clear. The placeholder is
+    // the BSP's guarded RSP0 stack, mapped in every root (0050-D2).
+    unsafe { interrupts::set_kernel_stack(stacks::bsp_rsp0_top()) };
     // SAFETY: All handlers returned, the user is suspended, and IF remains clear.
     unsafe { kernel.activate() }.expect("restore kernel root");
     process.thread_mut().context.extended = extended;
     #[cfg(feature = "boot-smoke")]
     crate::fpu::assert_kernel_clean();
-    // Session pointers remain exclusively borrowed until deferred copy/syscall
-    // work completes. No user context or interrupt handler is active here.
-    if let State::Memory(request) = process.thread().state {
-        complete_memory(process, frames, ipc, request);
-    }
-    ACTIVE_IPC.store(core::ptr::null_mut(), Ordering::SeqCst);
-    ACTIVE_SURFACE.store(core::ptr::null_mut(), Ordering::SeqCst);
-    ACTIVE_INPUT.store(core::ptr::null_mut(), Ordering::SeqCst);
-    ACTIVE_WINDOWS.store(core::ptr::null_mut(), Ordering::SeqCst);
-    assert_ne!(
-        process.thread().state,
-        State::Running,
-        "process returned without transition"
-    );
 }
 
 /// At a dispatch, record a flagged wake's latency, or that a flagged spinner
@@ -2184,7 +2627,7 @@ impl ShellRuntime<'_> {
             .position(Option::is_none)
             .ok_or(-11)?;
         assert!(self.children[index].is_none());
-        let before = frames.stats().unwrap().allocated_frames;
+        let baseline = FrameBaseline::take(frames);
         let slot = create_process(
             self.kernel,
             frames,
@@ -2243,7 +2686,8 @@ impl ShellRuntime<'_> {
                 // SAFETY: The child has never run, and failed resource creation
                 // released all offscreen pages before this address-space teardown.
                 unsafe { child.space.destroy(frames) }.expect("application-load rollback");
-                assert_eq!(frames.stats().unwrap().allocated_frames, before);
+                // The discarded child's stack stays pooled (0050-D2).
+                baseline.assert_kept(frames, "application-load rollback leaked");
                 return Err(error);
             }
         };
@@ -2668,7 +3112,10 @@ fn member_by_id(process: &Process, tid: u64) -> Option<usize> {
         .find(|&index| process.member(index).is_some_and(|thread| thread.id == tid))
 }
 
-fn create_thread(process: &mut Process, frame: &TrapFrame) -> Result<u64, i64> {
+/// The handler half of THREAD_CREATE: validate the descriptor and check for
+/// room, failing synchronously, and return the start for the scheduler's
+/// continuation, which builds the thread (0050-D2).
+fn create_thread(process: &mut Process, frame: &TrapFrame) -> Result<thread_abi::ThreadStart, i64> {
     if frame.rsi != thread_abi::THREAD_START_SIZE as u64 || frame.rdx != 0 {
         return Err(-22);
     }
@@ -2690,18 +3137,14 @@ fn create_thread(process: &mut Process, frame: &TrapFrame) -> Result<u64, i64> {
     {
         return Err(-14);
     }
-    let owner = usize::from(process.thread().process);
-    add_thread(process, owner, &start)
+    vacant_member(process)?;
+    Ok(start)
 }
 
-/// Add a ready, queued thread to `process`, which occupies table slot
-/// `owner`, and return its ID. A full process or a full thread table both
-/// refuse with EAGAIN (0030-D4).
-fn add_thread(
-    process: &mut Process,
-    owner: usize,
-    start: &thread_abi::ThreadStart,
-) -> Result<u64, i64> {
+/// The lowest vacant member index, if both the process and the thread table
+/// have room; a full process or a full thread table both refuse with EAGAIN
+/// (0030-D4).
+fn vacant_member(process: &Process) -> Result<usize, i64> {
     let index = process
         .members
         .iter()
@@ -2710,10 +3153,52 @@ fn add_thread(
     if !sched::has_room(0, 1) {
         return Err(-11);
     }
+    Ok(index)
+}
+
+/// Complete a validated THREAD_CREATE in the scheduler, after its handler has
+/// unwound, with the kernel root active (0050-D2): build the thread with its
+/// kernel stack and return the TID in RAX, or -11 when there is no room or
+/// the stack cannot be built. The creator is ready again.
+fn complete_create(
+    kernel: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    process: &mut Process,
+    start: thread_abi::ThreadStart,
+) {
+    assert!(ACTIVE.load(Ordering::SeqCst).is_null());
+    let owner = usize::from(process.thread().process);
+    let result = add_thread(kernel, frames, process, owner, &start)
+        .map_or_else(|error| error, |tid| tid as i64);
+    let thread = process.thread_mut();
+    thread.context.frame.rax = result as u64;
+    thread.state = State::Ready;
+}
+
+/// Add a ready, queued thread to `process`, which occupies table slot
+/// `owner`, and return its ID. Room is checked first, then the thread's
+/// kernel stack is built (0050-D2); either failure refuses with EAGAIN and
+/// leaves no trace, since a failed build rolls back its own frames and span.
+fn add_thread(
+    kernel: &PageTables,
+    frames: &mut FrameAllocator<'_>,
+    process: &mut Process,
+    owner: usize,
+    start: &thread_abi::ThreadStart,
+) -> Result<u64, i64> {
+    let index = vacant_member(process)?;
+    let kernel_stack = build_stack(kernel, frames, process.direct_map).map_err(|_| -11)?;
     // A running thread's own entry is the process's current member; this
     // insert touches only a vacant slot and the table's occupancy bitmap.
     let slot = sched::insert_thread(|slot| {
-        let mut thread = Thread::new(start.entry, start.stack, start.argument, owner, slot);
+        let mut thread = Thread::new(
+            start.entry,
+            start.stack,
+            start.argument,
+            owner,
+            slot,
+            kernel_stack,
+        );
         thread.context.frame.fs_base = start.fs;
         thread.context.frame.gs_base = start.gs;
         thread
@@ -2726,6 +3211,11 @@ fn add_thread(
         process.threads_created += 1;
         let live = process.threads().count();
         process.threads_peak = process.threads_peak.max(live);
+        let stacks = process
+            .threads()
+            .filter(|thread| thread.stack.is_some())
+            .count();
+        process.stacks_peak = process.stacks_peak.max(stacks);
     }
     Ok(tid)
 }
@@ -2788,8 +3278,7 @@ pub fn run_shell(
     assert!(!arch::interrupts_enabled());
     #[cfg(feature = "boot-smoke")]
     windows::self_test(frames, direct_map);
-    let before = frames.stats().unwrap().allocated_frames;
-    let heap_before = heap::stats().size;
+    let baseline = FrameBaseline::take(frames);
     let desktop_image = elf::parse(programs[0]).expect("invalid shell ELF");
     let image = elf::parse(programs[1]).expect("invalid application ELF");
     let shell = create_process(
@@ -2907,13 +3396,11 @@ pub fn run_shell(
     }
     #[cfg(feature = "boot-smoke")]
     desktop.check_charges_zero();
-    // Each session ends at its own frame baseline.
-    assert_eq!(
-        frames.stats().unwrap().allocated_frames,
-        // 0050-D2's shared rule, heap term (0059).
-        before + (heap::stats().size - heap_before) / PAGE_SIZE as usize,
-        "shell frame leak"
-    );
+    // The drain trims the stack pool, which stays mapped only without the
+    // shootdown transport; the session then ends at its own frame baseline,
+    // under 0050-D2's rule.
+    drain_stacks(kernel, frames);
+    baseline.assert_kept(frames, "shell frame leak");
     // 0059 acceptance test 4: the last session's drain leaks one charge,
     // requires the reap check to report it, repairs it, and only then prints
     // the marker.
@@ -2965,9 +3452,13 @@ fn app_load_rollback_test<'a>(
     shell: usize,
 ) -> ShellRuntime<'a> {
     // SAFETY: Seeding holds the only reference to the shell's entry, and the
-    // failed launch reaches only the slot it creates and discards.
+    // failed launches reach only the slots they create and discard.
     let desktop = unsafe { sched::process(shell) };
-    let baseline = frames.stats().unwrap().allocated_frames;
+    let baseline = FrameBaseline::take(frames);
+    assert_eq!(
+        baseline.stacks.pooled, 0,
+        "the launch rollback test needs an empty stack pool"
+    );
     let mut temporary = [0; 8];
     let mut count = 0;
     loop {
@@ -2983,8 +3474,26 @@ fn app_load_rollback_test<'a>(
             Err(error) => panic!("rollback test handle failure: {error:?}"),
         }
     }
+    // Spec 0050, acceptance test 5, the process half: the child's stack build
+    // fails at its Nth frame while the pool is empty, so the launch fails
+    // with -12 and the frame and window baselines are exact. It runs first:
+    // a later launch would reuse the stack the next one pools.
+    kernel_va::arm_frame_failure(kernel_va::STACK_PAGES / 2);
+    assert_eq!(runtime.launch(frames, desktop, 0), Err(-12));
+    let failed = FrameBaseline::take(frames);
+    assert_eq!(
+        (failed.allocated, failed.stacks),
+        (baseline.allocated, baseline.stacks),
+        "a failed child stack build left frames or window state behind"
+    );
+    // The child's stack is built before the handle insert fails, and the
+    // rollback pools it: D2's rule holds with a pool delta of 16 frames.
     assert_eq!(runtime.launch(frames, desktop, 0), Err(-24));
-    assert_eq!(frames.stats().unwrap().allocated_frames, baseline);
+    baseline.assert_kept(frames, "application-load rollback leaked");
+    assert_eq!(
+        kernel_va::stats().expect("kernel VA stats").pooled,
+        baseline.stacks.pooled + 1
+    );
     assert!(runtime.children.iter().all(Option::is_none));
     assert!(runtime.windows.applications.iter().all(Option::is_none));
     assert_eq!(
@@ -3093,6 +3602,12 @@ fn validate_process(process: &Process, scenario: u64) {
         "thread checks did not complete: {:?}",
         process.outcome
     );
+    // Spec 0050, acceptance test 3: each thread trapped onto its own kernel
+    // stack (check_trap_stack), and traps from different threads interleaved.
+    assert!(
+        process.trap_stack_switches > 0,
+        "threads never trapped onto distinct kernel stacks"
+    );
     serial::println!(
         "MIRROR_USER_THREADS_OK pid={} created={} joined={} exited={} cancelled={} preemptions={}",
         process.pid,
@@ -3103,7 +3618,7 @@ fn validate_process(process: &Process, scenario: u64) {
         process.thread_preemptions
     );
     assert!(
-        process.tls_checks,
+        process.tls_checks && process.tls_preemptions > 0,
         "TLS checks did not complete: {:?}",
         process.outcome
     );
@@ -3338,7 +3853,47 @@ fn with_active(frame: &TrapFrame, operation: impl FnOnce(&mut Process)) {
     unsafe {
         let process = &mut *pointer;
         assert_eq!(process.thread().state, State::Running);
+        // The trapping thread is the one this CPU's CpuData names (0050-D1).
+        #[cfg(feature = "boot-smoke")]
+        assert_eq!(
+            crate::cpudata::current_thread(),
+            process.thread().id,
+            "per-CPU current thread"
+        );
+        #[cfg(feature = "boot-smoke")]
+        check_trap_stack(process, frame);
         operation(process);
+    }
+}
+
+/// Spec 0050, acceptance test 3: every trap from a thread lands on that
+/// thread's own kernel stack, which TSS.RSP0 names while it runs. The frame,
+/// or a handler's copy of it, lies inside that stack. Count the traps that
+/// came from another thread's stack than the process's previous trap.
+#[cfg(feature = "boot-smoke")]
+fn check_trap_stack(process: &mut Process, frame: &TrapFrame) {
+    let stack = process
+        .thread()
+        .stack
+        .as_ref()
+        .expect("a running thread owns a kernel stack");
+    let (bottom, top) = (stack.bottom(), stack.top());
+    let address = core::ptr::from_ref(frame) as u64;
+    assert!(
+        (bottom..top).contains(&address)
+            && (bottom..=top).contains(&(address + size_of::<TrapFrame>() as u64)),
+        "a trap frame lies outside its thread's kernel stack"
+    );
+    assert_eq!(
+        interrupts::kernel_stack(),
+        top,
+        "TSS.RSP0 is not the running thread's kernel stack"
+    );
+    if process.trap_stack != bottom {
+        if process.trap_stack != 0 {
+            process.trap_stack_switches += 1;
+        }
+        process.trap_stack = bottom;
     }
 }
 
@@ -3471,6 +4026,15 @@ fn match_init_oracles(process: &mut Process, message: &[u8]) {
     process.capacity_checks |= message == b"Mirror init: thread capacity checks passed\n";
     process.wait_queue_checks |= message == b"Mirror init: wait queue checks passed\n";
     process.sync_checks |= message == b"Mirror init: synchronization checks passed\n";
+    if message == b"Mirror init: TLS preemption begin\n" {
+        process.tls_preemption_start = Some(process.preemptions);
+    }
+    if message == b"Mirror init: TLS preemption end\n" {
+        process.tls_preemptions = process
+            .tls_preemption_start
+            .take()
+            .map_or(0, |start| process.preemptions.saturating_sub(start));
+    }
     if message == b"Mirror init: FPU preemption begin\n" {
         process.fpu_preemption_start = Some(process.preemptions);
     }
@@ -4206,9 +4770,15 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                     };
                 }
             }
-            thread_abi::SYS_THREAD_CREATE => {
-                result = create_thread(process, frame).map_or_else(|error| error, |tid| tid as i64);
-            }
+            // The scheduler builds the thread once this handler unwinds
+            // (0050-D2); validation and room failures return at once.
+            thread_abi::SYS_THREAD_CREATE => match create_thread(process, frame) {
+                Ok(start) => {
+                    result = 0;
+                    suspension = Some(State::Creating(start));
+                }
+                Err(error) => result = error,
+            },
             thread_abi::SYS_THREAD_EXIT => {
                 if frame.rsi != 0 || frame.rdx != 0 {
                     result = -22;
@@ -4340,7 +4910,8 @@ fn suspend(frame: &mut TrapFrame, state: State) {
 
 /// Return the running thread to the scheduler still ready, so the threads
 /// that an event woke dispatch first. It keeps the rest of its quantum and
-/// then rejoins the run queue behind them (0030-D3).
+/// rejoins the run queue at its head, so it resumes after the first eligible
+/// woken thread, ahead of the threads queued before it ran (0030-D3).
 fn displace(frame: &mut TrapFrame) {
     park_current(frame, State::Ready, true);
 }
@@ -4362,6 +4933,7 @@ fn park_current(frame: &mut TrapFrame, state: State, displaced: bool) {
                 | State::Launching(_)
                 | State::Closing(_)
                 | State::Memory(_)
+                | State::Creating(_)
                 | State::Joining(_)
                 | State::Waiting(_)
                 | State::Exited(_)

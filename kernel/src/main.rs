@@ -13,6 +13,7 @@ mod capability;
 mod clock;
 mod console;
 mod context;
+mod cpudata;
 mod dma;
 mod drivers;
 mod elf;
@@ -23,6 +24,7 @@ mod heap;
 mod input;
 mod interrupts;
 mod ipc;
+mod kernel_va;
 mod kernel_vm;
 mod keyboard;
 mod memory;
@@ -60,11 +62,18 @@ pub extern "C" fn _start() -> ! {
     #[cfg(feature = "test-trace")]
     serial::println!("MIRROR_TRACE_ON");
     interrupts::init();
+    // SAFETY: CPL0 with IF clear on the BSP, after interrupts::init's
+    // descriptor load zeroed both GS MSRs and before anything reads through
+    // GS (spec 0050-D1 (e)). Slot 0 is the BSP's and is installed once.
+    assert!(unsafe { cpudata::install(0) }, "BSP per-CPU data install");
     fpu::init();
     hardening::init();
     interrupts::tls_ready();
     #[cfg(feature = "boot-smoke")]
-    fpu::self_test();
+    {
+        fpu::self_test();
+        cpudata::self_test();
+    }
 
     let boot = boot::info();
     let entries = boot.memory_map.entries();
@@ -357,7 +366,15 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
     // SAFETY: BSP owns the hierarchy and allocator, IF=0, no AP or retained
     // user root has been released. Runtime leaf changes keep these tables pinned.
     unsafe { tables.prepare_shared_window(&mut frames) }.expect("shared kernel window");
+    // The kernel VA window's tables are pinned before smp::init seals kernel
+    // mappings, and every flavor reports the window once (spec 0050-D4).
+    // SAFETY: As above: the BSP alone, IF=0, the active root and its sole
+    // allocator, before AP release and before any retained user root.
+    unsafe { kernel_va::init(&mut tables, &mut frames) };
     smp::init(&boot, topology.as_ref(), &mut tables, &mut frames);
+    // Every flavor checks that each online CPU runs with its own CpuData in
+    // GS and reports it once (spec 0050-D4).
+    smp::report_cpu_data();
     // Every flavor reports each online CPU's stacks, then the BSP region,
     // then each online CPU's protections and the BSP's speculative-execution
     // exposure.
@@ -368,6 +385,13 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
     kernel_vm::init(&tables, &mut frames, boot.direct_map_offset);
     #[cfg(feature = "boot-smoke")]
     kernel_vm::heap_window_self_test(&tables, &mut frames, boot.direct_map_offset);
+    // SAFETY: The BSP with IF=0 on the active kernel root, after SMP startup,
+    // with the sole allocator and its HHDM. No client uses the window yet and
+    // no IRQ-needed lock is held.
+    #[cfg(feature = "boot-smoke")]
+    unsafe {
+        kernel_va::self_test(&tables, &mut frames, boot.direct_map_offset)
+    };
     grow_kernel_heap(&tables, &mut frames, boot.direct_map_offset, "boot");
     // The process and thread tables are .bss statics; every flavor reports
     // them once, before the first session or the skipped-desktop path.
@@ -495,6 +519,24 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
                 // idle; the probe checks that IF is clear. The #DF handler on
                 // IST1 must report the fault and terminate the guest.
                 unsafe { stacks::overflow_rsp0() };
+            }
+            boot::SmokeMode::ThreadStackOverflow => {
+                // Spec 0050, acceptance test 3: a thread kernel stack from
+                // the kernel VA window, with its unmapped guard page below.
+                // SAFETY: The BSP with IF=0 on the active kernel root, with
+                // the sole allocator and its HHDM; no window guard is held.
+                let stack = unsafe {
+                    kernel_va::allocate_stack(&tables, &mut frames, boot.direct_map_offset)
+                }
+                .expect("thread stack for the overflow probe");
+                serial::println!("MIRROR_KSTACK_GUARD guard={:#x}", stack.guard_below());
+                serial::println!("MIRROR_TEST_EXPECT_FATAL vector=8");
+                // SAFETY: Deliberate smoke-test #DF on the BSP. Userspace has
+                // finished, so no user context is active, IF is clear, and
+                // this freshly allocated stack is used by nothing else; its
+                // guard page below is unmapped. The #DF handler on IST1 must
+                // report the fault and terminate the guest.
+                unsafe { stacks::overflow(stack.top()) };
             }
             mode @ (boot::SmokeMode::KernelSmep | boot::SmokeMode::KernelSmap) => {
                 serial::println!("MIRROR_TEST_EXPECT_FATAL vector=14");

@@ -1,4 +1,5 @@
 # Single-BSP resumable user context, SysV ABI, soft-float kernel Rust.
+# Kernel code runs with this CPU's CpuData in GS (interrupts.S, spec 0050-D1).
 # The original kernel call stack remains mapped but is never used by ring-3
 # interrupts: TSS.RSP0 selects a separate supervisor stack for those entries.
 .section .text.userspace_entry,"ax",@progbits
@@ -16,7 +17,8 @@ mirror_resume_user:
     mov rax, cr0
     push rax
     push rsi
-    mov [rip + MIRROR_USER_KERNEL_RSP], rsp
+    # The return path finds the suspended stack in this CPU's CpuData.
+    mov qword ptr gs:[{cpu_user_rsp}], rsp
     # Preserve the source frame while setting up the data segments.
     mov r8, rdi
 
@@ -49,8 +51,9 @@ mirror_resume_user:
 .type mirror_resume_kernel, @function
 mirror_resume_kernel:
     # Reached only by the common interrupt epilogue after Rust handlers return.
-    # IRETQ restored the suspended stack, kernel CS/SS, sanitized IF=0 flags,
-    # and the zero FS/GS state written by return_from_user to its continuation.
+    # IRETQ restored the suspended stack, kernel CS/SS and sanitized IF=0
+    # flags. That CPL0 exit left the TLS state alone: the CPL3 entry already
+    # nulled both selectors, zeroed the FS base and installed CpuData in GS.
     # Save even faulted/exited processes before clearing their register data.
     # FXSAVE does not test pending x87 exceptions; FNINIT then FXRSTOR installs
     # an entirely clean kernel image, including data in empty x87 registers.
@@ -61,14 +64,6 @@ mirror_resume_kernel:
     mov ax, {kernel_data}
     mov ds, ax
     mov es, ax
-    xor eax, eax
-    mov fs, ax
-    mov gs, ax
-    mov ecx, 0xc0000100
-    xor edx, edx
-    wrmsr
-    inc ecx
-    wrmsr
     pop rax
     mov cr0, rax
     pop r15

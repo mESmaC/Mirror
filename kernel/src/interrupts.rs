@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "boot-smoke")]
 use core::sync::atomic::{AtomicU64, AtomicUsize};
 
-use crate::{arch, fpu, serial, stacks::IST_COUNT, timer};
+use crate::{arch, cpudata, fpu, serial, stacks::IST_COUNT, timer};
 
 global_asm!(
     include_str!("interrupts.S"),
@@ -22,6 +22,8 @@ global_asm!(
     gs_base = const offset_of!(TrapFrame, gs_base),
     fs_selector = const offset_of!(TrapFrame, fs_selector),
     gs_selector = const offset_of!(TrapFrame, gs_selector),
+    frame_cs = const offset_of!(TrapFrame, cs),
+    cpu_self = const cpudata::SELF_OFFSET,
 );
 global_asm!(
     include_str!("userspace_entry.S"),
@@ -29,6 +31,7 @@ global_asm!(
     user_data = const USER_DATA_SELECTOR,
     frame_size = const size_of::<TrapFrame>(),
     frame_words = const size_of::<TrapFrame>() / size_of::<u64>(),
+    cpu_user_rsp = const cpudata::USER_KERNEL_RSP_OFFSET,
 );
 
 const CODE_SELECTOR: u16 = 0x08;
@@ -120,8 +123,11 @@ impl IdtEntry {
 }
 
 // Match interrupts.S exactly. Long mode always saves SS:RSP, including CPL0
-// entries without an IST switch. The common stub saves every integer register
-// and both visible selectors and actual hidden TLS bases before clearing them.
+// entries without an IST switch. The common stub saves every integer register.
+// A CPL3 entry also saves both visible selectors and the actual hidden TLS
+// bases before clearing them, and a CPL3 exit restores them; CPL0 entries
+// zero these four fields and their exits ignore them (spec 0050-D1). The
+// paranoid NMI/#DF/#MC entry records the interrupted values for diagnostics.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct TrapFrame {
@@ -189,14 +195,11 @@ static mut SECONDARY_TSS: [TaskStateSegment; MAX_CPUS - 1] =
     [const { TaskStateSegment::EMPTY }; MAX_CPUS - 1];
 static mut SECONDARY_GDT: [[u64; 7]; MAX_CPUS - 1] = [[0; 7]; MAX_CPUS - 1];
 
+// Assembly saves the BSP's suspended kernel stack in its CpuData, with IF
+// clear (spec 0050-D1). APs do not execute userspace yet. The BSP scheduler
+// resumes after each yield or preemption; it retains user trap frames rather
+// than suspended Rust handler stacks.
 static USER_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-// Assembly saves the BSP's suspended kernel stack here, with IF clear. User
-// pages cannot access this supervisor-only kernel object. APs do not execute
-// userspace yet. The BSP scheduler resumes after each yield or preemption;
-// it retains user trap frames rather than suspended Rust handler stacks.
-#[unsafe(no_mangle)]
-static mut MIRROR_USER_KERNEL_RSP: u64 = 0;
 
 #[cfg(feature = "boot-smoke")]
 static BREAKPOINT_ARMED: AtomicBool = AtomicBool::new(false);
@@ -216,6 +219,12 @@ const NO_IST_PROBE: u64 = u64::MAX;
 static IST_PROBE_VECTOR: AtomicU64 = AtomicU64::new(NO_IST_PROBE);
 #[cfg(feature = "boot-smoke")]
 static IST_PROBE_STACK: AtomicU64 = AtomicU64::new(0);
+// The IA32_GS_BASE the armed IST handler ran with, and its FS base ORed with
+// its FS selector, which must be 0.
+#[cfg(feature = "boot-smoke")]
+static IST_PROBE_GS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "boot-smoke")]
+static IST_PROBE_FS: AtomicU64 = AtomicU64::new(u64::MAX);
 
 unsafe extern "C" {
     static mirror_exception_entries: [u64; 48];
@@ -248,10 +257,17 @@ pub(crate) fn trigger_triple_fault() -> ! {
 
 /// Report the TLS execution contract after fpu::init disabled FSGSBASE. Only
 /// the syscall ABI may install arbitrary bases; selector loads remain legal.
+/// The BSP has installed its CpuData, so both GS MSRs name it (0050-D1).
 pub(crate) fn tls_ready() {
     assert!(fpu::is_initialized(), "TLS setup requires CPU state setup");
     assert!(!arch::interrupts_enabled(), "TLS setup requires IF=0");
+    assert!(cpudata::bsp_installed(), "TLS setup requires per-CPU data");
     assert_kernel_tls_clean();
+    assert_eq!(
+        cpudata::kernel_gs_base(),
+        cpudata::address(0),
+        "IA32_KERNEL_GS_BASE must name CpuData at install"
+    );
     let cr4: u64;
     // SAFETY: CPL0. This only reads CR4; no feature is enabled here.
     unsafe { asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
@@ -280,21 +296,27 @@ pub(crate) fn valid_user_tls(frame: &TrapFrame) -> bool {
         && valid_selector(frame.gs_selector)
 }
 
-/// Kernel Rust must never inherit user TLS. Reading the actual MSRs also
+/// Kernel Rust must never inherit user TLS, and on the BSP it runs with its
+/// CpuData in GS once installed (0050-D1). Reading the actual MSRs also
 /// catches selector loads that changed a base without a TLS syscall.
 fn assert_kernel_tls_clean() {
-    assert!(kernel_tls_clean(), "kernel FS/GS state is not clean");
+    assert!(
+        kernel_tls_clean(cpudata::expected_bsp_gs_base(), true),
+        "kernel FS/GS state is not clean"
+    );
 }
 
-fn kernel_tls_clean() -> bool {
+/// The kernel TLS state on this CPU: a zero FS base, IA32_GS_BASE equal to
+/// `expected_gs` (this CPU's CpuData, or 0 before its install), and, when
+/// `selectors` is set, null FS and GS selectors. IA32_KERNEL_GS_BASE is
+/// scratch in kernel mode and is not checked.
+fn kernel_tls_clean(expected_gs: u64, selectors: bool) -> bool {
     let fs_selector: u16;
     let gs_selector: u16;
     let fs_low: u32;
     let fs_high: u32;
-    let gs_low: u32;
-    let gs_high: u32;
-    // SAFETY: Called only at CPL0. These MSRs exist in x86-64 and reads do not
-    // alter processor state. No FS/GS-relative access is made by kernel Rust.
+    // SAFETY: Called only at CPL0. The MSR exists in x86-64 and reads do not
+    // alter processor state. No FS-relative access is made by kernel Rust.
     unsafe {
         asm!("mov {:x}, fs", out(reg) fs_selector,
             options(nomem, nostack, preserves_flags));
@@ -303,11 +325,10 @@ fn kernel_tls_clean() -> bool {
         asm!("rdmsr", in("ecx") 0xc000_0100_u32,
             out("eax") fs_low, out("edx") fs_high,
             options(nomem, nostack, preserves_flags));
-        asm!("rdmsr", in("ecx") 0xc000_0101_u32,
-            out("eax") gs_low, out("edx") gs_high,
-            options(nomem, nostack, preserves_flags));
     }
-    fs_selector == 0 && gs_selector == 0 && (fs_low | fs_high | gs_low | gs_high) == 0
+    (!selectors || (fs_selector == 0 && gs_selector == 0))
+        && (fs_low | fs_high) == 0
+        && cpudata::gs_base() == expected_gs
 }
 
 /// Install the boot CPU's GDT, TSS and exception/IRQ IDT once at CPL0, then
@@ -318,6 +339,7 @@ fn kernel_tls_clean() -> bool {
 pub fn init() {
     arch::disable_interrupts();
     assert!(!is_initialized(), "IDT already loaded");
+    assert!(!cpudata::bsp_installed(), "per-CPU data before the IDT");
 
     let tss_address = addr_of!(TSS) as u64;
     let stack_top = addr_of!(EARLY_IST_STACK) as u64 + EARLY_IST_STACK_SIZE as u64;
@@ -439,12 +461,16 @@ unsafe fn enable_machine_check() -> bool {
 
 /// The caller owns this CPU's writable GDT/TSS with IF clear, and both tables
 /// remain mapped. CS/data/TSS selectors must use the layout from gdt_entries.
+/// This CPU has not installed its CpuData yet: the load leaves null FS/GS
+/// selectors and zeroes the FS base and both GS MSRs, the state install
+/// starts from (0050-D1 (e)). Nothing calls this after install.
 unsafe fn load_descriptors(gdtr: &DescriptorPointer, idtr: &DescriptorPointer) {
     // SAFETY: CPL0, interrupts disabled, persistent valid descriptors. The far
     // return reloads CS with balanced stack use; data selectors are replaced
-    // before LTR. Kernel Rust uses zero FS/GS bases and selectors. LTR marks
-    // our writable TSS descriptor busy. No ring3 transitions or IRQs are enabled
-    // here; APIC/timer setup configures routing before the caller may set IF.
+    // before LTR. Before install kernel Rust runs with null FS/GS selectors
+    // and zero bases, and nothing reads through GS. LTR marks our writable TSS
+    // descriptor busy. No ring3 transitions or IRQs are enabled here;
+    // APIC/timer setup configures routing before the caller may set IF.
     unsafe {
         asm!(
             "lgdt [{gdt}]",
@@ -460,9 +486,12 @@ unsafe fn load_descriptors(gdtr: &DescriptorPointer, idtr: &DescriptorPointer) {
             "xor eax, eax",
             "mov fs, ax",
             "mov gs, ax",
-            // A null selector can retain the bootloader's hidden base.
+            // A null selector can retain the bootloader's hidden base, and
+            // the bootloader may leave IA32_KERNEL_GS_BASE set as well.
             "xor edx, edx",
             "mov ecx, 0xc0000100",
+            "wrmsr",
+            "inc ecx",
             "wrmsr",
             "inc ecx",
             "wrmsr",
@@ -565,6 +594,13 @@ pub(crate) unsafe fn init_secondary(
     // SAFETY: The private GDT/TSS are initialized and writable, the shared IDT
     // was acquired after BSP publication, and IF remains clear on this CPU.
     unsafe { load_descriptors(&gdtr, &idtr) };
+    // Per-CPU data goes in right after the descriptor load zeroed both GS
+    // MSRs, before the readback below expects it (0050-D1 (e)). A refused
+    // install leaves GS at 0 and fails that readback.
+    // SAFETY: CPL0 with IF clear on the CPU that claimed this slot, after its
+    // descriptor load and before anything reads through GS. The claim above
+    // makes this the slot's only install.
+    let installed = unsafe { cpudata::install(slot) };
     // SAFETY: This AP runs at CPL0 with IF clear and has just loaded the
     // shared IDT. Until the caller activates the root that maps IST3, a
     // machine check's push onto IST3 raises #PF. #MC is benign, so that #PF is
@@ -625,7 +661,9 @@ pub(crate) unsafe fn init_secondary(
         && stack == DATA_SELECTOR
         && storage_valid
         && machine_check
-        && kernel_tls_clean()
+        && installed
+        && kernel_tls_clean(cpudata::address(slot), true)
+        && cpudata::kernel_gs_base() == cpudata::address(slot)
 }
 
 /// Point the BSP's IST1-3 at their guarded stacks, replacing the early static
@@ -692,7 +730,21 @@ pub(crate) unsafe fn installed_ists(cpu: usize) -> [u64; IST_COUNT] {
     core::array::from_fn(|index| fields[index])
 }
 
-/// Set the dedicated kernel stack used by hardware on CPL3 -> CPL0 entry.
+/// The BSP's TSS.RSP0: the running thread's kernel stack top during a
+/// dispatch, the placeholder otherwise (0050-D2).
+pub(crate) fn kernel_stack() -> u64 {
+    // SAFETY: Only the BSP writes RSP0, with IF clear, and this unaligned read
+    // of the packed field forms no reference.
+    unsafe {
+        addr_of!(TSS.privilege_stacks)
+            .cast::<u64>()
+            .read_unaligned()
+    }
+}
+
+/// Set the kernel stack used by hardware on CPL3 -> CPL0 entry: the running
+/// thread's own stack at each dispatch, and the BSP's placeholder stack while
+/// no thread runs (0050-D2).
 ///
 /// # Safety
 /// Only the BSP may call, with interrupts disabled and no active user context.
@@ -790,13 +842,7 @@ pub(crate) unsafe fn resume_user(frame: &TrapFrame, extended: *mut fpu::State) {
     );
     let mut prepared = *frame;
     prepared.rflags = (prepared.rflags & USER_RFLAGS_MASK) | 0x202;
-    // SAFETY: Exclusive BSP call with IF clear; no mutable reference is formed.
-    let rsp0 = unsafe {
-        addr_of!(TSS.privilege_stacks)
-            .cast::<u64>()
-            .read_unaligned()
-    };
-    assert_ne!(rsp0, 0, "user entry requires a kernel stack");
+    assert_ne!(kernel_stack(), 0, "user entry requires a kernel stack");
     assert!(
         !USER_ACTIVE.swap(true, Ordering::SeqCst),
         "nested user entry"
@@ -810,8 +856,8 @@ pub(crate) unsafe fn resume_user(frame: &TrapFrame, extended: *mut fpu::State) {
     assert!(!arch::interrupts_enabled(), "user return requires IF=0");
     #[cfg(feature = "boot-smoke")]
     assert_kernel_tls_clean();
-    // SAFETY: Assembly has returned to the saved stack with IF clear.
-    unsafe { addr_of_mut!(MIRROR_USER_KERNEL_RSP).write(0) };
+    // Assembly has returned to the saved stack with IF clear.
+    cpudata::clear_user_kernel_rsp();
     assert!(USER_ACTIVE.swap(false, Ordering::SeqCst));
 }
 
@@ -821,9 +867,10 @@ pub(crate) fn return_from_user(frame: &mut TrapFrame) {
     assert_eq!(frame.cs & 3, 3, "kernel return requires a user frame");
     assert!(!arch::interrupts_enabled(), "user handler requires IF=0");
     assert!(USER_ACTIVE.load(Ordering::SeqCst), "no active user context");
-    // SAFETY: Only the BSP runs, and IF is clear. The entry assembly published
-    // this trusted supervisor-only stack pointer before enabling user execution.
-    let kernel_rsp = unsafe { addr_of!(MIRROR_USER_KERNEL_RSP).read() };
+    // Only the BSP runs, and IF is clear. The entry assembly recorded this
+    // trusted supervisor-only stack pointer in this CPU's CpuData before
+    // enabling user execution.
+    let kernel_rsp = cpudata::user_kernel_rsp();
     assert_ne!(kernel_rsp, 0, "no suspended kernel stack");
     frame.rip = mirror_resume_kernel as *const () as u64;
     frame.cs = u64::from(CODE_SELECTOR);
@@ -831,97 +878,65 @@ pub(crate) fn return_from_user(frame: &mut TrapFrame) {
     frame.rsp = kernel_rsp;
     frame.ss = u64::from(DATA_SELECTOR);
     // suspend() already copied the original user state, when it is resumable.
-    // The common epilogue must install clean bases before the kernel trampoline.
-    frame.fs_base = 0;
-    frame.gs_base = 0;
-    frame.fs_selector = 0;
-    frame.gs_selector = 0;
+    // The CPL0 exit ignores the TLS fields: the CPL3 entry already left null
+    // selectors, a zero FS base and CpuData in GS for the continuation.
 }
+
+/// A canonical value that is never this CPU's CpuData, for the scratch MSR.
+#[cfg(feature = "boot-smoke")]
+const KERNEL_GS_SENTINEL: u64 = 0x2345_6789_a000;
+/// User-range FS and GS bases for the exit-window probe (0050, test 2).
+#[cfg(feature = "boot-smoke")]
+const WINDOW_FS_BASE: u64 = 0x1234_5678_9000;
+#[cfg(feature = "boot-smoke")]
+const WINDOW_GS_BASE: u64 = 0x7654_3210_f000;
 
 #[cfg(feature = "boot-smoke")]
 pub fn self_test() {
     assert!(INITIALIZED.load(Ordering::SeqCst), "IDT not initialized");
+    let data = cpudata::address(0);
+    assert_kernel_tls_clean();
     let before = BREAKPOINT_COUNT.load(Ordering::SeqCst);
     assert!(!BREAKPOINT_ARMED.swap(true, Ordering::SeqCst));
+    // A CPL0 round trip leaves every TLS register alone (0050-D1 (d)):
+    // IA32_GS_BASE keeps CpuData with a null selector, and the sentinel in
+    // the scratch IA32_KERNEL_GS_BASE survives.
+    // SAFETY: CPL0 with IF clear on the installed BSP. Nothing enters user
+    // mode before the scratch MSR is restored below, and IA32_GS_BASE stays
+    // in the kernel half throughout.
+    unsafe { cpudata::set_kernel_gs_base(KERNEL_GS_SENTINEL) };
     let restored_rax: u64;
     let restored_r10: u64;
     let restored_flags: u64;
-    let restored_fs_selector: u64;
-    let restored_gs_selector: u64;
-    let restored_fs_base: u64;
-    let restored_gs_base: u64;
-    // SAFETY: Vector3 is installed and armed for a returning test. Assembly
-    // installs valid selectors and canonical sentinel bases without using
-    // them for memory accesses. Entry clears DF/TLS before Rust; return must
-    // restore all four TLS fields even for CPL0. Capture the results and clear
-    // DF/TLS again before Rust resumes, while checking two volatile GPRs.
+    // SAFETY: Vector3 is installed and armed for a returning test. The entry
+    // clears DF before Rust and IRET must restore it; clear DF again before
+    // compiler-generated code resumes, while checking two volatile GPRs.
     unsafe {
         asm!(
-            "push rax",
-            "mov ax, {user_data}",
-            "mov fs, ax",
-            "mov ax, {user_code}",
-            "mov gs, ax",
-            "mov ecx, 0xc0000100",
-            "mov eax, 0x56789000",
-            "mov edx, 0x1234",
-            "wrmsr",
-            "inc ecx",
-            "mov eax, 0x6789a000",
-            "mov edx, 0x2345",
-            "wrmsr",
-            "pop rax",
             "std",
             "int3",
             "pushfq",
             "pop r11",
             "cld",
-            "push rax",
-            "xor r9d, r9d",
-            "mov r9w, fs",
-            "xor r8d, r8d",
-            "mov r8w, gs",
-            "mov ecx, 0xc0000100",
-            "rdmsr",
-            "shl rdx, 32",
-            "or rax, rdx",
-            "mov rsi, rax",
-            "inc ecx",
-            "rdmsr",
-            "shl rdx, 32",
-            "or rax, rdx",
-            "mov rdi, rax",
-            "xor eax, eax",
-            "mov fs, ax",
-            "mov gs, ax",
-            "xor edx, edx",
-            "mov ecx, 0xc0000100",
-            "wrmsr",
-            "inc ecx",
-            "wrmsr",
-            "pop rax",
-            user_data = const USER_DATA_SELECTOR,
-            user_code = const USER_CODE_SELECTOR,
             inout("rax") 0x1234_5678_9abc_def0_u64 => restored_rax,
             inout("r10") 0xfedc_ba98_7654_3210_u64 => restored_r10,
             lateout("r11") restored_flags,
-            lateout("r9") restored_fs_selector,
-            lateout("r8") restored_gs_selector,
-            lateout("rsi") restored_fs_base,
-            lateout("rdi") restored_gs_base,
-            out("rcx") _,
-            out("rdx") _,
         );
     }
+    let scratch = cpudata::kernel_gs_base();
+    let clean = kernel_tls_clean(data, true);
+    // SAFETY: As above; CpuData is canonical.
+    unsafe { cpudata::set_kernel_gs_base(data) };
     assert_eq!(BREAKPOINT_COUNT.load(Ordering::SeqCst), before + 1);
     assert!(!BREAKPOINT_ARMED.load(Ordering::SeqCst));
     assert_eq!(restored_rax, 0x1234_5678_9abc_def0);
     assert_eq!(restored_r10, 0xfedc_ba98_7654_3210);
     assert_ne!(restored_flags & (1 << 10), 0, "IRET did not restore DF");
-    assert_eq!(restored_fs_selector, u64::from(USER_DATA_SELECTOR));
-    assert_eq!(restored_gs_selector, u64::from(USER_CODE_SELECTOR));
-    assert_eq!(restored_fs_base, 0x1234_5678_9000);
-    assert_eq!(restored_gs_base, 0x2345_6789_a000);
+    assert!(clean, "a CPL0 round trip changed the kernel TLS state");
+    assert_eq!(
+        scratch, KERNEL_GS_SENTINEL,
+        "a CPL0 round trip changed IA32_KERNEL_GS_BASE"
+    );
     assert_kernel_tls_clean();
     serial::println!("MIRROR_EXCEPTIONS_OK");
     serial::println!("MIRROR_TLS_KERNEL_OK selectors=1 bases=1 clean=1");
@@ -931,44 +946,202 @@ pub fn self_test() {
     }
 }
 
-/// Raise NMI and #MC in software at CPL0, each against an armed expectation.
-/// Each handler must find its frame inside its own guarded BSP IST stack, IST2
-/// for NMI and IST3 for #MC, and return. The marker reports the IST stack each
-/// handler observed.
+/// The TLS state an exit-window IST probe returned to, read before the probe
+/// restores the kernel state.
+#[cfg(feature = "boot-smoke")]
+#[derive(Debug, PartialEq, Eq)]
+struct WindowState {
+    fs_selector: u64,
+    gs_selector: u64,
+    fs_base: u64,
+    gs_base: u64,
+    kernel_gs_base: u64,
+}
+
+/// Raise `$vector` in the state a CPL3 exit is in between its selector loads
+/// and IRETQ (0050-D1 (c)): IA32_KERNEL_GS_BASE names CpuData, IA32_GS_BASE
+/// and the FS base hold user-range values, and FS and GS hold the user data
+/// selector. Returns the state the handler returned to, after restoring the
+/// kernel state: null selectors, a zero FS base and CpuData in IA32_GS_BASE.
+#[cfg(feature = "boot-smoke")]
+macro_rules! raise_in_exit_window {
+    ($vector:literal, $data:expr) => {{
+        let fs_selector: u64;
+        let gs_selector: u64;
+        let fs_base: u64;
+        let gs_base: u64;
+        let kernel_gs_base: u64;
+        // SAFETY: CPL0 with IF clear on the installed BSP, whose IST gate for
+        // this vector is armed for a returning probe. The user selector and
+        // the user-range bases are never used for a memory access, and the
+        // block restores the kernel TLS state before Rust code resumes:
+        // selectors first, since their loads overwrite the bases.
+        unsafe {
+            asm!(
+                "mov ecx, 0xc0000102",
+                "mov rax, r11",
+                "mov rdx, r11",
+                "shr rdx, 32",
+                "wrmsr",
+                "mov ax, {user_data}",
+                "mov fs, ax",
+                "mov gs, ax",
+                "mov ecx, 0xc0000100",
+                "mov rax, {fs_window}",
+                "mov rdx, rax",
+                "shr rdx, 32",
+                "wrmsr",
+                "inc ecx",
+                "mov rax, {gs_window}",
+                "mov rdx, rax",
+                "shr rdx, 32",
+                "wrmsr",
+                concat!("int ", $vector),
+                "xor r8d, r8d",
+                "mov r8w, fs",
+                "xor r9d, r9d",
+                "mov r9w, gs",
+                "mov ecx, 0xc0000100",
+                "rdmsr",
+                "shl rdx, 32",
+                "or rax, rdx",
+                "mov rsi, rax",
+                "inc ecx",
+                "rdmsr",
+                "shl rdx, 32",
+                "or rax, rdx",
+                "mov rdi, rax",
+                "inc ecx",
+                "rdmsr",
+                "shl rdx, 32",
+                "or rax, rdx",
+                "mov r10, rax",
+                "xor eax, eax",
+                "mov fs, ax",
+                "mov gs, ax",
+                "xor edx, edx",
+                "mov ecx, 0xc0000100",
+                "wrmsr",
+                "inc ecx",
+                "mov rax, r11",
+                "mov rdx, r11",
+                "shr rdx, 32",
+                "wrmsr",
+                user_data = const USER_DATA_SELECTOR,
+                fs_window = const WINDOW_FS_BASE,
+                gs_window = const WINDOW_GS_BASE,
+                in("r11") $data,
+                out("rax") _,
+                out("rcx") _,
+                out("rdx") _,
+                lateout("r8") fs_selector,
+                lateout("r9") gs_selector,
+                lateout("rsi") fs_base,
+                lateout("rdi") gs_base,
+                lateout("r10") kernel_gs_base,
+            );
+        }
+        WindowState {
+            fs_selector,
+            gs_selector,
+            fs_base,
+            gs_base,
+            kernel_gs_base,
+        }
+    }};
+}
+
+/// Raise NMI and #MC in software at CPL0, each against an armed expectation,
+/// in two states. In the kernel state IA32_GS_BASE names CpuData and the
+/// scratch MSR holds a sentinel, so a wrong swap would show. In the exit
+/// window's state (`raise_in_exit_window`) the paranoid entry must swap.
+/// Each handler must find its frame inside its own guarded BSP IST stack,
+/// IST2 for NMI and IST3 for #MC, run with this CPU's CpuData in GS and a
+/// null FS selector and zero FS base, and return to exactly the state it
+/// interrupted. The marker reports the IST stack each handler observed.
 #[cfg(feature = "boot-smoke")]
 fn ist_self_test() {
     assert!(!arch::interrupts_enabled());
+    let data = cpudata::address(0);
     let mut observed = [0; 2];
     for (index, vector) in [2_u64, 18].into_iter().enumerate() {
-        IST_PROBE_STACK.store(0, Ordering::SeqCst);
-        assert_eq!(
-            IST_PROBE_VECTOR.swap(vector, Ordering::SeqCst),
-            NO_IST_PROBE
-        );
-        // SAFETY: Both gates are DPL0 interrupt gates installed by init, and
-        // install_bsp_ists pointed IST2 and IST3 at mapped guarded stacks.
-        // The armed handler returns through IRETQ, which restores every
-        // register and RFLAGS; IF stays clear. An unexpected outcome is fatal.
-        unsafe {
-            if vector == 2 {
-                asm!("int 2");
+        for exit_window in [false, true] {
+            IST_PROBE_STACK.store(0, Ordering::SeqCst);
+            IST_PROBE_GS.store(0, Ordering::SeqCst);
+            IST_PROBE_FS.store(u64::MAX, Ordering::SeqCst);
+            assert_eq!(
+                IST_PROBE_VECTOR.swap(vector, Ordering::SeqCst),
+                NO_IST_PROBE
+            );
+            if exit_window {
+                let state = match vector {
+                    2 => raise_in_exit_window!("2", data),
+                    _ => raise_in_exit_window!("18", data),
+                };
+                assert_eq!(
+                    state,
+                    WindowState {
+                        fs_selector: u64::from(USER_DATA_SELECTOR),
+                        gs_selector: u64::from(USER_DATA_SELECTOR),
+                        fs_base: WINDOW_FS_BASE,
+                        gs_base: WINDOW_GS_BASE,
+                        kernel_gs_base: data,
+                    },
+                    "an IST probe did not restore the exit window"
+                );
             } else {
-                asm!("int 18");
+                // SAFETY: CPL0 with IF clear on the installed BSP; the
+                // scratch MSR is restored below before any user entry.
+                unsafe { cpudata::set_kernel_gs_base(KERNEL_GS_SENTINEL) };
+                // SAFETY: Both gates are DPL0 interrupt gates installed by
+                // init, and install_bsp_ists pointed IST2 and IST3 at mapped
+                // guarded stacks. The armed handler returns through IRETQ,
+                // which restores every register and RFLAGS; IF stays clear.
+                // An unexpected outcome is fatal.
+                unsafe {
+                    if vector == 2 {
+                        asm!("int 2");
+                    } else {
+                        asm!("int 18");
+                    }
+                }
+                let scratch = cpudata::kernel_gs_base();
+                // SAFETY: As above; CpuData is canonical.
+                unsafe { cpudata::set_kernel_gs_base(data) };
+                assert_eq!(
+                    scratch, KERNEL_GS_SENTINEL,
+                    "an IST probe swapped GS in the kernel state"
+                );
             }
+            assert_eq!(
+                IST_PROBE_VECTOR.load(Ordering::SeqCst),
+                NO_IST_PROBE,
+                "IST probe was not delivered"
+            );
+            assert_eq!(
+                IST_PROBE_GS.load(Ordering::SeqCst),
+                data,
+                "an IST handler ran without this CPU's CpuData"
+            );
+            assert_eq!(
+                IST_PROBE_FS.load(Ordering::SeqCst),
+                0,
+                "an IST handler ran with a user FS state"
+            );
+            let stack = IST_PROBE_STACK.load(Ordering::SeqCst);
+            if exit_window {
+                assert_eq!(stack, observed[index], "IST probe stacks differ");
+            } else {
+                observed[index] = stack;
+            }
+            assert_kernel_tls_clean();
         }
-        assert_eq!(
-            IST_PROBE_VECTOR.load(Ordering::SeqCst),
-            NO_IST_PROBE,
-            "IST probe was not delivered"
-        );
-        observed[index] = IST_PROBE_STACK.load(Ordering::SeqCst);
     }
     assert_eq!(
         observed,
         [u64::from(NMI_IST), u64::from(MACHINE_CHECK_IST)],
         "IST probe ran on the wrong stack"
     );
-    assert_kernel_tls_clean();
     serial::println!("MIRROR_IST_OK nmi={} mc={}", observed[0], observed[1]);
 }
 
@@ -1055,6 +1228,57 @@ extern "C" fn mirror_exception_dispatch(frame: &mut TrapFrame) {
     if frame.cs & 3 == 3 {
         crate::userspace::prepare_return(frame);
     }
+}
+
+/// NMI, #DF and #MC arrive through the paranoid entry (interrupts.S). Its
+/// exit restores exactly the interrupted state, so the frame is never
+/// redirected: no user return check runs, and the only handlers that return
+/// are the boot-smoke IST probes, from CPL0. A paranoid vector from CPL3 is a
+/// fatal platform failure in `dispatch`.
+#[unsafe(no_mangle)]
+extern "C" fn mirror_paranoid_dispatch(frame: &mut TrapFrame) {
+    if crate::smp::is_secondary() {
+        let cr2: u64;
+        // SAFETY: As in mirror_exception_dispatch's secondary path.
+        unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
+        crate::smp::secondary_fault(frame.vector, frame.error, frame.rip, cr2);
+    }
+    // The paranoid entry swapped in CpuData when a user GS base was live and
+    // cleared the FS state, but leaves the GS selector as it found it, so the
+    // selector checks are skipped (0050-D1 (c)).
+    #[cfg(feature = "boot-smoke")]
+    assert!(
+        kernel_tls_clean(cpudata::expected_bsp_gs_base(), false),
+        "paranoid entry left a user TLS state"
+    );
+    dispatch(frame);
+    assert_eq!(
+        frame.cs,
+        u64::from(CODE_SELECTOR),
+        "a paranoid vector returned to user mode"
+    );
+}
+
+/// This CPU's IA32_FS_BASE.
+#[cfg(feature = "boot-smoke")]
+fn fs_base() -> u64 {
+    let low: u32;
+    let high: u32;
+    // SAFETY: CPL0; reading the FS base MSR changes no processor state.
+    unsafe {
+        asm!("rdmsr", in("ecx") 0xc000_0100_u32, out("eax") low, out("edx") high,
+            options(nomem, nostack, preserves_flags));
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+/// This CPU's FS selector.
+#[cfg(feature = "boot-smoke")]
+fn fs_selector() -> u16 {
+    let selector: u16;
+    // SAFETY: Reading a segment register has no side effects.
+    unsafe { asm!("mov {:x}, fs", out(reg) selector, options(nomem, nostack, preserves_flags)) };
+    selector
 }
 
 fn dispatch(frame: &mut TrapFrame) {
@@ -1151,6 +1375,8 @@ fn dispatch(frame: &mut TrapFrame) {
         {
             let stack = ist_holding(frame);
             IST_PROBE_STACK.store(stack, Ordering::SeqCst);
+            IST_PROBE_GS.store(cpudata::gs_base(), Ordering::SeqCst);
+            IST_PROBE_FS.store(fs_base() | u64::from(fs_selector()), Ordering::SeqCst);
             let expected = if frame.vector == 2 {
                 NMI_IST
             } else {

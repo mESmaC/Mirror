@@ -400,7 +400,9 @@ extern "C" fn queue_worker(index: u64) -> ! {
     let result = wait(address(&QUEUE_WORD), 0, WAIT_FOREVER);
     // The ticket comes first, so ticket order is the order in which the
     // woken waiters ran. A fresh dispatch has a full two-tick quantum, so
-    // no preemption falls between the wait's return and this increment.
+    // no preemption falls between the wait's return and this increment, and
+    // a deadline that displaces this thread first puts it back at the head
+    // of the run queue, still ahead of the waiters woken after it (0030-D3).
     let ticket = QUEUE_SEQUENCE.fetch_add(1, Ordering::AcqRel);
     require(result == 0, 659);
     syscall(SYS_THREAD_EXIT, ticket, 0, 0);

@@ -10,7 +10,7 @@
 use crate::{
     apic, arch,
     boot::BootInfo,
-    fpu, hardening, interrupts,
+    cpudata, fpu, hardening, interrupts,
     memory::{FrameAllocator, PAGE_SIZE},
     paging::{self, PageTables},
     serial, stacks, timer,
@@ -41,12 +41,15 @@ const FAILED: u32 = 3;
 const CANCELLED: u32 = 4;
 const OP_PROOF: u32 = 1;
 const OP_INVALIDATE_RANGE: u32 = 2;
-const MAX_INVALIDATE_PAGES: u64 = 256;
+/// The most pages one shootdown command covers; kernel_va batches trims by it.
+pub(crate) const MAX_INVALIDATE_PAGES: u64 = 256;
 const OP_READ_SHARED: u32 = 3;
 #[cfg(feature = "boot-smoke")]
 const OP_GUARD_FAULT: u32 = 4;
 #[cfg(feature = "boot-smoke")]
 const OP_UNMAPPED_FAULT: u32 = 5;
+#[cfg(feature = "boot-smoke")]
+const OP_READ_CPU_DATA: u32 = 6;
 
 #[repr(align(64))]
 struct Slot {
@@ -63,6 +66,9 @@ struct Slot {
     actual_efer: AtomicU64,
     cpuid_mce: AtomicBool,
     controls: AtomicU8,
+    // IA32_GS_BASE as the AP read it back after installing its CpuData
+    // (0050-D1 (e)), for the BSP's check before MIRROR_CPU_DATA_READY.
+    cpu_data: AtomicU64,
     command: AtomicU64,
     operation: AtomicU32,
     argument: AtomicU64,
@@ -89,6 +95,7 @@ impl Slot {
             actual_efer: AtomicU64::new(0),
             cpuid_mce: AtomicBool::new(false),
             controls: AtomicU8::new(0),
+            cpu_data: AtomicU64::new(0),
             command: AtomicU64::new(0),
             operation: AtomicU32::new(0),
             argument: AtomicU64::new(0),
@@ -555,6 +562,9 @@ extern "C" fn secondary_main(index: usize) -> ! {
     slot.actual_root.store(root, Ordering::Relaxed);
     slot.actual_cr4.store(cr4, Ordering::Relaxed);
     slot.actual_efer.store(efer, Ordering::Relaxed);
+    // init_secondary installed this CPU's CpuData and checked it; the BSP
+    // checks this readback too before it reports per-CPU data.
+    slot.cpu_data.store(cpudata::gs_base(), Ordering::Relaxed);
     slot.cpuid_mce
         .store(interrupts::cpuid_mce(), Ordering::Relaxed);
     // Cancellation is terminal: a late AP may never resurrect an offline slot.
@@ -590,11 +600,23 @@ fn initial_apic_id() -> u32 {
     __cpuid(1).ebx >> 24
 }
 
+/// Whether this CPU is an AP. Once this CPU installed its CpuData the
+/// answer is a read of IA32_GS_BASE (0050-D1); before that, the CPUID check.
 pub fn is_secondary() -> bool {
-    PUBLISHED.load(Ordering::Acquire) && initial_apic_id() != BSP_ID.load(Ordering::Relaxed)
+    match cpudata::try_current_slot() {
+        Some(slot) => slot != 0,
+        None => {
+            PUBLISHED.load(Ordering::Acquire) && initial_apic_id() != BSP_ID.load(Ordering::Relaxed)
+        }
+    }
 }
 
+/// This CPU's slot: its installed CpuData's, or before install the CPUID
+/// scan, which finds a slot only once SMP startup has published them.
 fn current_slot() -> Option<usize> {
+    if let Some(slot) = cpudata::try_current_slot() {
+        return Some(slot);
+    }
     if !PUBLISHED.load(Ordering::Acquire) {
         return None;
     }
@@ -648,6 +670,7 @@ fn invalidation_range_valid(address: u64, pages: u64) -> bool {
     [
         (paging::SHARED_BASE, paging::SHARED_PAGES as u64 * PAGE_SIZE),
         (crate::heap::HEAP_START, crate::heap::HEAP_MAX_SIZE as u64),
+        (crate::kernel_va::BASE, crate::kernel_va::SIZE as u64),
     ]
     .into_iter()
     .any(|(start, bytes)| {
@@ -677,6 +700,8 @@ fn operation_valid(operation: u32, argument: u64, payload: u64, index: usize) ->
         OP_GUARD_FAULT => index != 0 && argument == 0,
         #[cfg(feature = "boot-smoke")]
         OP_UNMAPPED_FAULT => index != 0 && shared_page_valid(argument),
+        #[cfg(feature = "boot-smoke")]
+        OP_READ_CPU_DATA => argument == 0 && payload == 0,
         _ => {
             let _ = index;
             false
@@ -814,7 +839,8 @@ pub(crate) fn prepare_kernel_update() -> Result<KernelUpdate, &'static str> {
 }
 
 impl KernelUpdate {
-    /// Complete one already-published shared-window or heap PTE change.
+    /// Complete one already-published shared-window, heap or kernel VA PTE
+    /// change.
     ///
     /// # Safety
     /// The caller must satisfy invalidate_range's contract for this one page.
@@ -828,11 +854,13 @@ impl KernelUpdate {
     /// per target. Any failure stops the BSP before a retired frame is returned.
     ///
     /// # Safety
-    /// The caller owns every aligned page in the range, wholly inside either
-    /// the shared window or reserved heap, and excludes live access throughout
-    /// the update. No IRQ-needed lock or allocator guard may be held. Removed
-    /// frames and page tables remain allocated until this call returns. Call
-    /// on the same BSP/root with IF=0 that prepared this ticket.
+    /// The range lies wholly inside the shared window, the reserved heap or
+    /// the kernel VA window. The caller owns every changed page in it and
+    /// excludes live access to them throughout the update; an unchanged page
+    /// keeps its mapping, and invalidation only drops cached copies of it. No
+    /// IRQ-needed lock or allocator guard may be held. Removed frames and page
+    /// tables remain allocated until this call returns. Call on the same
+    /// BSP/root with IF=0 that prepared this ticket.
     pub(crate) unsafe fn invalidate_range(self, address: u64, pages: usize) {
         let pages = pages as u64;
         assert!(
@@ -865,14 +893,16 @@ impl KernelUpdate {
     }
 }
 
-/// Read one caller-owned shared-window or heap page on every CPU and verify the
-/// value and per-CPU sequence proof. This deliberately warms each CPU's TLB.
+/// Read one caller-owned shared-window, heap or kernel VA page on every CPU
+/// and verify the value and per-CPU sequence proof. This deliberately warms
+/// each CPU's TLB.
 ///
 /// # Safety
 /// Run on BSP with IF=0, holding no IRQ-needed lock. The aligned page must be
-/// initialized and mapped readable in the shared window or reserved heap. It
-/// remains allocated, mapped and immutable until all commands complete. No
-/// allocator guard may be held, and no Rust reference spans an IPI read.
+/// initialized and mapped readable in the shared window, the reserved heap or
+/// the kernel VA window. It remains allocated, mapped and immutable until all
+/// commands complete. No allocator guard may be held, and no Rust reference
+/// spans an IPI read.
 pub(crate) unsafe fn probe_shared_page(address: u64, expected: u64) -> usize {
     assert!(
         invalidation_range_valid(address, 1),
@@ -963,6 +993,14 @@ pub fn handle_ipi() {
         }
         fail(index, 10);
     }
+    #[cfg(feature = "boot-smoke")]
+    if operation == OP_READ_CPU_DATA {
+        let value = cpu_data_proof(index, sequence);
+        slot.result.store(value, Ordering::Relaxed);
+        slot.completed.fetch_add(1, Ordering::Relaxed);
+        slot.acknowledgement.store(sequence, Ordering::Release);
+        return;
+    }
     let value = if operation == OP_INVALIDATE_RANGE {
         // SAFETY: BSP published the PTE before the command release; operation
         // validation checked the entire canonical range and bounded page count.
@@ -994,6 +1032,92 @@ pub fn handle_ipi() {
     slot.result.store(value, Ordering::Relaxed);
     slot.completed.fetch_add(1, Ordering::Relaxed);
     slot.acknowledgement.store(sequence, Ordering::Release);
+}
+
+/// OP_READ_CPU_DATA's answer (0050, acceptance test 2): this CPU's CpuData
+/// address and slot, both read through GS, bound to its CPUID APIC ID. The
+/// BSP expects them to name the slot whose mailbox it wrote. A GS read that
+/// disagrees with IA32_GS_BASE fails this CPU.
+#[cfg(feature = "boot-smoke")]
+fn cpu_data_proof(index: usize, sequence: u64) -> u64 {
+    let (address, slot) = cpudata::read_through_gs();
+    if address != cpudata::gs_base() {
+        if index == 0 {
+            panic!("BSP per-CPU data disagrees with IA32_GS_BASE");
+        }
+        fail(index, 13);
+    }
+    proof(address ^ slot, initial_apic_id(), sequence)
+}
+
+/// After SMP startup, check that every online CPU runs with its own CpuData
+/// in GS and report `MIRROR_CPU_DATA_READY cpus=<online>` (0050-D4). The BSP
+/// reads its own MSR; each AP's readback comes from its slot. Smoke kernels
+/// first send OP_READ_CPU_DATA to the BSP and every online AP.
+pub fn report_cpu_data() {
+    assert!(!arch::interrupts_enabled() && !is_secondary());
+    assert_eq!(cpudata::current_cpu(), 0, "BSP per-CPU slot");
+    assert_eq!(cpudata::gs_base(), cpudata::address(0), "BSP per-CPU data");
+    // COUNT stays 0 when SMP was skipped, so only the BSP counts.
+    let count = COUNT.load(Ordering::Relaxed);
+    let mut cpus = 1;
+    for (index, slot) in SLOTS.iter().enumerate().take(count).skip(1) {
+        if slot.state.load(Ordering::Acquire) == ONLINE {
+            assert_eq!(
+                slot.cpu_data.load(Ordering::Relaxed),
+                cpudata::address(index),
+                "AP per-CPU data readback"
+            );
+            cpus += 1;
+        }
+    }
+    #[cfg(feature = "boot-smoke")]
+    {
+        let probed = read_cpu_data_self_test();
+        assert_eq!(probed, cpus, "per-CPU data probe count");
+        serial::println!("MIRROR_CPU_DATA_TESTS_OK cpus={}", probed);
+    }
+    serial::println!("MIRROR_CPU_DATA_READY cpus={}", cpus);
+}
+
+/// Send OP_READ_CPU_DATA to the BSP and every online AP and check each
+/// answer against its slot's CpuData and APIC ID. Without published SMP the
+/// BSP checks itself directly. Returns the number of CPUs proved.
+#[cfg(feature = "boot-smoke")]
+fn read_cpu_data_self_test() -> usize {
+    let update = prepare_kernel_update().expect("per-CPU data probe preflight");
+    if update.count == 0 {
+        assert_eq!(
+            cpudata::read_through_gs(),
+            (cpudata::address(0), 0),
+            "BSP per-CPU data through GS"
+        );
+        return 1;
+    }
+    let mut targets = update.targets;
+    targets[0] = true;
+    for index in 0..update.count {
+        publish_command(index, update.sequences[index], OP_READ_CPU_DATA, 0, 0)
+            .expect("per-CPU data probe delivery failed");
+    }
+    wait_exact(
+        update.count,
+        &targets,
+        &update.sequences,
+        "per-CPU data probe acknowledgement timeout",
+    );
+    for (index, slot) in SLOTS[..update.count].iter().enumerate() {
+        assert_eq!(
+            slot.result.load(Ordering::Relaxed),
+            proof(
+                cpudata::address(index) ^ index as u64,
+                slot.apic_id.load(Ordering::Relaxed),
+                update.sequences[index]
+            ),
+            "a CPU's GS did not resolve to its own CpuData"
+        );
+    }
+    update.count
 }
 
 fn wait_until(mut done: impl FnMut() -> bool) -> bool {
@@ -1425,6 +1549,15 @@ fn self_test() {
     assert!(!operation_valid(u32::MAX, 0, 0, 1));
     assert!(!operation_valid(OP_PROOF, paging::SHARED_BASE, 0, 1));
     assert!(!operation_valid(OP_GUARD_FAULT, 0, 0, 0));
+    assert!(operation_valid(OP_READ_CPU_DATA, 0, 0, 0));
+    assert!(operation_valid(OP_READ_CPU_DATA, 0, 0, 1));
+    assert!(!operation_valid(
+        OP_READ_CPU_DATA,
+        paging::SHARED_BASE,
+        0,
+        1
+    ));
+    assert!(!operation_valid(OP_READ_CPU_DATA, 0, 1, 1));
     assert!(!operation_valid(
         OP_UNMAPPED_FAULT,
         paging::SHARED_BASE,

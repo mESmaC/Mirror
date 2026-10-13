@@ -402,6 +402,166 @@ function Assert-MirrorSchedReady {
     }
 }
 
+function Assert-MirrorKernelVa {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [Parameter(Mandatory = $true)][int]$OnlineCpus,
+        [Parameter(Mandatory = $true)][bool]$Smoke
+    )
+
+    # Spec 0050-D4. Every flavor pins the kernel VA window's tables before SMP
+    # startup seals kernel mappings and reports the window exactly once.
+    $names = [regex]::Matches($Serial, '(?m)^MIRROR_KVA_READY(?:\s|$)')
+    $records = [regex]::Matches($Serial, '(?m)^MIRROR_KVA_READY base=0xffffd40000000000 size=33554432\r?$')
+    if ($names.Count -ne 1 -or $records.Count -ne 1) {
+        throw 'Mirror must report MIRROR_KVA_READY base=0xffffd40000000000 size=33554432 exactly once.'
+    }
+    $startup = [regex]::Matches($Serial, '(?m)^MIRROR_SMP_(?:READY|SKIPPED)(?:\s|$)')
+    if ($startup.Count -ne 1 -or $records[0].Index -ge $startup[0].Index) {
+        throw 'MIRROR_KVA_READY must precede SMP startup.'
+    }
+    # Only smoke kernels run the window's self-test (0050, acceptance test 4),
+    # after SMP startup, so it probes every online CPU, and before the
+    # scheduler report. It fills all 455 stack spans and trims them in 33
+    # batches of up to 256 pages.
+    $tests = [regex]::Matches($Serial, '(?m)^MIRROR_KVA_TESTS_OK(?:\s|$)')
+    if ($Smoke) {
+        $pattern = '(?m)^MIRROR_KVA_TESTS_OK cpus={0} spans=455 trimmed=455 batches=33 reuse=1 rollback=1 degraded=1\r?$' -f $OnlineCpus
+        $valid = [regex]::Matches($Serial, $pattern)
+        $sched = [regex]::Match($Serial, '(?m)^MIRROR_SCHED_READY(?:\s|$)')
+        if ($tests.Count -ne 1 -or $valid.Count -ne 1 -or $valid[0].Index -le $startup[0].Index -or
+            -not $sched.Success -or $valid[0].Index -ge $sched.Index) {
+            throw "A smoke kernel must pass the kernel VA self-test on $OnlineCpus CPU(s) exactly once, after SMP startup and before the scheduler report."
+        }
+    }
+    elseif ($tests.Count -ne 0) {
+        throw 'Only smoke kernels run the kernel VA self-test.'
+    }
+}
+
+function Assert-MirrorKernelStacks {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [string]$FaultMode = 'None'
+    )
+
+    # Spec 0050-D4, smoke kernels only. The first init-pair session runs with
+    # the kernel VA window's shootdown transport withheld and says so once,
+    # after the table-bounds test (test 4). Each pair session's drain then
+    # reports its thread stacks once, with its full field list: threads= is
+    # the per-process peak of live stacks, 16 at the primary's capacity check;
+    # watermark_pages= the deepest high-water mark, 1 to 16 pages; built= the
+    # stacks the session built fresh; and pool= the pool after the trim. The
+    # first session skips its trim, so its pool holds every stack it built,
+    # 17 to 32 for the interleaved pair. The second reuses that pool, so
+    # together they built at most 32, and its trim empties the pool. Returns
+    # the guard page that ThreadStackOverflow reports, or $null.
+    $bounds = [regex]::Match($Serial, '(?m)^MIRROR_SCHED_BOUNDS_OK(?:\s|$)')
+    $degraded = [regex]::Matches($Serial, '(?m)^MIRROR_KVA_DEGRADED(?:\s|$)')
+    $degradedValid = [regex]::Matches($Serial, '(?m)^MIRROR_KVA_DEGRADED session=1\r?$')
+    if ($degraded.Count -ne 1 -or $degradedValid.Count -ne 1 -or -not $bounds.Success -or
+        $degradedValid[0].Index -le $bounds.Index) {
+        throw 'A smoke kernel must report MIRROR_KVA_DEGRADED session=1 exactly once, after the table-bounds test.'
+    }
+    $lines = [regex]::Matches($Serial, '(?m)^MIRROR_KSTACK_OK(?:\s|$)')
+    $records = [regex]::Matches($Serial, '(?m)^MIRROR_KSTACK_OK threads=(\d+) watermark_pages=(\d+) built=(\d+) pool=(\d+)\r?$')
+    if ($lines.Count -ne 2 -or $records.Count -ne 2 -or $records[0].Index -le $degradedValid[0].Index) {
+        throw 'A smoke kernel must report MIRROR_KSTACK_OK threads= watermark_pages= built= pool= exactly twice, once per init-pair session, after MIRROR_KVA_DEGRADED.'
+    }
+    foreach ($record in $records) {
+        $watermark = [int]$record.Groups[2].Value
+        if ($watermark -lt 1 -or $watermark -gt 16) {
+            throw 'Each init-pair session must peak at 16 live thread stacks in one process, with a high-water mark of 1 to 16 pages.'
+        }
+    }
+    # 0054-D5's scenarios replace the relaunch pair with two single-threaded
+    # processes: only the battery pair peaks at 16 live stacks.
+    $scenarioPair = $FaultMode -in @('OomOrder', 'ClassLimits')
+    if ([int]$records[0].Groups[1].Value -ne 16 -or
+        [int]$records[1].Groups[1].Value -ne $(if ($scenarioPair) { 1 } else { 16 })) {
+        throw 'Each init-pair session must peak at 16 live thread stacks in one process.'
+    }
+    $firstBuilt = [int]$records[0].Groups[3].Value
+    $secondBuilt = [int]$records[1].Groups[3].Value
+    if ($firstBuilt -lt 17 -or $firstBuilt -gt 32 -or [int]$records[0].Groups[4].Value -ne $firstBuilt) {
+        throw 'The degraded session must build 17 to 32 thread stacks and keep every one pooled.'
+    }
+    if ([int]$records[1].Groups[4].Value -ne 0 -or $firstBuilt + $secondBuilt -gt 32) {
+        throw 'The second session must reuse the pool, building at most 32 stacks in all, and trim it empty.'
+    }
+    # Spec 0050, acceptance test 3: only ThreadStackOverflow reports the guard
+    # page below its stack, once, after both sessions and before it announces
+    # the fatal fault.
+    $guards = [regex]::Matches($Serial, '(?m)^MIRROR_KSTACK_GUARD(?:\s|$)')
+    if ($FaultMode -ne 'ThreadStackOverflow') {
+        if ($guards.Count -ne 0) {
+            throw 'Only the ThreadStackOverflow case reports MIRROR_KSTACK_GUARD.'
+        }
+        return $null
+    }
+    $guard = [regex]::Matches($Serial, '(?m)^MIRROR_KSTACK_GUARD guard=(0x[0-9a-f]+)\r?$')
+    $expect = [regex]::Matches($Serial, '(?m)^MIRROR_TEST_EXPECT_FATAL(?:\s|$)')
+    if ($guards.Count -ne 1 -or $guard.Count -ne 1 -or $expect.Count -ne 1 -or
+        $guard[0].Index -le $records[1].Index -or $guard[0].Index -ge $expect[0].Index) {
+        throw 'ThreadStackOverflow must report MIRROR_KSTACK_GUARD once, after both sessions and before announcing its fault.'
+    }
+    $address = [Convert]::ToUInt64($guard[0].Groups[1].Value.Substring(2), 16)
+    $window = [Convert]::ToUInt64('ffffd40000000000', 16)
+    if ($address -lt $window -or $address -ge $window + 33554432 -or ($address % 4096) -ne 0) {
+        throw 'The thread stack guard must be a page of the kernel VA window.'
+    }
+    return $address
+}
+
+function Assert-MirrorCpuData {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [Parameter(Mandatory = $true)][bool]$Smoke
+    )
+
+    # Spec 0050-D4. After SMP startup every flavor checks that each online CPU
+    # runs with its own CpuData in GS and reports it exactly once, after
+    # MIRROR_KVA_READY. cpus= is recomputed from the SMP line: online= of
+    # MIRROR_SMP_READY, or 1 when MIRROR_SMP_SKIPPED kept the APs offline.
+    $startup = [regex]::Matches($Serial, '(?m)^MIRROR_SMP_(?:READY|SKIPPED)(?:\s|$)')
+    if ($startup.Count -ne 1) {
+        throw 'Mirror must report SMP startup exactly once before its per-CPU data.'
+    }
+    $smpReady = [regex]::Matches($Serial, '(?m)^MIRROR_SMP_READY discovered=\d+ online=(\d+) ')
+    $smpSkipped = [regex]::Matches($Serial, '(?m)^MIRROR_SMP_SKIPPED reason=\S+ online=1\r?$')
+    if ($smpReady.Count -eq 1 -and $smpSkipped.Count -eq 0) {
+        $cpus = [int]$smpReady[0].Groups[1].Value
+    }
+    elseif ($smpReady.Count -eq 0 -and $smpSkipped.Count -eq 1) {
+        $cpus = 1
+    }
+    else {
+        throw 'Mirror reported no SMP startup line to count online CPUs from.'
+    }
+    $names = [regex]::Matches($Serial, '(?m)^MIRROR_CPU_DATA_READY(?:\s|$)')
+    $records = [regex]::Matches($Serial, ('(?m)^MIRROR_CPU_DATA_READY cpus={0}\r?$' -f $cpus))
+    if ($names.Count -ne 1 -or $records.Count -ne 1) {
+        throw "Mirror must report MIRROR_CPU_DATA_READY cpus=$cpus exactly once."
+    }
+    $kva = [regex]::Match($Serial, '(?m)^MIRROR_KVA_READY(?:\s|$)')
+    if (-not $kva.Success -or $records[0].Index -le $kva.Index -or $records[0].Index -le $startup[0].Index) {
+        throw 'MIRROR_CPU_DATA_READY must follow MIRROR_KVA_READY and SMP startup.'
+    }
+    # Only smoke kernels send OP_READ_CPU_DATA to the BSP and every online AP
+    # (0050, acceptance test 2), just before the report.
+    $tests = [regex]::Matches($Serial, '(?m)^MIRROR_CPU_DATA_TESTS_OK(?:\s|$)')
+    if ($Smoke) {
+        $valid = [regex]::Matches($Serial, ('(?m)^MIRROR_CPU_DATA_TESTS_OK cpus={0}\r?$' -f $cpus))
+        if ($tests.Count -ne 1 -or $valid.Count -ne 1 -or $valid[0].Index -le $startup[0].Index -or
+            $valid[0].Index -ge $records[0].Index) {
+            throw "A smoke kernel must prove per-CPU data on $cpus CPU(s) exactly once, before MIRROR_CPU_DATA_READY."
+        }
+    }
+    elseif ($tests.Count -ne 0) {
+        throw 'Only smoke kernels run the per-CPU data probe.'
+    }
+}
+
 function Assert-MirrorStacks {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,

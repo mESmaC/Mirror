@@ -75,6 +75,10 @@ function Assert-MirrorCaptureSmp {
     Assert-MirrorUsbMarkers -Serial $Serial -Attached $false -Smoke $false
     # Trace and default kernels report every CPU's guarded stacks too (spec 0016a).
     $null = Assert-MirrorStacks -Serial $Serial -OnlineCpus $RequestedCpus -Smoke $false
+    # And the kernel VA window, without the smoke-only self-test (spec 0050-D4).
+    Assert-MirrorKernelVa -Serial $Serial -OnlineCpus $RequestedCpus -Smoke $false
+    # And per-CPU data, without the smoke-only probe (spec 0050-D4).
+    Assert-MirrorCpuData -Serial $Serial -Smoke $false
     # And every CPU's protections (spec 0016b). The capture CPU,
     # qemu64,+smep,+smap, reports SMEP and SMAP but not UMIP (0016-D6).
     Assert-MirrorHardening -Serial $Serial -OnlineCpus $RequestedCpus -SmepSmap $true -Umip $false
@@ -778,7 +782,7 @@ try {
         throw "Trace boot unexpectedly reported an OOM kill. See $serialLog."
     }
     # Trace kernels run no init battery and recognize no fixture (spec 0010).
-    foreach ($marker in @('MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_SCHEDULER_OK', 'MIRROR_IPC_OK', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_USER_SURFACE_OK', 'MIRROR_USER_SURFACE_CLEANUP_OK', 'MIRROR_USER_CLOCK_OK', 'MIRROR_AHCI_READ_OK', 'MIRROR_HEAP_CHARGE_OK')) {
+    foreach ($marker in @('MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_SCHEDULER_OK', 'MIRROR_IPC_OK', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_USER_SURFACE_OK', 'MIRROR_USER_SURFACE_CLEANUP_OK', 'MIRROR_USER_CLOCK_OK', 'MIRROR_AHCI_READ_OK', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED')) {
         if ($serial -match "(?m)^$marker(?:\s|$)") { throw "Trace boot unexpectedly reported $marker. See $serialLog." }
     }
     if ($serial -match '(?m)^MIRROR_FRAMEBUFFER_SKIPPED(?:\s|$)') { throw 'Normal boot skipped framebuffer output.' }

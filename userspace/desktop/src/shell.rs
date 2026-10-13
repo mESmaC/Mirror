@@ -1293,6 +1293,12 @@ fn smoke_test(console: u64, supervisor: u64) -> ! {
             shell.windows[busy].unwrap().pid,
         ],
     );
+    // So fence that log before the close ends the peer: the peer reads the
+    // Focus(false) this queues only in the event-loop pass after the one that
+    // committed the edit and then logged its text, so its unfocused border
+    // shows the text log was written.
+    shell.focus(None);
+    wait_pixel(&mut shell, second, 12, 60, UNFOCUSED_BORDER);
     shell.close(busy);
     shell.close(second);
     shell.flush_logs(console);
