@@ -23,7 +23,7 @@ param(
     [switch]$LegacyPic,
     [switch]$PitTimer,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
-    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'ThreadStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'TimerCalibration', 'ClockActivation', 'Ps2BatTimeout', 'Ps2StaleScancode', 'VmmouseError', 'Reset', 'ResetFromKbc', 'ResetFromCf9', 'ResetFromTripleFault', 'ResetSuppressed', 'OomOrder', 'ClassLimits', 'PerfInvalid')][string]$Fault = 'None',
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'ThreadStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'UserFlushTimeout', 'TimerCalibration', 'ClockActivation', 'Ps2BatTimeout', 'Ps2StaleScancode', 'VmmouseError', 'Reset', 'ResetFromKbc', 'ResetFromCf9', 'ResetFromTripleFault', 'ResetSuppressed', 'OomOrder', 'ClassLimits', 'PerfInvalid')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -89,8 +89,23 @@ function Assert-MirrorSmpMarkers {
     if ($FaultMode -ne 'SmpTlbTimeout' -and $Serial -match '(?m)^MIRROR_(?:SMP_TLB_TIMEOUT_ARMED|SHARED_TIMEOUT_\w+)(?:\s|$)') {
         throw 'Unexpected TLB timeout injection.'
     }
+    if ($FaultMode -ne 'UserFlushTimeout' -and $Serial -match '(?m)^MIRROR_USER_FLUSH_TIMEOUT_\w+(?:\s|$)') {
+        throw 'Unexpected user flush timeout injection.'
+    }
+    # The user flush self-test (spec 0051, step 2), after SMP startup and the
+    # print check: every online AP loads a scratch root, a release from it
+    # makes each reload CR3 before the frames return, each then reads the new
+    # frame, and a flush sent to an AP that left the root only acknowledges.
+    $flushCpus = if ($UseLegacyPic) { 1 } else { $RequestedCpus }
+    $flushPattern = '(?m)^MIRROR_USER_FLUSH_TESTS_OK cpus={0} reloaded={1} skipped={2}\r?$' -f $flushCpus, ($flushCpus - 1), [int]($flushCpus -gt 1)
+    $flushTests = [regex]::Matches($Serial, $flushPattern)
+    if ($flushTests.Count -ne 1 -or
+        [regex]::Matches($Serial, '(?m)^MIRROR_USER_FLUSH_TESTS_OK(?:\s|$)').Count -ne 1 -or
+        $flushTests[0].Index -le $testsOk[0].Index -or $flushTests[0].Index -le $shared[0].Index) {
+        throw "Mirror must flush a scratch user root on all $flushCpus CPU(s) exactly once, after SMP startup."
+    }
     if ($UseLegacyPic) {
-        if ($FaultMode -in @('SmpUnmap', 'SmpTlbTimeout')) {
+        if ($FaultMode -in @('SmpUnmap', 'SmpTlbTimeout', 'UserFlushTimeout')) {
             throw 'SMP memory fault probes require the APIC backend.'
         }
         if ([regex]::Matches($Serial, '(?m)^MIRROR_SMP_SKIPPED reason=legacy_pic online=1\r?$').Count -ne 1 -or
@@ -162,6 +177,9 @@ function Assert-MirrorSmpMarkers {
         if ($phase.Name -eq 'boot' -and $firstLine[0] -le $phaseRecords[0].Index) {
             throw 'The SMP print check must follow the boot rendezvous, with every AP online.'
         }
+        if ($phase.Name -eq 'after_userspace' -and $flushTests[0].Index -ge $phaseRecords[0].Index) {
+            throw 'The user flush self-test must precede userspace.'
+        }
         $previousPhase = $phaseRecords[0].Index
     }
     $guardRecords = [regex]::Matches($Serial, '(?m)^MIRROR_SMP_GUARD_OK(?:\s|$)')
@@ -192,6 +210,34 @@ function Assert-MirrorSmpMarkers {
         $retainedFrame = [Convert]::ToUInt64($expected[0].Groups[1].Value.Substring(2), 16)
         if ($retainedFrame -eq 0 -or ($retainedFrame % 4096) -ne 0) {
             throw 'The missing-ACK test must retain a valid allocated frame.'
+        }
+        return
+    }
+    if ($FaultMode -eq 'UserFlushTimeout') {
+        # The last AP withholds its OP_FLUSH_USER acknowledgement: the release
+        # must panic inside its flush, before the withdrawn frames return to
+        # the allocator, and before any destructive fault test (spec 0051).
+        if ($guardRecords.Count -ne 0 -or $unmapRecords.Count -ne 0 -or $offlineRecords.Count -ne 0) {
+            throw 'The user flush timeout must fail inside its flush before destructive fault tests or reclamation.'
+        }
+        $armedPattern = '(?m)^MIRROR_USER_FLUSH_TIMEOUT_ARMED target={0}\r?$' -f ($RequestedCpus - 1)
+        $armed = [regex]::Matches($Serial, $armedPattern)
+        $expected = [regex]::Matches($Serial, '(?m)^MIRROR_USER_FLUSH_TIMEOUT_EXPECT root=(0x[0-9a-f]+) frame=(0x[0-9a-f]+)\r?$')
+        $panic = [regex]::Matches($Serial, '(?m)^MIRROR_PANIC:[^\r\n]*\r?\nuser TLB shootdown acknowledgement timeout\r?$')
+        if ($RequestedCpus -le 1 -or $armed.Count -ne 1 -or $expected.Count -ne 1 -or $panic.Count -ne 1 -or
+            [regex]::Matches($Serial, '(?m)^MIRROR_USER_FLUSH_TIMEOUT_\w+(?:\s|$)').Count -ne 2 -or
+            [regex]::Matches($Serial, '(?im)^(?:MIRROR_PANIC|PANIC|\[panic\])(?::|\s|$)').Count -ne 1 -or
+            [regex]::Matches($Serial, '(?m)^user TLB shootdown acknowledgement timeout\r?$').Count -ne 1 -or
+            $armed[0].Index -le $previousPhase -or $expected[0].Index -le $armed[0].Index -or
+            $panic[0].Index -le $expected[0].Index -or
+            $Serial -match '(?m)^MIRROR_(?:PAGE_FAULT_OK|BOOT_OK|EXCEPTION)(?:\s|$)') {
+            throw 'The missing user flush ACK must panic inside the flush after arming, before the release frees its frames.'
+        }
+        foreach ($group in 1, 2) {
+            $address = [Convert]::ToUInt64($expected[0].Groups[$group].Value.Substring(2), 16)
+            if ($address -eq 0 -or ($address % 4096) -ne 0) {
+                throw 'The user flush timeout must name a valid root and retained frame.'
+            }
         }
         return
     }
@@ -276,7 +322,7 @@ $usbFixture = if ($XhciKeyboard) { 'Keyboard' } elseif ($XhciMouse) { 'Mouse' } 
 if ($NoTestDisk -and ($Fault -eq 'BlockIoError' -or $writableBlock)) {
     throw "-Fault $Fault requires the test disk."
 }
-if ($Fault -in @('SmpUnmap', 'SmpTlbTimeout') -and ($CpuCount -lt 2 -or $LegacyPic)) {
+if ($Fault -in @('SmpUnmap', 'SmpTlbTimeout', 'UserFlushTimeout') -and ($CpuCount -lt 2 -or $LegacyPic)) {
     throw 'SMP memory fault probes require at least two CPUs and the APIC backend.'
 }
 if ($Fault -eq 'TimerCalibration' -and ($LegacyPic -or $PitTimer)) {
@@ -365,6 +411,7 @@ $testMode = switch ($Fault) {
     'UserUmip' { 'user-umip' }
     'SmpUnmap' { 'smp-unmap' }
     'SmpTlbTimeout' { 'smp-tlb-timeout' }
+    'UserFlushTimeout' { 'user-flush-timeout' }
     'TimerCalibration' { 'timer-calibration' }
     'ClockActivation' { 'clock-activation' }
     'Ps2BatTimeout' { 'ps2-bat-timeout' }
@@ -576,7 +623,8 @@ try {
             (Get-FileHash -LiteralPath $attachedDisk -Algorithm SHA256).Hash -ne $testDiskHash)) {
         throw 'The AHCI read-only probe modified its disposable disk image.'
     }
-    $expectedTlbTimeout = $Fault -eq 'SmpTlbTimeout'
+    # A missing kernel or user shootdown ACK panics and exits 35.
+    $expectedTimeout = $Fault -in @('SmpTlbTimeout', 'UserFlushTimeout')
     if ($Fault -eq 'PerfInvalid') {
         $panic = [regex]::Matches($serial, '(?m)^MIRROR_PANIC:[^\r\n]*\r?\nunknown smoke-test command line\r?$')
         if ($qemuExitCode -ne 35 -or $panic.Count -ne 1 -or
@@ -588,7 +636,7 @@ try {
         Write-Host 'PerfInvalid rejected the raw invalid token with one OFF and the expected panic.'
         return
     }
-    if (-not $expectedTlbTimeout -and $serial -match '(?im)^(?:MIRROR_PANIC|PANIC|\[panic\])') {
+    if (-not $expectedTimeout -and $serial -match '(?im)^(?:MIRROR_PANIC|PANIC|\[panic\])') {
         throw "Mirror reported a panic. See $serialLog."
     }
     $fatalKernelFault = $Fault -in @('PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'ThreadStackOverflow', 'KernelSmep', 'KernelSmap')
@@ -600,7 +648,7 @@ try {
     # A reset case restarts after every self-test, and -no-reboot turns the
     # guest reset into a QEMU exit with code 0 (spec 0058a, D11).
     $resetCase = $Fault -like 'Reset*'
-    $expectedExitCode = if ($fatalKernelFault -or $expectedTlbTimeout) { 35 } elseif ($resetCase) { 0 } else { 33 }
+    $expectedExitCode = if ($fatalKernelFault -or $expectedTimeout) { 35 } elseif ($resetCase) { 0 } else { 33 }
     if ($qemuExitCode -ne $expectedExitCode) {
         $qemuError = [System.IO.File]::ReadAllText($stderrLog)
         throw "Mirror smoke test expected QEMU exit $expectedExitCode; got $qemuExitCode. $qemuError See $serialLog."
@@ -1127,7 +1175,7 @@ try {
             throw "Mirror must report $threadMarker exactly $expectedCount time(s). See $serialLog."
         }
     }
-    if (-not $expectedTlbTimeout -and -not $fatalKernelFault) {
+    if (-not $expectedTimeout -and -not $fatalKernelFault) {
         if ($resetCase) {
             # The restart replaces the smoke tail's expected #PF.
             if ($serial -match '(?m)^MIRROR_(?:PAGE_FAULT_OK|BOOT_OK)(?:\s|$)') {

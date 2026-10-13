@@ -27,7 +27,7 @@ use crate::{
     ipc::{Ipc, IpcError, MESSAGE_SIZE},
     kernel_va::{self, KernelStack, KvaError},
     memory::{FrameAllocator, PAGE_SIZE},
-    paging::{PageTables, PagingError, UserAddressSpace, UserPermissions},
+    paging::{PageTables, PagingError, UserAddressSpace, UserPermissions, Withdrawal},
     ps2, serial, stacks, surface, timer, vm, windows,
 };
 use mirror_clock_protocol as clock_abi;
@@ -588,7 +588,8 @@ impl Process {
 
     /// Record the outcome and finish every thread, taking each off the run
     /// queue and every wait queue. Threads keep their slots until the process
-    /// is reaped.
+    /// is reaped. A thread still on a CPU returns to its scheduler at its next
+    /// trap; teardown waits for that (`quiescent`, spec 0051 point 8).
     fn finish(&mut self, outcome: Outcome) {
         assert!(self.outcome.is_none());
         self.outcome = Some(outcome);
@@ -631,11 +632,22 @@ impl Process {
         self.surface_frames == 0 && self.space.owned_table_count() == 0
     }
 
+    /// Whether no thread of this process is on a CPU and no CPU has its root
+    /// loaded, so its threads and address space may be torn down (spec 0051,
+    /// point 8).
+    fn quiescent(&self) -> bool {
+        self.threads().all(|thread| !thread.on_cpu) && self.space.loaded_cpus() == 0
+    }
+
     /// Release a finished process's thread entries, once no thread context
     /// is in use. The zombie keeps only its outcome, counters, handles and
     /// address space until its session validates and reaps it (0030-D5).
     fn release_threads(&mut self) {
         assert!(self.finished(), "released a live process's threads");
+        assert!(
+            self.quiescent(),
+            "released the threads of a process on a CPU"
+        );
         for index in 0..thread_abi::MAX_THREADS {
             if self.members[index] != sched::NO_SLOT {
                 self.remove_member(index);
@@ -2067,11 +2079,13 @@ fn trim_recovery_test(
     release_stack(second);
     memory::arm_frame_budget(0);
     assert_eq!(
-        materialize_or_kill(kernel, process, frames, base, 1, true),
+        materialize_or_kill(kernel, slot, frames, base, 1, true),
         Ok(()),
         "the trim must cover the failure without a kill"
     );
     memory::lift_frame_budget();
+    // SAFETY: As above; the borrow before the page-in has ended.
+    let process = unsafe { sched::process(slot) };
     // SAFETY: the process never ran; release returns the page's frame.
     unsafe {
         process
@@ -2295,12 +2309,16 @@ fn resume_process(kernel: &PageTables, frames: &mut FrameAllocator<'_>, owner: u
         complete_create(kernel, frames, process, start);
         process.thread_mut().state = State::Running;
     }
-    // SAFETY: As above; no user context or interrupt handler is active here.
-    let process = unsafe { sched::process(owner) };
     // Deferred copy/syscall work completes with the session still published.
-    if let State::Memory(request) = process.thread().state {
-        complete_memory(kernel, process, frames, request);
+    // A release or protection change may release the scheduler lock for its
+    // shootdowns, so it borrows the process afresh for each step.
+    // SAFETY: As above; no user context or interrupt handler is active here,
+    // and this borrow ends at once.
+    if let State::Memory(request) = unsafe { sched::process(owner) }.thread().state {
+        complete_memory(kernel, owner, frames, request);
     }
+    // SAFETY: As above.
+    let process = unsafe { sched::process(owner) };
     // A creation deferred through a syscall-buffer page-in completes here,
     // and the creator rejoins the run queue, as after any page-in.
     if let State::Creating(start) = process.thread().state {
@@ -2322,6 +2340,12 @@ fn resume_process(kernel: &PageTables, frames: &mut FrameAllocator<'_>, owner: u
     // Its FPU image is stored and its request completed: another CPU may
     // dispatch it, or complete its waits, from now on (spec 0051, point 2).
     thread.on_cpu = false;
+    // Only now, with its stack freed and the thread off this CPU, may a
+    // joiner reap an exited thread's entry (spec 0051, point 8).
+    if let (State::Exited(_), Some(tid)) = (thread.state, thread.joiner) {
+        let joiner = member_by_id(process, tid).expect("join waiter exists");
+        sched::signal(process.members[joiner], None);
+    }
 }
 
 /// Run the current thread of process slot `owner` in user mode on its own
@@ -2362,7 +2386,10 @@ fn enter_user(kernel: &PageTables, owner: usize) {
         // SAFETY: As above.
         let process = unsafe { sched::process(owner) };
         // SAFETY: IF=0, and the shared upper mappings cover both kernel
-        // stacks. The root stays live while the thread is on this CPU.
+        // stacks. The root stays live while the thread is on this CPU: its
+        // process is torn down only once no CPU has the root loaded and no
+        // thread is on a CPU. This CPU's bit in the space's mask is set before
+        // the root loads (spec 0051, point 8).
         unsafe { process.space.activate() }.expect("activate user root");
     }
     sched::unlocked(|| {
@@ -2375,10 +2402,12 @@ fn enter_user(kernel: &PageTables, owner: usize) {
     // SAFETY: The user is suspended and IF remains clear. The placeholder is
     // the BSP's guarded RSP0 stack, mapped in every root (0050-D2).
     unsafe { interrupts::set_kernel_stack(stacks::bsp_rsp0_top()) };
-    // SAFETY: All handlers returned, the user is suspended, and IF remains clear.
-    unsafe { kernel.activate() }.expect("restore kernel root");
     // SAFETY: As above; every handler has unwound.
     let process = unsafe { sched::process(owner) };
+    // SAFETY: All handlers returned, the user is suspended, and IF remains
+    // clear. This CPU's bit in the mask clears once the kernel root has
+    // replaced the user's (spec 0051, point 8).
+    unsafe { process.space.deactivate(kernel) }.expect("restore kernel root");
     process.thread_mut().context.extended = extended;
     #[cfg(feature = "boot-smoke")]
     crate::fpu::assert_kernel_clean();
@@ -2414,9 +2443,8 @@ fn record_latency(process: &mut Process, resumed: bool) {
 /// and release its threads, close its handles, and destroy its address space
 /// immediately; the zombie keeps only the outcome, and reap skips the destroy.
 fn kill_oom_victim(slot: usize, frames: &mut FrameAllocator<'_>) {
-    // SAFETY: The scheduler selected this occupied slot and holds no other
-    // reference to it; the victim is not running, since only the BSP runs
-    // user threads (spec 0051, step 1).
+    // SAFETY: The scheduler holds the lock, selected this occupied slot and
+    // holds no other reference to it.
     let process = unsafe { sched::process(slot) };
     serial::println!(
         "MIRROR_OOM_KILL class={} pid={}",
@@ -2424,36 +2452,57 @@ fn kill_oom_victim(slot: usize, frames: &mut FrameAllocator<'_>) {
         process.pid
     );
     process.finish(Outcome::OutOfMemory);
+    // Only the BSP runs user threads, and it is completing the requester's
+    // request, so the victim is quiescent: no thread of it is on a CPU and no
+    // CPU has its root loaded (spec 0051, point 8). release_threads and
+    // destroy both check this.
     process.release_threads();
     with_ipc(|ipc| release_handles(process, ipc));
-    // SAFETY: no thread is current and no handler retains a reference into
-    // the victim's tree; its frames return to the pool at once.
+    // SAFETY: No CPU has the victim's root loaded, no thread is current, and
+    // no handler retains a reference into its tree; its frames return to the
+    // pool at once.
     unsafe { process.space.destroy(frames) }.expect("OOM victim address space");
     process.space_destroyed = true;
 }
 
-/// 0054-D5: a frame-starved materialize kills one lower-class victim per round
-/// and retries, bounded, stopping when no candidate remains.
+/// 0054-D5: a frame-starved materialize for the current thread of process
+/// slot `owner` kills one lower-class victim per round and retries, bounded,
+/// stopping when no candidate remains. A trim of the stack pool releases the
+/// scheduler lock for its shootdowns, so the process is borrowed afresh for
+/// each attempt. If a sibling on another CPU ended the process meanwhile,
+/// this returns `NoFrames` and the caller, which checks for that first,
+/// leaves the finished thread alone.
 fn materialize_or_kill(
     kernel: &PageTables,
-    process: &mut Process,
+    owner: usize,
     frames: &mut FrameAllocator<'_>,
     address: u64,
     length: usize,
     write: bool,
 ) -> Result<(), vm::VmError> {
     loop {
-        // SAFETY: The saved faulting instruction has not resumed. The
-        // allocator is unique and all affected user mappings are inactive.
-        let result = unsafe {
-            process.vm.materialize(
-                &mut process.space,
-                frames,
-                process.direct_map,
-                address,
-                length,
-                write,
-            )
+        let (result, class) = {
+            // SAFETY: The scheduler holds the lock and no other process
+            // reference; this borrow ends with the block, before a trim can
+            // release the lock.
+            let process = unsafe { sched::process(owner) };
+            if process.finished() {
+                return Err(vm::VmError::NoFrames);
+            }
+            // SAFETY: The saved faulting instruction has not resumed. The BSP
+            // runs this with the kernel root active and its unique allocator;
+            // no DMA uses user pages.
+            let result = unsafe {
+                process.vm.materialize(
+                    &mut process.space,
+                    frames,
+                    process.direct_map,
+                    address,
+                    length,
+                    write,
+                )
+            };
+            (result, process.memory_class)
         };
         match result {
             Err(vm::VmError::NoFrames) => {
@@ -2464,8 +2513,7 @@ fn materialize_or_kill(
                 if drain_stacks(kernel, frames).stacks > 0 {
                     continue;
                 }
-                let requester = Some((sched::slot_of(process), process.memory_class));
-                let Some(victim) = sched::select_victim(requester) else {
+                let Some(victim) = sched::select_victim(Some((owner, class))) else {
                     return Err(vm::VmError::NoFrames);
                 };
                 kill_oom_victim(victim, frames);
@@ -2476,62 +2524,142 @@ fn materialize_or_kill(
     }
 }
 
-/// Complete bounded VM work with the kernel root active and no interrupt frames
-/// or published process borrow. Disjoint I/O sessions remain borrowed by resume.
+/// Complete bounded VM work for the current thread of process slot `owner`,
+/// with the kernel root active and no interrupt frames. Disjoint I/O sessions
+/// remain borrowed by resume. A release or protection change runs in batches
+/// and releases the scheduler lock while each batch's shootdown waits (spec
+/// 0051, point 8), and a page-in's trim does too, so no process borrow lives
+/// across one.
 fn complete_memory(
     kernel: &PageTables,
-    process: &mut Process,
+    owner: usize,
     frames: &mut FrameAllocator<'_>,
     request: MemoryRequest,
 ) {
     assert!(!interrupts::user_context_active());
     assert!(!arch::interrupts_enabled());
-    match request {
-        MemoryRequest::Operation => {
-            let frame = process.thread().context.frame;
-            let result = match frame.rax {
-                vm_abi::SYS_VM_RESERVE => process
-                    .vm
-                    .reserve(frame.rdi, frame.rsi, frame.rdx)
-                    .map(|address| address as i64),
-                vm_abi::SYS_VM_RELEASE if frame.rdx != 0 => Err(-22),
-                vm_abi::SYS_VM_RELEASE => {
-                    // SAFETY: The inactive tree belongs only to this suspended
-                    // process; all its threads are suspended, with no DMA or references.
-                    unsafe {
-                        process
-                            .vm
-                            .release(&mut process.space, frames, frame.rdi, frame.rsi)
-                    }
-                    .map(|()| 0)
-                }
-                vm_abi::SYS_VM_PROTECT => {
-                    // SAFETY: Kernel CR3 is active; all user threads are suspended.
-                    unsafe {
-                        process
-                            .vm
-                            .protect(&mut process.space, frame.rdi, frame.rsi, frame.rdx)
-                    }
-                    .map(|()| 0)
-                }
-                _ => unreachable!("invalid deferred VM operation"),
-            };
-            if result.is_ok() && frame.rax != vm_abi::SYS_VM_RESERVE {
-                // Invalidate the old wait key before any sibling can run or
-                // re-reserve this address. Failed transactional changes leave
-                // waiters untouched. No backing page or raw pointer is pinned.
-                invalidate_waits(
-                    process,
-                    frame.rdi,
-                    frame.rsi,
-                    frame.rax == vm_abi::SYS_VM_RELEASE || frame.rdx == vm_abi::PROT_NONE,
-                );
+    if request != MemoryRequest::Operation {
+        complete_page_in(kernel, owner, frames, request);
+        return;
+    }
+    // SAFETY: As above; this borrow ends with the statement.
+    let frame = unsafe { sched::process(owner) }.thread().context.frame;
+    let result = match frame.rax {
+        // SAFETY: As above.
+        vm_abi::SYS_VM_RESERVE => unsafe { sched::process(owner) }
+            .vm
+            .reserve(frame.rdi, frame.rsi, frame.rdx)
+            .map(|address| address as i64),
+        vm_abi::SYS_VM_RELEASE if frame.rdx != 0 => Err(-22),
+        vm_abi::SYS_VM_RELEASE => complete_removal(owner, frames, |process| {
+            process.vm.begin_release(frame.rdi, frame.rsi)
+        }),
+        vm_abi::SYS_VM_PROTECT => complete_removal(owner, frames, |process| {
+            process
+                .vm
+                .begin_protect(&process.space, frame.rdi, frame.rsi, frame.rdx)
+        }),
+        _ => unreachable!("invalid deferred VM operation"),
+    };
+    // SAFETY: As above; no other borrow is live.
+    let process = unsafe { sched::process(owner) };
+    // A sibling on another CPU may have ended the process while a shootdown
+    // waited; its threads are finished then, this one included.
+    if process.finished() {
+        return;
+    }
+    if result.is_ok() && frame.rax != vm_abi::SYS_VM_RESERVE {
+        // Cancel the old wait keys before this thread runs again. The ledger
+        // changed first, so no sibling began a wait in the interval since.
+        // Failed transactional changes leave waiters untouched. No backing
+        // page or raw pointer is pinned.
+        invalidate_waits(
+            process,
+            frame.rdi,
+            frame.rsi,
+            frame.rax == vm_abi::SYS_VM_RELEASE || frame.rdx == vm_abi::PROT_NONE,
+        );
+    }
+    process.thread_mut().context.frame.rax = result.unwrap_or_else(|error| error) as u64;
+    process.thread_mut().state = State::Ready;
+}
+
+/// Run a release or protection change that `begin` starts on the process in
+/// slot `owner`, one batch at a time (spec 0051, point 8): withdraw or change
+/// up to a batch of leaves and read the space's mask under the scheduler
+/// lock; then, when some other CPU has the root loaded, release the lock,
+/// flush those CPUs and free the batch's frames, and retake it. Returns 0, or
+/// the error `begin` refused with before anything changed.
+fn complete_removal(
+    owner: usize,
+    frames: &mut FrameAllocator<'_>,
+    begin: impl FnOnce(&mut Process) -> Result<vm::Removal, i64>,
+) -> Result<i64, i64> {
+    // SAFETY: The scheduler holds the lock and no other process reference;
+    // each borrow below ends before the lock can be released.
+    let mut removal = begin(unsafe { sched::process(owner) })?;
+    while !removal.is_done() {
+        let mut batch = Withdrawal::empty();
+        let (root, targets) = {
+            // SAFETY: As above.
+            let process = unsafe { sched::process(owner) };
+            if process.finished() {
+                // A sibling ended the process during a shootdown: its
+                // teardown frees whatever is left.
+                break;
             }
-            process.thread_mut().context.frame.rax = result.unwrap_or_else(|error| error) as u64;
-            process.thread_mut().state = State::Ready;
+            // SAFETY: The BSP with IF=0 and the kernel root active; the
+            // process's tables change only here, and no DMA uses its pages.
+            let changed = unsafe {
+                process
+                    .vm
+                    .step(&mut removal, &mut process.space, &mut batch)
+            };
+            let targets = if changed == 0 {
+                0
+            } else {
+                process.space.shootdown_targets()
+            };
+            (process.space.root_physical_address(), targets)
+        };
+        if targets == 0 {
+            // SAFETY: No CPU had the root loaded after the batch's changes.
+            unsafe { vm::finish_batch(root, 0, &mut batch, frames) };
+        } else {
+            // The flush waits for other CPUs, which may spin on the lock.
+            sched::unlocked(|| {
+                // SAFETY: The targets were read after the batch's changes. The
+                // process stays in its slot: it is torn down only once no
+                // thread is on a CPU, and this one is on this CPU.
+                unsafe { vm::finish_batch(root, targets, &mut batch, frames) }
+            });
         }
+    }
+    Ok(0)
+}
+
+/// Complete a deferred page-in for the current thread of process slot
+/// `owner`: a demand fault, or a syscall's buffer, which the syscall then
+/// runs with.
+fn complete_page_in(
+    kernel: &PageTables,
+    owner: usize,
+    frames: &mut FrameAllocator<'_>,
+    request: MemoryRequest,
+) {
+    match request {
+        MemoryRequest::Operation => unreachable!("a VM operation is not a page-in"),
         MemoryRequest::Fault { address, error } => {
-            let result = materialize_or_kill(kernel, process, frames, address, 1, error & 2 != 0);
+            let result = materialize_or_kill(kernel, owner, frames, address, 1, error & 2 != 0);
+            // SAFETY: The scheduler holds the lock and no other process
+            // reference.
+            let process = unsafe { sched::process(owner) };
+            // A sibling on another CPU may have ended the process while a trim
+            // released the lock; its threads are finished then, this one
+            // included.
+            if process.finished() {
+                return;
+            }
             if result.is_ok() {
                 #[cfg(feature = "boot-smoke")]
                 {
@@ -2552,10 +2680,17 @@ fn complete_memory(
             length,
             writable,
         } => {
-            // SAFETY: Complete access validation preceded this deferral; repeat
-            // it in materialize before allocating or performing syscall work.
-            // 0054-D5: frame starvation kills a lower-class victim and retries.
-            let result = materialize_or_kill(kernel, process, frames, address, length, writable);
+            // 0054-D5: frame starvation kills a lower-class victim and
+            // retries. Complete access validation preceded this deferral;
+            // materialize repeats it before allocating or performing syscall
+            // work.
+            let result = materialize_or_kill(kernel, owner, frames, address, length, writable);
+            // SAFETY: As above.
+            let process = unsafe { sched::process(owner) };
+            // As above: a sibling may have ended the process meanwhile.
+            if process.finished() {
+                return;
+            }
             if let Err(error) = result {
                 process.thread_mut().context.frame.rax = (if error.errno() == -12 {
                     -12_i64
@@ -2798,10 +2933,16 @@ impl ShellRuntime<'_> {
         Ok(handle)
     }
 
+    /// Reap and destroy a finished child that is quiescent (spec 0051,
+    /// point 8).
     fn reclaim(&mut self, index: usize, frames: &mut FrameAllocator<'_>, ipc: &mut Ipc) {
         let slot = self.children[index]
             .take()
             .expect("reclaim live child slot");
+        // SAFETY: The scheduler holds no other reference to the child; this
+        // borrow ends with the statement.
+        let quiescent = unsafe { sched::process(slot) }.quiescent();
+        assert!(quiescent, "reclaimed a child that is on a CPU");
         // SAFETY: The scheduler holds no reference to the child; reap checks
         // that it finished.
         let mut child = unsafe { sched::reap(slot) };
@@ -2848,17 +2989,23 @@ impl ShellRuntime<'_> {
         );
     }
 
+    /// Reclaim every finished child that is quiescent; one still on a CPU
+    /// waits for a later pass (spec 0051, point 8).
     fn reclaim_finished(&mut self, frames: &mut FrameAllocator<'_>, ipc: &mut Ipc) {
         for index in 0..self.children.len() {
             if self.children[index].is_some_and(|slot| {
                 // SAFETY: The scheduler holds no other reference to the child.
-                unsafe { sched::process(slot) }.finished()
+                let child = unsafe { sched::process(slot) };
+                child.finished() && child.quiescent()
             }) {
                 self.reclaim(index, frames, ipc);
             }
         }
     }
 
+    /// Close the app `pid`: finish its process, reclaim it, and destroy its
+    /// window resources. None means the finished child still has a thread on
+    /// a CPU, and the close completes in a later pass (spec 0051, point 8).
     fn close(
         &mut self,
         frames: &mut FrameAllocator<'_>,
@@ -2866,17 +3013,15 @@ impl ShellRuntime<'_> {
         ipc: &mut Ipc,
         pid: u64,
         reason: Outcome,
-    ) -> Result<(), i64> {
-        let index = self
-            .windows
-            .applications
-            .iter()
-            .position(|entry| {
-                entry
-                    .as_ref()
-                    .is_some_and(|application| application.pid == pid)
-            })
-            .ok_or(-9)?;
+    ) -> Option<Result<(), i64>> {
+        let index = self.windows.applications.iter().position(|entry| {
+            entry
+                .as_ref()
+                .is_some_and(|application| application.pid == pid)
+        });
+        let Some(index) = index else {
+            return Some(Err(-9));
+        };
         if let Some(slot) = self.children[index] {
             // SAFETY: The child's slot is distinct from the shell's, and this
             // borrow ends before reclaim removes the entry.
@@ -2884,6 +3029,9 @@ impl ShellRuntime<'_> {
             assert!(child.threads().all(|thread| thread.state != State::Running));
             if !child.finished() {
                 child.finish(reason);
+            }
+            if !child.quiescent() {
+                return None;
             }
             self.reclaim(index, frames, ipc);
         }
@@ -2904,14 +3052,14 @@ impl ShellRuntime<'_> {
             self.windows.closes += 1;
         }
         serial::println!("MIRROR_APP_CLOSED pid={} surfaces_reclaimed=1", pid);
-        Ok(())
+        Some(Ok(()))
     }
 }
 
 /// Record the current thread's suspension (0030-D2). A blocking state
 /// snapshots the thread's charge and attaches it to its event queue and, for
 /// a timed wait, the deadline heap. A joiner waits on its target's `joiner`
-/// field, so an exit signals that joiner instead.
+/// field, so the scheduler signals that joiner once the exit is complete.
 fn park(process: &mut Process, state: State) {
     let owner = process.thread().process;
     let (queue, deadline) = match state {
@@ -2929,14 +3077,8 @@ fn park(process: &mut Process, state: State) {
             pending.deadline,
         ),
         State::Joining(_) => (None, None),
-        State::Exited(_) => {
-            if let Some(tid) = process.thread().joiner {
-                let joiner = member_by_id(process, tid).expect("join waiter exists");
-                sched::signal(process.members[joiner], None);
-            }
-            process.thread_mut().state = state;
-            return;
-        }
+        // An exit signals its joiner only once its stack is freed, as the
+        // scheduler finishes with it (resume_process, spec 0051 point 8).
         _ => {
             process.thread_mut().state = state;
             return;
@@ -3053,12 +3195,17 @@ fn complete_wait(
             Some(result)
         }
         State::Joining(tid) => {
-            // The target's exit signaled this join after its context was
-            // saved and its pointer released, so it is reaped here.
+            // The target's exit signaled this join once its stack was freed
+            // and it left its CPU, so it is reaped here.
             let target = member_by_id(process, tid).expect("join target exists");
-            let State::Exited(status) = process.member(target).expect("join target").state else {
+            let exited = process.member(target).expect("join target");
+            let State::Exited(status) = exited.state else {
                 panic!("join signaled before its target exited");
             };
+            assert!(
+                exited.stack.is_none() && !exited.on_cpu,
+                "join signaled before its target left its CPU"
+            );
             process.thread_mut().context.frame.rdx = status;
             process.remove_member(target);
             #[cfg(feature = "boot-smoke")]
@@ -3118,16 +3265,21 @@ fn wait_word(process: &mut Process, frame: &TrapFrame) -> Result<State, i64> {
     if !thread_abi::wait_word_address_valid(frame.rdi) {
         return Err(-14);
     }
-    let mut bytes = [0; thread_abi::WAIT_WORD_SIZE as usize];
     // Check ledger permissions too: PROT_NONE may retain physical backing.
     process
         .vm
-        .preflight(&process.space, frame.rdi, bytes.len(), false)
+        .preflight(
+            &process.space,
+            frame.rdi,
+            thread_abi::WAIT_WORD_SIZE as usize,
+            false,
+        )
         .map_err(|_| -14)?;
-    // SAFETY: User execution is stopped on the BSP. The checked copy translates
-    // every byte through owned user mappings, with no concurrent user writer.
-    unsafe { process.space.copy_from_user(frame.rdi, &mut bytes) }.map_err(|_| -14)?;
-    if u64::from(u32::from_le_bytes(bytes)) != frame.rsi {
+    // SAFETY: Only the BSP edits the tables, under the lock this handler
+    // holds. Siblings may write the word from other CPUs, so it is read with
+    // one atomic load (spec 0051, point 7); the lock orders it against wakes.
+    let word = unsafe { process.space.read_word(frame.rdi) }.map_err(|_| -14)?;
+    if u64::from(word) != frame.rsi {
         return Err(-11);
     }
     if frame.rdx == 0 {
@@ -3339,7 +3491,13 @@ fn join_thread(process: &mut Process, frame: &mut TrapFrame) -> Result<Option<St
     if target.joiner.is_some() {
         return Err(-16);
     }
-    if let State::Exited(status) = target.state {
+    // An exited thread still on its CPU keeps its stack until that CPU's
+    // scheduler frees it; the join then waits for that scheduler's signal
+    // (spec 0051, point 8).
+    if let State::Exited(status) = target.state
+        && !target.on_cpu
+    {
+        assert!(target.stack.is_none(), "an exited thread kept its stack");
         frame.rdx = status;
         process.remove_member(index);
         #[cfg(feature = "boot-smoke")]
@@ -3469,6 +3627,7 @@ pub fn run_shell(
         let desktop = unsafe { sched::process(shell) };
         runtime
             .close(frames, desktop, &mut ipc, pid, Outcome::SessionEnded)
+            .expect("a closed app still on a CPU at session end")
             .expect("shell child cancellation");
     }
     // The shell is a zombie now: finished, with its thread entries released.

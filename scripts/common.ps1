@@ -1306,7 +1306,7 @@ function Assert-MirrorHeapGrowth {
                 throw 'Heap capacity checks must follow the final SMP rendezvous.'
             }
         }
-        $faults = [regex]::Matches($Serial, '(?m)^MIRROR_SMP_(?:GUARD_OK|UNMAP_OK|TLB_TIMEOUT_ARMED)(?:\s|$)')
+        $faults = [regex]::Matches($Serial, '(?m)^MIRROR_(?:SMP_(?:GUARD_OK|UNMAP_OK|TLB_TIMEOUT_ARMED)|USER_FLUSH_TIMEOUT_ARMED)(?:\s|$)')
         foreach ($fault in $faults) {
             if ($fault.Index -le $limit[0].Index) {
                 throw 'Heap capacity checks must precede destructive SMP tests.'

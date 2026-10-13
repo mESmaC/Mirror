@@ -1,11 +1,18 @@
 //! Per-process anonymous virtual memory. Region edits are planned before page
-//! tables change; physical work runs only after the user root is suspended.
-//! Release/protect skip absent paging subtrees. Resident work remains bounded
-//! by 8192 pages per process and is not yet preemptible on the single boot CPU.
+//! tables change, and only the BSP changes them, while sibling threads may
+//! run the space on other CPUs (spec 0051, points 7 and 8). A page-in takes
+//! every frame it needs before it publishes anything. A release or protection
+//! change updates the ledger first, then changes resident leaves in batches;
+//! each batch's CPUs flush before its frames are freed. Release/protect skip
+//! absent paging subtrees. Resident work remains bounded by 8192 pages per
+//! process.
 
 use crate::{
     memory::{FrameAllocator, PAGE_SIZE},
-    paging::{PagingError, UserAddressSpace, UserPermissions},
+    paging::{
+        FrameReserve, PagingError, UserAddressSpace, UserPermissions, WITHDRAW_BATCH, Withdrawal,
+    },
+    smp,
 };
 
 use mirror_vm_protocol::{ARENA_END, ARENA_START, MAX_REGIONS, RESERVED_LIMIT};
@@ -250,55 +257,33 @@ impl Vm {
         Ok(start)
     }
 
-    /// Release any completely reserved page interval, including a subrange.
-    /// Metadata capacity and holes are checked before any page is withdrawn.
-    ///
-    /// # Safety
-    /// The user's root must be inactive on the sole CPU with interrupts off.
-    /// Use its original allocator and exclude live references/DMA to its pages.
-    pub unsafe fn release(
-        &mut self,
-        space: &mut UserAddressSpace,
-        frames: &mut FrameAllocator<'_>,
-        start: u64,
-        length: u64,
-    ) -> Result<(), i64> {
+    /// Begin releasing a completely reserved page interval, including a
+    /// subrange. Metadata capacity and holes are checked first; then the
+    /// ledger drops the interval, so no new access, wait or page-in can
+    /// start in it, and `step` withdraws its resident pages.
+    pub fn begin_release(&mut self, start: u64, length: u64) -> Result<Removal, i64> {
         let end = check_interval(start, length)?;
-        let next = self.regions.edit(start, end, None)?;
-        let mut cursor = start;
-        while cursor < end {
-            let Some(address) = space
-                .next_owned_page(cursor, end)
-                .expect("anonymous release encountered invalid owned tables")
-            else {
-                break;
-            };
-            // SAFETY: The caller suspended the sole owner; every address is an
-            // aligned private anonymous page and allocator ownership is unique.
-            let removed = unsafe { space.unmap_page(address, frames) }
-                .expect("anonymous release violated paging ownership");
-            assert!(removed, "owned anonymous leaf disappeared");
-            self.committed -= PAGE_SIZE;
-            cursor = address + PAGE_SIZE;
-        }
-        self.regions = next;
+        self.regions = self.regions.edit(start, end, None)?;
         self.reserved -= length;
-        Ok(())
+        Ok(Removal {
+            cursor: start,
+            end,
+            change: None,
+        })
     }
 
-    /// Change promises and existing leaves together. NONE retains physical
-    /// backing while denying user access, so restoring access preserves bytes.
-    ///
-    /// # Safety
-    /// The root is inactive on the sole CPU with interrupts disabled. No live
-    /// references or DMA may rely on the old permissions during this operation.
-    pub unsafe fn protect(
+    /// Begin changing promises and existing leaves together. The interval and
+    /// every resident leaf in it are checked first, so the change cannot fail
+    /// partway; then the ledger changes and `step` changes the leaves. NONE
+    /// retains physical backing while denying user access, so restoring
+    /// access preserves bytes.
+    pub fn begin_protect(
         &mut self,
-        space: &mut UserAddressSpace,
+        space: &UserAddressSpace,
         start: u64,
         length: u64,
         protection: u64,
-    ) -> Result<(), i64> {
+    ) -> Result<Removal, i64> {
         check_protection(protection)?;
         let end = check_interval(start, length)?;
         let next = self.regions.edit(start, end, Some(protection))?;
@@ -310,46 +295,119 @@ impl Vm {
         .permissions();
         let mut cursor = start;
         while cursor < end {
-            let address = match space.next_owned_page(cursor, end) {
-                Ok(Some(address)) => address,
-                Ok(None) => break,
-                Err(error) => {
-                    // SAFETY: Restore the same inactive hierarchy's already
-                    // modified prefix before reporting the malformed later path.
-                    unsafe { self.restore_protection(space, start, cursor) };
-                    return Err(paging_error(error));
-                }
+            let Some(address) = space.next_owned_page(cursor, end).map_err(paging_error)? else {
+                break;
             };
-            // SAFETY: Same inactive, exclusive hierarchy contract as this API.
-            if let Err(error) = unsafe { space.protect_page(address, permissions) } {
-                // SAFETY: Rollback restores exactly the old ledger permissions
-                // on the same suspended hierarchy, excluding the failed leaf.
-                unsafe { self.restore_protection(space, start, address) };
-                return Err(paging_error(error));
-            }
+            space
+                .check_protect(address, permissions)
+                .map_err(paging_error)?;
             cursor = address + PAGE_SIZE;
         }
         self.regions = next;
+        Ok(Removal {
+            cursor: start,
+            end,
+            change: Some(permissions),
+        })
+    }
+
+    /// Withdraw or change the removal's next batch of resident leaves, at
+    /// most WITHDRAW_BATCH entries, and return how many leaves changed. The
+    /// caller then reads the space's shootdown targets and passes them, with
+    /// the batch, to `finish_batch` (spec 0051, point 8).
+    ///
+    /// # Safety
+    /// Run on the BSP with IF=0, on the Vm and space the removal began on;
+    /// this CPU does not run the space. No live reference or DMA may access
+    /// its pages or rely on their old permissions.
+    pub unsafe fn step(
+        &mut self,
+        removal: &mut Removal,
+        space: &mut UserAddressSpace,
+        batch: &mut Withdrawal,
+    ) -> usize {
+        let mut changed = 0;
+        while removal.cursor < removal.end && batch.has_room() && changed < WITHDRAW_BATCH {
+            let Some(address) = space
+                .next_owned_page(removal.cursor, removal.end)
+                .expect("anonymous removal encountered invalid owned tables")
+            else {
+                removal.cursor = removal.end;
+                break;
+            };
+            match removal.change {
+                None => {
+                    // SAFETY: The caller's contract; every address is an
+                    // aligned private anonymous page.
+                    let removed = unsafe { space.withdraw_page(address, batch) }
+                        .expect("anonymous release violated paging ownership");
+                    assert!(removed, "owned anonymous leaf disappeared");
+                    self.committed -= PAGE_SIZE;
+                }
+                // SAFETY: As above; begin_protect checked this leaf, and only
+                // this removal has changed the tables since.
+                Some(permissions) => unsafe { space.protect_page(address, permissions) }
+                    .expect("checked anonymous protection change"),
+            }
+            changed += 1;
+            removal.cursor = address + PAGE_SIZE;
+        }
+        changed
+    }
+
+    /// Release a completely reserved interval, flushing each batch's CPUs
+    /// before its frames are freed. The scheduler drives a process's release
+    /// batch by batch instead, so it can release its lock for each flush.
+    ///
+    /// # Safety
+    /// As for `step` and `finish_batch`.
+    #[cfg(feature = "boot-smoke")]
+    pub unsafe fn release(
+        &mut self,
+        space: &mut UserAddressSpace,
+        frames: &mut FrameAllocator<'_>,
+        start: u64,
+        length: u64,
+    ) -> Result<(), i64> {
+        let mut removal = self.begin_release(start, length)?;
+        while !removal.is_done() {
+            let mut batch = Withdrawal::empty();
+            // SAFETY: The caller's contract.
+            let changed = unsafe { self.step(&mut removal, space, &mut batch) };
+            let targets = if changed == 0 {
+                0
+            } else {
+                space.shootdown_targets()
+            };
+            // SAFETY: The targets were read after the batch's withdrawals.
+            unsafe { finish_batch(space.root_physical_address(), targets, &mut batch, frames) };
+        }
         Ok(())
     }
 
-    /// Caller retains the inactive, exclusive hierarchy used by protect.
-    unsafe fn restore_protection(&self, space: &mut UserAddressSpace, start: u64, end: u64) {
-        let mut cursor = start;
-        while cursor < end {
-            let Some(address) = space
-                .next_owned_page(cursor, end)
-                .expect("anonymous protection rollback traversal")
-            else {
-                break;
-            };
-            let permissions = self.regions.containing(address).unwrap().permissions();
-            // SAFETY: This is exactly a previously modified owned leaf in the
-            // inactive root; the old ledger and its data backing remain intact.
-            unsafe { space.protect_page(address, permissions) }
-                .expect("anonymous protection rollback failed");
-            cursor = address + PAGE_SIZE;
+    /// Change promises and existing leaves together, flushing each batch's
+    /// CPUs. The scheduler drives a process's change batch by batch instead.
+    ///
+    /// # Safety
+    /// As for `step` and `finish_batch`.
+    #[cfg(feature = "boot-smoke")]
+    pub unsafe fn protect(
+        &mut self,
+        space: &mut UserAddressSpace,
+        start: u64,
+        length: u64,
+        protection: u64,
+    ) -> Result<(), i64> {
+        let mut removal = self.begin_protect(space, start, length, protection)?;
+        while !removal.is_done() {
+            let mut batch = Withdrawal::empty();
+            // SAFETY: The caller's contract.
+            if unsafe { self.step(&mut removal, space, &mut batch) } != 0 {
+                flush(space.root_physical_address(), space.shootdown_targets());
+            }
+            assert!(batch.is_empty(), "a protection change withdrew frames");
         }
+        Ok(())
     }
 
     /// Preflight every page before allocating or copying. Eager ELF/stack
@@ -385,13 +443,15 @@ impl Vm {
     }
 
     /// Resolve all granted missing pages in a buffer as one allocation
-    /// transaction. On failure, both previously existing contents and region
-    /// metadata survive; only newly installed pages/tables are reclaimed.
+    /// transaction. Every frame it needs, data pages and new tables alike, is
+    /// taken before anything is published, so a failure leaves nothing that a
+    /// sibling on another CPU could have seen (spec 0051, point 7). On
+    /// failure, both previously existing contents and region metadata survive.
     ///
     /// # Safety
-    /// Run with the kernel root active on the sole CPU and interrupts disabled.
-    /// `frames` is this space's allocator; `direct_map` maps all allocatable RAM
-    /// writable. No references or DMA may access the user's pages concurrently.
+    /// Run on the BSP with IF=0; this CPU does not run the space. `frames` is
+    /// this space's allocator; `direct_map` maps all allocatable RAM writable.
+    /// No DMA may access the user's pages.
     pub unsafe fn materialize(
         &mut self,
         space: &mut UserAddressSpace,
@@ -412,14 +472,14 @@ impl Vm {
             .unwrap();
         // A valid contiguous range containing a missing page is anonymous and
         // bounded by this process's reservation quota. This fixed bitmap keeps
-        // rollback off the heap and well below the kernel stack limit.
+        // the transaction off the heap and well below the kernel stack limit.
         if first < ARENA_START || end > ARENA_END || end - first > RESERVED_LIMIT {
             return Err(VmError::Fault);
         }
         let mut new_pages = [0_u64; RESIDENT_BITMAP_WORDS];
         let mut count = 0_u64;
-        #[cfg(feature = "boot-smoke")]
-        let mut installed = 0;
+        let mut tables = 0;
+        let mut previous = None;
         for (index, page) in (first..end).step_by(PAGE_SIZE as usize).enumerate() {
             if space
                 .translate(page)
@@ -428,84 +488,73 @@ impl Vm {
             {
                 new_pages[index / 64] |= 1 << (index % 64);
                 count += 1;
+                tables += space
+                    .missing_tables(page, previous)
+                    .map_err(VmError::from_paging)?;
+                previous = Some(page);
             }
         }
         if self.committed + count * PAGE_SIZE > self.committed_limit {
             return Err(VmError::QuotaExceeded);
         }
-        // 0054-D4: preflight this operation's worst-case frames against the
-        // reserve floor; one check per operation, so no partial operation
-        // straddles the floor. The data pages, plus every page-table page the
-        // span could miss: one P1 table per 512 pages (plus one for boundary
-        // misalignment), one P2 per 262144 pages (plus one), and one P3.
-        let worst_case = count + count / 512 + count / 262144 + 4;
-        if !frames.preflight_reserve(worst_case as usize, self.may_draw_reserve) {
+        // 0054-D4: preflight this operation's frames against the reserve
+        // floor; one check per operation, so no partial operation straddles
+        // the floor. The walk above counted exactly the data pages and the
+        // page tables their paths lack (spec 0051, point 7), which is the
+        // operation's worst case.
+        if !frames.preflight_reserve(count as usize + tables, self.may_draw_reserve) {
             return Err(VmError::NoFrames);
+        }
+        // Deterministic allocation failure (boot-smoke) stops the reservation
+        // after this many frames, through the same rollback as exhaustion.
+        #[cfg(feature = "boot-smoke")]
+        let budget = self.allocation_budget.unwrap_or(usize::MAX);
+        #[cfg(not(feature = "boot-smoke"))]
+        let budget = usize::MAX;
+        let mut reserve = FrameReserve::empty();
+        let mut reserved = Ok(());
+        for taken in 0..count as usize + tables {
+            if taken == budget {
+                reserved = Err(VmError::NoFrames);
+                break;
+            }
+            if let Err(error) = space.reserve_frame(&mut reserve, frames) {
+                reserved = Err(VmError::from_paging(error));
+                break;
+            }
+        }
+        if let Err(error) = reserved {
+            // SAFETY: Nothing was published; the reserve alone owns its frames.
+            unsafe { space.release_reserve(&mut reserve, frames) };
+            return Err(error);
         }
         for (index, page) in (first..end).step_by(PAGE_SIZE as usize).enumerate() {
             if new_pages[index / 64] & (1 << (index % 64)) == 0 {
                 continue;
             }
-            let result = (|| {
-                #[cfg(feature = "boot-smoke")]
-                if self
-                    .allocation_budget
-                    .is_some_and(|budget| installed == budget)
-                {
-                    return Err(VmError::NoFrames);
-                }
-                let physical = frames.allocate().ok_or(VmError::NoFrames)?;
-                let result = (|| {
-                    let destination = direct_map.checked_add(physical).ok_or(VmError::Fault)?;
-                    destination
-                        .checked_add(PAGE_SIZE - 1)
-                        .ok_or(VmError::Fault)?;
-                    let permissions = self
-                        .regions
-                        .containing(page)
-                        .unwrap()
-                        .permissions()
-                        .unwrap();
-                    // SAFETY: A fresh, exclusively owned full usable frame is
-                    // writable through HHDM; zero before publishing to userspace.
-                    unsafe {
-                        (destination as *mut u8).write_bytes(0, PAGE_SIZE as usize);
-                        space.map_page(page, physical, permissions, frames)
-                    }
-                    .map_err(VmError::from_paging)
-                })();
-                if result.is_err() {
-                    // SAFETY: map_page transfers ownership only on success;
-                    // no user or table mapping owns this rejected fresh frame.
-                    unsafe { frames.deallocate(physical) }.expect("unmapped anonymous frame");
-                }
-                result
-            })();
-            if let Err(error) = result {
-                // Also prune empty tables left by an unsuccessful map_page.
-                // SAFETY: No mapped leaf existed at this address before the
-                // transaction, and failure never transfers physical ownership.
-                let removed = unsafe { space.unmap_page(page, frames) }
-                    .expect("failed anonymous map cleanup");
-                assert!(!removed);
-                for (previous_index, previous) in
-                    (first..page).step_by(PAGE_SIZE as usize).enumerate()
-                {
-                    if new_pages[previous_index / 64] & (1 << (previous_index % 64)) != 0 {
-                        // SAFETY: These are exactly this transaction's newly
-                        // installed, inactive leaves, with no surviving aliases.
-                        let removed = unsafe { space.unmap_page(previous, frames) }
-                            .expect("anonymous materialization rollback");
-                        assert!(removed);
-                    }
-                }
-                return Err(error);
+            let physical = space
+                .take_reserved(&mut reserve)
+                .expect("reserved anonymous page");
+            let destination = direct_map
+                .checked_add(physical)
+                .expect("reserved frame direct map");
+            let permissions = self
+                .regions
+                .containing(page)
+                .unwrap()
+                .permissions()
+                .unwrap();
+            // SAFETY: A reserved, exclusively owned full usable frame, writable
+            // through the HHDM; it is zeroed before its Release publication.
+            // The reserve holds every table its path lacks, and the walks above
+            // checked that path, so nothing here can fail partway.
+            unsafe {
+                (destination as *mut u8).write_bytes(0, PAGE_SIZE as usize);
+                space.map_reserved(page, physical, permissions, &mut reserve)
             }
-            #[cfg(feature = "boot-smoke")]
-            {
-                installed += 1;
-            }
+            .expect("reserved anonymous mapping");
         }
+        assert!(reserve.is_empty(), "a page-in reserved unused frames");
         self.committed += count * PAGE_SIZE;
         Ok(())
     }
@@ -520,6 +569,53 @@ impl Vm {
                 .containing(address)
                 .is_some_and(|region| region.allows(error & 2 != 0))
     }
+}
+
+/// A release or protection change whose ledger change is made, with its
+/// resident leaves still to change, one batch per `Vm::step` (spec 0051,
+/// point 8).
+pub struct Removal {
+    cursor: u64,
+    end: u64,
+    /// None withdraws the pages; Some gives them these permissions.
+    change: Option<Option<UserPermissions>>,
+}
+
+impl Removal {
+    pub fn is_done(&self) -> bool {
+        self.cursor >= self.end
+    }
+}
+
+/// Make every CPU in `targets` drop its translations through `root`, and
+/// return how many had the root loaded. No targets, no IPI.
+fn flush(root: u64, targets: u64) -> usize {
+    if targets == 0 {
+        0
+    } else {
+        smp::flush_user(root, targets)
+    }
+}
+
+/// End one removal batch (spec 0051, point 8): flush every CPU in `targets`,
+/// then free the batch's frames. Returns how many targets had the root
+/// loaded. With targets, the caller holds no scheduler lock: the flush waits
+/// for other CPUs.
+///
+/// # Safety
+/// Run on the BSP with IF=0 and the allocator the frames came from.
+/// `targets` was read from the space's `shootdown_targets` after every
+/// withdrawal in the batch.
+pub unsafe fn finish_batch(
+    root: u64,
+    targets: u64,
+    batch: &mut Withdrawal,
+    frames: &mut FrameAllocator<'_>,
+) -> usize {
+    let reloaded = flush(root, targets);
+    // SAFETY: Every CPU that could translate through the batch has flushed.
+    unsafe { batch.release(frames) };
+    reloaded
 }
 
 fn check_protection(protection: u64) -> Result<(), i64> {
@@ -797,8 +893,11 @@ pub fn self_test(
         assert_eq!(frames.stats().unwrap().allocated_frames, before);
         assert!(space.translate(base).unwrap().unwrap().writable);
 
-        // Trigger an allocation failure only after pages on opposite sides of
-        // a one-GiB paging boundary exist, requiring leaf and table rollback.
+        // Pages on both sides of a one-GiB paging boundary need three data
+        // frames and three tables (a PT, then a PD and its PT). The page-in
+        // takes all six before it publishes anything (spec 0051, point 7), so
+        // a failure at the third frame publishes nothing and only returns the
+        // two reserved frames.
         let rollback = vm
             .reserve(base + (1 << 30) - PAGE_SIZE, 3 * PAGE_SIZE, READ_WRITE)
             .unwrap();
@@ -837,6 +936,8 @@ pub fn self_test(
             true,
         )
         .unwrap();
+        assert_eq!(frames.stats().unwrap().allocated_frames, before + 6);
+        assert_eq!(space.owned_table_count(), before_tables + 3);
         vm.protect(&mut space, rollback + PAGE_SIZE, PAGE_SIZE, 0)
             .unwrap();
         vm.release(&mut space, frames, rollback, 3 * PAGE_SIZE)
@@ -957,4 +1058,162 @@ pub fn self_test(
     }
     assert_eq!(frames.stats().unwrap().allocated_frames, baseline);
     crate::serial::println!("MIRROR_VM_TESTS_OK");
+}
+
+/// A scratch space for the user flush tests: one anonymous page holding
+/// `value` in its first word, kept as a supervisor-only leaf (PROT_NONE), so
+/// an AP can read it with SMAP on. Returns the space, its ledger, the page's
+/// address and its frame.
+#[cfg(feature = "boot-smoke")]
+fn flush_test_space(
+    kernel: &crate::paging::PageTables,
+    frames: &mut FrameAllocator<'_>,
+    direct_map: u64,
+    value: u64,
+) -> (UserAddressSpace, Vm, u64, u64) {
+    // SAFETY: The BSP with IF=0 and the kernel root active, with the unique
+    // allocator. The caller destroys the root, or ends the boot.
+    let mut space = unsafe { UserAddressSpace::new(kernel, frames) }.expect("user flush test root");
+    let mut vm = Vm::new(RESERVED_LIMIT, mirror_vm_protocol::COMMITTED_LIMIT, false);
+    let base = vm.reserve(0, PAGE_SIZE, READ_WRITE).unwrap();
+    // SAFETY: As above; no CPU has the root loaded yet.
+    unsafe {
+        vm.materialize(&mut space, frames, direct_map, base, 8, true)
+            .unwrap();
+        space.copy_to_user(base, &value.to_le_bytes()).unwrap();
+    }
+    let frame = space.translate(base).unwrap().unwrap().physical;
+    // SAFETY: As above.
+    unsafe { vm.protect(&mut space, base, PAGE_SIZE, 0) }.unwrap();
+    (space, vm, base, frame)
+}
+
+/// Spec 0051 step 2: a release from a root that every online AP has loaded
+/// flushes each AP before its frames return, each proving its CR3 reload, and
+/// each AP then reads the page's new frame. A flush target that already left
+/// the root only acknowledges, and destroy refuses while any CPU has the root
+/// loaded. QEMU's TCG drops an AP's cached translations between commands, so
+/// there a stale read cannot show a missing flush; the reload proofs do, and
+/// the step 5 battery's canary checks with threads running. With one CPU
+/// online the release runs the same path with nothing to flush.
+#[cfg(feature = "boot-smoke")]
+pub fn user_flush_self_test(
+    kernel: &crate::paging::PageTables,
+    frames: &mut FrameAllocator<'_>,
+    direct_map: u64,
+) {
+    const OLD: u64 = 0x4d49_5252_4f52_0001;
+    const NEW: u64 = 0x4d49_5252_4f52_0002;
+    let baseline = frames.stats().unwrap().allocated_frames;
+    let aps = smp::online_aps();
+    let (mut space, mut vm, base, old) = flush_test_space(kernel, frames, direct_map, OLD);
+    let root = space.root_physical_address();
+    // The replacement is taken while the old frame is still allocated, so
+    // the two differ: an AP that kept a stale entry would read the old one.
+    let replacement = frames.allocate().expect("user flush replacement frame");
+    let pointer = direct_map
+        .checked_add(replacement)
+        .expect("replacement direct map") as *mut u64;
+    // SAFETY: A fresh, exclusively owned frame that the direct map covers.
+    unsafe {
+        pointer.cast::<u8>().write_bytes(0, PAGE_SIZE as usize);
+        pointer.write(NEW);
+    }
+    space.note_loaded_for_test(aps, true);
+    smp::enter_user_root_for_test(aps, root, base, OLD);
+    assert_eq!(space.loaded_cpus(), aps);
+    if aps != 0 {
+        // SAFETY: Destroy must refuse before it frees anything.
+        let refused = unsafe { space.destroy(frames) };
+        assert_eq!(refused, Err(PagingError::StillActive));
+    }
+    // The removal path itself: one batch withdraws the leaf and its three
+    // tables, which the release empties.
+    let mut removal = vm.begin_release(base, PAGE_SIZE).unwrap();
+    let mut batch = Withdrawal::empty();
+    // SAFETY: The BSP with IF=0 does not run the scratch root, and nothing
+    // else uses its page.
+    assert_eq!(unsafe { vm.step(&mut removal, &mut space, &mut batch) }, 1);
+    assert!(removal.is_done());
+    assert_eq!(batch.frames().len(), 4);
+    assert_eq!(batch.frames()[0], old);
+    let targets = space.shootdown_targets();
+    assert_eq!(targets, aps);
+    // SAFETY: The targets were read after the withdrawal.
+    let reloaded = unsafe { finish_batch(root, targets, &mut batch, frames) };
+    assert_eq!(
+        reloaded,
+        aps.count_ones() as usize,
+        "a CPU with the root loaded skipped its flush"
+    );
+    // SAFETY: As above; the replacement is initialized and owned, and becomes
+    // supervisor-only like the old page.
+    unsafe {
+        space
+            .map_page(base, replacement, UserPermissions::READ_WRITE, frames)
+            .unwrap();
+        space.protect_page(base, None).unwrap();
+    }
+    smp::enter_user_root_for_test(aps, root, base, NEW);
+    // The last AP leaves the root; a flush still sent to it only acknowledges.
+    let mut skipped = 0;
+    if aps != 0 {
+        let last = 1 << (63 - aps.leading_zeros());
+        smp::leave_user_root_for_test(last);
+        space.note_loaded_for_test(last, false);
+        assert_eq!(
+            smp::flush_user(root, aps),
+            aps.count_ones() as usize - 1,
+            "a CPU without the root reloaded it"
+        );
+        skipped = 1;
+    }
+    let loaded = space.loaded_cpus();
+    smp::leave_user_root_for_test(loaded);
+    space.note_loaded_for_test(loaded, false);
+    assert_eq!(space.loaded_cpus(), 0);
+    // SAFETY: No CPU has the root loaded, and its pages have no other users.
+    unsafe { space.destroy(frames) }.expect("user flush test root teardown");
+    assert_eq!(frames.stats().unwrap().allocated_frames, baseline);
+    crate::serial::println!(
+        "MIRROR_USER_FLUSH_TESTS_OK cpus={} reloaded={} skipped={}",
+        aps.count_ones() + 1,
+        reloaded,
+        skipped
+    );
+}
+
+/// The UserFlushTimeout fault (spec 0051, step 2): the last AP withholds its
+/// OP_FLUSH_USER acknowledgement, so the release's flush must panic before
+/// the batch's frames reach the allocator. This boot ends there.
+#[cfg(feature = "boot-smoke")]
+pub fn user_flush_timeout_self_test(
+    kernel: &crate::paging::PageTables,
+    frames: &mut FrameAllocator<'_>,
+    direct_map: u64,
+) -> ! {
+    const OLD: u64 = 0x4d49_5252_4f52_0003;
+    let aps = smp::online_aps();
+    assert_ne!(aps, 0, "the user flush timeout needs an online AP");
+    let (mut space, mut vm, base, old) = flush_test_space(kernel, frames, direct_map, OLD);
+    let root = space.root_physical_address();
+    space.note_loaded_for_test(aps, true);
+    smp::enter_user_root_for_test(aps, root, base, OLD);
+    smp::arm_user_flush_timeout_for_test();
+    let mut removal = vm.begin_release(base, PAGE_SIZE).unwrap();
+    let mut batch = Withdrawal::empty();
+    // SAFETY: The BSP with IF=0 does not run the scratch root, and nothing
+    // else uses its page.
+    assert_eq!(unsafe { vm.step(&mut removal, &mut space, &mut batch) }, 1);
+    let targets = space.shootdown_targets();
+    crate::serial::println!(
+        "MIRROR_USER_FLUSH_TIMEOUT_EXPECT root={:#x} frame={:#x}",
+        root,
+        old
+    );
+    // SAFETY: The targets were read after the withdrawal. The withheld ACK
+    // must stop this call before it frees the batch.
+    unsafe { finish_batch(root, targets, &mut batch, frames) };
+    crate::serial::println!("MIRROR_USER_FLUSH_TIMEOUT_UNEXPECTED_RETURN");
+    panic!("a user shootdown returned without every acknowledgement");
 }

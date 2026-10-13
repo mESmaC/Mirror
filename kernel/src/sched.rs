@@ -819,16 +819,6 @@ pub(super) unsafe fn discard(slot: usize) -> Process {
     unsafe { remove_process(slot) }
 }
 
-/// The slot whose entry is `process`, by pointer identity (0054-D5's skip
-/// rule). No table entry is borrowed, so the caller's own reference stays
-/// unique.
-pub(super) fn slot_of(process: &Process) -> usize {
-    let pointer = core::ptr::from_ref(process);
-    process_slots()
-        .find(|&slot| core::ptr::eq(PROCESSES.entry(slot).cast_const(), pointer))
-        .expect("live process not in the table")
-}
-
 /// Occupied process slots, in slot order.
 pub(super) fn process_slots() -> impl Iterator<Item = usize> {
     (0..PROCESS_SLOTS).filter(|&slot| PROCESSES.is_occupied(slot))
@@ -1435,15 +1425,15 @@ pub(super) fn run(
         // this reborrow, which ends before the dispatch below, is the only one.
         let session = unsafe { &mut *published };
         // A finished process's endpoints close before any peer's receive is
-        // checked, so a blocked peer observes closure (readme, IPC). Every
-        // thread context was saved on its way back here, so the process then
-        // gives up its thread entries and stays a zombie until reaped
-        // (0030-D5).
+        // checked, so a blocked peer observes closure (readme, IPC). Once no
+        // thread of it is on a CPU and no CPU has its root loaded, every
+        // thread context is saved, so the process gives up its thread entries
+        // and stays a zombie until reaped (0030-D5; spec 0051, point 8).
         for slot in process_slots() {
             // SAFETY: The scheduler holds no other process reference.
             let process = unsafe { process(slot) };
             release_handles(process, &mut session.ipc);
-            if process.finished() && !process.zombie() {
+            if process.finished() && !process.zombie() && process.quiescent() {
                 process.release_threads();
             }
         }
@@ -1617,9 +1607,16 @@ fn complete_shell_requests(
             State::Launching(kind) => runtime
                 .launch(frames, shell, kind)
                 .unwrap_or_else(|error| error as u64),
-            State::Closing(pid) => runtime
-                .close(frames, shell, &mut session.ipc, pid, Outcome::Terminated)
-                .map_or_else(|error| error as u64, |()| 0),
+            // A close whose app still has a thread on a CPU stays pending.
+            State::Closing(pid) => {
+                match runtime.close(frames, shell, &mut session.ipc, pid, Outcome::Terminated) {
+                    Some(result) => result.map_or_else(|error| error as u64, |()| 0),
+                    None => {
+                        clear_current();
+                        continue;
+                    }
+                }
+            }
             _ => unreachable!("a shell request that is neither launch nor close"),
         };
         let thread = shell.thread_mut();

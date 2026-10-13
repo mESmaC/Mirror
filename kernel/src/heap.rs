@@ -1091,7 +1091,9 @@ pub unsafe fn growth_self_test(
     let observed = unsafe {
         borrowed.activate().expect("activate older heap borrower");
         let value = (probe as *const u64).read_volatile();
-        tables.activate().expect("restore kernel after heap probe");
+        borrowed
+            .deactivate(tables)
+            .expect("restore kernel after heap probe");
         value
     };
     assert_eq!(observed, expected, "new heap leaf absent in older root");

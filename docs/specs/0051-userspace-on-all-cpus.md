@@ -89,6 +89,7 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
    - Leaves are withdrawn or downgraded by atomic swap, as the kernel windows already do (paging.rs:619-625).
    - `materialize` takes its frames and worst-case tables before publishing anything, so it never has to unmap a published leaf on failure (vm.rs:449-468).
    - User copies and the futex read (paging.rs:1494-1567, userspace.rs:2447-2449) use `rep movsb` and atomic loads, because sibling threads write user memory concurrently.
+   - 2026-10-12, step 2: a page-in counts exactly the tables its new pages lack (`missing_tables`) and chains every frame it takes through the frames' own first words (`FrameReserve`), so a reservation of any size needs no stack or heap and publication cannot fail. The futex read is one atomic 32-bit load (`read_word`).
    - The BSP is the only writer of any space.
 
 8. **User TLB shootdown and teardown.**
@@ -99,8 +100,14 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
      3. If the mask is non-zero, send the new `OP_FLUSH_USER(root)` to those CPUs. A target whose CR3 holds that root reloads CR3; any other target just ACKs. The operation has its own validation (root page-aligned, nonzero, within the physical mask). The kernel-only whitelist (smp.rs:658-681) is unchanged.
      4. Free the batch's frames, then retake `SCHED`.
    - `check_inactive` (paging.rs:1615-1620) becomes "the mask is 0".
+   - 2026-10-12, step 2:
+     - `protect` flushes after any leaf change, upgrades included: a stale read-only entry would turn a now-permitted write into a protection fault, which kills the process.
+     - A release or protection change checks its whole interval, and a protection change every resident leaf, then updates the ledger before its first batch. So it never fails partway, and siblings see the new ledger while its batches run.
+     - A batch releases `SCHED` only when its mask is nonzero. Edits require only that the editing CPU does not run the root; `destroy` requires the mask to be 0.
+     - A removed frame goes into a batch (`Withdrawal`, 512 entries) and nothing writes it before the flush, since a stale entry or a walker may still reach it.
+     - A shell `close` of an app with a thread still on a CPU stays pending and retries in a later pass. The kicks come with vector 242 in step 3.
    - **Teardown.** `Process::finish` (userspace.rs:509-530) marks the process killed and kicks the CPUs running its threads. Those threads return to the scheduler at their next trap. `destroy`, `reclaim` and `release_threads` (sched.rs:1069-1071) run only once the mask is 0 and no thread is `on_cpu`.
-   - **Join.** A joiner is signalled only after the BSP has freed the exited thread's stack (userspace.rs:2253-2257, :2378-2383).
+   - **Join.** A joiner is signalled only after the BSP has freed the exited thread's stack (userspace.rs:2253-2257, :2378-2383). 2026-10-12, step 2: the signal comes at the end of `resume_process`, after the stack free and `on_cpu` cleared; a join that finds its target exited but still on a CPU waits for that signal.
 
 9. **Serial, clock, accounting and session end.**
    - `serial::print` (serial.rs:64-70) takes an owner-aware spinlock after `cli`. Re-entry on the same CPU prints without waiting. The crash owner bypasses the lock after the stop and starts with `\r\n`. 2026-10-12, step 1: the wait is bounded (at least 2.5 s), after which the CPU prints unlocked, so a CPU stopped mid-print can garble a line but never hang a report.
@@ -143,7 +150,8 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
     - **Boot-smoke only:**
       - `MIRROR_SMP_PRINT cpu= line= text=`, eight per printing CPU, then `MIRROR_SMP_TESTS_OK print_cpus=<n> print_lines=8` (step 1);
       - `MIRROR_SMP_USER_OK cpus= threads=16 ran_on= cross_wakes= flushes= stale=0`;
-      - `MIRROR_USER_FLUSH_TESTS_OK`;
+      - `MIRROR_USER_FLUSH_TESTS_OK cpus= reloaded= skipped=` (2026-10-12: fields added, step 2);
+      - `MIRROR_USER_FLUSH_TIMEOUT_ARMED target=` and `MIRROR_USER_FLUSH_TIMEOUT_EXPECT root= frame=`, in UserFlushTimeout only;
       - `MIRROR_TEST_EXPECT_PANIC cpu=`;
       - `MIRROR_CRASH_PROBE_OK`, `MIRROR_CRASH_SCREEN_OK`, `MIRROR_CRASH_TESTS_OK`.
     - No crash marker starts with `MIRROR_PANIC`, so none matches the panic regex at run.ps1:528-531.
@@ -153,7 +161,10 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
 Each step is one commit and must pass its targeted smoke cases.
 
 1. **Lock and per-CPU state, userspace still on the BSP only.** Points 1, 2 and 9. Pass gate: the existing 1-CPU and `-CpuCount 4` cases pass unchanged, and `MIRROR_SMP_TESTS_OK` gains a check that APs and the BSP print at the same time without breaking lines. 2026-10-12: the check runs after the boot rendezvous (the BSP alone with `-LegacyPic` or one CPU). Each CPU prints a first line, waits for every CPU's first, then prints seven more; run.ps1 requires whole lines and every CPU's last line after every CPU's first, before `MIRROR_SMP_TESTS_OK print_cpus= print_lines=8`.
-2. **User address-space concurrency and the shootdown.** Points 7 and 8: atomic publication, materialize taking frames up front, the CPU mask, `OP_FLUSH_USER`, two-phase removal, killed-process teardown, and join after the stack free. A boot-smoke self-test flushes a scratch root on every AP and prints `MIRROR_USER_FLUSH_TESTS_OK`. Add `UserFlushTimeout`.
+2. **User address-space concurrency and the shootdown.** Points 7 and 8: atomic publication, materialize taking frames up front, the CPU mask, `OP_FLUSH_USER`, two-phase removal, killed-process teardown, and join after the stack free. A boot-smoke self-test flushes a scratch root on every AP and prints `MIRROR_USER_FLUSH_TESTS_OK`. Add `UserFlushTimeout`. 2026-10-12:
+   - The self-test runs after the kernel VA self-test. Every online AP loads a scratch root with the smoke-only `OP_USER_ENTER` and reads a supervisor-only word through it. A release from that root must make each AP reload CR3, which its answer proves, before the frames return, and each AP then reads the new frame. An AP that left the root (`OP_USER_LEAVE`) only acknowledges a later flush, and `destroy` refuses while the mask is nonzero. The marker is `cpus=<online> reloaded=<online - 1> skipped=<1 with an AP, else 0>`.
+   - QEMU's TCG drops an AP's cached translations between two commands even without a flush, so on QEMU a stale read cannot show a missing flush here; the reload proofs do. Step 5's canary checks stale reads with threads running.
+   - UserFlushTimeout runs at the end of boot, as SmpTlbTimeout does. The last AP withholds its acknowledgement, and the release panics with "user TLB shootdown acknowledgement timeout" inside its flush, after `MIRROR_USER_FLUSH_TIMEOUT_EXPECT`, so its frames never reach the allocator.
 3. **AP plumbing.** Points 3 and 4: AP timers, vector 242, `send_ipi` from any CPU, and AP trap routing with `expect_fault`. `MIRROR_SMP_TESTS_OK` gains checks that every AP ticks and answers a 242 round trip.
 4. **NMI stop and backtrace.** Frame pointers, `crash.rs`, `send_nmi`, `STOPPED`, the paranoid hook and the routing. Add the STOP, FRAME, BACKTRACE, ACTION and NESTED markers, `Assert-MirrorCrash`, and the Panic, ApPanic, DoublePanic, NestedPanic and SchedStall cases. This lands before step 5, so that failures on APs in step 5 are visible rather than silent.
 5. **APs run threads.**

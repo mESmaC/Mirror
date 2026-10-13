@@ -399,6 +399,10 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
     unsafe {
         kernel_va::self_test(&tables, &mut frames, boot.direct_map_offset)
     };
+    // A user release flushes every AP that has the root loaded before its
+    // frames return (spec 0051, step 2).
+    #[cfg(feature = "boot-smoke")]
+    vm::user_flush_self_test(&tables, &mut frames, boot.direct_map_offset);
     grow_kernel_heap(&tables, &mut frames, boot.direct_map_offset, "boot");
     // The process and thread tables are .bss statics; every flavor reports
     // them once, before the first session or the skipped-desktop path.
@@ -479,6 +483,9 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
             boot::SmokeMode::SmpTlbTimeout => {
                 kernel_vm::timeout_self_test(&tables, &mut frames, boot.direct_map_offset);
             }
+            boot::SmokeMode::UserFlushTimeout => {
+                vm::user_flush_timeout_self_test(&tables, &mut frames, boot.direct_map_offset);
+            }
             _ => {
                 smp::guard_fault_self_test();
                 kernel_vm::offline_self_test(&tables, &mut frames, boot.direct_map_offset);
@@ -504,7 +511,8 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
             | boot::SmokeMode::VmmouseError
             | boot::SmokeMode::OomOrder
             | boot::SmokeMode::ClassLimits
-            | boot::SmokeMode::SmpTlbTimeout => {
+            | boot::SmokeMode::SmpTlbTimeout
+            | boot::SmokeMode::UserFlushTimeout => {
                 interrupts::arm_expected_page_fault(paging::TEST_ADDRESS)
             }
             // Every self-test has run; restart instead of the expected #PF

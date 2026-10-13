@@ -5,8 +5,9 @@
 //! userspace or device queues. Serial output from any CPU goes through its
 //! owner-aware lock (spec 0051); only the boot-smoke print check prints on an
 //! AP so far. Shared mapping changes use bounded synchronous shootdowns;
-//! retired frames remain owned until every target ACKs. This establishes CPU
-//! ownership and interrupt delivery, not SMP scheduling.
+//! retired frames remain owned until every target ACKs. A user root's changes
+//! flush the CPUs in its space's mask with OP_FLUSH_USER (spec 0051, point 8).
+//! This establishes CPU ownership and interrupt delivery, not SMP scheduling.
 //! https://github.com/Limine-Bootloader/limine-protocol/blob/trunk/PROTOCOL.md#mp-multiprocessor-feature
 
 use crate::{
@@ -58,6 +59,17 @@ const OP_READ_CPU_DATA: u32 = 6;
 const OP_PRINT: u32 = 7;
 #[cfg(feature = "boot-smoke")]
 const PRINT_LINES: u64 = 8;
+/// Drop every translation through one user root (spec 0051, point 8). The
+/// argument is the root: a target whose CR3 holds it reloads CR3, and any
+/// other target only acknowledges. The result proves which it did.
+const OP_FLUSH_USER: u32 = 8;
+/// Load a scratch user root and read one word through it; the argument is
+/// the root, the payload the word's address (boot-smoke user flush test).
+#[cfg(feature = "boot-smoke")]
+const OP_USER_ENTER: u32 = 9;
+/// Return to the kernel root (boot-smoke user flush test).
+#[cfg(feature = "boot-smoke")]
+const OP_USER_LEAVE: u32 = 10;
 /// Fixed text that makes each check line long enough for a broken one to show.
 #[cfg(feature = "boot-smoke")]
 const PRINT_TEXT: &str = "0123456789abcdefghijklmnopqrstuvwxyz";
@@ -134,8 +146,13 @@ static COUNT: AtomicUsize = AtomicUsize::new(0);
 static ROOT: AtomicU64 = AtomicU64::new(0);
 static PAT: AtomicU64 = AtomicU64::new(0);
 static COMMAND_BUSY: AtomicBool = AtomicBool::new(false);
+/// The kernel tables' physical-address mask, which bounds a user root.
+static PHYSICAL_MASK: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "boot-smoke")]
 static TIMEOUT_ARMED: AtomicBool = AtomicBool::new(false);
+/// The command whose first acknowledgement the timeout target withholds.
+#[cfg(feature = "boot-smoke")]
+static TIMEOUT_OPERATION: AtomicU32 = AtomicU32::new(0);
 #[cfg(feature = "boot-smoke")]
 static TIMEOUT_TARGET: AtomicUsize = AtomicUsize::new(MAX_CPUS);
 #[cfg(feature = "boot-smoke")]
@@ -261,6 +278,7 @@ pub fn init(
     assert!(!arch::interrupts_enabled());
     assert!(!ATTEMPTED.swap(true, Ordering::SeqCst));
     ROOT.store(tables.root_physical_address(), Ordering::Relaxed);
+    PHYSICAL_MASK.store(tables.physical_mask(), Ordering::Relaxed);
     #[cfg(feature = "boot-smoke")]
     self_test();
     if !apic::is_enabled() {
@@ -725,11 +743,32 @@ unsafe fn invalidate_local_range(address: u64, pages: u64) {
     }
 }
 
+/// A user root a flush may name: nonzero, page-aligned, within the physical
+/// mask, and not the kernel root.
+fn user_root_valid(root: u64) -> bool {
+    root != 0
+        && root.is_multiple_of(PAGE_SIZE)
+        && root & !PHYSICAL_MASK.load(Ordering::Relaxed) == 0
+        && root != ROOT.load(Ordering::Relaxed)
+}
+
+/// A lower-half word the user flush test may read: aligned, past the null
+/// page and below the end of user space.
+#[cfg(feature = "boot-smoke")]
+fn user_word_valid(address: u64) -> bool {
+    address.is_multiple_of(8) && (PAGE_SIZE..(1 << 47) - 8).contains(&address)
+}
+
 fn operation_valid(operation: u32, argument: u64, payload: u64, index: usize) -> bool {
     match operation {
         OP_PROOF => argument == 0,
         OP_INVALIDATE_RANGE => invalidation_range_valid(argument, payload),
         OP_READ_SHARED => invalidation_range_valid(argument, 1),
+        OP_FLUSH_USER => index != 0 && user_root_valid(argument) && payload == 0,
+        #[cfg(feature = "boot-smoke")]
+        OP_USER_ENTER => index != 0 && user_root_valid(argument) && user_word_valid(payload),
+        #[cfg(feature = "boot-smoke")]
+        OP_USER_LEAVE => index != 0 && argument == 0 && payload == 0,
         #[cfg(feature = "boot-smoke")]
         OP_GUARD_FAULT => index != 0 && argument == 0,
         #[cfg(feature = "boot-smoke")]
@@ -1050,6 +1089,35 @@ pub fn handle_ipi() {
         return;
     }
     #[cfg(feature = "boot-smoke")]
+    if operation == OP_USER_ENTER {
+        // SAFETY: CPL0 with IF=0. The BSP validated the root, keeps it live
+        // with this CPU's bit set in its space until OP_USER_LEAVE is
+        // acknowledged, and it borrows every kernel mapping.
+        unsafe { paging::load_root_for_test(argument) };
+        let value: u64;
+        // SAFETY: The BSP mapped this aligned word as a supervisor-only leaf
+        // of the scratch root and keeps it until the acknowledgement.
+        unsafe {
+            asm!("mov {}, qword ptr [{}]", out(reg) value, in(reg) payload,
+                options(nostack, readonly, preserves_flags));
+        }
+        slot.result
+            .store(proof(value, initial_apic_id(), sequence), Ordering::Relaxed);
+        slot.completed.fetch_add(1, Ordering::Relaxed);
+        slot.acknowledgement.store(sequence, Ordering::Release);
+        return;
+    }
+    #[cfg(feature = "boot-smoke")]
+    if operation == OP_USER_LEAVE {
+        // SAFETY: CPL0 with IF=0; the sealed kernel root maps everything live.
+        unsafe { paging::load_root_for_test(ROOT.load(Ordering::Relaxed)) };
+        slot.result
+            .store(proof(0, initial_apic_id(), sequence), Ordering::Relaxed);
+        slot.completed.fetch_add(1, Ordering::Relaxed);
+        slot.acknowledgement.store(sequence, Ordering::Release);
+        return;
+    }
+    #[cfg(feature = "boot-smoke")]
     if operation == OP_PRINT {
         if !print_lines(index, argument) {
             fail(index, 14);
@@ -1068,16 +1136,19 @@ pub fn handle_ipi() {
         // Every page is invalidated before ACK without accessing its mapping.
         unsafe { invalidate_local_range(argument, payload) };
         #[cfg(feature = "boot-smoke")]
-        if TIMEOUT_TARGET.load(Ordering::Acquire) == index {
-            let _ =
-                TIMEOUT_SEQUENCE.compare_exchange(0, sequence, Ordering::AcqRel, Ordering::Acquire);
-            if TIMEOUT_SEQUENCE.load(Ordering::Acquire) == sequence {
-                // Keep suppressing duplicates of this same command, otherwise
-                // an unrelated IPI could turn the timeout probe into success.
-                return;
-            }
+        if withhold_acknowledgement(index, operation, sequence) {
+            return;
         }
         0
+    } else if operation == OP_FLUSH_USER {
+        // SAFETY: CPL0 with IF=0. The current root, reloaded unchanged, maps
+        // every live kernel code, stack and data page.
+        let reloaded = unsafe { paging::flush_user_root(argument) };
+        #[cfg(feature = "boot-smoke")]
+        if withhold_acknowledgement(index, operation, sequence) {
+            return;
+        }
+        proof(u64::from(reloaded), initial_apic_id(), sequence)
     } else if operation == OP_READ_SHARED {
         let value: u64;
         // SAFETY: The BSP owns and retains this mapped, immutable kernel page
@@ -1093,6 +1164,21 @@ pub fn handle_ipi() {
     slot.result.store(value, Ordering::Relaxed);
     slot.completed.fetch_add(1, Ordering::Relaxed);
     slot.acknowledgement.store(sequence, Ordering::Release);
+}
+
+/// Whether this CPU, as the armed timeout target, withholds this command's
+/// acknowledgement after doing its work (boot-smoke SmpTlbTimeout and
+/// UserFlushTimeout). It keeps withholding duplicates of the same command,
+/// otherwise an unrelated IPI could turn the timeout probe into success.
+#[cfg(feature = "boot-smoke")]
+fn withhold_acknowledgement(index: usize, operation: u32, sequence: u64) -> bool {
+    if TIMEOUT_TARGET.load(Ordering::Acquire) != index
+        || TIMEOUT_OPERATION.load(Ordering::Acquire) != operation
+    {
+        return false;
+    }
+    let _ = TIMEOUT_SEQUENCE.compare_exchange(0, sequence, Ordering::AcqRel, Ordering::Acquire);
+    TIMEOUT_SEQUENCE.load(Ordering::Acquire) == sequence
 }
 
 /// OP_READ_CPU_DATA's answer (0050, acceptance test 2): this CPU's CpuData
@@ -1492,8 +1578,185 @@ pub(crate) fn arm_shootdown_timeout_for_test() {
     assert!(update.count > 1, "shootdown timeout probe requires an AP");
     assert!(!TIMEOUT_ARMED.swap(true, Ordering::SeqCst));
     let target = update.count - 1;
+    TIMEOUT_OPERATION.store(OP_INVALIDATE_RANGE, Ordering::Release);
     TIMEOUT_TARGET.store(target, Ordering::Release);
     serial::println!("MIRROR_SMP_TLB_TIMEOUT_ARMED target={}", target);
+}
+
+/// Withhold the final AP's next OP_FLUSH_USER acknowledgement after its
+/// reload (UserFlushTimeout). The flush that waits for it must stop before
+/// the withdrawn frames return to the allocator.
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn arm_user_flush_timeout_for_test() {
+    let count = configured_count();
+    assert!(count > 1, "user flush timeout probe requires an AP");
+    assert!(!TIMEOUT_ARMED.swap(true, Ordering::SeqCst));
+    let target = count - 1;
+    TIMEOUT_OPERATION.store(OP_FLUSH_USER, Ordering::Release);
+    TIMEOUT_TARGET.store(target, Ordering::Release);
+    serial::println!("MIRROR_USER_FLUSH_TIMEOUT_ARMED target={}", target);
+}
+
+/// The configured CPU count once SMP startup has published its slots, else 0.
+fn configured_count() -> usize {
+    if PUBLISHED.load(Ordering::Acquire) {
+        COUNT.load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+/// The commands one call sent: the configured CPU count, the selected slots
+/// and their sequences.
+struct Sent {
+    count: usize,
+    selected: [bool; MAX_CPUS],
+    sequences: [u64; MAX_CPUS],
+}
+
+/// Send one command to each AP in `targets`, a mask of slots, and wait for
+/// every acknowledgement; a missing one panics with `timeout`. The caller
+/// holds the command guard, on the BSP with IF=0 and no scheduler lock.
+fn command_each(
+    targets: u64,
+    operation: u32,
+    argument: u64,
+    payload: u64,
+    timeout: &'static str,
+) -> Sent {
+    let count = configured_count();
+    assert!(
+        targets & 1 == 0 && (count == MAX_CPUS || targets >> count == 0),
+        "command targets outside the configured APs"
+    );
+    let mut sent = Sent {
+        count,
+        selected: [false; MAX_CPUS],
+        sequences: [0; MAX_CPUS],
+    };
+    for (index, slot) in SLOTS.iter().enumerate().take(count).skip(1) {
+        if targets & (1 << index) != 0 {
+            sent.sequences[index] = ready_sequence(slot).expect("command target not online");
+            sent.selected[index] = true;
+        }
+    }
+    for index in 1..count {
+        if sent.selected[index] {
+            publish_command(index, sent.sequences[index], operation, argument, payload)
+                .expect("command delivery failed");
+        }
+    }
+    wait_exact(count, &sent.selected, &sent.sequences, timeout);
+    sent
+}
+
+/// Make every CPU in `targets`, a mask of AP slots, drop its translations
+/// through user root `root` (spec 0051, point 8), and return how many had it
+/// loaded and reloaded CR3. A removal calls this after it withdrew entries
+/// and read its space's mask, with the scheduler lock released; its frames
+/// stay allocated until this returns. A missing acknowledgement panics.
+pub(crate) fn flush_user(root: u64, targets: u64) -> usize {
+    // No holder of the scheduler lock waits for another CPU (spec 0051, open
+    // point 3).
+    assert!(
+        !cpudata::sched_held(),
+        "user shootdown under the scheduler lock"
+    );
+    assert!(!arch::interrupts_enabled() && !is_secondary());
+    assert!(user_root_valid(root), "invalid user shootdown root");
+    if targets == 0 {
+        return 0;
+    }
+    let _guard = CommandGuard::acquire().expect("user shootdown command transport");
+    let sent = command_each(
+        targets,
+        OP_FLUSH_USER,
+        root,
+        0,
+        "user TLB shootdown acknowledgement timeout",
+    );
+    let mut reloaded = 0;
+    for (index, slot) in SLOTS[..sent.count].iter().enumerate() {
+        if !sent.selected[index] {
+            continue;
+        }
+        let answer = |reload: u64| {
+            proof(
+                reload,
+                slot.apic_id.load(Ordering::Relaxed),
+                sent.sequences[index],
+            )
+        };
+        let result = slot.result.load(Ordering::Relaxed);
+        if result == answer(1) {
+            reloaded += 1;
+        } else {
+            assert_eq!(result, answer(0), "a CPU did not complete its user flush");
+        }
+    }
+    reloaded
+}
+
+/// The online APs, as a mask of slots (boot-smoke user flush test).
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn online_aps() -> u64 {
+    SLOTS[..configured_count()]
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, slot)| slot.state.load(Ordering::Acquire) == ONLINE)
+        .fold(0, |mask, (index, _)| mask | 1 << index)
+}
+
+/// Make every AP in `targets` load user root `root` and read the supervisor
+/// word at `address` through it, which must hold `expected` (boot-smoke user
+/// flush test). The caller set their bits in the space's mask first and
+/// keeps the root and the word live until they leave.
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn enter_user_root_for_test(targets: u64, root: u64, address: u64, expected: u64) {
+    assert!(!arch::interrupts_enabled() && !is_secondary());
+    if targets == 0 {
+        return;
+    }
+    let _guard = CommandGuard::acquire().expect("user root test command transport");
+    let sent = command_each(
+        targets,
+        OP_USER_ENTER,
+        root,
+        address,
+        "user root test acknowledgement timeout",
+    );
+    for (index, slot) in SLOTS[..sent.count].iter().enumerate() {
+        if sent.selected[index] {
+            assert_eq!(
+                slot.result.load(Ordering::Relaxed),
+                proof(
+                    expected,
+                    slot.apic_id.load(Ordering::Relaxed),
+                    sent.sequences[index]
+                ),
+                "an AP read a stale user translation"
+            );
+        }
+    }
+}
+
+/// Make every AP in `targets` return to the kernel root (boot-smoke user
+/// flush test). The caller then clears their bits in the space's mask.
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn leave_user_root_for_test(targets: u64) {
+    assert!(!arch::interrupts_enabled() && !is_secondary());
+    if targets == 0 {
+        return;
+    }
+    let _guard = CommandGuard::acquire().expect("user root test command transport");
+    command_each(
+        targets,
+        OP_USER_LEAVE,
+        0,
+        0,
+        "user root test acknowledgement timeout",
+    );
 }
 
 fn report_failure(index: usize) {
@@ -1700,6 +1963,38 @@ fn self_test() {
     assert!(!operation_valid(OP_PRINT, 0b10, 0, 1));
     assert!(!operation_valid(OP_PRINT, 0b101, 0, 1));
     assert!(!operation_valid(OP_PRINT, 0b11, 1, 1));
+    // A user flush names a user root, never the kernel's, and goes to an AP.
+    let mask = PHYSICAL_MASK.load(Ordering::Relaxed);
+    let kernel_root = ROOT.load(Ordering::Relaxed);
+    let user_root = if kernel_root == 0x1000 {
+        0x2000
+    } else {
+        0x1000
+    };
+    assert!(operation_valid(OP_FLUSH_USER, user_root, 0, 1));
+    for (root, payload, index) in [
+        (user_root, 0, 0),
+        (user_root, 1, 1),
+        (0, 0, 1),
+        (user_root + 8, 0, 1),
+        (kernel_root, 0, 1),
+        (mask + PAGE_SIZE, 0, 1),
+    ] {
+        assert!(!operation_valid(OP_FLUSH_USER, root, payload, index));
+    }
+    assert!(operation_valid(OP_USER_ENTER, user_root, PAGE_SIZE, 1));
+    for (root, address, index) in [
+        (user_root, 0, 1),
+        (user_root, PAGE_SIZE + 4, 1),
+        (user_root, 1 << 47, 1),
+        (user_root, PAGE_SIZE, 0),
+        (kernel_root, PAGE_SIZE, 1),
+    ] {
+        assert!(!operation_valid(OP_USER_ENTER, root, address, index));
+    }
+    assert!(operation_valid(OP_USER_LEAVE, 0, 0, 1));
+    assert!(!operation_valid(OP_USER_LEAVE, user_root, 0, 1));
+    assert!(!operation_valid(OP_USER_LEAVE, 0, 0, 0));
     assert!(!operation_valid(
         OP_UNMAPPED_FAULT,
         paging::SHARED_BASE,

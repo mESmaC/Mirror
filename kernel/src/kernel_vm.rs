@@ -182,7 +182,7 @@ pub fn init(tables: &PageTables, frames: &mut FrameAllocator<'_>, offset: u64) {
             let observed = unsafe {
                 borrowed.activate().expect("activate borrowed kernel root");
                 let value = (PROBE_ADDRESS as *const u64).read_volatile();
-                tables.activate().expect("restore kernel root");
+                borrowed.deactivate(tables).expect("restore kernel root");
                 value
             };
             assert_eq!(observed, expected, "shared leaf missing from borrowed root");

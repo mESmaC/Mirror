@@ -96,7 +96,7 @@ function Assert-MirrorCaptureSmp {
     Assert-MirrorCpuVulnerability -Serial $Serial
     # Markers observes a live shell; ordinary captures end with restart.
     Assert-MirrorReset -Serial $Serial -Smoke $false -ConsoleRestart (-not $PerfCapture) -WithoutHpet ([bool]$NoHpet)
-    if ($Serial -match '(?m)^MIRROR_(?:SMP_SKIPPED|SMP_CPU_FAILED|SMP_GUARD_OK|SMP_UNMAP_OK|SMP_TLB_TIMEOUT_ARMED|SHARED_TIMEOUT_\w+|SHARED_VM_SKIPPED|SHARED_OFFLINE_OK)(?:\s|$)') {
+    if ($Serial -match '(?m)^MIRROR_(?:SMP_SKIPPED|SMP_CPU_FAILED|SMP_GUARD_OK|SMP_UNMAP_OK|SMP_TLB_TIMEOUT_ARMED|SHARED_TIMEOUT_\w+|SHARED_VM_SKIPPED|SHARED_OFFLINE_OK|USER_FLUSH_\w+)(?:\s|$)') {
         throw 'Normal capture skipped SMP, lost a CPU, or ran an injected guard fault.'
     }
     $readyPattern = '(?m)^MIRROR_SMP_READY discovered={0} online={0} bsp=(\d+) aps={1} userspace_cpus=1\r?$' -f $RequestedCpus, ($RequestedCpus - 1)

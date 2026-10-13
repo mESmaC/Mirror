@@ -42,13 +42,14 @@ function Assert-MirrorKernelImage {
         # kernels test the policy, skip methods or suppress writes (0058a).
         # 0059: the auto-phase growth records are test-trace-gated, and the
         # capacity skip record and charge summary exist only in boot-smoke.
-        # Only smoke kernels run the concurrent SMP print check (0051).
+        # Only smoke kernels run the concurrent SMP print check and the user
+        # flush self-test and fault (0051).
         $required = @('MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=', 'MIRROR_MEM_RESERVE frames=', 'MIRROR_KVA_READY base=', 'MIRROR_CPU_DATA_READY cpus=') + $resetRequired
-        $forbidden = @('MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_TRACE_ON', 'MIRROR_CONSOLE_COMMAND operation=', 'MIRROR_POINTER_UPDATED', 'MIRROR_POINTER_CLICK', 'MIRROR_SHELL_FRAME', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'Mirror shell: ready', 'MIRROR_USERSPACE_OK', 'Mirror init: VM checks passed', 'fixture data mismatch', 'unexpected budget exhaustion', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROWN phase=auto', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED', 'MIRROR_SMP_PRINT') + $resetForbidden
+        $forbidden = @('MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_TRACE_ON', 'MIRROR_CONSOLE_COMMAND operation=', 'MIRROR_POINTER_UPDATED', 'MIRROR_POINTER_CLICK', 'MIRROR_SHELL_FRAME', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'Mirror shell: ready', 'MIRROR_USERSPACE_OK', 'Mirror init: VM checks passed', 'fixture data mismatch', 'unexpected budget exhaustion', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROWN phase=auto', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED', 'MIRROR_SMP_PRINT', 'MIRROR_USER_FLUSH') + $resetForbidden
     }
     else {
         $required = @('MIRROR_TRACE_ON', 'MIRROR_SHELL_FRAME', 'MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=', 'MIRROR_HEAP_GROWN phase=auto', 'MIRROR_MEM_RESERVE frames=', 'MIRROR_KVA_READY base=', 'MIRROR_CPU_DATA_READY cpus=') + $resetRequired
-        $forbidden = @('MIRROR_USERSPACE_OK', 'fixture data mismatch', 'MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED', 'MIRROR_SMP_PRINT') + $resetForbidden
+        $forbidden = @('MIRROR_USERSPACE_OK', 'fixture data mismatch', 'MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED', 'MIRROR_SMP_PRINT', 'MIRROR_USER_FLUSH') + $resetForbidden
     }
     foreach ($text in $required) {
         if ($image.IndexOf($text, [StringComparison]::Ordinal) -lt 0) {
@@ -184,9 +185,10 @@ try {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -ExtendedCpu -CpuCount $cpuCount -Release:$release -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
             Save-MirrorSmokeLogs "$profile-ExtendedCpu-CpuCount$cpuCount"
         }
-        # A removed shared alias must fault on an AP, and a missing shootdown
-        # ACK must stop unmap before returning a frame for allocator reuse.
-        foreach ($fault in @('SmpUnmap', 'SmpTlbTimeout')) {
+        # A removed shared alias must fault on an AP, and a missing kernel or
+        # user shootdown ACK must stop the removal before returning a frame
+        # for allocator reuse.
+        foreach ($fault in @('SmpUnmap', 'SmpTlbTimeout', 'UserFlushTimeout')) {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -CpuCount 4 -Fault $fault -Release:$release -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
             Save-MirrorSmokeLogs "$profile-$fault"
         }

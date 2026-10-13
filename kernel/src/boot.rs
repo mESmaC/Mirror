@@ -173,6 +173,9 @@ pub enum SmokeMode {
     XhciDeviceFailure,
     SmpUnmap,
     SmpTlbTimeout,
+    /// The last AP withholds its OP_FLUSH_USER acknowledgement during a user
+    /// release (spec 0051, step 2).
+    UserFlushTimeout,
     TimerCalibration,
     ClockActivation,
     Ps2BatTimeout,
@@ -256,6 +259,7 @@ pub fn smoke_mode() -> SmokeMode {
         b"mirror.test=xhci-device-failure" => SmokeMode::XhciDeviceFailure,
         b"mirror.test=smp-unmap" => SmokeMode::SmpUnmap,
         b"mirror.test=smp-tlb-timeout" => SmokeMode::SmpTlbTimeout,
+        b"mirror.test=user-flush-timeout" => SmokeMode::UserFlushTimeout,
         b"mirror.test=timer-calibration" => SmokeMode::TimerCalibration,
         b"mirror.test=clock-activation" => SmokeMode::ClockActivation,
         b"mirror.test=ps2-bat-timeout" => SmokeMode::Ps2BatTimeout,

@@ -8,12 +8,18 @@
 //! arbitrary kernel mappings are sealed. Prepared heap, kernel VA and 2 MiB
 //! scratch windows permit changes to 4 KiB leaves. Removals complete through
 //! synchronous TLB shootdowns; the kernel VA window maps absent leaves locally
-//! (spec 0050-D3). Every window's table hierarchy remains pinned. APs retain
-//! the kernel root and never access
-//! private user mappings or their physical pages. Huge-page splitting and
-//! arbitrary shared hierarchy changes remain unsupported.
-//! Bootloader-reclaimable memory stays reserved for the stack and
-//! boot responses even after the page-table hierarchy has been copied.
+//! (spec 0050-D3). Every window's table hierarchy remains pinned.
+//!
+//! A user root may be loaded on several CPUs while the BSP, its only writer,
+//! edits it (spec 0051, points 7 and 8). Each space keeps the mask of CPUs
+//! that have it loaded. Entries are published by Release stores after their
+//! tables are zeroed, and withdrawn or changed by atomic exchange, since
+//! hardware on other CPUs walks the tables and sets A and D bits. A removal
+//! hands its frames to the caller, which flushes the mask's CPUs before it
+//! frees them. Huge-page splitting and arbitrary shared hierarchy changes
+//! remain unsupported. Bootloader-reclaimable memory stays reserved for the
+//! stack and boot responses even after the page-table hierarchy has been
+//! copied.
 
 use core::{
     arch::{
@@ -22,7 +28,7 @@ use core::{
     },
     marker::PhantomData,
     ptr::NonNull,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence},
 };
 
 use crate::memory::{FrameAllocator, PAGE_SIZE};
@@ -108,6 +114,8 @@ pub enum PagingError {
     KvaWindowNotPrepared,
     KvaWindowReserved,
     InvalidKvaRange,
+    /// A removal batch has no room for one more page and its table path.
+    WithdrawalFull,
 }
 
 pub struct PageTables {
@@ -125,6 +133,11 @@ pub struct PageTables {
 impl PageTables {
     pub fn root_physical_address(&self) -> u64 {
         self.root
+    }
+
+    /// The physical-address bits a table entry may name, page-aligned.
+    pub fn physical_mask(&self) -> u64 {
+        self.physical_mask
     }
 
     pub fn owned_table_count(&self) -> usize {
@@ -1033,20 +1046,162 @@ pub struct UserTranslation {
     pub executable: bool,
 }
 
+/// The most entries one removal batch withdraws before its shootdown (spec
+/// 0051, point 8).
+pub const WITHDRAW_BATCH: usize = 512;
+/// The most frames one withdrawn page takes: its leaf and three empty tables.
+const WITHDRAW_PATH: usize = 4;
+/// Hardware sets A and D at most once each while software leaves them, so a
+/// permission change that races them succeeds by its third exchange.
+const PROTECT_ATTEMPTS: usize = 3;
+const ACCESSED_DIRTY: u64 = (1 << 5) | (1 << 6);
+
+/// Treat one page-table entry as an atomic: hardware walkers on other CPUs
+/// read live user tables and set their A and D bits (spec 0051, point 7).
+///
+/// # Safety
+/// `slot` is an aligned entry of an initialized table that stays allocated
+/// while the returned reference is used.
+unsafe fn table_entry<'a>(slot: *mut u64) -> &'a AtomicU64 {
+    // SAFETY: The caller's contract. Software reaches live entries only
+    // through these atomics; plain writes touch only unpublished tables.
+    unsafe { AtomicU64::from_ptr(slot) }
+}
+
+/// This CPU's bit in a space's CPU mask.
+fn cpu_bit() -> u64 {
+    1 << crate::cpudata::current_cpu()
+}
+
+/// Copy `count` bytes with `rep movsb`, which the compiler can neither split
+/// nor elide: sibling threads on other CPUs may write the user side at any
+/// time (spec 0051, point 7), so no Rust access may assume it is stable.
+///
+/// # Safety
+/// Both ranges are valid for `count` bytes, the destination is writable,
+/// and the ranges do not overlap.
+unsafe fn copy_bytes(destination: *mut u8, source: *const u8, count: usize) {
+    // SAFETY: The caller's contract. The SysV ABI keeps DF clear, so the
+    // copy runs forward, and REP MOVSB changes no flags.
+    unsafe {
+        asm!(
+            "rep movsb",
+            inout("rcx") count => _,
+            inout("rdi") destination => _,
+            inout("rsi") source => _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Frames withdrawn from a user hierarchy, which stay allocated until every
+/// CPU that could still translate through them has flushed (spec 0051,
+/// point 8). Nothing is written to them meanwhile: a sibling may still reach
+/// a withdrawn page through a stale TLB entry, and a hardware walker a
+/// withdrawn table. Dropping a batch that still holds frames panics.
+pub struct Withdrawal {
+    frames: [u64; WITHDRAW_BATCH],
+    count: usize,
+}
+
+impl Withdrawal {
+    pub const fn empty() -> Self {
+        Self {
+            frames: [0; WITHDRAW_BATCH],
+            count: 0,
+        }
+    }
+
+    #[cfg(feature = "boot-smoke")]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// The withdrawn frames, in withdrawal order.
+    #[cfg(feature = "boot-smoke")]
+    pub fn frames(&self) -> &[u64] {
+        &self.frames[..self.count]
+    }
+
+    /// Whether one more page fits, with every table on its path.
+    pub fn has_room(&self) -> bool {
+        self.count + WITHDRAW_PATH <= WITHDRAW_BATCH
+    }
+
+    fn push(&mut self, frame: u64) {
+        assert!(self.count < WITHDRAW_BATCH, "withdrawal batch overflow");
+        self.frames[self.count] = frame;
+        self.count += 1;
+    }
+
+    /// Return every withdrawn frame to the allocator and empty the batch.
+    ///
+    /// # Safety
+    /// Run on the BSP with IF=0, with the allocator the frames came from.
+    /// Every CPU in the space's mask as read after the withdrawal has
+    /// flushed, and no reference, DMA or alias but the dormant direct map
+    /// reaches the frames.
+    pub unsafe fn release(&mut self, frames: &mut FrameAllocator<'_>) {
+        for &frame in &self.frames[..self.count] {
+            // SAFETY: The caller's contract: each frame is withdrawn, flushed
+            // on every CPU and owned by nothing else.
+            unsafe { frames.deallocate(frame) }.expect("release a withdrawn user frame");
+        }
+        self.count = 0;
+    }
+}
+
+impl Drop for Withdrawal {
+    fn drop(&mut self) {
+        assert_eq!(self.count, 0, "withdrawn user frames dropped unreleased");
+    }
+}
+
+/// Fresh frames taken before a transaction publishes anything (spec 0051,
+/// point 7), chained through their own first words, so a reservation of any
+/// size needs neither stack nor heap. A reserved frame has no alias but its
+/// direct map. Dropping a reserve that still holds frames panics.
+pub struct FrameReserve {
+    head: u64,
+    count: usize,
+}
+
+impl FrameReserve {
+    pub const fn empty() -> Self {
+        Self { head: 0, count: 0 }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+impl Drop for FrameReserve {
+    fn drop(&mut self) {
+        assert_eq!(self.count, 0, "reserved frames dropped unreleased");
+    }
+}
+
 /// An isolated lower half with a borrowed kernel table hierarchy above it.
 /// There is deliberately no Drop: teardown requires the unique frame allocator
-/// and proof that this root is inactive. Call destroy explicitly after restore.
-/// Only the BSP may activate or modify it. APs keep the kernel root and must
-/// never access this lower hierarchy or its owned physical pages. Borrowed
-/// table paths remain pinned; prepared shared leaves can change through the
-/// acknowledged shootdown protocol while this private root is inactive.
-/// The kernel hierarchy is held by pointer, not by lifetime, so a process
-/// table entry can own its space (spec 0030a); `new` states the contract.
+/// and proof that no CPU has the root loaded. Call destroy explicitly.
+/// Only the BSP edits it, with IF=0 (spec 0051, point 5), while any CPU may
+/// run it; `cpus` names the CPUs that have it loaded (point 8). Borrowed table
+/// paths remain pinned; prepared shared leaves can change through the
+/// acknowledged shootdown protocol. The kernel hierarchy is held by pointer,
+/// not by lifetime, so a process table entry can own its space (spec 0030a);
+/// `new` states the contract.
 pub struct UserAddressSpace {
     kernel: NonNull<PageTables>,
     root: u64,
     owned_tables: usize,
     owned_pages: usize,
+    /// The CPUs that have this root loaded, by SMP slot (spec 0051, point 8).
+    /// A CPU sets its bit before it loads the root and clears it once the
+    /// kernel root has replaced it. PCID stays off, so that replacement drops
+    /// every translation through this root, and the mask is exactly the set
+    /// of CPUs that can hold one.
+    cpus: AtomicU64,
 }
 
 struct OwnedPath {
@@ -1059,8 +1214,9 @@ struct OwnedPath {
 impl UserAddressSpace {
     fn kernel(&self) -> &PageTables {
         // SAFETY: `new`'s caller keeps the kernel tables at this address and
-        // alive until destroy. Every use is a shared read on the BSP with
-        // IF=0, and nothing mutates them through another reference meanwhile.
+        // alive until destroy. Users read only the root, the direct-map
+        // offset and the physical mask, which never change after
+        // take_ownership.
         unsafe { self.kernel.as_ref() }
     }
 
@@ -1071,13 +1227,12 @@ impl UserAddressSpace {
     /// # Safety
     /// Run at CPL0 on the BSP with interrupts disabled and `kernel` active.
     /// Preserve its HHDM and exclusively own its allocator, with recycling
-    /// enabled. APs may use only the retained kernel hierarchy.
-    /// Executing code, stack, and all kernel data used while this root is active
-    /// must be in the upper half. The prepared shared window, if used, must
-    /// already exist. Borrowed table paths remain fixed; only prepared leaves
-    /// may change, through the shared update methods with this root inactive.
+    /// enabled. Executing code, stack, and all kernel data used while this
+    /// root is active must be in the upper half. The prepared shared window,
+    /// if used, must already exist. Borrowed table paths remain fixed; only
+    /// prepared leaves may change, through the shared update methods.
     /// `kernel` must stay at its address, unmoved and undropped, until this
-    /// space is destroyed; only the BSP, with IF=0, may use the space. The
+    /// space is destroyed; only the BSP, with IF=0, may edit the space. The
     /// boot tables live in `continue_boot`'s frame, which never returns.
     pub unsafe fn new(
         kernel: &PageTables,
@@ -1093,6 +1248,7 @@ impl UserAddressSpace {
             root: 0,
             owned_tables: 0,
             owned_pages: 0,
+            cpus: AtomicU64::new(0),
         };
         let root = space.allocate_table(frames)?;
         let destination = kernel.table_pointer(root)?;
@@ -1120,14 +1276,114 @@ impl UserAddressSpace {
         self.owned_pages
     }
 
-    /// Transfer one initialized frame into an inactive user's lower half.
-    /// On error, ownership of `physical` stays with the caller. Any intermediate
-    /// tables allocated before an error stay reachable and owned until destroy.
+    /// Add one fresh frame from `frames` to `reserve`. On error the reserve
+    /// is unchanged and the frame, if any was taken, is back in `frames`.
+    pub fn reserve_frame(
+        &self,
+        reserve: &mut FrameReserve,
+        frames: &mut FrameAllocator<'_>,
+    ) -> Result<(), PagingError> {
+        let physical = frames.allocate().ok_or(PagingError::OutOfFrames)?;
+        let pointer = match self.kernel().table_pointer(physical) {
+            Ok(pointer) => pointer,
+            Err(error) => {
+                // SAFETY: This fresh frame has no mapping or live reference.
+                unsafe { frames.deallocate(physical) }
+                    .map_err(|_| PagingError::FrameReleaseFailed)?;
+                return Err(error);
+            }
+        };
+        // SAFETY: A fresh, exclusively owned frame that the direct map covers
+        // in full; its first word links the chain until it is taken.
+        unsafe { pointer.write(reserve.head) };
+        reserve.head = physical;
+        reserve.count += 1;
+        Ok(())
+    }
+
+    /// Take one frame out of `reserve`. Its first word holds a stale link;
+    /// the rest of its contents are whatever the allocator handed out.
+    pub fn take_reserved(&self, reserve: &mut FrameReserve) -> Option<u64> {
+        if reserve.count == 0 {
+            return None;
+        }
+        let physical = reserve.head;
+        let pointer = self
+            .kernel()
+            .table_pointer(physical)
+            .expect("reserved frame direct map");
+        // SAFETY: reserve_frame validated this owned frame and wrote its link.
+        reserve.head = unsafe { pointer.read() };
+        reserve.count -= 1;
+        Some(physical)
+    }
+
+    /// Return every frame left in `reserve` to `frames`.
+    ///
+    /// # Safety
+    /// Run on the BSP with IF=0, with the allocator the frames came from. No
+    /// frame still in the reserve was published or aliased.
+    pub unsafe fn release_reserve(
+        &self,
+        reserve: &mut FrameReserve,
+        frames: &mut FrameAllocator<'_>,
+    ) {
+        while let Some(physical) = self.take_reserved(reserve) {
+            // SAFETY: The caller's contract: an unpublished frame that only
+            // the reserve owned.
+            unsafe { frames.deallocate(physical) }.expect("release a reserved frame");
+        }
+    }
+
+    /// How many tables mapping the page at `address` would add: its absent
+    /// PDPT, PD and PT, without those it shares with `previous`, the last
+    /// page counted before it in the same ascending transaction. The tables
+    /// cannot change between this count and the transaction's publication:
+    /// the BSP is their only writer.
+    pub fn missing_tables(
+        &self,
+        address: u64,
+        previous: Option<u64>,
+    ) -> Result<usize, PagingError> {
+        check_user_address(address)?;
+        check_page_address(address)?;
+        self.check_live()?;
+        let mut physical = self.root;
+        for level in (2..=4).rev() {
+            let table = self.kernel().table_pointer(physical)?;
+            // SAFETY: An initialized owned table and an in-range index.
+            let entry =
+                unsafe { table_entry(table.add(index(address, level))) }.load(Ordering::Acquire);
+            if entry & PRESENT == 0 {
+                // Every table below the absent entry is new. A table that
+                // `previous` shares was counted for it: its walk met the same
+                // absent entry.
+                return Ok((1..level)
+                    .filter(|&below| {
+                        let shift = 12 + 9 * below;
+                        previous.is_none_or(|previous| previous >> shift != address >> shift)
+                    })
+                    .count());
+            }
+            if entry & HUGE != 0 {
+                return Err(PagingError::InvalidTable);
+            }
+            if entry & USER == 0 {
+                return Err(PagingError::UserAccessDenied);
+            }
+            physical = entry & self.kernel().physical_mask;
+        }
+        Ok(0)
+    }
+
+    /// Transfer one initialized frame into this lower half, allocating any
+    /// missing table from `frames`. On error, ownership of `physical` stays
+    /// with the caller. Any intermediate tables allocated before an error stay
+    /// reachable and owned until destroy.
     ///
     /// # Safety
     /// Run on the BSP with interrupts disabled, exclusively using the same
-    /// allocator as new. No other CPU may access this private lower hierarchy
-    /// or the supplied page. The caller must own a full, initialized USABLE frame
+    /// allocator as new. The caller must own a full, initialized USABLE frame
     /// and end all references and aliases other than the dormant HHDM alias.
     /// Never pass a frame already mapped here, a kernel frame, or a table frame.
     pub unsafe fn map_page(
@@ -1137,24 +1393,61 @@ impl UserAddressSpace {
         permissions: UserPermissions,
         frames: &mut FrameAllocator<'_>,
     ) -> Result<(), PagingError> {
+        self.map_with(address, physical, permissions, |space| {
+            space.allocate_table(frames)
+        })
+    }
+
+    /// Transfer one initialized frame into this lower half, taking any missing
+    /// table from `reserve`, which `missing_tables` sized (spec 0051, point
+    /// 7). On error, ownership of `physical` stays with the caller.
+    ///
+    /// # Safety
+    /// As for map_page; `reserve`'s frames came from the same allocator.
+    pub unsafe fn map_reserved(
+        &mut self,
+        address: u64,
+        physical: u64,
+        permissions: UserPermissions,
+        reserve: &mut FrameReserve,
+    ) -> Result<(), PagingError> {
+        self.map_with(address, physical, permissions, |space| {
+            let table = space
+                .take_reserved(reserve)
+                .ok_or(PagingError::OutOfFrames)?;
+            Ok(space.adopt_table(table))
+        })
+    }
+
+    /// Publish one leaf, publishing any missing table from `table` first.
+    /// Each table is zeroed before a Release store makes it reachable, and the
+    /// leaf comes last, so a walker on any CPU sees either nothing or a
+    /// complete path (spec 0051, point 7). Inserting a leaf needs no flush:
+    /// no CPU caches an absent entry.
+    fn map_with(
+        &mut self,
+        address: u64,
+        physical: u64,
+        permissions: UserPermissions,
+        mut table: impl FnMut(&mut Self) -> Result<u64, PagingError>,
+    ) -> Result<(), PagingError> {
         check_user_address(address)?;
         check_page_address(address)?;
         self.kernel().check_physical(physical)?;
-        self.check_inactive()?;
+        self.check_writer()?;
         if permissions.writable && permissions.executable {
             return Err(PagingError::InvalidUserPermissions);
         }
         let mut table_physical = self.root;
         for level in (2..=4).rev() {
-            let table = self.kernel().table_pointer(table_physical)?;
+            let pointer = self.kernel().table_pointer(table_physical)?;
             // SAFETY: Each table belongs to this root and the index is in range.
-            let slot = unsafe { table.add(index(address, level)) };
-            // SAFETY: This is an initialized, aligned table entry.
-            let entry = unsafe { slot.read_volatile() };
+            let slot = unsafe { table_entry(pointer.add(index(address, level))) };
+            let entry = slot.load(Ordering::Acquire);
             if entry & PRESENT == 0 {
-                let child = self.allocate_table(frames)?;
-                // SAFETY: The child is zeroed and owned before publication.
-                unsafe { slot.write_volatile(child | PRESENT | WRITABLE | USER) };
+                let child = table(self)?;
+                // Release: the child's zeroing precedes its publication.
+                slot.store(child | PRESENT | WRITABLE | USER, Ordering::Release);
                 table_physical = child;
             } else {
                 if entry & HUGE != 0 {
@@ -1171,11 +1464,10 @@ impl UserAddressSpace {
                 table_physical = entry & self.kernel().physical_mask;
             }
         }
-        let table = self.kernel().table_pointer(table_physical)?;
-        // SAFETY: This is the in-range leaf slot in our inactive hierarchy.
-        let slot = unsafe { table.add(index(address, 1)) };
-        // SAFETY: The table was initialized and is exclusively owned.
-        if unsafe { slot.read_volatile() } & PRESENT != 0 {
+        let pointer = self.kernel().table_pointer(table_physical)?;
+        // SAFETY: This is the in-range leaf slot of an owned table.
+        let slot = unsafe { table_entry(pointer.add(index(address, 1))) };
+        if slot.load(Ordering::Acquire) & PRESENT != 0 {
             return Err(PagingError::AlreadyMapped);
         }
         let mut flags = PRESENT | USER;
@@ -1185,9 +1477,9 @@ impl UserAddressSpace {
         if !permissions.executable {
             flags |= NO_EXECUTE;
         }
-        // SAFETY: The caller transfers its exclusively owned initialized page.
-        // User leaves are never global; activate flushes the reused PCID.
-        unsafe { slot.write_volatile(physical | flags) };
+        // The caller transfers its exclusively owned initialized page; Release
+        // publishes its contents with it. User leaves are never global.
+        slot.store(physical | flags, Ordering::Release);
         self.owned_pages += 1;
         Ok(())
     }
@@ -1216,7 +1508,8 @@ impl UserAddressSpace {
                 let table = self.kernel().table_pointer(physical)?;
                 // SAFETY: The live owned hierarchy provides a full initialized
                 // table, and each index is within its 512 aligned entries.
-                let entry = unsafe { table.add(index(address, level)).read_volatile() };
+                let entry = unsafe { table_entry(table.add(index(address, level))) }
+                    .load(Ordering::Acquire);
                 if entry & PRESENT == 0 {
                     let span = 1_u64 << (12 + 9 * (level - 1));
                     // Lower-half addresses and level<=4 keep this boundary
@@ -1242,28 +1535,30 @@ impl UserAddressSpace {
         Ok(None)
     }
 
-    /// Remove an owned leaf and reclaim each empty lower table on its path.
-    /// A missing page returns false and prunes any empty tables left by a
-    /// failed map_page. The user root and borrowed upper mappings are never
-    /// freed. Supervisor-only leaves
-    /// installed by protect_page(None) remain owned and can be removed here.
-    /// Failed releases restore that entry; earlier successful releases remain
-    /// reflected in the tree and ownership counts, so teardown can be retried.
+    /// Withdraw an owned leaf and each lower table that its removal empties,
+    /// moving their frames into `batch` (spec 0051, point 8). A missing page
+    /// returns false and withdraws any empty tables left by a failed map_page.
+    /// The user root and borrowed upper mappings are never withdrawn.
+    /// Supervisor-only leaves installed by protect_page(None) remain owned and
+    /// can be withdrawn here. Every error precedes the first change.
     ///
     /// # Safety
-    /// Run on the BSP with interrupts disabled and this private root inactive,
-    /// using the original unique allocator. No AP may have used the user root
-    /// or its owned pages. Restore the kernel root on the BSP before
-    /// calling to flush stale user translations. No live reference or DMA may
-    /// access this page or any table that becomes empty after its removal.
-    pub unsafe fn unmap_page(
+    /// Run on the BSP with interrupts disabled; this CPU does not run the
+    /// root. The caller keeps every withdrawn frame allocated until each CPU
+    /// in `shootdown_targets`, read after this call, has flushed, then frees
+    /// them with the original allocator. No live reference or DMA may access
+    /// the page or a table that becomes empty.
+    pub unsafe fn withdraw_page(
         &mut self,
         address: u64,
-        frames: &mut FrameAllocator<'_>,
+        batch: &mut Withdrawal,
     ) -> Result<bool, PagingError> {
         check_user_address(address)?;
         check_page_address(address)?;
-        self.check_inactive()?;
+        self.check_writer()?;
+        if !batch.has_room() {
+            return Err(PagingError::WithdrawalFull);
+        }
         let path = self.owned_path(address)?;
         let present = path.depth == 4 && path.entries[3] & PRESENT != 0;
 
@@ -1275,9 +1570,11 @@ impl UserAddressSpace {
             let table = self.kernel().table_pointer(path.frames[depth])?;
             let removed_index = index(address, 4 - depth as u32);
             let has_neighbor = (0..ENTRIES).any(|entry_index| {
-                // SAFETY: This is a full, initialized, exclusively owned table.
                 entry_index != removed_index
-                    && unsafe { table.add(entry_index).read_volatile() } & PRESENT != 0
+                    // SAFETY: This is a full, initialized, owned table.
+                    && unsafe { table_entry(table.add(entry_index)) }.load(Ordering::Acquire)
+                        & PRESENT
+                        != 0
             });
             if has_neighbor {
                 break;
@@ -1285,52 +1582,66 @@ impl UserAddressSpace {
             first_reclaimed_table = depth;
         }
 
+        let mask = self.kernel().physical_mask;
         if present {
-            // SAFETY: The entire inactive path is validated. Withdraw its owned
-            // leaf before releasing the frame; no stale translation remains live.
-            unsafe { path.slots[3].write_volatile(0) };
-            // SAFETY: This exclusively owned leaf has no remaining active alias.
-            if unsafe { frames.deallocate(path.entries[3] & self.kernel().physical_mask) }.is_err()
-            {
-                // SAFETY: A rejected free retains the allocation and ownership.
-                unsafe { path.slots[3].write_volatile(path.entries[3]) };
-                return Err(PagingError::FrameReleaseFailed);
-            }
+            // The exchange keeps the frame identity even when hardware on
+            // another CPU set A or D since the walk above.
+            // SAFETY: The validated leaf slot of a live owned table.
+            let withdrawn = unsafe { table_entry(path.slots[3]) }.swap(0, Ordering::AcqRel);
+            assert_eq!(
+                withdrawn & !ACCESSED_DIRTY,
+                path.entries[3] & !ACCESSED_DIRTY,
+                "a user leaf changed during its withdrawal"
+            );
+            batch.push(withdrawn & mask);
             self.owned_pages -= 1;
         }
         for depth in (first_reclaimed_table..path.depth).rev() {
-            // SAFETY: This child table is empty after successful descendant
-            // removal, and the parent remains live until its own later turn.
-            unsafe { path.slots[depth - 1].write_volatile(0) };
-            // SAFETY: The table is inactive, empty and no longer reachable.
-            if unsafe { frames.deallocate(path.frames[depth]) }.is_err() {
-                // SAFETY: Preserve ownership of the still-allocated table.
-                unsafe { path.slots[depth - 1].write_volatile(path.entries[depth - 1]) };
-                return Err(PagingError::FrameReleaseFailed);
-            }
+            // The child table is empty now; its parent stays until its own turn.
+            // SAFETY: The validated parent slot of a live owned table.
+            let withdrawn = unsafe { table_entry(path.slots[depth - 1]) }.swap(0, Ordering::AcqRel);
+            assert_eq!(
+                withdrawn & mask,
+                path.frames[depth],
+                "a user table changed during its withdrawal"
+            );
+            batch.push(path.frames[depth]);
             self.owned_tables -= 1;
         }
         Ok(present)
     }
 
-    /// Change permissions without replacing or clearing an owned data frame.
-    /// None keeps an owned present supervisor-only, non-executable leaf, so
-    /// restoring user access preserves its contents. Physical address, access
-    /// and dirty bits, and unrelated leaf attributes survive every transition.
+    /// Withdraw a page from a root that no CPU has loaded, and free its frames
+    /// at once: no CPU can hold a translation through them.
     ///
     /// # Safety
-    /// Run on the BSP with interrupts disabled and this private root inactive.
-    /// No AP may use its lower hierarchy or owned pages. Restore the kernel
-    /// root on the BSP before calling to flush stale user permissions.
-    /// No live reference or DMA may depend on the old access permissions.
-    pub unsafe fn protect_page(
+    /// As for withdraw_page, with the original allocator.
+    #[cfg(feature = "boot-smoke")]
+    pub unsafe fn unmap_page(
         &mut self,
         address: u64,
+        frames: &mut FrameAllocator<'_>,
+    ) -> Result<bool, PagingError> {
+        self.check_inactive()?;
+        let mut batch = Withdrawal::empty();
+        // SAFETY: The caller's contract; an empty mask leaves no CPU to flush.
+        let present = unsafe { self.withdraw_page(address, &mut batch) };
+        // SAFETY: No CPU has the root loaded, so none translates through the
+        // withdrawn frames; an error withdrew nothing.
+        unsafe { batch.release(frames) };
+        present
+    }
+
+    /// Check a permission change of the owned leaf at `address` without making
+    /// it, returning the leaf's path. Every protect_page error comes from here.
+    fn protect_path(
+        &self,
+        address: u64,
         permissions: Option<UserPermissions>,
-    ) -> Result<(), PagingError> {
+    ) -> Result<OwnedPath, PagingError> {
         check_user_address(address)?;
         check_page_address(address)?;
-        self.check_inactive()?;
+        self.check_writer()?;
         if permissions.is_some_and(|permissions| permissions.writable && permissions.executable) {
             return Err(PagingError::InvalidUserPermissions);
         }
@@ -1347,23 +1658,76 @@ impl UserAddressSpace {
                 }
             }
         }
-        let mut entry = path.entries[3] & !(USER | WRITABLE | NO_EXECUTE);
-        match permissions {
-            Some(permissions) => {
-                entry |= USER;
-                if permissions.writable {
-                    entry |= WRITABLE;
+        Ok(path)
+    }
+
+    /// Check that protect_page would accept this change, changing nothing.
+    pub fn check_protect(
+        &self,
+        address: u64,
+        permissions: Option<UserPermissions>,
+    ) -> Result<(), PagingError> {
+        self.protect_path(address, permissions).map(|_| ())
+    }
+
+    /// Change permissions without replacing or clearing an owned data frame.
+    /// None keeps an owned present supervisor-only, non-executable leaf, so
+    /// restoring user access preserves its contents. Physical address, access
+    /// and dirty bits, and unrelated leaf attributes survive every transition.
+    ///
+    /// # Safety
+    /// Run on the BSP with interrupts disabled; this CPU does not run the
+    /// root. Any change can leave stale translations on the CPUs in
+    /// `shootdown_targets`, read after this call: a stale read-only entry
+    /// would turn a now-permitted write into a fatal fault, so the caller
+    /// flushes them before it resumes any thread of this space. No live
+    /// reference or DMA may depend on the old access permissions.
+    pub unsafe fn protect_page(
+        &mut self,
+        address: u64,
+        permissions: Option<UserPermissions>,
+    ) -> Result<(), PagingError> {
+        let path = self.protect_path(address, permissions)?;
+        let permission_bits = |entry: u64| {
+            let mut entry = entry & !(USER | WRITABLE | NO_EXECUTE);
+            match permissions {
+                Some(permissions) => {
+                    entry |= USER;
+                    if permissions.writable {
+                        entry |= WRITABLE;
+                    }
+                    if !permissions.executable {
+                        entry |= NO_EXECUTE;
+                    }
                 }
-                if !permissions.executable {
-                    entry |= NO_EXECUTE;
+                None => entry |= NO_EXECUTE,
+            }
+            entry
+        };
+        // SAFETY: The validated leaf slot of a live owned table.
+        let slot = unsafe { table_entry(path.slots[3]) };
+        let mut current = slot.load(Ordering::Acquire);
+        for _ in 0..PROTECT_ATTEMPTS {
+            // Only the permission bits change; an exchange that hardware's A
+            // or D update beat retries with the updated entry.
+            match slot.compare_exchange(
+                current,
+                permission_bits(current),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => {
+                    assert_eq!(
+                        actual & !ACCESSED_DIRTY,
+                        current & !ACCESSED_DIRTY,
+                        "a user leaf changed during its protection change"
+                    );
+                    current = actual;
                 }
             }
-            None => entry |= NO_EXECUTE,
         }
-        // SAFETY: The full path belongs to the inactive root; only the desired
-        // leaf permission bits change. Activation will flush prior permissions.
-        unsafe { path.slots[3].write_volatile(entry) };
-        Ok(())
+        panic!("a user leaf protection change kept racing its A and D bits")
     }
 
     /// Walk an owned lower-half path without requiring user access on its leaf.
@@ -1381,8 +1745,8 @@ impl UserAddressSpace {
             let table = self.kernel().table_pointer(physical)?;
             // SAFETY: The live owned table has exactly ENTRIES entries.
             let slot = unsafe { table.add(index(address, level)) };
-            // SAFETY: The slot is initialized and no concurrent writer exists.
-            let entry = unsafe { slot.read_volatile() };
+            // SAFETY: An initialized entry; only the BSP writes it.
+            let entry = unsafe { table_entry(slot) }.load(Ordering::Acquire);
             path.frames[depth] = physical;
             path.entries[depth] = entry;
             path.slots[depth] = slot;
@@ -1416,7 +1780,8 @@ impl UserAddressSpace {
         for level in (1..=4).rev() {
             let table = self.kernel().table_pointer(table_physical)?;
             // SAFETY: Owned, live, initialized table and an in-range index.
-            let entry = unsafe { table.add(index(address, level)).read_volatile() };
+            let entry =
+                unsafe { table_entry(table.add(index(address, level))) }.load(Ordering::Acquire);
             if entry & PRESENT == 0 {
                 return Ok(None);
             }
@@ -1489,11 +1854,12 @@ impl UserAddressSpace {
     /// Copy through the HHDM only after validating every page in the range.
     /// User-supplied integers are never cast directly into dereferenceable
     /// pointers. This also handles ranges crossing noncontiguous physical pages.
+    /// Sibling threads may write the source concurrently from other CPUs; the
+    /// copy then holds a mix of old and new bytes, as a user copy may.
     ///
     /// # Safety
-    /// The BSP must be in the kernel with this user suspended. APs must not
-    /// access its private pages, and no DMA or concurrent writer may modify
-    /// its mappings or page contents. The destination must not alias any source
+    /// Only the BSP edits the tables, and not during the copy. No DMA may
+    /// write the source pages. The destination must not alias any source
     /// page, including through the HHDM.
     pub unsafe fn copy_from_user(
         &self,
@@ -1514,11 +1880,12 @@ impl UserAddressSpace {
                 .ok_or(PagingError::DirectMapOverflow)?;
             // SAFETY: The checked user walk resolves initialized owned RAM,
             // mapped fully by HHDM. Count stays within this source page and the
-            // destination bounds; the caller excludes aliases and writers.
+            // destination bounds; the caller excludes aliases. REP MOVSB
+            // tolerates sibling writers.
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    source as *const u8,
+                copy_bytes(
                     destination.as_mut_ptr().add(copied),
+                    source as *const u8,
                     count,
                 );
             }
@@ -1530,13 +1897,14 @@ impl UserAddressSpace {
     /// Copy to owned user pages only after validating the entire writable range.
     /// This follows each page's physical mapping through the HHDM rather than
     /// dereferencing the supplied user address or assuming physical contiguity.
+    /// Sibling threads may access the destination concurrently from other
+    /// CPUs, as they may during any user copy.
     ///
     /// # Safety
-    /// The BSP must be in the kernel with this user suspended. APs must not
-    /// access its private pages, and no DMA or concurrent access may modify
-    /// its mappings or access destination bytes.
-    /// No live kernel references may cover those bytes. The source must not
-    /// alias any destination page, including through the HHDM or another mapping.
+    /// Only the BSP edits the tables, and not during the copy. No DMA may
+    /// access the destination pages, and no live kernel reference may cover
+    /// those bytes. The source must not alias any destination page, including
+    /// through the HHDM or another mapping.
     pub unsafe fn copy_to_user(&self, address: u64, source: &[u8]) -> Result<(), PagingError> {
         self.validate_writable(address, source.len())?;
         let mut copied = 0;
@@ -1553,44 +1921,117 @@ impl UserAddressSpace {
             // SAFETY: The complete range was checked for effective user write
             // permission and valid HHDM addresses before any write. This chunk
             // stays inside its page and source bounds; the caller excludes
-            // concurrent access, changes to mappings, and aliasing references.
+            // changes to mappings and aliasing references. REP MOVSB tolerates
+            // sibling accesses.
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    source.as_ptr().add(copied),
-                    destination as *mut u8,
-                    count,
-                );
+                copy_bytes(destination as *mut u8, source.as_ptr().add(copied), count);
             }
             copied += count;
         }
         Ok(())
     }
 
-    /// Activate this root using PCID zero and flush stale global translations.
+    /// Read the aligned 32-bit user word at `address` with one atomic load,
+    /// after copy_from_user's validation: a futex word, which sibling threads
+    /// may write from other CPUs at any time (spec 0051, point 7).
     ///
     /// # Safety
-    /// Run at CPL0 on the BSP with interrupts disabled. No AP may activate this
-    /// private root or access its lower mappings. Code, current and
-    /// interrupt stacks, and all kernel data must reside in the shared upper
-    /// half. Keep this root and its borrowed kernel hierarchy live until the
-    /// kernel root is restored; userspace must not outlive its owned pages.
+    /// Only the BSP edits the tables, and not during the read.
+    pub unsafe fn read_word(&self, address: u64) -> Result<u32, PagingError> {
+        if !address.is_multiple_of(4) {
+            return Err(PagingError::UnalignedAddress);
+        }
+        self.validate_readable(address, 4)?;
+        let translation = self.translate(address)?.ok_or(PagingError::NotMapped)?;
+        let word = self
+            .kernel()
+            .offset
+            .checked_add(translation.physical)
+            .ok_or(PagingError::DirectMapOverflow)?;
+        // SAFETY: The checked walk resolved owned, initialized RAM that the
+        // HHDM maps in full, and the 4-aligned word lies within one page.
+        Ok(unsafe { AtomicU32::from_ptr(word as *mut u32) }.load(Ordering::Acquire))
+    }
+
+    /// Load this root on this CPU, using PCID zero and flushing stale global
+    /// translations. This CPU's bit in the mask is set first (SeqCst), so a
+    /// removal that reads the mask after its withdrawal either flushes this
+    /// CPU or is seen by this load's walks (spec 0051, point 8).
+    ///
+    /// # Safety
+    /// Run at CPL0 with interrupts disabled. Code, current and interrupt
+    /// stacks, and all kernel data must reside in the shared upper half. Keep
+    /// this root and its borrowed kernel hierarchy live until `deactivate`;
+    /// userspace must not outlive its owned pages.
     pub unsafe fn activate(&self) -> Result<(), PagingError> {
         self.check_live()?;
+        let bit = cpu_bit();
+        if self.cpus.fetch_or(bit, Ordering::SeqCst) & bit != 0 {
+            return Err(PagingError::StillActive);
+        }
         // SAFETY: The caller preserves the shared supervisor code and stack.
         unsafe { switch_root(self.root) };
         Ok(())
     }
 
-    /// Release private leaves/tables after restoring the kernel root. Shared
+    /// Replace this root with the kernel's on this CPU, then clear this CPU's
+    /// bit in the mask: the root switch has dropped every translation this
+    /// CPU held through this root.
+    ///
+    /// # Safety
+    /// Run at CPL0 with interrupts disabled, after `activate` on this CPU,
+    /// with `kernel` the hierarchy this space borrows.
+    pub unsafe fn deactivate(&self, kernel: &PageTables) -> Result<(), PagingError> {
+        self.check_live()?;
+        let bit = cpu_bit();
+        if self.cpus.load(Ordering::Relaxed) & bit == 0 || read_cr3() & ADDRESS_MASK != self.root {
+            return Err(PagingError::NotActive);
+        }
+        // SAFETY: The caller's contract; the kernel root maps all live code,
+        // stacks and data.
+        unsafe { kernel.activate() }?;
+        self.cpus.fetch_and(!bit, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// The CPUs that must flush after a withdrawal or permission change, read
+    /// after it: the mask of CPUs with this root loaded. The SeqCst fence
+    /// orders the change before the read, so a CPU this misses set its bit
+    /// later and loads the root after the change (spec 0051, point 8).
+    pub fn shootdown_targets(&self) -> u64 {
+        fence(Ordering::SeqCst);
+        let targets = self.cpus.load(Ordering::SeqCst);
+        assert_eq!(targets & cpu_bit(), 0, "a CPU changed a root it runs");
+        targets
+    }
+
+    /// The CPUs that have this root loaded now; 0 once none can translate
+    /// through it.
+    pub fn loaded_cpus(&self) -> u64 {
+        self.cpus.load(Ordering::SeqCst)
+    }
+
+    /// Record that the BSP made other CPUs load or leave this root, for the
+    /// user flush self-test: it sets their bits before it sends the load and
+    /// clears them once they have acknowledged leaving.
+    #[cfg(feature = "boot-smoke")]
+    pub fn note_loaded_for_test(&self, cpus: u64, loaded: bool) {
+        assert_eq!(cpus & cpu_bit(), 0, "the BSP runs its own root changes");
+        if loaded {
+            self.cpus.fetch_or(cpus, Ordering::SeqCst);
+        } else {
+            self.cpus.fetch_and(!cpus, Ordering::SeqCst);
+        }
+    }
+
+    /// Release private leaves/tables once no CPU has the root loaded. Shared
     /// upper tables are never traversed or freed. Partial failures preserve
     /// remaining ownership and counts so teardown can be retried.
     ///
     /// # Safety
     /// Run on the BSP with interrupts disabled using the original unique
     /// allocator. No live references, DMA, or pending users may access these
-    /// pages, and no AP may have used the private root or its owned pages.
-    /// Restore through PageTables::activate to flush the BSP's stale user
-    /// translations; no AP may retain a translation into this private hierarchy.
+    /// pages.
     pub unsafe fn destroy(&mut self, frames: &mut FrameAllocator<'_>) -> Result<(), PagingError> {
         self.check_inactive()?;
         self.release_entries(self.root, 4, ENTRIES / 2, frames)?;
@@ -1612,9 +2053,24 @@ impl UserAddressSpace {
         }
     }
 
-    fn check_inactive(&self) -> Result<(), PagingError> {
+    /// Software may edit this live hierarchy here: this CPU does not run it,
+    /// so its own translations need no flush (spec 0051, point 8).
+    fn check_writer(&self) -> Result<(), PagingError> {
         self.check_live()?;
-        if read_cr3() & ADDRESS_MASK == self.root {
+        if read_cr3() & ADDRESS_MASK == self.root
+            || self.cpus.load(Ordering::Relaxed) & cpu_bit() != 0
+        {
+            Err(PagingError::StillActive)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// No CPU has this root loaded, so none can translate through it: the
+    /// mask is 0 (spec 0051, point 8).
+    fn check_inactive(&self) -> Result<(), PagingError> {
+        self.check_writer()?;
+        if self.cpus.load(Ordering::SeqCst) != 0 {
             Err(PagingError::StillActive)
         } else {
             Ok(())
@@ -1623,19 +2079,25 @@ impl UserAddressSpace {
 
     fn allocate_table(&mut self, frames: &mut FrameAllocator<'_>) -> Result<u64, PagingError> {
         let physical = frames.allocate().ok_or(PagingError::OutOfFrames)?;
-        let pointer = match self.kernel().table_pointer(physical) {
-            Ok(pointer) => pointer,
-            Err(error) => {
-                // SAFETY: This fresh frame has no mapping or live references.
-                unsafe { frames.deallocate(physical) }
-                    .map_err(|_| PagingError::FrameReleaseFailed)?;
-                return Err(error);
-            }
-        };
-        // SAFETY: A fresh, exclusively owned frame covered by the HHDM contract.
+        if let Err(error) = self.kernel().table_pointer(physical) {
+            // SAFETY: This fresh frame has no mapping or live references.
+            unsafe { frames.deallocate(physical) }.map_err(|_| PagingError::FrameReleaseFailed)?;
+            return Err(error);
+        }
+        Ok(self.adopt_table(physical))
+    }
+
+    /// Zero a fresh, validated frame and own it as an unpublished table.
+    fn adopt_table(&mut self, physical: u64) -> u64 {
+        let pointer = self
+            .kernel()
+            .table_pointer(physical)
+            .expect("validated table direct map");
+        // SAFETY: A fresh, exclusively owned frame covered by the HHDM contract,
+        // not yet reachable from any table.
         unsafe { pointer.write_bytes(0, ENTRIES) };
         self.owned_tables += 1;
-        Ok(physical)
+        physical
     }
 
     fn release_entries(
@@ -1647,10 +2109,10 @@ impl UserAddressSpace {
     ) -> Result<(), PagingError> {
         let table = self.kernel().table_pointer(physical)?;
         for entry_index in 0..count {
-            // SAFETY: The count is 256 at PML4 or 512 at each lower level.
-            let slot = unsafe { table.add(entry_index) };
-            // SAFETY: The inactive, exclusively owned table is initialized.
-            let entry = unsafe { slot.read_volatile() };
+            // SAFETY: The count is 256 at PML4 or 512 at each lower level, in
+            // an initialized owned table.
+            let slot = unsafe { table_entry(table.add(entry_index)) };
+            let entry = slot.load(Ordering::Acquire);
             if entry & PRESENT == 0 {
                 continue;
             }
@@ -1661,15 +2123,15 @@ impl UserAddressSpace {
             if level > 1 {
                 self.release_entries(child, level - 1, ENTRIES, frames)?;
             }
-            // SAFETY: No live access uses this inactive root. Withdraw the last
-            // mapping or parent reference before recycling the owned frame.
-            unsafe { slot.write_volatile(0) };
+            // No CPU has this root loaded. Withdraw the last mapping or parent
+            // reference before recycling the owned frame.
+            slot.store(0, Ordering::Release);
             // SAFETY: The child is exclusively owned, inactive, and no longer
             // reachable from any table except its dormant direct-map alias.
             if unsafe { frames.deallocate(child) }.is_err() {
-                // SAFETY: A rejected free leaves the child allocated; restore
+                // A rejected free leaves the child allocated; restore
                 // ownership so the caller can diagnose or retry destruction.
-                unsafe { slot.write_volatile(entry) };
+                slot.store(entry, Ordering::Release);
                 return Err(PagingError::FrameReleaseFailed);
             }
             if level == 1 {
@@ -1679,6 +2141,41 @@ impl UserAddressSpace {
             }
         }
         Ok(())
+    }
+}
+
+/// Drop this CPU's translations through user root `root` when CR3 holds it
+/// (OP_FLUSH_USER, spec 0051, point 8), returning whether it did. A reload of
+/// CR3 drops every non-global translation and the paging-structure caches,
+/// and user leaves are never global.
+///
+/// # Safety
+/// CPL0 with IF clear. The current root, reloaded unchanged, maps all live
+/// kernel code, stacks and data.
+pub(crate) unsafe fn flush_user_root(root: u64) -> bool {
+    let cr3 = read_cr3();
+    if cr3 & ADDRESS_MASK != root {
+        return false;
+    }
+    // SAFETY: The caller's contract; the same root and flags reload, so only
+    // cached translations change. No `nomem`: the reload orders memory.
+    unsafe { asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags)) };
+    true
+}
+
+/// Load `root` on this CPU for the boot-smoke user flush self-test, on an AP,
+/// unless CR3 already holds it: a reload would flush this CPU's translations
+/// and hide a missing OP_FLUSH_USER.
+///
+/// # Safety
+/// CPL0 with IF clear. `root` is the sealed kernel root or a live user root
+/// that borrows it, and stays live while loaded here.
+#[cfg(feature = "boot-smoke")]
+pub(crate) unsafe fn load_root_for_test(root: u64) {
+    if read_cr3() & ADDRESS_MASK != root {
+        // SAFETY: The caller's contract: either root maps all live kernel
+        // code, stacks and data.
+        unsafe { switch_root(root) };
     }
 }
 
@@ -1883,9 +2380,9 @@ fn check_user_address(address: u64) -> Result<(), PagingError> {
 /// PCIDs are never selected by this implementation.
 unsafe fn switch_root(root: u64) {
     let cr4: u64;
-    // SAFETY: All callers run at CPL0 with interrupts disabled on this CPU.
-    // The BSP owns private user roots; an AP may only adopt the sealed kernel
-    // root. CR3/CR4 changes and the resulting invalidations are CPU-local.
+    // SAFETY: All callers run at CPL0 with interrupts disabled on this CPU,
+    // loading the sealed kernel root or a user root that borrows its upper
+    // half. CR3/CR4 changes and the resulting invalidations are CPU-local.
     unsafe { asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
     if cr4 & CR4_PGE != 0 {
         // SAFETY: Only disable global pages, flushing their cached permissions
@@ -1999,7 +2496,6 @@ unsafe fn self_test_user_mutation(kernel: &PageTables, frames: &mut FrameAllocat
     const DATA: u64 = 0x5000_0000;
     const NEIGHBOR: u64 = DATA + PAGE_SIZE;
     const OTHER_TABLE: u64 = DATA + (1 << 21);
-    const ACCESSED_DIRTY: u64 = (1 << 5) | (1 << 6);
     let before = frames.stats().expect("mutation test frame tracking");
     // SAFETY: The kernel root is active on the sole CPU with IF clear. The
     // unique allocator and shared supervisor mappings outlive this test root.
@@ -2142,9 +2638,17 @@ unsafe fn self_test_user_mutation(kernel: &PageTables, frames: &mut FrameAllocat
             Err(PagingError::NotMapped)
         );
         user.activate().unwrap();
+        assert_eq!(user.activate(), Err(PagingError::StillActive));
         assert_eq!(user.unmap_page(DATA, frames), Err(PagingError::StillActive));
         assert_eq!(user.protect_page(DATA, None), Err(PagingError::StillActive));
-        kernel.activate().unwrap();
+        let mut batch = Withdrawal::empty();
+        assert_eq!(
+            user.withdraw_page(DATA, &mut batch),
+            Err(PagingError::StillActive)
+        );
+        user.deactivate(kernel).unwrap();
+        assert_eq!(user.deactivate(kernel), Err(PagingError::NotActive));
+        assert_eq!(user.loaded_cpus(), 0);
         user.protect_page(DATA, None).unwrap();
         assert_eq!(user.unmap_page(DATA, frames), Ok(true));
         assert_eq!(user.unmap_page(DATA, frames), Ok(false));
@@ -2468,8 +2972,10 @@ unsafe fn self_test_userspace(kernel: &PageTables, frames: &mut FrameAllocator<'
     unsafe {
         user.activate().expect("activate user root");
         assert_eq!(read_cr3() & ADDRESS_MASK, user.root);
+        assert_eq!(user.loaded_cpus(), 1);
         assert_eq!(user.destroy(frames), Err(PagingError::StillActive));
-        kernel.activate().expect("restore kernel root");
+        user.deactivate(kernel).expect("restore kernel root");
+        assert_eq!(read_cr3() & ADDRESS_MASK, kernel.root);
         user.destroy(frames).expect("reclaim user root");
     }
     assert_eq!(user.owned_table_count(), 0);
