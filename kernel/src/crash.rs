@@ -178,18 +178,26 @@ pub(crate) fn enter(cause: Cause<'_>) -> ! {
         targets.count_ones(),
         stopped.count_ones()
     );
-    let known = known_stacks(slot);
+    let known = known_stacks();
     #[cfg(feature = "boot-smoke")]
     let planted = PLANTED.load(Ordering::Acquire);
     #[cfg(feature = "boot-smoke")]
     let mut found = false;
-    let (frames, end) = walk(frame, known.ranges(), &text(), |index, rip| {
-        report!("MIRROR_CRASH_FRAME index={} rip={:#x}", index, rip);
-        #[cfg(feature = "boot-smoke")]
-        if planted != 0 && rip == planted {
-            found = true;
-        }
-    });
+    // SAFETY: `known` holds only this CPU's own stacks, which stay mapped
+    // through the walk (`known_stacks`). They are raw stack memory that
+    // compiled code reaches through RBP and RSP, and the walk reads frame
+    // links there, which no Rust borrow covers. No other CPU writes them, and
+    // with IF clear only an NMI or a fault could run here, which is fatal and
+    // enters `nested`, never returning to the walk.
+    let (frames, end) = unsafe {
+        walk(frame, known.ranges(), &text(), |index, rip| {
+            report!("MIRROR_CRASH_FRAME index={} rip={:#x}", index, rip);
+            #[cfg(feature = "boot-smoke")]
+            if planted != 0 && rip == planted {
+                found = true;
+            }
+        })
+    };
     report!(
         "MIRROR_CRASH_BACKTRACE frames={} end={}",
         frames,
@@ -320,11 +328,16 @@ impl Stacks {
     }
 }
 
-/// CPU `slot`'s mapped stacks: the BSP's scheduler, RSP0 placeholder and
-/// IST1-3 stacks once mapped, or an AP's kernel and IST1-3 stacks, and the
-/// running thread's kernel stack when TSS.RSP0 names one in the kernel VA
-/// window. None for an unknown CPU.
-fn known_stacks(slot: Option<usize>) -> Stacks {
+/// This CPU's mapped stacks, by its crash slot: the BSP's scheduler, RSP0
+/// placeholder and IST1-3 stacks once mapped, or an AP's kernel and IST1-3
+/// stacks, and the running thread's kernel stack when TSS.RSP0 names one in
+/// the kernel VA window. None for a CPU outside the slots. Each stays mapped
+/// while this CPU runs: the BSP region is never unmapped, an AP's stacks are
+/// mapped before it starts and an AP takes the crash path only once it is
+/// ONLINE, and RSP0 names a thread's stack only while that thread runs on
+/// this CPU (0050-D2).
+fn known_stacks() -> Stacks {
+    let slot = smp::crash_slot();
     let mut known = Stacks {
         ranges: [const { 0..0 }; MAX_STACKS],
         count: 0,
@@ -340,10 +353,9 @@ fn known_stacks(slot: Option<usize>) -> Stacks {
             .for_each(|range| known.push(range)),
         None => {}
     }
-    if let Some(range) = slot
-        .and_then(interrupts::rsp0_of)
-        .and_then(kernel_va::stack_below)
-    {
+    // SAFETY: `slot` is `crash_slot`'s, so it is this CPU's own.
+    let rsp0 = slot.and_then(|slot| unsafe { interrupts::rsp0_of(slot) });
+    if let Some(range) = rsp0.and_then(kernel_va::stack_below) {
         known.push(range);
     }
     known
@@ -353,7 +365,15 @@ fn known_stacks(slot: Option<usize>) -> Stacks {
 /// the return address above it. `emit` gets each frame's index and return
 /// address. Memory is read only inside `stacks`. Returns the frames emitted
 /// and why the walk ended.
-fn walk(
+///
+/// # Safety
+///
+/// Every range in `stacks` is mapped, readable memory for the whole walk,
+/// and no other CPU or interrupt handler writes it until the walk returns.
+/// The walk reads it through pointers made from integers, so a range inside
+/// a Rust object needs that object's address exposed by a pointer-to-integer
+/// cast, and no `&mut` to the object may be used until the walk returns.
+unsafe fn walk(
     mut rbp: u64,
     stacks: &[Range<u64>],
     text: &Range<u64>,
@@ -388,13 +408,14 @@ fn walk(
             return (index, End::Order);
         }
         highest[stack] = Some(rbp);
-        // SAFETY: The two aligned words at rbp lie inside one of this CPU's
-        // mapped stacks (or a self-test's buffer), and volatile reads form no
-        // reference to memory another context may write.
+        // SAFETY: The two aligned words at rbp lie inside one range of
+        // `stacks`, which the contract makes readable through pointers made
+        // from integers, with no concurrent writer. Volatile reads form no
+        // reference.
         let (next, rip) = unsafe {
             (
-                (rbp as *const u64).read_volatile(),
-                ((rbp + 8) as *const u64).read_volatile(),
+                core::ptr::with_exposed_provenance::<u64>(rbp as usize).read_volatile(),
+                core::ptr::with_exposed_provenance::<u64>(rbp as usize + 8).read_volatile(),
             )
         };
         // A return address follows a call instruction, so it is never the
@@ -465,26 +486,38 @@ pub(crate) fn self_test() {
         ".text holds the kernel"
     );
     // A synthetic stack: frame i at word 2i saves the next frame's RBP and
-    // a return address inside the fake text range.
-    let mut buffer = [0_u64; 2 * MAX_FRAMES + 2];
-    let base = buffer.as_mut_ptr() as u64;
+    // a return address inside the fake text range. Past `ptr`, the buffer is
+    // reached only through `ptr` and through the walk's pointers made from
+    // `base`, never through a borrow that would invalidate their provenance.
+    const WORDS: usize = 2 * MAX_FRAMES + 2;
+    let mut buffer = [0_u64; WORDS];
+    let ptr = (&raw mut buffer).cast::<u64>();
+    let base = ptr.expose_provenance() as u64;
     let fake_text = 0xffff_ffff_8000_1000..0xffff_ffff_8000_2000;
     let frame = |index: usize| base + 16 * index as u64;
-    let stack = base..base + core::mem::size_of_val(&buffer) as u64;
-    let mut chain = |links: &[(u64, u64)]| {
+    let stack = base..base + core::mem::size_of::<[u64; WORDS]>() as u64;
+    let chain = |links: &[(u64, u64)]| {
+        assert!(2 * links.len() <= WORDS, "synthetic chain too long");
         for (index, &(next, rip)) in links.iter().enumerate() {
-            buffer[2 * index] = next;
-            buffer[2 * index + 1] = rip;
+            // SAFETY: 2 * index + 1 < WORDS, so both words lie inside
+            // `buffer`, which is live and which no borrow aliases.
+            unsafe {
+                ptr.add(2 * index).write(next);
+                ptr.add(2 * index + 1).write(rip);
+            }
         }
-        // The writes are done before the walker's volatile reads.
-        core::hint::black_box(&mut buffer);
         let mut rips = [0_u64; MAX_FRAMES];
-        let (frames, end) = walk(
-            frame(0),
-            core::slice::from_ref(&stack),
-            &fake_text,
-            |index, rip| rips[index] = rip,
-        );
+        // SAFETY: `stack` is exactly `buffer`, a live local of this frame
+        // whose address `base` exposed. Only this CPU touches it, through
+        // `ptr` alone, and not during the walk.
+        let (frames, end) = unsafe {
+            walk(
+                frame(0),
+                core::slice::from_ref(&stack),
+                &fake_text,
+                |index, rip| rips[index] = rip,
+            )
+        };
         assert!(rips[..frames].iter().all(|rip| fake_text.contains(rip)));
         (frames, end)
     };
@@ -503,11 +536,23 @@ pub(crate) fn self_test() {
         link.0 = frame(index + 1);
     }
     assert_eq!(chain(&long), (MAX_FRAMES, End::Limit));
-    // The live chain: every frame from here up to boot's continuation.
-    let known = known_stacks(Some(0));
-    let (frames, end) = walk(frame_pointer(), known.ranges(), &text, |_, rip| {
-        assert!(text.start < rip && rip <= text.end);
-    });
+    // The live chain: every frame from here up to boot's continuation, on
+    // the BSP's stacks.
+    assert_eq!(
+        smp::crash_slot(),
+        Some(0),
+        "the walker test runs on the BSP"
+    );
+    let known = known_stacks();
+    let rbp = frame_pointer();
+    // SAFETY: `known` holds only this CPU's own mapped stacks, as in
+    // `enter`. No other CPU writes them, and with IF clear nothing else runs
+    // here until the walk returns, short of a fatal NMI or fault.
+    let (frames, end) = unsafe {
+        walk(rbp, known.ranges(), &text, |_, rip| {
+            assert!(text.start < rip && rip <= text.end);
+        })
+    };
     assert_eq!(end, End::Zero, "the boot RBP chain is broken");
     assert!(frames >= 1, "the boot RBP chain is empty");
     assert_eq!(OWNER.load(Ordering::Relaxed), NO_OWNER);

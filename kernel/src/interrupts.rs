@@ -774,8 +774,13 @@ fn current_tss() -> *mut TaskStateSegment {
 /// CPU `cpu`'s TSS.RSP0, read without GS and without asserting, for the
 /// crash backtrace's view of a running thread's stack (spec 0051, point 11):
 /// `None` for a slot out of range or an AP whose descriptors are not
-/// installed. Only the crashing CPU reads its own.
-pub(crate) fn rsp0_of(cpu: usize) -> Option<u64> {
+/// installed.
+///
+/// # Safety
+///
+/// `cpu` is the calling CPU's slot. Each CPU writes its own RSP0 with plain
+/// stores, so reading another CPU's would race them.
+pub(crate) unsafe fn rsp0_of(cpu: usize) -> Option<u64> {
     let tss = if cpu == 0 {
         addr_of!(TSS)
     } else if cpu < MAX_CPUS && SECONDARY_CLAIMED[cpu - 1].load(Ordering::Acquire) {
@@ -790,8 +795,8 @@ pub(crate) fn rsp0_of(cpu: usize) -> Option<u64> {
         return None;
     };
     // SAFETY: Every TSS is permanently mapped. Only its own CPU writes its
-    // RSP0, and the caller is that CPU. The unaligned read of the packed
-    // field forms no reference.
+    // RSP0, and the caller is that CPU by the contract. The unaligned read
+    // of the packed field forms no reference.
     Some(unsafe {
         addr_of!((*tss).privilege_stacks)
             .cast::<u64>()
