@@ -151,6 +151,73 @@ pub fn perf_command_line() -> Option<&'static [u8]> {
         .map(|response| response.cmdline().to_bytes())
 }
 
+/// The crash path's final action from the command line (spec 0051, point 12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanicPolicy {
+    Halt,
+    Reboot,
+}
+
+/// Why a `mirror.panic=` token was rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanicPolicyError {
+    /// A value other than `halt` or `reboot`.
+    Unknown,
+    /// The token appears more than once.
+    Repeated,
+}
+
+/// The two `mirror.panic=` tokens, accepted in every flavor.
+const PANIC_HALT: &[u8] = b"mirror.panic=halt";
+const PANIC_REBOOT: &[u8] = b"mirror.panic=reboot";
+
+/// `mirror.panic=halt|reboot`, or `None` without the token. Any other
+/// `mirror.panic=` value, or a second such token, is an error.
+pub fn panic_policy() -> Result<Option<PanicPolicy>, PanicPolicyError> {
+    parse_panic_policy(command_line())
+}
+
+fn parse_panic_policy(line: &[u8]) -> Result<Option<PanicPolicy>, PanicPolicyError> {
+    let mut policy = None;
+    for token in line
+        .split(|byte| mirror_perf_protocol::is_ascii_whitespace(*byte))
+        .filter(|token| token.starts_with(b"mirror.panic="))
+    {
+        let choice = match token {
+            PANIC_HALT => PanicPolicy::Halt,
+            PANIC_REBOOT => PanicPolicy::Reboot,
+            _ => return Err(PanicPolicyError::Unknown),
+        };
+        if policy.replace(choice).is_some() {
+            return Err(PanicPolicyError::Repeated);
+        }
+    }
+    Ok(policy)
+}
+
+/// The command-line parser's cases (spec 0051, point 12).
+#[cfg(feature = "boot-smoke")]
+pub fn panic_policy_self_test() {
+    use PanicPolicyError::{Repeated, Unknown};
+    let parse = parse_panic_policy;
+    assert_eq!(parse(b""), Ok(None));
+    assert_eq!(parse(b"mirror.test=panic"), Ok(None));
+    assert_eq!(parse(b"xmirror.panic=halt"), Ok(None));
+    assert_eq!(parse(b"mirror.panic=halt"), Ok(Some(PanicPolicy::Halt)));
+    assert_eq!(
+        parse(b"mirror.irq=pic  mirror.panic=reboot\tmirror.test=panic"),
+        Ok(Some(PanicPolicy::Reboot))
+    );
+    assert_eq!(parse(b"mirror.panic="), Err(Unknown));
+    assert_eq!(parse(b"mirror.panic=Halt"), Err(Unknown));
+    assert_eq!(parse(b"mirror.panic=reboot,halt"), Err(Unknown));
+    assert_eq!(parse(b"mirror.panic=halt mirror.panic=halt"), Err(Repeated));
+    assert_eq!(
+        parse(b"mirror.panic=halt mirror.panic=reboot"),
+        Err(Repeated)
+    );
+}
+
 #[cfg(feature = "boot-smoke")]
 pub enum SmokeMode {
     Normal,
@@ -217,8 +284,9 @@ pub enum ResetTest {
 
 #[cfg(feature = "boot-smoke")]
 pub fn smoke_mode() -> SmokeMode {
-    // Interrupt policy composes with exactly one optional smoke scenario.
-    // Ignore only the recognized policy token; other unknown arguments and
+    // Interrupt and panic policy compose with exactly one optional smoke
+    // scenario. Ignore only the recognized policy tokens, which
+    // `panic_policy` checks for repeats; other unknown arguments and
     // multiple fault selectors must retain the strict smoke-test rejection.
     let mut tokens = command_line()
         .split(|byte| mirror_perf_protocol::is_ascii_whitespace(*byte))
@@ -227,6 +295,8 @@ pub fn smoke_mode() -> SmokeMode {
                 && *token != b"mirror.irq=pic"
                 && *token != b"mirror.timer=pit"
                 && !(crate::perf::configured() && token.starts_with(b"mirror.perf="))
+                && *token != PANIC_HALT
+                && *token != PANIC_REBOOT
         });
     let mode = match tokens.next().unwrap_or(b"") {
         b"" => SmokeMode::Normal,

@@ -3,7 +3,9 @@
 //! once in a single pass that ends in the one method x86 cannot survive (D1).
 //!
 //! Contract: BSP only, IF clear, after `timer::init` (the stopwatch's PIT
-//! fallback), with every other CPU idle in `smp.rs`. Nothing is mapped,
+//! fallback), with every other CPU idle in `smp.rs`. The crash owner (spec
+//! 0051, point 12) may also restart, on any CPU, once it has stopped every
+//! other CPU it could, and its lines skip the serial lock. Nothing is mapped,
 //! allocated or read from firmware here: `init` stored the register at boot
 //! (D3). This module owns port 0xCF9 (D5) and, once restart begins, COM1; it
 //! reaches the i8042 only through `ps2` (D4). Each step prints a content-free
@@ -39,6 +41,8 @@ pub enum Cause {
     /// A boot-smoke restart case (D11).
     #[cfg(feature = "boot-smoke")]
     Test,
+    /// The crash path's reboot (spec 0051, point 12).
+    Panic,
 }
 
 impl Cause {
@@ -47,6 +51,7 @@ impl Cause {
             Self::Console => "console",
             #[cfg(feature = "boot-smoke")]
             Self::Test => "test",
+            Self::Panic => "panic",
         }
     }
 }
@@ -225,10 +230,18 @@ pub fn init(register: Option<FadtReset>) {
     }
 }
 
+/// Whether `init` ran, so `restart` may (the crash path's reboot asks).
+pub(crate) fn is_initialized() -> bool {
+    INITIALIZED.load(Ordering::Acquire)
+}
+
 /// Restart the machine (D1). Never returns: the chain ends in a triple fault.
 pub fn restart(cause: Cause) -> ! {
     arch::disable_interrupts();
-    assert!(!crate::smp::is_secondary(), "restart runs on the BSP");
+    assert!(
+        !crate::smp::is_secondary() || crate::crash::is_owner(),
+        "restart runs on the BSP or the crash owner"
+    );
     assert!(INITIALIZED.load(Ordering::Acquire), "restart before init");
     serial::println!("MIRROR_RESET_BEGIN cause={}", cause.name());
     let register = Register::decode(REGISTER.load(Ordering::Acquire));

@@ -245,6 +245,12 @@ fn selected_tick(vector: u8, local: bool) -> bool {
 
 /// Delivered timer interrupts, not elapsed wall-clock time. No data publication
 /// is associated with this counter, so relaxed atomic ordering is sufficient.
+/// Whether `init` ran, so the restart stopwatch may fall back to the PIT
+/// (the crash path's reboot asks, spec 0051, point 12).
+pub(crate) fn is_initialized() -> bool {
+    INITIALIZED.load(Ordering::SeqCst)
+}
+
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
@@ -283,7 +289,13 @@ pub(crate) fn stop_secondary() -> Result<(), &'static str> {
 pub fn pit_counter() -> u16 {
     assert!(INITIALIZED.load(Ordering::SeqCst), "timer not initialized");
     assert!(!arch::interrupts_enabled(), "PIT read requires IF clear");
-    assert!(!crate::smp::is_secondary(), "PIT read requires the BSP");
+    // The crash owner may read it on any CPU while it restarts (spec 0051,
+    // point 12): the BSP is then stopped, at worst between a latch and its
+    // reads, which can only lengthen a bounded wait.
+    assert!(
+        !crate::smp::is_secondary() || crate::crash::is_owner(),
+        "PIT read requires the BSP"
+    );
     // SAFETY: init finished programming channel 0 for low/high byte access, and
     // nothing reprograms it later. The BSP owns the PIT ports and IF is clear,
     // so no other latch or read can split this latch-low-high sequence.

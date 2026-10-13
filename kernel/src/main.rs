@@ -80,6 +80,9 @@ pub extern "C" fn _start() -> ! {
     }
 
     let boot = boot::info();
+    // The crash path's final action (spec 0051, point 12), before anything
+    // that could crash reads it; until here the flavor's default applies.
+    crash::configure(boot::panic_policy());
     let entries = boot.memory_map.entries();
     let usable_bytes = entries
         .iter()
@@ -234,8 +237,14 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
         // hierarchy preserves its mapping and cache attributes; its memory is
         // never allocated as RAM. This local driver is the sole writer on the
         // BSP, and no interrupt handler or user mapping exposes its bytes.
+        // The crash screen's raw writer is the one exception: it draws only
+        // once every other CPU stopped, and this driver never runs again
+        // (framebuffer::crash_screen, spec 0051, point 11).
         match unsafe { framebuffer::Driver::from_limine(framebuffer) } {
             Ok(mut driver) => {
+                // The crash screen draws over this framebuffer (spec 0051,
+                // point 11).
+                driver.publish_for_crash();
                 let info = driver.info();
                 driver.render_boot(usable_bytes);
                 driver.update_status("NATIVE USERSPACE STARTING", 70);
@@ -283,6 +292,7 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
         pointer::self_test();
         console::self_test();
         reset::policy_self_test();
+        boot::panic_policy_self_test();
         assert!(devices.functions > 0, "no PCI devices discovered");
         assert!(
             devices.virtio_block_devices > 0,

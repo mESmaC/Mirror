@@ -5,7 +5,8 @@
 //! without waiting. Lock order is the scheduler lock, then this one; nothing
 //! is taken while it is held. Normal IRQ handlers never print. The crash
 //! owner prints without the lock once it has stopped the other CPUs
-//! (`print_unlocked`, spec 0051, point 10).
+//! (`print_unlocked`, spec 0051, point 10), and so do its restart chain's
+//! lines (point 12).
 
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -113,7 +114,9 @@ pub fn print(args: fmt::Arguments<'_>) {
     // re-enables interrupts, so finding it here means this print interrupted
     // this CPU's own: print at once, and leave the release to the outer print.
     let nested = OWNER.load(Ordering::Relaxed) == me;
-    let locked = !nested && lock(me);
+    // The crash owner never waits for a CPU it stopped, which may hold the
+    // lock: its lines start after the report's leading newline.
+    let locked = !nested && !crate::crash::is_owner() && lock(me);
     let _ = Console.write_fmt(args);
     if locked {
         OWNER.store(FREE, Ordering::Release);

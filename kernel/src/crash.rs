@@ -25,27 +25,31 @@
 //! after `MAX_FRAMES` frames. The trap stubs keep the interrupted RBP, so a
 //! walk from an exception continues through the interrupted code.
 //!
-//! The final action: a boot-smoke kernel exits QEMU with code 35, any other
-//! kernel halts. Step 6 of spec 0051 adds the crash screen and the
-//! halt-or-reboot policy (point 12).
+//! After the report, the owner draws the crash screen over the boot
+//! framebuffer when every other CPU stopped (point 11), then takes the final
+//! action (point 12): `mirror.panic=halt|reboot` in any flavor, else a
+//! boot-smoke kernel exits QEMU with code 35, a debug kernel halts and a
+//! release kernel reboots after `RELEASE_REBOOT_DELAY_MS` through 0058a's
+//! restart chain (`reset::Cause::Panic`).
 
 use core::arch::asm;
 #[cfg(feature = "boot-smoke")]
 use core::fmt;
 use core::ops::Range;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
-use crate::{apic, arch, clock, interrupts, kernel_va, serial, smp, stacks};
+use crate::{apic, arch, boot, clock, framebuffer, interrupts, kernel_va, reset, serial};
+use crate::{smp, stacks, timer};
 
 /// `OWNER` while no CPU owns a crash. Initial APIC IDs are below 255.
 const NO_OWNER: u32 = u32::MAX;
 /// How long the owner waits for the stopped CPUs' bits.
 const STOP_WAIT_NS: u64 = 1_000_000_000;
-/// The stop wait's poll backstop, at 2 ns per poll as in `clock::SpinBound`:
-/// it ends the wait when no clock is published or the counter stalls.
-const STOP_POLLS: u64 = STOP_WAIT_NS / 2;
-/// Polls between two clock reads in the stop wait.
+/// The crash waits' poll backstop, at 2 ns per poll as in `clock::SpinBound`:
+/// it ends a wait when no clock is published or the counter stalls.
+const POLL_NS: u64 = 2;
+/// Polls between two clock reads in a crash wait.
 const CLOCK_SAMPLE: u64 = 64;
 /// The most frames a backtrace prints.
 const MAX_FRAMES: usize = 32;
@@ -53,6 +57,14 @@ const MAX_FRAMES: usize = 32;
 const MAX_STACKS: usize = 6;
 /// The slot the STOP line names for a CPU outside the slots.
 const NO_SLOT: usize = 64;
+/// How long a release kernel shows the crash screen before it reboots
+/// without `mirror.panic=` (spec 0051, open point 4). Smoke kernels exit.
+#[cfg_attr(feature = "boot-smoke", allow(dead_code))]
+const RELEASE_REBOOT_DELAY_MS: u64 = 10_000;
+/// `POLICY` values: the flavor's default, or `mirror.panic=`'s choice.
+const POLICY_DEFAULT: u8 = 0;
+const POLICY_HALT: u8 = 1;
+const POLICY_REBOOT: u8 = 2;
 /// Canonical kernel-half addresses start here; user ones end at 2^47.
 const KERNEL_HALF: u64 = 0xffff_8000_0000_0000;
 const USER_END: u64 = 1 << 47;
@@ -65,15 +77,96 @@ static STOPPED: AtomicU64 = AtomicU64::new(0);
 /// final action.
 static NESTED: AtomicBool = AtomicBool::new(false);
 static ACTED: AtomicBool = AtomicBool::new(false);
+/// The final action `mirror.panic=` chose at boot (`configure`).
+static POLICY: AtomicU8 = AtomicU8::new(POLICY_DEFAULT);
 /// The Panic case's planted return address (boot-smoke): the backtrace must
 /// find it among its frames.
 #[cfg(feature = "boot-smoke")]
 static PLANTED: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "boot-smoke")]
-const ACTION: &str = "exit";
-#[cfg(not(feature = "boot-smoke"))]
-const ACTION: &str = "halt";
+/// The crash path's final action (spec 0051, point 12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    /// Exit QEMU with code 35 (boot-smoke kernels only).
+    #[cfg(feature = "boot-smoke")]
+    Exit,
+    Halt,
+    /// Restart through 0058a's chain after `delay_ms`.
+    Reboot {
+        delay_ms: u64,
+    },
+}
+
+impl Action {
+    /// `mirror.panic=`'s choice, else the flavor's default.
+    fn current() -> Self {
+        match POLICY.load(Ordering::Acquire) {
+            POLICY_HALT => Self::Halt,
+            POLICY_REBOOT => Self::Reboot { delay_ms: 0 },
+            _ => Self::DEFAULT,
+        }
+    }
+
+    /// Boot-smoke kernels exit, debug kernels halt and release kernels
+    /// reboot after the delay.
+    #[cfg(feature = "boot-smoke")]
+    const DEFAULT: Self = Self::Exit;
+    #[cfg(not(feature = "boot-smoke"))]
+    const DEFAULT: Self = if cfg!(debug_assertions) {
+        Self::Halt
+    } else {
+        Self::Reboot {
+            delay_ms: RELEASE_REBOOT_DELAY_MS,
+        }
+    };
+
+    fn name(self) -> &'static str {
+        match self {
+            #[cfg(feature = "boot-smoke")]
+            Self::Exit => "exit",
+            Self::Halt => "halt",
+            Self::Reboot { .. } => "reboot",
+        }
+    }
+
+    fn delay_ms(self) -> u64 {
+        match self {
+            Self::Reboot { delay_ms } => delay_ms,
+            _ => 0,
+        }
+    }
+}
+
+/// Record `mirror.panic=`'s choice (spec 0051, point 12). Once, early on the
+/// BSP. A malformed or repeated token is rejected: a boot-smoke kernel
+/// panics on it, as on any unknown smoke token, and any other kernel keeps
+/// its flavor's default action.
+pub(crate) fn configure(policy: Result<Option<boot::PanicPolicy>, boot::PanicPolicyError>) {
+    let value = match policy {
+        Ok(Some(boot::PanicPolicy::Halt)) => POLICY_HALT,
+        Ok(Some(boot::PanicPolicy::Reboot)) => POLICY_REBOOT,
+        Ok(None) => POLICY_DEFAULT,
+        Err(error) => {
+            #[cfg(feature = "boot-smoke")]
+            panic!("invalid mirror.panic= command line: {error:?}");
+            #[cfg(not(feature = "boot-smoke"))]
+            {
+                let _ = error;
+                POLICY_DEFAULT
+            }
+        }
+    };
+    POLICY.store(value, Ordering::Release);
+}
+
+/// Whether this CPU owns a crash. The restart path's BSP-only asserts admit
+/// the owner once it has stopped the other CPUs (spec 0051, point 12), and
+/// its prints skip the serial lock. One atomic load, and CPUID only while a
+/// crash is in progress.
+pub(crate) fn is_owner() -> bool {
+    let owner = OWNER.load(Ordering::Acquire);
+    owner != NO_OWNER && owner == smp::initial_apic_id()
+}
 
 unsafe extern "C" {
     /// The bounds of the kernel's `.text`, from kernel/linker.ld. Only their
@@ -153,7 +246,7 @@ pub(crate) fn enter(cause: Cause<'_>) -> ! {
     let (targets, stopped) = stop_others(slot);
     // The first newline ends any line that a stopped CPU left unfinished.
     serial::print_unlocked(format_args!("\n"));
-    match cause {
+    match &cause {
         Cause::Panic(info) => report!("MIRROR_PANIC: {}", info),
         Cause::Exception(trap) => {
             report!(
@@ -183,6 +276,7 @@ pub(crate) fn enter(cause: Cause<'_>) -> ! {
     let planted = PLANTED.load(Ordering::Acquire);
     #[cfg(feature = "boot-smoke")]
     let mut found = false;
+    let mut rips = [0_u64; MAX_FRAMES];
     // SAFETY: `known` holds only this CPU's own stacks, which stay mapped
     // through the walk (`known_stacks`). They are raw stack memory that
     // compiled code reaches through RBP and RSP, and the walk reads frame
@@ -192,6 +286,9 @@ pub(crate) fn enter(cause: Cause<'_>) -> ! {
     let (frames, end) = unsafe {
         walk(frame, known.ranges(), &text(), |index, rip| {
             report!("MIRROR_CRASH_FRAME index={} rip={:#x}", index, rip);
+            if let Some(slot) = rips.get_mut(index) {
+                *slot = rip;
+            }
             #[cfg(feature = "boot-smoke")]
             if planted != 0 && rip == planted {
                 found = true;
@@ -207,7 +304,120 @@ pub(crate) fn enter(cause: Cause<'_>) -> ! {
     if found {
         report!("MIRROR_CRASH_PROBE_OK");
     }
+    let action = Action::current();
+    // Draw only once every target stopped: a CPU still running could still
+    // be drawing, and the screen must be the framebuffer's only writer.
+    let screen = (stopped == targets).then(|| {
+        let stop = Stop {
+            slot,
+            targets: targets.count_ones(),
+            stopped: stopped.count_ones(),
+        };
+        draw(&cause, stop, &rips[..frames.min(MAX_FRAMES)], end, action)
+    });
+    let screen = screen.flatten();
+    report!("MIRROR_CRASH_SCREEN drawn={}", u8::from(screen.is_some()));
+    #[cfg(feature = "boot-smoke")]
+    if screen.as_ref().is_some_and(|screen| screen.verify_reason()) {
+        report!("MIRROR_CRASH_SCREEN_OK");
+    }
     act()
+}
+
+/// The STOP line's facts, for the screen.
+#[derive(Clone, Copy)]
+struct Stop {
+    slot: Option<usize>,
+    targets: u32,
+    stopped: u32,
+}
+
+/// Draw the crash screen (spec 0051, point 11): the reason, the stop line,
+/// the backtrace and the action. `None` without a published framebuffer.
+/// Only the owner calls this, once every target stopped.
+fn draw(
+    cause: &Cause<'_>,
+    stop: Stop,
+    rips: &[u64],
+    end: End,
+    action: Action,
+) -> Option<framebuffer::CrashScreen<'static>> {
+    // SAFETY: Only the owner reaches this, after `stop_others` saw every
+    // target stop; a CPU that lost the race stopped too. Stopped CPUs halt
+    // for good, and this path never returns to code that could draw, so the
+    // screen is the framebuffer's only writer.
+    let mut screen = unsafe { framebuffer::crash_screen() }?;
+    match cause {
+        Cause::Panic(info) => {
+            screen.reason(format_args!("{}", info.message()));
+            if let Some(location) = info.location() {
+                screen.detail(format_args!("at {location}"));
+            }
+        }
+        Cause::Exception(trap) => {
+            screen.reason(format_args!(
+                "CPU exception {} ({}), error {:#x}",
+                trap.vector,
+                exception_name(trap.vector),
+                trap.error
+            ));
+            screen.detail(format_args!("rip {:#x}  cr2 {:#x}", trap.rip, trap.cr2));
+        }
+    }
+    match stop.slot {
+        Some(slot) => screen.detail(format_args!(
+            "CPU {slot} crashed; {} of {} other CPUs stopped.",
+            stop.stopped, stop.targets
+        )),
+        None => screen.detail(format_args!(
+            "An unlisted CPU crashed; {} of {} other CPUs stopped.",
+            stop.stopped, stop.targets
+        )),
+    }
+    screen.detail(format_args!(
+        "Backtrace: {} frames, end {}",
+        rips.len(),
+        end.name()
+    ));
+    screen.frames(rips);
+    match action {
+        #[cfg(feature = "boot-smoke")]
+        Action::Exit => screen.action(format_args!("Test kernel: ending the run.")),
+        Action::Halt => screen.action(format_args!("Halted. Restart the machine to continue.")),
+        Action::Reboot { delay_ms: 0 } => screen.action(format_args!("Restarting now.")),
+        Action::Reboot { delay_ms } => screen.action(format_args!(
+            "Restarting in {} seconds.",
+            delay_ms.div_ceil(1000)
+        )),
+    }
+    Some(screen)
+}
+
+/// A short name for an exception vector, for the crash screen.
+fn exception_name(vector: u64) -> &'static str {
+    match vector {
+        0 => "divide error",
+        1 => "debug",
+        2 => "NMI",
+        3 => "breakpoint",
+        4 => "overflow",
+        5 => "bound range",
+        6 => "invalid opcode",
+        7 => "device not available",
+        8 => "double fault",
+        10 => "invalid TSS",
+        11 => "segment not present",
+        12 => "stack fault",
+        13 => "general protection",
+        14 => "page fault",
+        16 => "x87 floating point",
+        17 => "alignment check",
+        18 => "machine check",
+        19 => "SIMD floating point",
+        20 => "virtualization",
+        21 => "control protection",
+        _ => "unexpected vector",
+    }
 }
 
 /// The paranoid dispatch's first statement (spec 0051, point 10): during a
@@ -234,15 +444,35 @@ fn nested() -> ! {
     act()
 }
 
-/// Report the final action once, then take it.
+/// Report the final action once, then take it (spec 0051, point 12). A
+/// reboot waits its delay, then restarts through 0058a's chain, whose BSP
+/// asserts admit the owner. Before `reset` or `timer` is initialized, or
+/// when the owner enters again from inside the action, such as a panic in
+/// the restart chain, a reboot is a direct triple fault.
 fn act() -> ! {
-    if !ACTED.swap(true, Ordering::AcqRel) {
-        report!("MIRROR_CRASH_ACTION action={} delay_ms=0", ACTION);
+    let action = Action::current();
+    let again = ACTED.swap(true, Ordering::AcqRel);
+    if !again {
+        report!(
+            "MIRROR_CRASH_ACTION action={} delay_ms={}",
+            action.name(),
+            action.delay_ms()
+        );
     }
-    #[cfg(feature = "boot-smoke")]
-    arch::exit_qemu(false);
-    #[cfg(not(feature = "boot-smoke"))]
-    arch::halt()
+    match action {
+        #[cfg(feature = "boot-smoke")]
+        Action::Exit => arch::exit_qemu(false),
+        Action::Halt => arch::halt(),
+        Action::Reboot { delay_ms } => {
+            if !again {
+                spin_until(delay_ms.saturating_mul(1_000_000), || false);
+                if reset::is_initialized() && timer::is_initialized() {
+                    reset::restart(reset::Cause::Panic);
+                }
+            }
+            interrupts::trigger_triple_fault()
+        }
+    }
 }
 
 /// Park this CPU for good: record its slot in `STOPPED`, then halt with IF
@@ -266,31 +496,34 @@ fn stop_others(me: Option<usize>) -> (u64, u64) {
         targets |= 1 << slot;
         let _ = apic::send_nmi(apic_id);
     }
-    (targets, wait_stopped(targets))
+    spin_until(STOP_WAIT_NS, || {
+        STOPPED.load(Ordering::SeqCst) & targets == targets
+    });
+    (targets, STOPPED.load(Ordering::SeqCst) & targets)
 }
 
-/// Wait until every slot in `targets` stopped, for at most `STOP_WAIT_NS` of
-/// the HPET's forward progress, or `STOP_POLLS` polls without a clock.
-fn wait_stopped(targets: u64) -> u64 {
+/// Spin until `done` holds, for at most `limit_ns` of the HPET's forward
+/// progress, or `limit_ns / POLL_NS` polls without a clock or while its
+/// counter stalls. Returns whether `done` ended the wait.
+fn spin_until(limit_ns: u64, mut done: impl FnMut() -> bool) -> bool {
     let mut last = clock::crash_counter_ns();
     let mut elapsed = 0_u64;
-    for poll in 1..=STOP_POLLS {
-        let stopped = STOPPED.load(Ordering::SeqCst) & targets;
-        if stopped == targets {
-            return stopped;
+    for poll in 1..=limit_ns / POLL_NS {
+        if done() {
+            return true;
         }
         if poll.is_multiple_of(CLOCK_SAMPLE)
             && let (Some(before), Some(now)) = (last, clock::crash_counter_ns())
         {
             elapsed = elapsed.saturating_add(now.saturating_sub(before));
             last = Some(now);
-            if elapsed >= STOP_WAIT_NS {
+            if elapsed >= limit_ns {
                 break;
             }
         }
         core::hint::spin_loop();
     }
-    STOPPED.load(Ordering::SeqCst) & targets
+    done()
 }
 
 /// This function's caller's RBP: with frame pointers forced, the frame of

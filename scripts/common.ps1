@@ -1018,14 +1018,17 @@ function Assert-MirrorReset {
     # Spec 0058a, closed-world over MIRROR_ACPI_RESET_* and MIRROR_RESET_*:
     # QEMU's FADT reset register at discovery, the smoke policy check, and at
     # most one restart, whose lines end the log. A smoke reset case (-Fault
-    # Reset*) restarts with cause=test; a capture types restart at the console.
+    # Reset*) restarts with cause=test; a capture types restart at the console;
+    # a panic case with -PanicReboot restarts with cause=panic (spec 0051,
+    # point 12), and QEMU's FADT register resets it at the first method.
     param(
         [Parameter(Mandatory = $true)][string]$Serial,
         [bool]$Smoke,
         [string]$FaultMode = 'None',
         [bool]$WithoutKeyboard,
         [bool]$WithoutHpet,
-        [bool]$ConsoleRestart
+        [bool]$ConsoleRestart,
+        [bool]$PanicRestart
     )
 
     $first = switch ($FaultMode) {
@@ -1036,16 +1039,17 @@ function Assert-MirrorReset {
         'ResetSuppressed' { 0 }
         default { $null }
     }
-    if (($null -ne $first -and -not $Smoke) -or ($ConsoleRestart -and ($Smoke -or $null -ne $first))) {
-        throw 'A reset fault needs a smoke kernel, and a console restart a trace or default one.'
+    if (($null -ne $first -and -not $Smoke) -or ($ConsoleRestart -and ($Smoke -or $null -ne $first)) -or
+        ($PanicRestart -and (-not $Smoke -or $null -ne $first))) {
+        throw 'A reset fault or a panic restart needs a smoke kernel, and a console restart a trace or default one.'
     }
     # q35 describes ICH9's RST_CNT with 0x0F, revision 3 or later (test 4).
     $expected = [System.Collections.Generic.List[string]]::new()
     $expected.Add('MIRROR_ACPI_RESET_READY revision=([0-9]+) port=0xcf9 value=0xf')
     if ($Smoke) { $expected.Add('MIRROR_RESET_POLICY_OK') }
-    $restarted = $ConsoleRestart -or $null -ne $first
-    if ($ConsoleRestart) {
-        $expected.Add('MIRROR_RESET_BEGIN cause=console')
+    $restarted = $ConsoleRestart -or $PanicRestart -or $null -ne $first
+    if ($ConsoleRestart -or $PanicRestart) {
+        $expected.Add($(if ($PanicRestart) { 'MIRROR_RESET_BEGIN cause=panic' } else { 'MIRROR_RESET_BEGIN cause=console' }))
         $expected.Add('MIRROR_RESET_ATTEMPT method=fadt')
     }
     elseif ($null -ne $first) {
@@ -1108,21 +1112,27 @@ function Assert-MirrorReset {
 }
 
 function Assert-MirrorCrash {
-    # Spec 0051, points 10, 11 and 13, closed-world over MIRROR_CRASH_* and
+    # Spec 0051, points 10 to 13, closed-world over MIRROR_CRASH_* and
     # MIRROR_TEST_EXPECT_PANIC on every smoke boot. Each boot reports the
     # backtrace walker's self-test once. Only a crash case reports a crash,
     # once and in order: its cause (the panic or exception lines), the stop
-    # of every other online CPU, the backtrace frames and summary, and the
-    # final action, which ends the log. The stop's targets are recomputed:
-    # every online CPU but the crashing one, less the AP that the guard
-    # probe faulted before an exception case. PerfInvalid's strict
-    # command-line panic comes at the first smoke-mode read, in clock or
-    # timer setup, before the walker self-test and before any AP starts.
+    # of every other online CPU, the backtrace frames and summary, the crash
+    # screen (drawn with a display, and then read back), and the final
+    # action, which ends the log. With -PanicReboot the action is an
+    # immediate reboot, and only the restart's lines, which
+    # Assert-MirrorReset checks, follow it. The stop's targets are
+    # recomputed: every online CPU but the crashing one, less the AP that the
+    # guard probe faulted before an exception case.
+    # PerfInvalid's strict command-line panic comes at the first smoke-mode
+    # read, in clock or timer setup, before the walker self-test and before
+    # any AP starts.
     param(
         [Parameter(Mandatory = $true)][string]$Serial,
         [string]$FaultMode = 'None',
         [int]$RequestedCpus = 1,
-        [bool]$UseLegacyPic
+        [bool]$UseLegacyPic,
+        [bool]$WithoutDisplay,
+        [bool]$PanicReboot
     )
 
     # The CPU each panic case announces, and the message it panics with.
@@ -1137,6 +1147,9 @@ function Assert-MirrorCrash {
     $timeoutCases = @('SmpTlbTimeout', 'UserFlushTimeout')
     $early = $FaultMode -eq 'PerfInvalid'
     $panicCase = $panicCpus.ContainsKey($FaultMode)
+    if ($PanicReboot -and -not $panicCase) {
+        throw "-PanicReboot needs a panic case; $FaultMode is none."
+    }
     $tests = [regex]::Matches($Serial, '(?m)^MIRROR_CRASH_TESTS_OK ends=6\r?$')
     $crashText = [regex]::Matches($Serial, 'MIRROR_CRASH_').Count
     $expectText = [regex]::Matches($Serial, 'MIRROR_TEST_EXPECT_PANIC').Count
@@ -1191,7 +1204,7 @@ function Assert-MirrorCrash {
     if ($records.Count -ne $crashText - $tests.Count -or $records.Count -eq 0 -or $records[0].Index -le $cause[0].Index) {
         throw "The $FaultMode crash lines must all be whole lines after its cause."
     }
-    $action = 'MIRROR_CRASH_ACTION action=exit delay_ms=0'
+    $action = if ($PanicReboot) { 'MIRROR_CRASH_ACTION action=reboot delay_ms=0' } else { 'MIRROR_CRASH_ACTION action=exit delay_ms=0' }
     if ($FaultMode -eq 'NestedPanic') {
         # The panic message's formatting panics while the cause prints: the
         # owner's second entry ends that line, reports itself and acts.
@@ -1237,6 +1250,11 @@ function Assert-MirrorCrash {
         # whose RBP chain ends at the zero that boot's stack switches set.
         $expected = @("MIRROR_CRASH_BACKTRACE frames=$frames end=zero")
         if ($FaultMode -eq 'Panic') { $expected += 'MIRROR_CRASH_PROBE_OK' }
+        # Every target stopped, so the screen is drawn over the boot
+        # framebuffer whenever there is one, and its reason row reads back.
+        # An early panic comes before boot publishes the framebuffer.
+        if ($WithoutDisplay -or $early) { $expected += 'MIRROR_CRASH_SCREEN drawn=0' }
+        else { $expected += @('MIRROR_CRASH_SCREEN drawn=1', 'MIRROR_CRASH_SCREEN_OK') }
         $expected += $action
         if ($frames -lt 1 -or $frames -gt 32 -or $records.Count -ne 1 + $frames + $expected.Count) {
             throw "The $FaultMode crash must print 1 to 32 frames, then: $($expected -join '; ')."
@@ -1248,10 +1266,16 @@ function Assert-MirrorCrash {
             }
         }
     }
-    # The final action ends the log.
+    # The final action ends the log, but for a reboot's restart lines.
     $markers = [regex]::Matches($Serial, '(?m)^MIRROR_[^\r\n]*')
-    if ($markers[$markers.Count - 1].Index -ne $records[$records.Count - 1].Index) {
-        throw "The crash's final action must be the log's last marker; found '$($markers[$markers.Count - 1].Value)' after it."
+    $after = @($markers | Where-Object { $_.Index -gt $records[$records.Count - 1].Index })
+    if ($PanicReboot) {
+        if ($after.Count -eq 0 -or @($after | Where-Object { $_.Value -notmatch '^MIRROR_RESET_' }).Count -ne 0) {
+            throw "Only the restart's lines may follow the crash's reboot action."
+        }
+    }
+    elseif ($after.Count -ne 0) {
+        throw "The crash's final action must be the log's last marker; found '$($after[0].Value)' after it."
     }
 }
 

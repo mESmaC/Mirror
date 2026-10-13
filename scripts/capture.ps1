@@ -610,6 +610,8 @@ function Assert-MirrorHygieneLog {
             '(?m)^MIRROR_(?:SHELL|DESKTOP)_(?:READY|FRAME)',
             'Mirror (?:init|app|shell|desktop|agent):',
             '(?m)^(?:MIRROR_PANIC|MIRROR_EXCEPTION|PANIC|EXCEPTION)(?:\s|:|$)',
+            '(?m)^MIRROR_CRASH_',
+            'cause=panic',
             '(?m)^MIRROR_USERSPACE_OK(?:\s|$)')) {
         $count = [regex]::Matches($Serial, $pattern).Count
         if ($count -ne 0) { throw "The default kernel printed $count line(s) matching '$pattern'. See $serialLog." }

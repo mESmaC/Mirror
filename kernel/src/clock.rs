@@ -379,11 +379,12 @@ impl SpinBound {
 /// reset write that resets the chipset but not the CPU may send the counter
 /// back to zero, and the restart chain must then go on to its next method
 /// rather than panic and halt; the restart stopwatch sums forward deltas.
-/// `None` without a published clock. BSP only, IF clear.
+/// `None` without a published clock. BSP only, or the crash owner on any CPU
+/// (spec 0051, point 12), IF clear.
 pub(crate) fn restart_counter_ns() -> Option<u64> {
     assert!(!arch::interrupts_enabled(), "clock read requires IF clear");
     assert!(
-        !crate::smp::is_secondary(),
+        !crate::smp::is_secondary() || crate::crash::is_owner(),
         "clock read requires BSP ownership"
     );
     let period = PERIOD_FS.load(Ordering::Acquire);

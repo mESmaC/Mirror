@@ -3,10 +3,18 @@
 //! This preserves the firmware-selected mode; it is not a GPU modesetting or
 //! acceleration driver. Device writes are volatile bytes or aligned RGB32 words;
 //! no framebuffer slice/reference or read is created, including for initially
-//! uninitialized VRAM.
+//! uninitialized VRAM. The one read is the boot-smoke crash screen's readback
+//! of its reason row (spec 0051, point 11).
+//!
+//! The crash screen is the documented exception to `Driver::from_limine`'s
+//! sole-writer contract: boot publishes the framebuffer's base and layout, and
+//! the crash owner builds a second, raw driver over them once every other CPU
+//! has stopped for good (`crash_screen`).
 //! Protocol: https://github.com/Limine-Bootloader/limine-protocol/blob/trunk/PROTOCOL.md
 //! Binding: https://docs.rs/limine/0.5.0/limine/framebuffer/struct.Framebuffer.html
 
+use core::fmt;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::{marker::PhantomData, ptr::NonNull};
 use limine::framebuffer::{Framebuffer, MemoryModel};
 use mirror_ui_tokens::{CURSOR, CURSOR_HEIGHT, CURSOR_WIDTH, DEFAULT, Rgb};
@@ -216,6 +224,21 @@ const BORDER: Color = Color::token(DEFAULT.border_strong);
 const TEXT: Color = Color::token(DEFAULT.text_primary);
 const MUTED: Color = Color::token(DEFAULT.text_secondary);
 const ACCENT: Color = Color::token(DEFAULT.accent);
+// The crash screen draws on the danger background (spec 0051, point 11).
+const CRASH_BACKGROUND: Color = Color::token(DEFAULT.danger_bg);
+const CRASH_TITLE: Color = Color::token(DEFAULT.danger);
+
+/// The boot framebuffer, published for the crash screen (spec 0051, point
+/// 11): its base address, whose provenance `publish_for_crash` exposed, or 0
+/// until then. The fields below hold the description its driver validated,
+/// which the crash path validates again. They are stored before the base's
+/// Release and read after its Acquire.
+static CRASH_BASE: AtomicUsize = AtomicUsize::new(0);
+/// `width << 32 | height`.
+static CRASH_EXTENT: AtomicU64 = AtomicU64::new(0);
+static CRASH_PITCH: AtomicU64 = AtomicU64::new(0);
+/// `bpp | red_shift << 16 | green_shift << 24 | blue_shift << 32`.
+static CRASH_FORMAT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Clip {
@@ -302,6 +325,33 @@ pub struct Driver<'a> {
     layout: Layout,
     clip: Option<Clip>,
     _exclusive: PhantomData<&'a mut ()>,
+}
+
+impl Driver<'static> {
+    /// Publish the boot framebuffer for the crash screen (spec 0051, point
+    /// 11). Once, on the BSP, for the driver `from_limine` validated; only
+    /// `crash_screen` reads what this stores.
+    pub fn publish_for_crash(&self) {
+        let info = self.layout.info;
+        CRASH_EXTENT.store(
+            (info.width as u64) << 32 | info.height as u64,
+            Ordering::Relaxed,
+        );
+        CRASH_PITCH.store(info.pitch as u64, Ordering::Relaxed);
+        CRASH_FORMAT.store(
+            u64::from(info.bpp)
+                | u64::from(self.layout.red_shift) << 16
+                | u64::from(self.layout.green_shift) << 24
+                | u64::from(self.layout.blue_shift) << 32,
+            Ordering::Relaxed,
+        );
+        let base = self.address.as_ptr().expose_provenance();
+        assert_eq!(
+            CRASH_BASE.swap(base, Ordering::Release),
+            0,
+            "crash framebuffer published twice"
+        );
+    }
 }
 
 impl<'a> Driver<'a> {
@@ -565,20 +615,53 @@ impl<'a> Driver<'a> {
         // Bound work even if a future boot-status caller supplies a long string.
         for (index, byte) in text.bytes().take(128).enumerate() {
             let origin = x.saturating_add(index as i64 * 6 * scale as i64);
-            for (row, bits) in glyph(byte).into_iter().enumerate() {
-                for column in 0..5 {
-                    if bits & (1 << (4 - column)) != 0 {
-                        self.fill_rect(
-                            origin.saturating_add(column * scale as i64),
-                            y.saturating_add(row as i64 * scale as i64),
-                            scale,
-                            scale,
-                            color,
-                        );
-                    }
+            self.draw_glyph(origin, y, byte, scale, color);
+        }
+    }
+
+    /// Draw one 5x7 glyph's set bits at `scale`, which the caller bounded.
+    fn draw_glyph(&mut self, x: i64, y: i64, byte: u8, scale: u64, color: Color) {
+        for (row, bits) in glyph(byte).into_iter().enumerate() {
+            for column in 0..5 {
+                if bits & (1 << (4 - column)) != 0 {
+                    self.fill_rect(
+                        x.saturating_add(column * scale as i64),
+                        y.saturating_add(row as i64 * scale as i64),
+                        scale,
+                        scale,
+                        color,
+                    );
                 }
             }
         }
+    }
+
+    /// Read one pixel's bytes back (boot-smoke crash screen readback only).
+    /// Outside the framebuffer it returns `None`.
+    #[cfg(feature = "boot-smoke")]
+    fn read_pixel(&self, x: usize, y: usize) -> Option<[u8; 4]> {
+        if x >= self.layout.info.width || y >= self.layout.info.height {
+            return None;
+        }
+        let offset = y * self.layout.info.pitch + x * self.layout.bytes_per_pixel;
+        let mut bytes = [0_u8; 4];
+        for (index, byte) in bytes
+            .iter_mut()
+            .take(self.layout.bytes_per_pixel)
+            .enumerate()
+        {
+            // SAFETY: As in `pixel`: the bounds and the validated pitch and
+            // length keep each byte inside the framebuffer, which this
+            // driver alone accesses. A volatile byte read of the boot
+            // framebuffer or of test RAM has no side effect.
+            *byte = unsafe {
+                self.address
+                    .as_ptr()
+                    .wrapping_add(offset + index)
+                    .read_volatile()
+            };
+        }
+        Some(bytes)
     }
 
     fn decimal(&mut self, x: i64, y: i64, mut value: u64, scale: u8, color: Color) -> usize {
@@ -861,6 +944,346 @@ impl<'a> Driver<'a> {
             scale,
             MUTED,
         );
+    }
+}
+
+/// Open the crash screen (spec 0051, point 11) over the boot framebuffer
+/// that boot published, or `None` when none was published or its stored
+/// description no longer validates.
+///
+/// # Safety
+///
+/// Only the crash owner calls this, once every other CPU that ran has
+/// stopped for good, so this screen is the framebuffer's only writer. That is
+/// the documented exception to `Driver::from_limine`'s contract: the boot
+/// driver may still exist, but it never runs again, because it lives on a
+/// stopped CPU or below the crash on this one, and the crash path never
+/// returns. No other driver over the framebuffer may be used afterwards.
+pub(crate) unsafe fn crash_screen() -> Option<CrashScreen<'static>> {
+    let base = CRASH_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return None;
+    }
+    let extent = CRASH_EXTENT.load(Ordering::Relaxed);
+    let format = CRASH_FORMAT.load(Ordering::Relaxed);
+    let mask = |shift: u64| Mask {
+        size: 8,
+        shift: (format >> shift) as u8,
+    };
+    let description = Description {
+        width: extent >> 32,
+        height: extent & u64::from(u32::MAX),
+        pitch: CRASH_PITCH.load(Ordering::Relaxed),
+        bpp: format as u16,
+        red: mask(16),
+        green: mask(24),
+        blue: mask(32),
+    };
+    let layout = Layout::validate(base, description).ok()?;
+    let driver = Driver {
+        address: NonNull::new(core::ptr::with_exposed_provenance_mut::<u8>(base))?,
+        layout,
+        clip: None,
+        _exclusive: PhantomData,
+    };
+    Some(CrashScreen::new(driver))
+}
+
+/// Rows a reason block may take, and the record of its first row.
+const REASON_ROWS: usize = 6;
+#[cfg(feature = "boot-smoke")]
+const RECORDED_CELLS: usize = 256;
+
+/// The crash screen (spec 0051, point 11): a title, the reason, the stop
+/// line, the backtrace's frames and the final action, in the 5x7 font on
+/// `danger_bg`, top to bottom. Every glyph is clipped to the framebuffer, and
+/// a block that would take more rows than it may is cut off. Nothing here
+/// allocates or locks.
+pub(crate) struct CrashScreen<'a> {
+    driver: Driver<'a>,
+    left: i64,
+    right: i64,
+    y: i64,
+    /// The body text's scale: 2 on a screen of at least 640x400, else 1.
+    body: u8,
+    /// The first row of the first reason block, which the boot-smoke
+    /// readback checks.
+    #[cfg(feature = "boot-smoke")]
+    reason: ReasonRow,
+}
+
+/// What the first reason row drew: its cells' bytes, where and how.
+#[cfg(feature = "boot-smoke")]
+struct ReasonRow {
+    bytes: [u8; RECORDED_CELLS],
+    len: usize,
+    x: i64,
+    y: i64,
+    scale: u64,
+    color: Color,
+    done: bool,
+}
+
+impl<'a> CrashScreen<'a> {
+    /// Clear the whole framebuffer to `danger_bg` and draw the title.
+    fn new(mut driver: Driver<'a>) -> Self {
+        let info = driver.info();
+        driver.fill_rect(
+            0,
+            0,
+            info.width as u64,
+            info.height as u64,
+            CRASH_BACKGROUND,
+        );
+        let large = info.width >= 640 && info.height >= 400;
+        let margin: i64 = if large { 48 } else { 8 };
+        let mut screen = Self {
+            driver,
+            left: margin,
+            right: (info.width as i64 - margin).max(margin + 1),
+            y: margin,
+            body: if large { 2 } else { 1 },
+            #[cfg(feature = "boot-smoke")]
+            reason: ReasonRow {
+                bytes: [0; RECORDED_CELLS],
+                len: 0,
+                x: 0,
+                y: 0,
+                scale: 1,
+                color: TEXT,
+                done: false,
+            },
+        };
+        screen.block(
+            screen.body * 2,
+            CRASH_TITLE,
+            1,
+            false,
+            format_args!("Mirror stopped"),
+        );
+        screen.block(
+            screen.body,
+            MUTED,
+            2,
+            false,
+            format_args!("A fatal kernel error stopped every CPU."),
+        );
+        screen
+    }
+
+    /// The crash's reason, in up to `REASON_ROWS` rows.
+    pub(crate) fn reason(&mut self, args: fmt::Arguments<'_>) {
+        self.block(self.body, TEXT, REASON_ROWS, true, args);
+    }
+
+    /// A detail line, such as the stop line or the backtrace summary.
+    pub(crate) fn detail(&mut self, args: fmt::Arguments<'_>) {
+        self.block(self.body, MUTED, 2, false, args);
+    }
+
+    /// The final action.
+    pub(crate) fn action(&mut self, args: fmt::Arguments<'_>) {
+        self.block(self.body, TEXT, 2, false, args);
+    }
+
+    /// The backtrace's return addresses in up to four columns.
+    pub(crate) fn frames(&mut self, rips: &[u64]) {
+        if rips.is_empty() {
+            return;
+        }
+        let scale = u64::from(self.body);
+        // "31 ffffffff80123456" and two cells of space.
+        let column_width = 21 * 6 * scale as i64;
+        let columns = ((self.right - self.left) / column_width).clamp(1, 4) as usize;
+        let rows = rips.len().div_ceil(columns);
+        for (index, rip) in rips.iter().enumerate() {
+            let x = self
+                .left
+                .saturating_add((index / rows) as i64 * column_width);
+            let y = self
+                .y
+                .saturating_add((index % rows) as i64 * line_height(scale));
+            let mut pen = Pen {
+                driver: &mut self.driver,
+                left: x,
+                right: x.saturating_add(column_width),
+                x,
+                y,
+                scale,
+                color: TEXT,
+                row: 0,
+                max_rows: 1,
+                #[cfg(feature = "boot-smoke")]
+                record: None,
+            };
+            let _ = fmt::Write::write_fmt(&mut pen, format_args!("{index:02} {rip:016x}"));
+        }
+        self.y = self
+            .y
+            .saturating_add(rows as i64 * line_height(scale) + block_gap(self.body));
+    }
+
+    /// Draw `args` from the left margin at the current row, wrapping at the
+    /// right margin and at newlines, in at most `max_rows` rows, then move
+    /// below it. `record` keeps the first reason row for the readback.
+    fn block(
+        &mut self,
+        scale: u8,
+        color: Color,
+        max_rows: usize,
+        record: bool,
+        args: fmt::Arguments<'_>,
+    ) {
+        let scale = u64::from(scale);
+        #[cfg(feature = "boot-smoke")]
+        let record = (record && !self.reason.done).then(|| {
+            self.reason.x = self.left;
+            self.reason.y = self.y;
+            self.reason.scale = scale;
+            self.reason.color = color;
+            self.reason.done = true;
+            &mut self.reason
+        });
+        #[cfg(not(feature = "boot-smoke"))]
+        let _ = record;
+        let mut pen = Pen {
+            driver: &mut self.driver,
+            left: self.left,
+            right: self.right,
+            x: self.left,
+            y: self.y,
+            scale,
+            color,
+            row: 0,
+            max_rows,
+            #[cfg(feature = "boot-smoke")]
+            record,
+        };
+        let _ = fmt::Write::write_fmt(&mut pen, args);
+        let rows = (pen.row + 1).min(max_rows);
+        self.y = self.y.saturating_add(
+            (rows as i64)
+                .saturating_mul(line_height(scale))
+                .saturating_add(block_gap(self.body)),
+        );
+    }
+
+    /// Read the first reason row back from the framebuffer (boot-smoke):
+    /// every pixel of each of its cells must be the glyph's color where the
+    /// 5x7 font sets a bit and `danger_bg` elsewhere, and the row must light
+    /// at least one pixel. False when any of it lies off the screen.
+    #[cfg(feature = "boot-smoke")]
+    pub(crate) fn verify_reason(&self) -> bool {
+        let row = &self.reason;
+        let layout = self.driver.layout;
+        let (Ok(left), Ok(top), Ok(scale)) = (
+            usize::try_from(row.x),
+            usize::try_from(row.y),
+            usize::try_from(row.scale),
+        ) else {
+            return false;
+        };
+        let foreground = layout.encode(row.color);
+        let background = layout.encode(CRASH_BACKGROUND);
+        let bytes = layout.bytes_per_pixel;
+        // Drain any write-combining buffer, so the reads see every write.
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let mut lit = 0_usize;
+        for (index, &byte) in row.bytes[..row.len].iter().enumerate() {
+            let bits = glyph(byte);
+            let origin = left + index * 6 * scale;
+            for dy in 0..7 * scale {
+                for dx in 0..6 * scale {
+                    let column = dx / scale;
+                    let on = column < 5 && bits[dy / scale] & (1 << (4 - column)) != 0;
+                    let expected = if on { foreground } else { background };
+                    match self.driver.read_pixel(origin + dx, top + dy) {
+                        Some(actual) if actual[..bytes] == expected[..bytes] => {}
+                        _ => return false,
+                    }
+                    lit += usize::from(on);
+                }
+            }
+        }
+        lit > 0
+    }
+}
+
+/// The distance from one text row's top to the next one's.
+fn line_height(scale: u64) -> i64 {
+    11 * scale as i64
+}
+
+/// The space below a block.
+fn block_gap(body: u8) -> i64 {
+    8 * i64::from(body)
+}
+
+/// Draws formatted text for the crash screen: printable ASCII as itself, a
+/// tab as a space, anything else as '?'. It wraps before a cell that would
+/// cross `right` and at a newline, and drops what falls past `max_rows`.
+struct Pen<'p, 'a> {
+    driver: &'p mut Driver<'a>,
+    left: i64,
+    right: i64,
+    x: i64,
+    y: i64,
+    scale: u64,
+    color: Color,
+    row: usize,
+    max_rows: usize,
+    #[cfg(feature = "boot-smoke")]
+    record: Option<&'p mut ReasonRow>,
+}
+
+impl Pen<'_, '_> {
+    fn next_row(&mut self) {
+        self.row += 1;
+        self.x = self.left;
+        self.y = self.y.saturating_add(line_height(self.scale));
+    }
+
+    fn put(&mut self, character: char) {
+        if self.row >= self.max_rows {
+            return;
+        }
+        if character == '\n' {
+            self.next_row();
+            return;
+        }
+        let scale = self.scale as i64;
+        if self.x > self.left && self.x.saturating_add(5 * scale) > self.right {
+            self.next_row();
+            // A wrapped row starts at its first visible character.
+            if self.row >= self.max_rows || character == ' ' {
+                return;
+            }
+        }
+        let byte = match character {
+            ' '..='~' => character as u8,
+            '\t' => b' ',
+            _ => b'?',
+        };
+        self.driver
+            .draw_glyph(self.x, self.y, byte, self.scale, self.color);
+        #[cfg(feature = "boot-smoke")]
+        if self.row == 0
+            && let Some(record) = self.record.as_deref_mut()
+            && record.len < RECORDED_CELLS
+        {
+            record.bytes[record.len] = byte;
+            record.len += 1;
+        }
+        self.x = self.x.saturating_add(6 * scale);
+    }
+}
+
+impl fmt::Write for Pen<'_, '_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        for character in text.chars() {
+            self.put(character);
+        }
+        Ok(())
     }
 }
 
@@ -1744,5 +2167,83 @@ pub fn self_test() {
         surface(&mut [0u8; 21], rgb24),
         Err(FramebufferError::BufferTooSmall)
     ));
+    crash_screen_self_test();
     crate::serial::println!("MIRROR_FRAMEBUFFER_TESTS_OK");
+}
+
+/// The crash screen (spec 0051, point 11) on RGB32 and RGB24 test storage:
+/// the screen is cleared to `danger_bg`, the first reason row reads back,
+/// changing one of its pixels fails the readback, a long reason keeps only
+/// its first row's cells, and a screen too small for the layout clips
+/// everything and fails the readback without faulting.
+#[cfg(feature = "boot-smoke")]
+fn crash_screen_self_test() {
+    fn screen(storage: &mut [u8], width: u64, height: u64, bpp: u16) -> CrashScreen<'_> {
+        let description = Description {
+            width,
+            height,
+            pitch: width * u64::from(bpp / 8),
+            bpp,
+            red: Mask { size: 8, shift: 16 },
+            green: Mask { size: 8, shift: 8 },
+            blue: Mask { size: 8, shift: 0 },
+        };
+        let layout = Layout::validate(storage.as_mut_ptr() as usize, description)
+            .expect("crash screen test layout");
+        assert!(layout.info.byte_len <= storage.len());
+        // The slice grants exclusive writable RAM for the screen's lifetime,
+        // as in the other fixtures here.
+        CrashScreen::new(Driver {
+            address: NonNull::new(storage.as_mut_ptr()).expect("nonempty test storage"),
+            layout,
+            clip: None,
+            _exclusive: PhantomData,
+        })
+    }
+
+    for bpp in [32_u16, 24] {
+        let pixel = usize::from(bpp / 8);
+        let mut storage = alloc::vec![0x5a_u8; 160 * 100 * pixel];
+        {
+            let mut crash = screen(&mut storage, 160, 100, bpp);
+            crash.reason(format_args!("crash screen test {}", 42));
+            crash.reason(format_args!("at kernel/src/framebuffer.rs:1:1"));
+            crash.detail(format_args!("CPU 0 crashed; 0 of 0 other CPUs stopped."));
+            crash.frames(&[0xffff_ffff_8000_1234, 0xffff_ffff_8000_5678]);
+            crash.action(format_args!("Halted."));
+            assert_eq!(
+                &crash.reason.bytes[..crash.reason.len],
+                b"crash screen test 42"
+            );
+            assert!(crash.verify_reason(), "crash screen readback");
+            // One wrong pixel in the reason row fails the readback.
+            let (x, y) = (crash.reason.x as usize, crash.reason.y as usize);
+            assert!(crash.driver.pixel(x + 1, y + 1, Color::rgb(1, 2, 3)));
+            assert!(
+                !crash.verify_reason(),
+                "crash screen readback missed a pixel"
+            );
+        }
+        // The corners keep danger_bg: the clear covered the whole screen.
+        let background = Color::token(DEFAULT.danger_bg);
+        let expected = [background.blue, background.green, background.red];
+        for offset in [0, storage.len() - pixel] {
+            assert_eq!(storage[offset..offset + 3], expected, "crash screen clear");
+        }
+    }
+    // A long reason wraps at the right margin; the record keeps row 0's 24
+    // cells (8 px margins and 6 px cells at scale 1 on 160 px).
+    let mut storage = alloc::vec![0_u8; 160 * 100 * 4];
+    {
+        let mut crash = screen(&mut storage, 160, 100, 32);
+        crash.reason(format_args!("{:-<80}", "wrapped"));
+        assert_eq!(crash.reason.len, 24);
+        assert!(crash.verify_reason());
+    }
+    // Too small for the margins: nothing is drawn and nothing faults.
+    let mut tiny = alloc::vec![0_u8; 16 * 8 * 4];
+    let mut crash = screen(&mut tiny, 16, 8, 32);
+    crash.reason(format_args!("clipped"));
+    crash.frames(&[0xffff_ffff_8000_1234; 32]);
+    assert!(!crash.verify_reason(), "an off-screen reason row read back");
 }

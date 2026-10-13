@@ -22,6 +22,7 @@ param(
     [switch]$BaselineCpu,
     [switch]$LegacyPic,
     [switch]$PitTimer,
+    [switch]$PanicReboot,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
     [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'ThreadStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'UserFlushTimeout', 'TimerCalibration', 'ClockActivation', 'Ps2BatTimeout', 'Ps2StaleScancode', 'VmmouseError', 'Reset', 'ResetFromKbc', 'ResetFromCf9', 'ResetFromTripleFault', 'ResetSuppressed', 'Panic', 'ApPanic', 'DoublePanic', 'NestedPanic', 'SchedStall', 'OomOrder', 'ClassLimits', 'PerfInvalid')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
@@ -373,6 +374,11 @@ if ($Fault -in @('SmpUnmap', 'SmpTlbTimeout', 'UserFlushTimeout') -and ($CpuCoun
 if ($Fault -in @('ApPanic', 'DoublePanic', 'SchedStall') -and ($CpuCount -lt 2 -or $LegacyPic)) {
     throw "-Fault $Fault needs an AP: at least two CPUs and the APIC backend."
 }
+# mirror.panic=reboot turns a panic case's exit into an immediate restart
+# through 0058a's chain (spec 0051, point 12).
+if ($PanicReboot -and $Fault -notin @('Panic', 'ApPanic', 'DoublePanic', 'NestedPanic', 'SchedStall')) {
+    throw '-PanicReboot needs a panic fault: Panic, ApPanic, DoublePanic, NestedPanic or SchedStall.'
+}
 if ($Fault -eq 'TimerCalibration' -and ($LegacyPic -or $PitTimer)) {
     throw 'Timer calibration fault injection requires APIC with automatic timer selection.'
 }
@@ -490,6 +496,7 @@ if ($Fault -eq 'ClassLimits' -and $MemoryMiB -ne 1024) {
 }
 if ($LegacyPic) { $kernelArguments += 'mirror.irq=pic' }
 if ($PitTimer) { $kernelArguments += 'mirror.timer=pit' }
+if ($PanicReboot) { $kernelArguments += 'mirror.panic=reboot' }
 if ($kernelArguments.Count -gt 0) { $bootConfig += "`n    cmdline: $($kernelArguments -join ' ')`n" }
 $smbiosConfig = Join-Path $buildDirectory 'limine-smbios.txt'
 [System.IO.File]::WriteAllText($smbiosConfig, "limine:config:$bootConfig")
@@ -690,7 +697,7 @@ try {
         }
         # The panic takes the crash path before any AP starts (spec 0051,
         # step 4), closed-world like every other smoke boot's crash lines.
-        Assert-MirrorCrash -Serial $serial -FaultMode $Fault -RequestedCpus $CpuCount -UseLegacyPic ([bool]$LegacyPic)
+        Assert-MirrorCrash -Serial $serial -FaultMode $Fault -RequestedCpus $CpuCount -UseLegacyPic ([bool]$LegacyPic) -WithoutDisplay ([bool]$NoDisplayDevice)
         Write-Host 'PerfInvalid rejected the raw invalid token with one OFF and the expected panic.'
         return
     }
@@ -703,10 +710,11 @@ try {
     # per-pair counts halve.
     $initRuns = if ($Fault -in @('OomOrder', 'ClassLimits')) { 2 } else { 4 }
     $pairRuns = if ($Fault -in @('OomOrder', 'ClassLimits')) { 1 } else { 2 }
-    # A reset case restarts after every self-test, and -no-reboot turns the
-    # guest reset into a QEMU exit with code 0 (spec 0058a, D11).
+    # A reset case restarts after every self-test, and so does a panic case
+    # with -PanicReboot; -no-reboot turns the guest reset into a QEMU exit
+    # with code 0 (spec 0058a, D11; spec 0051, point 12).
     $resetCase = $Fault -like 'Reset*'
-    $expectedExitCode = if ($fatalKernelFault -or $expectedTimeout -or $panicFault) { 35 } elseif ($resetCase) { 0 } else { 33 }
+    $expectedExitCode = if ($PanicReboot -or $resetCase) { 0 } elseif ($fatalKernelFault -or $expectedTimeout -or $panicFault) { 35 } else { 33 }
     if ($qemuExitCode -ne $expectedExitCode) {
         $qemuError = [System.IO.File]::ReadAllText($stderrLog)
         throw "Mirror smoke test expected QEMU exit $expectedExitCode; got $qemuExitCode. $qemuError See $serialLog."
@@ -744,11 +752,12 @@ try {
     }
     # The FADT reset register, the policy self-test and a reset case's chain,
     # closed-world (spec 0058a, test 4). Other cases print no restart line.
-    Assert-MirrorReset -Serial $serial -Smoke $true -FaultMode $Fault -WithoutKeyboard ([bool]$NoKeyboard) -WithoutHpet ([bool]$NoHpet)
-    # The crash path, closed-world (spec 0051, step 4): the walker's
-    # self-test in every boot, and a crash case's cause, NMI stop, backtrace
-    # and final action, which ends the log.
-    Assert-MirrorCrash -Serial $serial -FaultMode $Fault -RequestedCpus $CpuCount -UseLegacyPic ([bool]$LegacyPic)
+    Assert-MirrorReset -Serial $serial -Smoke $true -FaultMode $Fault -WithoutKeyboard ([bool]$NoKeyboard) -WithoutHpet ([bool]$NoHpet) -PanicRestart ([bool]$PanicReboot)
+    # The crash path, closed-world (spec 0051, steps 4 and 6): the walker's
+    # self-test in every boot, and a crash case's cause, NMI stop, backtrace,
+    # crash screen and final action, which ends the log but for a reboot's
+    # restart lines.
+    Assert-MirrorCrash -Serial $serial -FaultMode $Fault -RequestedCpus $CpuCount -UseLegacyPic ([bool]$LegacyPic) -WithoutDisplay ([bool]$NoDisplayDevice) -PanicReboot ([bool]$PanicReboot)
     if ($LegacyPic) {
         $markers += 'MIRROR_APIC_SKIPPED reason=boot_policy'
         if ($serial -match '(?m)^MIRROR_APIC_(?:READY|SPURIOUS_OK)(?:\s|$)') {
@@ -1305,7 +1314,7 @@ try {
             throw "Mirror smoke test did not report $marker. See $serialLog."
         }
     }
-    Write-Host "Mirror boot smoke test passed (fault=$Fault, profile=$DeviceProfile, xhci=$Xhci, usb=$usbFixture, usb-full-speed=$XhciFullSpeed, no-display=$NoDisplayDevice, extended-cpu=$ExtendedCpu, baseline-cpu=$BaselineCpu, cpus=$CpuCount, legacy-pic=$LegacyPic, pit-timer=$PitTimer, no-hpet=$NoHpet, QEMU exit $expectedExitCode). Serial log: $serialLog"
+    Write-Host "Mirror boot smoke test passed (fault=$Fault, profile=$DeviceProfile, xhci=$Xhci, usb=$usbFixture, usb-full-speed=$XhciFullSpeed, no-display=$NoDisplayDevice, extended-cpu=$ExtendedCpu, baseline-cpu=$BaselineCpu, cpus=$CpuCount, legacy-pic=$LegacyPic, pit-timer=$PitTimer, no-hpet=$NoHpet, panic-reboot=$PanicReboot, QEMU exit $expectedExitCode). Serial log: $serialLog"
     # Keep firmware's terminal control sequences in the raw log, not tool output.
     Write-Output (($serial -split '\r?\n' | Where-Object { $_ -match '^(MIRROR_|Memory map:|Direct map offset:|Page tables:)' }) -join [Environment]::NewLine)
 }

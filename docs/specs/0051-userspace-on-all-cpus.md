@@ -1,6 +1,6 @@
 # 0051: Userspace on all CPUs
 
-Status: draft (2026-10-12), claude; implementing on `claude/0051-smp-user`. Open points 1-5 are settled as recommended (team decision under Cameron's 2026-10-12 direction; claude decides), with point 2 subject to kimi's 0054a check.
+Status: implemented on `claude/0051-smp-user` (2026-10-13), steps 1-6; the full `test.ps1` in debug and release gates the merge, after the rebase onto 0054a and 0019a. Open points 1-5 are settled as recommended (team decision under Cameron's 2026-10-12 direction; claude decides), with point 2 subject to kimi's 0054a check. Open point 5's VMware checks are still to do.
 Depends on:
 - 0030a: the process and thread tables, one run queue, wait queues and wakeup preemption (sched.rs:195-211).
 - 0050: per-CPU `CpuData` through GS (cpudata.rs:37-48), per-thread guarded stacks from the kernel VA window (kernel_va.rs:352-420), and RSP0 set per dispatch (userspace.rs:1753).
@@ -164,12 +164,23 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
     - The walker follows rbp only inside this CPU's known stacks, requires rbp to increase strictly within each stack, requires return addresses inside `.text`, and stops at 32 frames.
     - At main.rs:227 the boot framebuffer's base and `Layout` are published. After the stop, the owner builds a raw writer (a documented exception to framebuffer.rs:309-347) and draws the reason, the stop line, the frames and the action on `danger_bg` (crates/ui-tokens/src/lib.rs:86-94), using the 5x7 font (framebuffer.rs:875-972).
     - 2026-10-13, step 4: the walk starts at `crash::enter`'s own frame, so its first return address is in the panic handler or the fatal trap path, and the trap stubs keep the interrupted RBP, so it continues through the interrupted code. A CPU's known stacks are the BSP region's five or an AP slot's four, plus the running thread's kernel stack, found through this CPU's TSS.RSP0 (`kernel_va::stack_below`). `end=user` means a nonzero RBP below 2^47; a misaligned or non-canonical RBP ends the walk with `range`.
+    - 2026-10-13, step 6:
+      - Boot publishes the base (its provenance exposed) and the validated description in atomics, and `framebuffer::crash_screen` validates them again before it builds the raw driver.
+      - The owner draws only when `stopped == targets`, after the BACKTRACE line (and PROBE_OK). Otherwise a CPU that did not stop might still be drawing, so it prints `drawn=0`, as without a framebuffer.
+      - Top to bottom: the title "Mirror stopped" in `danger`, a one-line summary, the reason (a panic's message, or the vector, its name and the error code), at most six rows, then its location, or rip and cr2. Then the stop line, a backtrace summary, the frames in up to four columns, and the action. Body text is at scale 2 on screens of at least 640x400, else scale 1. Text wraps at the margins, non-ASCII draws as '?', and everything is clipped.
+      - In every boot-smoke crash that draws, the owner reads the reason's first row back after a fence. Every pixel of each cell must be the glyph color or `danger_bg`, and at least one must be lit. Then it prints `MIRROR_CRASH_SCREEN_OK`, so the check is not limited to the Panic case.
+      - `framebuffer::self_test` draws the screen into RGB32 and RGB24 test storage. It checks the clear, the readback, a changed pixel, wrapping and a screen too small for the margins. `MIRROR_CRASH_TESTS_OK` is unchanged.
 
 12. **Halt or reboot.**
     - `mirror.panic=halt|reboot` is accepted in every flavor (boot.rs:189-195).
     - Without it, debug builds halt and release builds reboot after 10 s through 0058a's chain, with a new `reset::Cause::Panic` (reset.rs:33-51).
     - The BSP asserts at reset.rs:231, clock.rs:344-347 and timer.rs:252 also admit the crash owner after the stop. Before `reset` or `timer` is initialized, the action is a direct triple fault.
     - Boot-smoke builds default to `exit`, which gives exit code 35 (arch.rs:140-149).
+    - 2026-10-13, step 6:
+      - `mirror.panic=reboot` reboots at once (`delay_ms=0`), and `mirror.panic=halt` halts. Only the release default waits 10 s, timed like the stop wait: HPET forward deltas with a poll backstop.
+      - `crash::configure` reads the token right after `boot::info`. Any other `mirror.panic=` value, or a second token, panics a boot-smoke kernel (`smoke_mode` skips only the two valid tokens). Any other kernel keeps its flavor's default and prints nothing.
+      - The admission is `crash::is_owner()` (OWNER equals this CPU's initial APIC ID), at reset.rs's `restart`, `clock::restart_counter_ns` and `timer::pit_counter`. The owner's `serial::print` skips the lock, so the restart lines never wait for a stopped holder.
+      - If the owner enters again from inside its action, such as a panic in the restart chain, the reboot is a direct triple fault.
 
 13. **Markers.**
     - **Every flavor, content-free:**
@@ -256,6 +267,7 @@ The existing init pair stays pinned to the BSP, because its alternation, budget,
 | Panic | `panic` | 1, 4 | The BSP panics in its pass while battery threads run on every AP. `targets=n-1 stopped=n-1`. `MIRROR_CRASH_PROBE_OK` (the walker found the planted return address). `MIRROR_CRASH_SCREEN_OK` after the reason-line readback. Exit 35. |
 | Panic `-PanicReboot` | `panic` and `mirror.panic=reboot` | 4 | `action=reboot delay_ms=0`, `MIRROR_RESET_BEGIN cause=panic`, the reset lines last, exit 0. |
 | Panic `-NoDisplayDevice` | `panic` | 1 | `drawn=0` and no `SCREEN_OK`. |
+| ApPanic `-PanicReboot`, with and without `-NoHpet` | `ap-panic` and `mirror.panic=reboot` | 4 | 2026-10-13, step 6: as Panic `-PanicReboot`, with slot 1 restarting. This proves the crash owner's admission on an AP, through the HPET and the PIT stopwatch. |
 | ApPanic | `ap-panic` | 4 | Slot 1 panics while holding `SCHED`, with the BSP spinning on it at IF=0. `cpu=1`, and every other CPU stopped by NMI. |
 | DoublePanic | `double-panic` | 4 | Every CPU panics at once. Exactly one `MIRROR_PANIC` and one STOP line, with `stopped=targets`. |
 | NestedPanic | `nested-panic` | 1 | A panic message whose `Display` panics. `MIRROR_CRASH_NESTED depth=2`, then `action=exit`, with no hang. |
@@ -271,6 +283,7 @@ The existing init pair stays pinned to the BSP, because its alternation, budget,
 - `frames=` equals the number of FRAME lines, the indices are contiguous, and each rip is at least 0xffffffff80000000;
 - `drawn=` matches the display switch.
 - 2026-10-13, step 4: outside the crash cases, the one MIRROR_CRASH_ line allowed is `MIRROR_CRASH_TESTS_OK`. Every crash case so far crashes in kernel code, so its backtrace must end with `end=zero`, and its final action must be the log's last `MIRROR_` line. The fatal exception cases and the shootdown timeouts follow the same sequence after their existing diagnostics. SCREEN and its checks come with step 6.
+- 2026-10-13, step 6: every crash case but NestedPanic prints `MIRROR_CRASH_SCREEN drawn=1` and then `MIRROR_CRASH_SCREEN_OK` before its action. Without a display it prints `drawn=0` and nothing more. NestedPanic's owner re-enters while printing the cause and acts without drawing. With `-PanicReboot` only `MIRROR_RESET_` lines may follow the action, and `Assert-MirrorReset` requires `cause=panic` and then the `fadt` attempt that resets QEMU.
 
 **VMware (G11).** `userspace_cpus=` equals `online=` (roadmap-replan.md:130).
 

@@ -27,10 +27,11 @@ function Assert-MirrorKernelImage {
     # maps every byte to one character, so an ordinal search is a byte search.
     $resetRequired = @('MIRROR_ACPI_RESET_READY revision=', 'MIRROR_ACPI_RESET_SKIPPED reason=', 'MIRROR_RESET_BEGIN cause=', 'MIRROR_RESET_SKIPPED method=', 'MIRROR_RESET_ATTEMPT method=', 'MIRROR_RESET_TIMEOUT method=')
     $resetForbidden = @('test_skip', 'MIRROR_RESET_POLICY_OK', 'MIRROR_RESET_SUPPRESSED')
-    # Every flavor carries the crash path's lines; only smoke kernels test
-    # the walker and announce a deliberate panic or a planted frame (0051).
-    $crashRequired = @('MIRROR_CRASH_STOP cpu=', 'MIRROR_CRASH_FRAME index=', 'MIRROR_CRASH_BACKTRACE frames=', 'MIRROR_CRASH_ACTION action=', 'MIRROR_CRASH_NESTED depth=2')
-    $crashForbidden = @('MIRROR_CRASH_TESTS_OK', 'MIRROR_CRASH_PROBE_OK', 'MIRROR_TEST_EXPECT_PANIC', 'crash probe panic', 'crash test panic')
+    # Every flavor carries the crash path's lines and its screen; only smoke
+    # kernels test the walker and the screen, read the screen back, and
+    # announce a deliberate panic or a planted frame (0051).
+    $crashRequired = @('MIRROR_CRASH_STOP cpu=', 'MIRROR_CRASH_FRAME index=', 'MIRROR_CRASH_BACKTRACE frames=', 'MIRROR_CRASH_SCREEN drawn=', 'MIRROR_CRASH_ACTION action=', 'MIRROR_CRASH_NESTED depth=2', 'Mirror stopped')
+    $crashForbidden = @('MIRROR_CRASH_TESTS_OK', 'MIRROR_CRASH_PROBE_OK', 'MIRROR_CRASH_SCREEN_OK', 'MIRROR_TEST_EXPECT_PANIC', 'crash probe panic', 'crash test panic', 'crash screen test')
     $image = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes((Join-Path $repositoryRoot 'build/esp/kernel.elf')))
     if ($Flavor -eq 'Default') {
         # MIRROR_PERF_ strings (spec 0019) are allowed under 0010-D4's exception.
@@ -210,21 +211,28 @@ try {
             Save-MirrorSmokeLogs "$profile-$fault"
         }
         # A panic or fatal fault on any CPU stops every other online CPU by
-        # NMI and prints a frame-pointer backtrace (spec 0051, step 4): from
-        # the BSP alone and with three APs, from an AP holding the scheduler
-        # lock, from every CPU at once, from inside the panic report, and
-        # from a stuck lock holder. PageFault at four CPUs leaves out the AP
-        # the guard probe faulted.
+        # NMI, prints a frame-pointer backtrace and draws the crash screen
+        # (spec 0051, steps 4 and 6): from the BSP alone and with three APs,
+        # from an AP holding the scheduler lock, from every CPU at once, from
+        # inside the panic report, and from a stuck lock holder. PageFault at
+        # four CPUs leaves out the AP the guard probe faulted. Without a
+        # display nothing is drawn. mirror.panic=reboot restarts through
+        # 0058a's chain instead of exiting, from the BSP and from an AP, on
+        # HPET and on the PIT.
         foreach ($case in @(
-                @{ Fault = 'Panic'; Cpus = 1 },
-                @{ Fault = 'Panic'; Cpus = 4 },
-                @{ Fault = 'ApPanic'; Cpus = 4 },
-                @{ Fault = 'DoublePanic'; Cpus = 4 },
-                @{ Fault = 'NestedPanic'; Cpus = 1 },
-                @{ Fault = 'SchedStall'; Cpus = 4 },
-                @{ Fault = 'PageFault'; Cpus = 4 })) {
-            & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -CpuCount $case.Cpus -Fault $case.Fault -Release:$release -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
-            Save-MirrorSmokeLogs "$profile-$($case.Fault)-CpuCount$($case.Cpus)"
+                @{ Name = 'Panic-CpuCount1'; Fault = 'Panic'; Cpus = 1; NoDisplay = $false; Reboot = $false; NoHpet = $false },
+                @{ Name = 'Panic-CpuCount4'; Fault = 'Panic'; Cpus = 4; NoDisplay = $false; Reboot = $false; NoHpet = $false },
+                @{ Name = 'Panic-NoDisplayDevice'; Fault = 'Panic'; Cpus = 1; NoDisplay = $true; Reboot = $false; NoHpet = $false },
+                @{ Name = 'Panic-PanicReboot'; Fault = 'Panic'; Cpus = 4; NoDisplay = $false; Reboot = $true; NoHpet = $false },
+                @{ Name = 'ApPanic-CpuCount4'; Fault = 'ApPanic'; Cpus = 4; NoDisplay = $false; Reboot = $false; NoHpet = $false },
+                @{ Name = 'ApPanic-PanicReboot'; Fault = 'ApPanic'; Cpus = 4; NoDisplay = $false; Reboot = $true; NoHpet = $false },
+                @{ Name = 'ApPanic-PanicReboot-NoHpet'; Fault = 'ApPanic'; Cpus = 4; NoDisplay = $false; Reboot = $true; NoHpet = $true },
+                @{ Name = 'DoublePanic-CpuCount4'; Fault = 'DoublePanic'; Cpus = 4; NoDisplay = $false; Reboot = $false; NoHpet = $false },
+                @{ Name = 'NestedPanic-CpuCount1'; Fault = 'NestedPanic'; Cpus = 1; NoDisplay = $false; Reboot = $false; NoHpet = $false },
+                @{ Name = 'SchedStall-CpuCount4'; Fault = 'SchedStall'; Cpus = 4; NoDisplay = $false; Reboot = $false; NoHpet = $false },
+                @{ Name = 'PageFault-CpuCount4'; Fault = 'PageFault'; Cpus = 4; NoDisplay = $false; Reboot = $false; NoHpet = $false })) {
+            & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -CpuCount $case.Cpus -Fault $case.Fault -NoDisplayDevice:$case.NoDisplay -PanicReboot:$case.Reboot -NoHpet:$case.NoHpet -Release:$release -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+            Save-MirrorSmokeLogs "$profile-$($case.Name)"
         }
         # Both PIT selection paths retain the APIC/SMP backend and must still
         # preempt userspace after explicit policy or a rejected calibration.
