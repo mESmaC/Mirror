@@ -619,6 +619,17 @@ impl NativePackage {
     fn inventory(&self, end: Instant) -> io::Result<Vec<SourceFile>> {
         source_inventory(&self.scratch, &self.source_paths, end)
     }
+    // Keep the real Git ancestry gate injectable only through this private
+    // helper. Production callers always use the fixed CAPABILITIES commit IDs.
+    fn require_capability_ancestor(&mut self, required: &str, end: Instant) -> io::Result<String> {
+        let id = self.git(
+            &["rev-parse", "--verify", &format!("{required}^{{commit}}")],
+            end,
+        )?;
+        let commit = self.commit.clone();
+        self.git(&["merge-base", "--is-ancestor", &id, &commit], end)?;
+        Ok(id)
+    }
 }
 fn job_name(run: &str) -> String {
     format!(r"Local\MirrorLane-{run}")
@@ -968,13 +979,8 @@ impl Backend for NativePackage {
             .map(PathBuf::from)
             .collect::<Vec<_>>();
         paths::validate_lane_root(&self.options.lane_root, &paths_list)?;
-        for (name, prefix) in package::CAPABILITIES {
-            let id = self.git(
-                &["rev-parse", "--verify", &format!("{prefix}^{{commit}}")],
-                end,
-            )?;
-            let commit = self.commit.clone();
-            self.git(&["merge-base", "--is-ancestor", &id, &commit], end)?;
+        for (name, required) in package::CAPABILITIES {
+            let id = self.require_capability_ancestor(required, end)?;
             self.capabilities.push((name.into(), id));
         }
         let cwd = self.options.checkout.clone();
@@ -2105,6 +2111,71 @@ mod tests {
                 assert!(!arg.string().unwrap().contains(r"\\?\"));
             }
         }
+        p.prove_no_live_build(false, end()).unwrap();
+        p.lease
+            .as_mut()
+            .unwrap()
+            .publish_release(&utc_now())
+            .unwrap();
+        p.lease.take();
+    }
+    #[test]
+    fn real_git_capability_gate_accepts_ancestor_and_rejects_absent_or_unrelated() {
+        fn commit(
+            p: &mut NativePackage,
+            tree: &str,
+            parent: Option<&str>,
+            message: &str,
+        ) -> String {
+            let mut args = vec![
+                "-c",
+                "user.name=Lane Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit-tree",
+                tree,
+                "-m",
+                message,
+            ];
+            if let Some(parent) = parent {
+                args.extend(["-p", parent]);
+            }
+            p.git(&args, end()).unwrap()
+        }
+        let f = Fixture::new();
+        let locks = f.dir("locks");
+        let mut p = NativePackage::open_at(f.options(), &locks).unwrap();
+        p.git(&["init", "--quiet", "-b", "fixture"], end()).unwrap();
+        let tree = p.git(&["write-tree"], end()).unwrap();
+        let ancestor = commit(&mut p, &tree, None, "required capability");
+        let descendant = commit(&mut p, &tree, Some(&ancestor), "source package");
+        let unrelated = commit(&mut p, &tree, None, "unrelated capability");
+        p.git(&["update-ref", "HEAD", &descendant], end()).unwrap();
+        p.commit = p.git(&["rev-parse", "HEAD^{commit}"], end()).unwrap();
+        assert_eq!(
+            p.require_capability_ancestor(&ancestor, end()).unwrap(),
+            ancestor
+        );
+        let before = p.command_number;
+        assert!(
+            p.require_capability_ancestor(&"0".repeat(40), end())
+                .is_err()
+        );
+        assert_eq!(
+            p.command_number,
+            before + 1,
+            "absent object must fail resolution before ancestry"
+        );
+        let before = p.command_number;
+        assert!(p.require_capability_ancestor(&unrelated, end()).is_err());
+        assert_eq!(
+            p.command_number,
+            before + 2,
+            "existing unrelated object must reach merge-base rejection"
+        );
+        assert_eq!(p.commit, descendant);
         p.prove_no_live_build(false, end()).unwrap();
         p.lease
             .as_mut()
