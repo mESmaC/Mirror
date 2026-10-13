@@ -749,7 +749,8 @@ try {
         # A published busy frame can survive the loop until its next commit.
         # Bracket the supervisor's observation of the committed peer edit with
         # the actual busy handler diagnostics. The app's own text log follows
-        # its commit and can be delayed until after the supervisor closes peers.
+        # its commit and can come after the supervisor's progress line, but
+        # the supervisor waits for the app's next repaint before closing it.
         $busy = [regex]::Match($serial, '(?m)^user: Mirror app: busy start ([1-9][0-9]*)\\n\r?$')
         $progress = [regex]::Match($serial, '(?m)^user: Mirror shell: busy peer progress ([1-9][0-9]*) ([1-9][0-9]*)\\n\r?$')
         $peerText = [regex]::Match($serial, '(?m)^user: Mirror app: text ([1-9][0-9]*) abc\\n\r?$')

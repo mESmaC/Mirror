@@ -303,9 +303,12 @@ impl Changes {
     }
 }
 
+/// Spin until the smoke supervisor closes this app, which it does as soon as
+/// it has seen a peer progress, or for at most 1000 ticks. The cap is only a
+/// bound: under host load the supervisor's own checks took more than 200.
 fn busy_probe() {
     let start = syscall(SYS_TICKS, 0, 0, 0) as u64;
-    while (syscall(SYS_TICKS, 0, 0, 0) as u64).wrapping_sub(start) < 200 {
+    while (syscall(SYS_TICKS, 0, 0, 0) as u64).wrapping_sub(start) < 1000 {
         // SAFETY: Finite scalar work with no memory accesses or hidden state;
         // the loop never yields or sleeps, so preemption belongs to the kernel.
         unsafe {
