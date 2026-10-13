@@ -21,7 +21,14 @@ SECTIONS
         KEEP(*(.limine_requests_end))
     } :requests
 
-    .text : ALIGN(0x1000) { *(.text .text.*) } :text
+    /* The crash backtrace accepts only return addresses inside these
+       bounds (spec 0051, point 11). */
+    .text : ALIGN(0x1000)
+    {
+        __mirror_text_start = .;
+        *(.text .text.*)
+        __mirror_text_end = .;
+    } :text
     .rodata : ALIGN(0x1000) { *(.rodata .rodata.*) } :rodata
     .data : ALIGN(0x1000) { *(.data .data.*) *(.got .got.*) } :data
     .bss : ALIGN(0x1000) { *(.bss .bss.*) *(COMMON) } :data

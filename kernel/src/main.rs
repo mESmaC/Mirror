@@ -14,6 +14,7 @@ mod clock;
 mod console;
 mod context;
 mod cpudata;
+mod crash;
 mod dma;
 mod drivers;
 mod elf;
@@ -289,6 +290,7 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
         );
         memory::self_test_recycling(&mut frames);
         interrupts::self_test();
+        crash::self_test();
         // SAFETY: This is the active, exclusively owned hierarchy and allocator.
         unsafe { paging::self_test(&mut tables, &mut frames) };
         // SAFETY: Same exclusive hierarchy and allocator, before sealing. The
@@ -486,6 +488,13 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
             boot::SmokeMode::UserFlushTimeout => {
                 vm::user_flush_timeout_self_test(&tables, &mut frames, boot.direct_map_offset);
             }
+            // The crash cases stop every online CPU, so no AP is faulted
+            // first (spec 0051, step 4).
+            boot::SmokeMode::Panic
+            | boot::SmokeMode::ApPanic
+            | boot::SmokeMode::DoublePanic
+            | boot::SmokeMode::NestedPanic
+            | boot::SmokeMode::SchedStall => {}
             _ => {
                 smp::guard_fault_self_test();
                 kernel_vm::offline_self_test(&tables, &mut frames, boot.direct_map_offset);
@@ -518,6 +527,19 @@ unsafe extern "C" fn continue_boot(early: *const EarlyBoot) -> ! {
             // Every self-test has run; restart instead of the expected #PF
             // (spec 0058a, D11). QEMU's -no-reboot ends the boot.
             boot::SmokeMode::Reset(_) => reset::restart(reset::Cause::Test),
+            // The crash cases (spec 0051, step 4) end in the crash path,
+            // which stops the APs, reports and exits with code 35.
+            boot::SmokeMode::Panic => {
+                serial::println!("MIRROR_TEST_EXPECT_PANIC cpu=0");
+                crash::planted_panic();
+            }
+            boot::SmokeMode::NestedPanic => {
+                serial::println!("MIRROR_TEST_EXPECT_PANIC cpu=0");
+                panic!("{}", crash::NestedPanic);
+            }
+            boot::SmokeMode::ApPanic => smp::crash_test(smp::CrashTest::ApPanic),
+            boot::SmokeMode::DoublePanic => smp::crash_test(smp::CrashTest::DoublePanic),
+            boot::SmokeMode::SchedStall => smp::crash_test(smp::CrashTest::SchedStall),
             boot::SmokeMode::PageFault => {
                 serial::println!("MIRROR_TEST_EXPECT_FATAL vector=14");
             }
@@ -1575,17 +1597,14 @@ fn test_heap_with_interrupts() {
     );
 }
 
+/// A panic on the BSP or an ONLINE AP is a crash: the crash path stops the
+/// other CPUs and reports it (spec 0051, point 10). On an AP that is not
+/// ONLINE yet it only records the slot FAILED, as a trap there does.
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
     arch::disable_interrupts();
-    if smp::is_secondary() {
+    if smp::is_secondary() && smp::ap_records_faults() {
         smp::secondary_fault(u64::MAX, u64::MAX, 0, 0);
     }
-    serial::println!("MIRROR_PANIC: {}", info);
-
-    #[cfg(feature = "boot-smoke")]
-    arch::exit_qemu(false);
-
-    #[cfg(not(feature = "boot-smoke"))]
-    arch::halt()
+    crash::enter(crash::Cause::Panic(info))
 }

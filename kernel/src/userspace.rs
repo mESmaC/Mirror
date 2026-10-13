@@ -11,6 +11,12 @@
 mod sched;
 
 #[cfg(feature = "boot-smoke")]
+pub(crate) use sched::{
+    hold_scheduler_lock_for_test, scheduler_lock_contended_for_test,
+    wait_for_scheduler_lock_for_test,
+};
+
+#[cfg(feature = "boot-smoke")]
 use core::sync::atomic::{AtomicBool, AtomicUsize};
 use core::sync::atomic::{AtomicU64, Ordering};
 

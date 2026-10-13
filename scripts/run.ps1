@@ -23,7 +23,7 @@ param(
     [switch]$LegacyPic,
     [switch]$PitTimer,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
-    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'ThreadStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'UserFlushTimeout', 'TimerCalibration', 'ClockActivation', 'Ps2BatTimeout', 'Ps2StaleScancode', 'VmmouseError', 'Reset', 'ResetFromKbc', 'ResetFromCf9', 'ResetFromTripleFault', 'ResetSuppressed', 'OomOrder', 'ClassLimits', 'PerfInvalid')][string]$Fault = 'None',
+    [ValidateSet('None', 'PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'ThreadStackOverflow', 'KernelSmep', 'KernelSmap', 'UserKernelRead', 'UserCodeWrite', 'UserNx', 'UserGuard', 'UserPrivileged', 'UserBadStack', 'UserBudget', 'IpcPeerExit', 'IpcTimeout', 'BlockIoError', 'BlockWrite', 'BlockWriteError', 'BlockFlushError', 'BlockNoFlush', 'AhciIoError', 'AhciInitFailure', 'XhciInitFailure', 'XhciDeviceFailure', 'VmReadOnly', 'VmNx', 'VmReleased', 'VmGuard', 'UserX87', 'UserSimd', 'UserAvx', 'UserFsgsbase', 'ThreadLastExit', 'ThreadProcessExit', 'ThreadFault', 'UserSyscall', 'UserUmip', 'SmpUnmap', 'SmpTlbTimeout', 'UserFlushTimeout', 'TimerCalibration', 'ClockActivation', 'Ps2BatTimeout', 'Ps2StaleScancode', 'VmmouseError', 'Reset', 'ResetFromKbc', 'ResetFromCf9', 'ResetFromTripleFault', 'ResetSuppressed', 'Panic', 'ApPanic', 'DoublePanic', 'NestedPanic', 'SchedStall', 'OomOrder', 'ClassLimits', 'PerfInvalid')][string]$Fault = 'None',
     [string]$QemuPath = $env:QEMU_PATH,
     [string]$FirmwareCode = $env:OVMF_CODE,
     [string]$FirmwareVars = $env:OVMF_VARS,
@@ -109,8 +109,8 @@ function Assert-MirrorSmpMarkers {
         throw "Mirror must flush a scratch user root on all $flushCpus CPU(s) exactly once, after SMP startup."
     }
     if ($UseLegacyPic) {
-        if ($FaultMode -in @('SmpUnmap', 'SmpTlbTimeout', 'UserFlushTimeout')) {
-            throw 'SMP memory fault probes require the APIC backend.'
+        if ($FaultMode -in @('SmpUnmap', 'SmpTlbTimeout', 'UserFlushTimeout', 'ApPanic', 'DoublePanic', 'SchedStall')) {
+            throw 'SMP memory fault probes and the AP crash cases require the APIC backend.'
         }
         if ([regex]::Matches($Serial, '(?m)^MIRROR_SMP_SKIPPED reason=legacy_pic online=1\r?$').Count -ne 1 -or
             [regex]::Matches($Serial, '(?m)^MIRROR_SMP_SKIPPED(?:\s|$)').Count -ne 1) {
@@ -245,6 +245,15 @@ function Assert-MirrorSmpMarkers {
         }
         return
     }
+    if ($FaultMode -in @('Panic', 'ApPanic', 'DoublePanic', 'NestedPanic', 'SchedStall')) {
+        # The crash cases stop every online CPU at the end of boot, so no AP
+        # is faulted first (spec 0051, step 4); Assert-MirrorCrash checks the
+        # stop.
+        if ($guardRecords.Count -ne 0 -or $unmapRecords.Count -ne 0 -or $offlineRecords.Count -ne 0) {
+            throw 'The crash cases must crash before the AP guard probe and the shared-mapping rejection.'
+        }
+        return
+    }
     if ($FaultMode -eq 'SmpUnmap') {
         $pattern = '(?m)^MIRROR_SMP_UNMAP_OK slot={0} vector=14 remaining={0}\r?$' -f ($RequestedCpus - 1)
         $records = [regex]::Matches($Serial, $pattern)
@@ -328,6 +337,9 @@ if ($NoTestDisk -and ($Fault -eq 'BlockIoError' -or $writableBlock)) {
 }
 if ($Fault -in @('SmpUnmap', 'SmpTlbTimeout', 'UserFlushTimeout') -and ($CpuCount -lt 2 -or $LegacyPic)) {
     throw 'SMP memory fault probes require at least two CPUs and the APIC backend.'
+}
+if ($Fault -in @('ApPanic', 'DoublePanic', 'SchedStall') -and ($CpuCount -lt 2 -or $LegacyPic)) {
+    throw "-Fault $Fault needs an AP: at least two CPUs and the APIC backend."
 }
 if ($Fault -eq 'TimerCalibration' -and ($LegacyPic -or $PitTimer)) {
     throw 'Timer calibration fault injection requires APIC with automatic timer selection.'
@@ -428,6 +440,11 @@ $testMode = switch ($Fault) {
     'ResetSuppressed' { 'reset-suppressed' }
     'OomOrder' { 'oom-order' }
     'ClassLimits' { 'class-limits' }
+    'Panic' { 'panic' }
+    'ApPanic' { 'ap-panic' }
+    'DoublePanic' { 'double-panic' }
+    'NestedPanic' { 'nested-panic' }
+    'SchedStall' { 'sched-stall' }
     default { $null }
 }
 $kernelArguments = @()
@@ -627,8 +644,10 @@ try {
             (Get-FileHash -LiteralPath $attachedDisk -Algorithm SHA256).Hash -ne $testDiskHash)) {
         throw 'The AHCI read-only probe modified its disposable disk image.'
     }
-    # A missing kernel or user shootdown ACK panics and exits 35.
+    # A missing kernel or user shootdown ACK panics and exits 35, and so does
+    # each crash case, which panics on purpose (spec 0051, step 4).
     $expectedTimeout = $Fault -in @('SmpTlbTimeout', 'UserFlushTimeout')
+    $panicFault = $Fault -in @('Panic', 'ApPanic', 'DoublePanic', 'NestedPanic', 'SchedStall')
     if ($Fault -eq 'PerfInvalid') {
         $panic = [regex]::Matches($serial, '(?m)^MIRROR_PANIC:[^\r\n]*\r?\nunknown smoke-test command line\r?$')
         if ($qemuExitCode -ne 35 -or $panic.Count -ne 1 -or
@@ -637,10 +656,13 @@ try {
             $serial -match '(?m)^MIRROR_(?:BOOT_OK|TEST_EXPECT_FATAL|EXCEPTION)(?:\s|$)') {
             throw 'PerfInvalid must fail strict smoke parsing with the exact unknown-command-line panic and exit 35.'
         }
+        # The panic takes the crash path before any AP starts (spec 0051,
+        # step 4), closed-world like every other smoke boot's crash lines.
+        Assert-MirrorCrash -Serial $serial -FaultMode $Fault -RequestedCpus $CpuCount -UseLegacyPic ([bool]$LegacyPic)
         Write-Host 'PerfInvalid rejected the raw invalid token with one OFF and the expected panic.'
         return
     }
-    if (-not $expectedTimeout -and $serial -match '(?im)^(?:MIRROR_PANIC|PANIC|\[panic\])') {
+    if (-not $expectedTimeout -and -not $panicFault -and $serial -match '(?im)^(?:MIRROR_PANIC|PANIC|\[panic\])') {
         throw "Mirror reported a panic. See $serialLog."
     }
     $fatalKernelFault = $Fault -in @('PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'ThreadStackOverflow', 'KernelSmep', 'KernelSmap')
@@ -652,7 +674,7 @@ try {
     # A reset case restarts after every self-test, and -no-reboot turns the
     # guest reset into a QEMU exit with code 0 (spec 0058a, D11).
     $resetCase = $Fault -like 'Reset*'
-    $expectedExitCode = if ($fatalKernelFault -or $expectedTimeout) { 35 } elseif ($resetCase) { 0 } else { 33 }
+    $expectedExitCode = if ($fatalKernelFault -or $expectedTimeout -or $panicFault) { 35 } elseif ($resetCase) { 0 } else { 33 }
     if ($qemuExitCode -ne $expectedExitCode) {
         $qemuError = [System.IO.File]::ReadAllText($stderrLog)
         throw "Mirror smoke test expected QEMU exit $expectedExitCode; got $qemuExitCode. $qemuError See $serialLog."
@@ -691,6 +713,10 @@ try {
     # The FADT reset register, the policy self-test and a reset case's chain,
     # closed-world (spec 0058a, test 4). Other cases print no restart line.
     Assert-MirrorReset -Serial $serial -Smoke $true -FaultMode $Fault -WithoutKeyboard ([bool]$NoKeyboard) -WithoutHpet ([bool]$NoHpet)
+    # The crash path, closed-world (spec 0051, step 4): the walker's
+    # self-test in every boot, and a crash case's cause, NMI stop, backtrace
+    # and final action, which ends the log.
+    Assert-MirrorCrash -Serial $serial -FaultMode $Fault -RequestedCpus $CpuCount -UseLegacyPic ([bool]$LegacyPic)
     if ($LegacyPic) {
         $markers += 'MIRROR_APIC_SKIPPED reason=boot_policy'
         if ($serial -match '(?m)^MIRROR_APIC_(?:READY|SPURIOUS_OK)(?:\s|$)') {
@@ -1182,7 +1208,7 @@ try {
             throw "Mirror must report $threadMarker exactly $expectedCount time(s). See $serialLog."
         }
     }
-    if (-not $expectedTimeout -and -not $fatalKernelFault) {
+    if (-not $expectedTimeout -and -not $fatalKernelFault -and -not $panicFault) {
         if ($resetCase) {
             # The restart replaces the smoke tail's expected #PF.
             if ($serial -match '(?m)^MIRROR_(?:PAGE_FAULT_OK|BOOT_OK)(?:\s|$)') {

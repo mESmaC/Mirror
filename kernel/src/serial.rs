@@ -3,7 +3,9 @@
 //! each other (spec 0051, point 9). A CPU that prints again while it holds the
 //! lock, from an exception or NMI that interrupted its own print, goes ahead
 //! without waiting. Lock order is the scheduler lock, then this one; nothing
-//! is taken while it is held. Normal IRQ handlers never print.
+//! is taken while it is held. Normal IRQ handlers never print. The crash
+//! owner prints without the lock once it has stopped the other CPUs
+//! (`print_unlocked`, spec 0051, point 10).
 
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -120,6 +122,15 @@ pub fn print(args: fmt::Arguments<'_>) {
     // lock is held, so fatal exception diagnostics can print even during an
     // allocation.
     unsafe { arch::restore_interrupts(was_enabled) };
+}
+
+/// Print without the lock and without touching IF: the crash path only
+/// (spec 0051, points 9 and 10). Its owner has stopped every other CPU it
+/// could, and one stopped mid-print may still hold the lock, so waiting for
+/// it could only delay the report. The caller starts its first line with a
+/// newline, which ends any line that a stopped CPU left unfinished.
+pub(crate) fn print_unlocked(args: fmt::Arguments<'_>) {
+    let _ = Console.write_fmt(args);
 }
 
 macro_rules! println {

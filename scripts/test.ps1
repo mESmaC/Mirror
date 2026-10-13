@@ -27,6 +27,10 @@ function Assert-MirrorKernelImage {
     # maps every byte to one character, so an ordinal search is a byte search.
     $resetRequired = @('MIRROR_ACPI_RESET_READY revision=', 'MIRROR_ACPI_RESET_SKIPPED reason=', 'MIRROR_RESET_BEGIN cause=', 'MIRROR_RESET_SKIPPED method=', 'MIRROR_RESET_ATTEMPT method=', 'MIRROR_RESET_TIMEOUT method=')
     $resetForbidden = @('test_skip', 'MIRROR_RESET_POLICY_OK', 'MIRROR_RESET_SUPPRESSED')
+    # Every flavor carries the crash path's lines; only smoke kernels test
+    # the walker and announce a deliberate panic or a planted frame (0051).
+    $crashRequired = @('MIRROR_CRASH_STOP cpu=', 'MIRROR_CRASH_FRAME index=', 'MIRROR_CRASH_BACKTRACE frames=', 'MIRROR_CRASH_ACTION action=', 'MIRROR_CRASH_NESTED depth=2')
+    $crashForbidden = @('MIRROR_CRASH_TESTS_OK', 'MIRROR_CRASH_PROBE_OK', 'MIRROR_TEST_EXPECT_PANIC', 'crash probe panic', 'crash test panic')
     $image = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes((Join-Path $repositoryRoot 'build/esp/kernel.elf')))
     if ($Flavor -eq 'Default') {
         # MIRROR_PERF_ strings (spec 0019) are allowed under 0010-D4's exception.
@@ -44,12 +48,12 @@ function Assert-MirrorKernelImage {
         # capacity skip record and charge summary exist only in boot-smoke.
         # Only smoke kernels run the concurrent SMP print check and the user
         # flush self-test and fault (0051).
-        $required = @('MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=', 'MIRROR_MEM_RESERVE frames=', 'MIRROR_KVA_READY base=', 'MIRROR_CPU_DATA_READY cpus=') + $resetRequired
-        $forbidden = @('MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_TRACE_ON', 'MIRROR_CONSOLE_COMMAND operation=', 'MIRROR_POINTER_UPDATED', 'MIRROR_POINTER_CLICK', 'MIRROR_SHELL_FRAME', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'Mirror shell: ready', 'MIRROR_USERSPACE_OK', 'Mirror init: VM checks passed', 'fixture data mismatch', 'unexpected budget exhaustion', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROWN phase=auto', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED', 'MIRROR_SMP_PRINT', 'MIRROR_USER_FLUSH') + $resetForbidden
+        $required = @('MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=', 'MIRROR_MEM_RESERVE frames=', 'MIRROR_KVA_READY base=', 'MIRROR_CPU_DATA_READY cpus=') + $resetRequired + $crashRequired
+        $forbidden = @('MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_TRACE_ON', 'MIRROR_CONSOLE_COMMAND operation=', 'MIRROR_POINTER_UPDATED', 'MIRROR_POINTER_CLICK', 'MIRROR_SHELL_FRAME', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'Mirror shell: ready', 'MIRROR_USERSPACE_OK', 'Mirror init: VM checks passed', 'fixture data mismatch', 'unexpected budget exhaustion', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROWN phase=auto', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED', 'MIRROR_SMP_PRINT', 'MIRROR_USER_FLUSH') + $resetForbidden + $crashForbidden
     }
     else {
-        $required = @('MIRROR_TRACE_ON', 'MIRROR_SHELL_FRAME', 'MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=', 'MIRROR_HEAP_GROWN phase=auto', 'MIRROR_MEM_RESERVE frames=', 'MIRROR_KVA_READY base=', 'MIRROR_CPU_DATA_READY cpus=') + $resetRequired
-        $forbidden = @('MIRROR_USERSPACE_OK', 'fixture data mismatch', 'MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED', 'MIRROR_SMP_PRINT', 'MIRROR_USER_FLUSH') + $resetForbidden
+        $required = @('MIRROR_TRACE_ON', 'MIRROR_SHELL_FRAME', 'MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=', 'MIRROR_HEAP_GROWN phase=auto', 'MIRROR_MEM_RESERVE frames=', 'MIRROR_KVA_READY base=', 'MIRROR_CPU_DATA_READY cpus=') + $resetRequired + $crashRequired
+        $forbidden = @('MIRROR_USERSPACE_OK', 'fixture data mismatch', 'MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED', 'MIRROR_SMP_PRINT', 'MIRROR_USER_FLUSH') + $resetForbidden + $crashForbidden
     }
     foreach ($text in $required) {
         if ($image.IndexOf($text, [StringComparison]::Ordinal) -lt 0) {
@@ -191,6 +195,23 @@ try {
         foreach ($fault in @('SmpUnmap', 'SmpTlbTimeout', 'UserFlushTimeout')) {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -CpuCount 4 -Fault $fault -Release:$release -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
             Save-MirrorSmokeLogs "$profile-$fault"
+        }
+        # A panic or fatal fault on any CPU stops every other online CPU by
+        # NMI and prints a frame-pointer backtrace (spec 0051, step 4): from
+        # the BSP alone and with three APs, from an AP holding the scheduler
+        # lock, from every CPU at once, from inside the panic report, and
+        # from a stuck lock holder. PageFault at four CPUs leaves out the AP
+        # the guard probe faulted.
+        foreach ($case in @(
+                @{ Fault = 'Panic'; Cpus = 1 },
+                @{ Fault = 'Panic'; Cpus = 4 },
+                @{ Fault = 'ApPanic'; Cpus = 4 },
+                @{ Fault = 'DoublePanic'; Cpus = 4 },
+                @{ Fault = 'NestedPanic'; Cpus = 1 },
+                @{ Fault = 'SchedStall'; Cpus = 4 },
+                @{ Fault = 'PageFault'; Cpus = 4 })) {
+            & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -CpuCount $case.Cpus -Fault $case.Fault -Release:$release -MemoryMiB $smpMemoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
+            Save-MirrorSmokeLogs "$profile-$($case.Fault)-CpuCount$($case.Cpus)"
         }
         # Both PIT selection paths retain the APIC/SMP backend and must still
         # preempt userspace after explicit policy or a rejected calibration.

@@ -166,6 +166,33 @@ pub(super) fn unlocked<R>(operation: impl FnOnce() -> R) -> R {
     result
 }
 
+/// Take `SCHED` and never release it: the holder in ApPanic and SchedStall
+/// (spec 0051, step 4), an AP that then panics or spins until the crash
+/// stops it.
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn hold_scheduler_lock_for_test() {
+    SCHED.acquire();
+}
+
+/// Whether another CPU has taken a ticket for `SCHED` and spins for it
+/// while this CPU holds it (ApPanic).
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn scheduler_lock_contended_for_test() -> bool {
+    assert!(SCHED.held_here(), "contention check without the lock");
+    SCHED
+        .next
+        .load(Ordering::Relaxed)
+        .wrapping_sub(SCHED.serving.load(Ordering::Relaxed))
+        >= 2
+}
+
+/// Spin for `SCHED`, as every CPU does, and release it at once: the BSP's
+/// half of ApPanic and SchedStall, where an AP holds it for good.
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn wait_for_scheduler_lock_for_test() {
+    drop(lock());
+}
+
 /// Panic unless this CPU holds `SCHED`.
 fn assert_held() {
     assert!(SCHED.held_here(), "scheduler state without the lock");

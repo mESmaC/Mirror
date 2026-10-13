@@ -771,6 +771,34 @@ fn current_tss() -> *mut TaskStateSegment {
     }
 }
 
+/// CPU `cpu`'s TSS.RSP0, read without GS and without asserting, for the
+/// crash backtrace's view of a running thread's stack (spec 0051, point 11):
+/// `None` for a slot out of range or an AP whose descriptors are not
+/// installed. Only the crashing CPU reads its own.
+pub(crate) fn rsp0_of(cpu: usize) -> Option<u64> {
+    let tss = if cpu == 0 {
+        addr_of!(TSS)
+    } else if cpu < MAX_CPUS && SECONDARY_CLAIMED[cpu - 1].load(Ordering::Acquire) {
+        // SAFETY: The index is in bounds and no reference to the array is
+        // formed.
+        unsafe {
+            addr_of!(SECONDARY_TSS)
+                .cast::<TaskStateSegment>()
+                .add(cpu - 1)
+        }
+    } else {
+        return None;
+    };
+    // SAFETY: Every TSS is permanently mapped. Only its own CPU writes its
+    // RSP0, and the caller is that CPU. The unaligned read of the packed
+    // field forms no reference.
+    Some(unsafe {
+        addr_of!((*tss).privilege_stacks)
+            .cast::<u64>()
+            .read_unaligned()
+    })
+}
+
 /// This CPU's TSS.RSP0: the running thread's kernel stack top during a
 /// dispatch, the placeholder otherwise (0050-D2).
 pub(crate) fn kernel_stack() -> u64 {
@@ -1251,17 +1279,17 @@ extern "C" fn mirror_exception_dispatch(frame: &mut TrapFrame) {
             return;
         }
         if !ap_dispatches(frame) {
-            // A trap before this AP is ONLINE, a smoke probe's armed fault,
-            // or a vector no AP handles: device IRQs, which the IOAPIC sends
-            // only to the BSP, and kernel exceptions. Keep it out of BSP-only
-            // tests, scheduler state, logging and locks. Step 4 sends the
-            // last two kinds to the crash path (spec 0051, point 4).
-            let cr2: u64;
-            // SAFETY: Every installed gate enters at CPL0. The failure
-            // recorder uses only atomics before halting this CPU, without
-            // serial output.
-            unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
-            crate::smp::secondary_fault(frame.vector, frame.error, frame.rip, cr2);
+            // A trap before this AP is ONLINE or a smoke probe's armed fault
+            // keeps the slot's failure record, without serial output. On an
+            // ONLINE AP, a vector no AP handles is fatal: a device IRQ, which
+            // the IOAPIC sends only to the BSP, or a kernel exception. It
+            // takes the crash path, never the BSP's tests (spec 0051, point
+            // 4).
+            let cr2 = read_cr2();
+            if crate::smp::ap_records_faults() {
+                crate::smp::secondary_fault(frame.vector, frame.error, frame.rip, cr2);
+            }
+            fatal(frame, cr2);
         }
     }
     #[cfg(feature = "boot-smoke")]
@@ -1303,11 +1331,17 @@ fn ap_dispatches(frame: &TrapFrame) -> bool {
 /// fatal platform failure in `dispatch`.
 #[unsafe(no_mangle)]
 extern "C" fn mirror_paranoid_dispatch(frame: &mut TrapFrame) {
+    // During a crash, another CPU's NMI parks this one for good. Otherwise
+    // an NMI stays fatal, as 0016-D4 has it (spec 0051, point 10).
+    crate::crash::nmi_stop(frame.vector);
     if crate::smp::is_secondary() {
-        let cr2: u64;
-        // SAFETY: As in mirror_exception_dispatch's secondary path.
-        unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
-        crate::smp::secondary_fault(frame.vector, frame.error, frame.rip, cr2);
+        // As in mirror_exception_dispatch: only an ONLINE AP outside a smoke
+        // probe takes the crash path.
+        let cr2 = read_cr2();
+        if crate::smp::ap_records_faults() {
+            crate::smp::secondary_fault(frame.vector, frame.error, frame.rip, cr2);
+        }
+        fatal(frame, cr2);
     }
     // The paranoid entry swapped in CpuData when a user GS base was live and
     // cleared the FS state, but leaves the GS selector as it found it, so the
@@ -1411,10 +1445,9 @@ fn dispatch(frame: &mut TrapFrame) {
         return;
     }
 
-    let cr2: u64;
-    // SAFETY: Every gate targets this CPL0 handler. Capture CR2 before printing
-    // diagnostics, so a secondary fault cannot silently replace its value.
-    unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
+    // Capture CR2 before printing diagnostics, so a secondary fault cannot
+    // silently replace its value.
+    let cr2 = read_cr2();
 
     // NMI, double fault, and machine check are kernel/platform failures even
     // when delivered while CPL3 was running. Ordinary user exceptions are local.
@@ -1468,24 +1501,29 @@ fn dispatch(frame: &mut TrapFrame) {
         }
     }
 
-    serial::println!(
-        "MIRROR_EXCEPTION vector={} error={:#x} rip={:#x} cr2={:#x}",
-        frame.vector,
-        frame.error,
-        frame.rip,
-        cr2
-    );
-    serial::println!(
-        "Exception context: cs={:#x} rflags={:#x} rsp={:#x} ss={:#x}",
-        frame.cs,
-        frame.rflags,
-        frame.rsp,
-        frame.ss
-    );
+    fatal(frame, cr2)
+}
 
-    #[cfg(feature = "boot-smoke")]
-    arch::exit_qemu(false);
+/// CR2 on this CPU. Every gate enters at CPL0, where the read is allowed.
+fn read_cr2() -> u64 {
+    let cr2: u64;
+    // SAFETY: CPL0; reading CR2 changes no processor state.
+    unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
+    cr2
+}
 
-    #[cfg(not(feature = "boot-smoke"))]
-    arch::halt()
+/// End in the crash path for an unexpected trap: `crash::enter` prints the
+/// frame as `MIRROR_EXCEPTION` once it has stopped the other CPUs (spec 0051,
+/// point 10).
+fn fatal(frame: &TrapFrame, cr2: u64) -> ! {
+    crate::crash::enter(crate::crash::Cause::Exception(crate::crash::Exception {
+        vector: frame.vector,
+        error: frame.error,
+        rip: frame.rip,
+        cr2,
+        cs: frame.cs,
+        rflags: frame.rflags,
+        rsp: frame.rsp,
+        ss: frame.ss,
+    }))
 }

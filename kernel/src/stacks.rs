@@ -132,6 +132,15 @@ pub fn bsp_ist_stacks() -> [core::ops::Range<u64>; IST_COUNT] {
     core::array::from_fn(|index| ist_bottom(index)..top(ist_bottom(index), IST_PAGES))
 }
 
+/// The BSP region's mapped stacks as `bottom..top` ranges, guards excluded,
+/// in map order, or `None` before `map_bsp`: the stacks the crash backtrace
+/// may walk on the BSP (spec 0051, point 11). It never panics.
+pub fn bsp_stack_ranges() -> Option<[core::ops::Range<u64>; 2 + IST_COUNT]> {
+    BSP_MAPPED
+        .load(Ordering::Acquire)
+        .then(|| BSP_STACKS.map(|(bottom, pages)| bottom..top(bottom, pages)))
+}
+
 /// Check that every guard page of the BSP region is still unmapped, then
 /// report the region once in every build: the scheduler and RSP0 sizes in KiB,
 /// the IST count and the guard page below the RSP0 stack, which an RSP0

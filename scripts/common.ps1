@@ -1107,6 +1107,154 @@ function Assert-MirrorReset {
     }
 }
 
+function Assert-MirrorCrash {
+    # Spec 0051, points 10, 11 and 13, closed-world over MIRROR_CRASH_* and
+    # MIRROR_TEST_EXPECT_PANIC on every smoke boot. Each boot reports the
+    # backtrace walker's self-test once. Only a crash case reports a crash,
+    # once and in order: its cause (the panic or exception lines), the stop
+    # of every other online CPU, the backtrace frames and summary, and the
+    # final action, which ends the log. The stop's targets are recomputed:
+    # every online CPU but the crashing one, less the AP that the guard
+    # probe faulted before an exception case. PerfInvalid's strict
+    # command-line panic comes at the first smoke-mode read, in clock or
+    # timer setup, before the walker self-test and before any AP starts.
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [string]$FaultMode = 'None',
+        [int]$RequestedCpus = 1,
+        [bool]$UseLegacyPic
+    )
+
+    # The CPU each panic case announces, and the message it panics with.
+    $panicCpus = @{ Panic = '0'; ApPanic = '1'; DoublePanic = 'any'; NestedPanic = '0'; SchedStall = '0' }
+    $panicMessages = @{
+        Panic = 'crash probe panic'
+        ApPanic = 'AP crash test panic'
+        DoublePanic = 'double crash test panic'
+        SchedStall = 'scheduler lock wait exceeded: owner slot 1'
+    }
+    $exceptionCases = @('PageFault', 'InvalidOpcode', 'KernelStackOverflow', 'ThreadStackOverflow', 'KernelSmep', 'KernelSmap')
+    $timeoutCases = @('SmpTlbTimeout', 'UserFlushTimeout')
+    $early = $FaultMode -eq 'PerfInvalid'
+    $panicCase = $panicCpus.ContainsKey($FaultMode)
+    $tests = [regex]::Matches($Serial, '(?m)^MIRROR_CRASH_TESTS_OK ends=6\r?$')
+    $crashText = [regex]::Matches($Serial, 'MIRROR_CRASH_').Count
+    $expectText = [regex]::Matches($Serial, 'MIRROR_TEST_EXPECT_PANIC').Count
+    if ($tests.Count -ne [int](-not $early)) {
+        throw 'Every smoke boot must report MIRROR_CRASH_TESTS_OK ends=6 exactly once, and an early panic none.'
+    }
+    if (-not $panicCase -and -not $early -and $FaultMode -notin $exceptionCases -and $FaultMode -notin $timeoutCases) {
+        if ($crashText -ne 1 -or $expectText -ne 0) {
+            throw "Fault $FaultMode is no crash case, yet the log holds a crash or panic announcement."
+        }
+        return
+    }
+
+    # The cause, after the walker self-test.
+    if ($panicCase) {
+        $expect = [regex]::Matches($Serial, ('(?m)^MIRROR_TEST_EXPECT_PANIC cpu={0}\r?$' -f $panicCpus[$FaultMode]))
+        $panics = [regex]::Matches($Serial, '(?im)^(?:MIRROR_PANIC|PANIC|\[panic\])(?::|\s|$)')
+        $cause = [regex]::Matches($Serial, '(?m)^MIRROR_PANIC: panicked at [^\r\n]+:\r?\n')
+        if ($expect.Count -ne 1 -or $expectText -ne 1 -or $panics.Count -ne 1 -or $cause.Count -ne 1 -or
+            $cause[0].Index -le $expect[0].Index) {
+            throw "The $FaultMode case must announce its panic once, then panic exactly once."
+        }
+        if ($Serial -match '(?m)^MIRROR_(?:EXCEPTION|PAGE_FAULT_OK|BOOT_OK|TEST_EXPECT_FATAL)(?:\s|$)') {
+            throw "The $FaultMode case must panic instead of faulting or finishing the boot."
+        }
+        if ($panicMessages.ContainsKey($FaultMode)) {
+            $message = '(?m)^MIRROR_PANIC: panicked at [^\r\n]+:\r?\n{0}\r?$' -f [regex]::Escape($panicMessages[$FaultMode])
+            if ([regex]::Matches($Serial, $message).Count -ne 1) {
+                throw "The $FaultMode panic must report '$($panicMessages[$FaultMode])'."
+            }
+        }
+    }
+    elseif ($FaultMode -in $exceptionCases) {
+        $cause = [regex]::Matches($Serial, '(?m)^MIRROR_EXCEPTION ')
+        if ($cause.Count -ne 1 -or $expectText -ne 0) {
+            throw "The $FaultMode case must report one exception and announce no panic."
+        }
+    }
+    else {
+        $cause = [regex]::Matches($Serial, '(?m)^MIRROR_PANIC:')
+        if ($cause.Count -ne 1 -or $expectText -ne 0) {
+            throw "The $FaultMode case must report one panic and announce none."
+        }
+    }
+    if (-not $early -and $cause[0].Index -le $tests[0].Index) {
+        throw 'The crash walker self-test must precede the crash.'
+    }
+
+    # The crash lines after the cause: every MIRROR_CRASH_ text but the
+    # self-test's is one of them, a whole line.
+    $records = [regex]::Matches($Serial, '(?m)^MIRROR_CRASH_(?!TESTS_OK )[^\r\n]*')
+    if ($records.Count -ne $crashText - $tests.Count -or $records.Count -eq 0 -or $records[0].Index -le $cause[0].Index) {
+        throw "The $FaultMode crash lines must all be whole lines after its cause."
+    }
+    $action = 'MIRROR_CRASH_ACTION action=exit delay_ms=0'
+    if ($FaultMode -eq 'NestedPanic') {
+        # The panic message's formatting panics while the cause prints: the
+        # owner's second entry ends that line, reports itself and acts.
+        $expected = @('MIRROR_CRASH_NESTED depth=2', $action)
+        if ([regex]::Matches($Serial, '(?m)^MIRROR_PANIC: panicked at [^\r\n]+:\r?\n\r?\nMIRROR_CRASH_NESTED depth=2\r?$').Count -ne 1) {
+            throw 'The nested panic must report itself right after the unfinished panic line.'
+        }
+        if ($records.Count -ne $expected.Count) {
+            throw "The nested panic must print exactly: $($expected -join '; ')."
+        }
+        for ($index = 0; $index -lt $expected.Count; $index++) {
+            if ($records[$index].Value -cne $expected[$index]) {
+                throw "Nested crash line $($index + 1) must be '$($expected[$index])'; it is '$($records[$index].Value)'."
+            }
+        }
+    }
+    else {
+        $online = if ($UseLegacyPic -or $early) { 1 } else { $RequestedCpus }
+        if ($FaultMode -in $exceptionCases -and $online -gt 1) { $online-- }
+        $stop = [regex]::Match($records[0].Value, '^MIRROR_CRASH_STOP cpu=([0-9]+) targets=([0-9]+) stopped=([0-9]+)$')
+        $cpu = if ($stop.Success) { [int]$stop.Groups[1].Value } else { -1 }
+        $cpuValid = switch ($panicCpus[$FaultMode]) {
+            'any' { $cpu -ge 0 -and $cpu -lt $online }
+            '1' { $cpu -eq 1 }
+            default { $cpu -eq 0 }
+        }
+        if (-not $stop.Success -or -not $cpuValid -or [int]$stop.Groups[2].Value -ne $online - 1 -or
+            [int]$stop.Groups[3].Value -ne $online - 1) {
+            throw "The $FaultMode crash must stop all $($online - 1) other online CPU(s) by NMI; it printed '$($records[0].Value)'."
+        }
+        $kernelBase = [Convert]::ToUInt64('ffffffff80000000', 16)
+        $frames = 0
+        while ($frames + 1 -lt $records.Count) {
+            $frame = [regex]::Match($records[$frames + 1].Value, '^MIRROR_CRASH_FRAME index=([0-9]+) rip=0x([0-9a-f]+)$')
+            if (-not $frame.Success) { break }
+            if ([int]$frame.Groups[1].Value -ne $frames -or
+                [Convert]::ToUInt64($frame.Groups[2].Value, 16) -lt $kernelBase) {
+                throw "Crash frame $frames must have index $frames and a kernel return address; it is '$($records[$frames + 1].Value)'."
+            }
+            $frames++
+        }
+        # Every crash case so far crashes in kernel code on a kernel stack,
+        # whose RBP chain ends at the zero that boot's stack switches set.
+        $expected = @("MIRROR_CRASH_BACKTRACE frames=$frames end=zero")
+        if ($FaultMode -eq 'Panic') { $expected += 'MIRROR_CRASH_PROBE_OK' }
+        $expected += $action
+        if ($frames -lt 1 -or $frames -gt 32 -or $records.Count -ne 1 + $frames + $expected.Count) {
+            throw "The $FaultMode crash must print 1 to 32 frames, then: $($expected -join '; ')."
+        }
+        for ($index = 0; $index -lt $expected.Count; $index++) {
+            $line = $records[1 + $frames + $index].Value
+            if ($line -cne $expected[$index]) {
+                throw "The $FaultMode crash line after its frames must be '$($expected[$index])'; it is '$line'."
+            }
+        }
+    }
+    # The final action ends the log.
+    $markers = [regex]::Matches($Serial, '(?m)^MIRROR_[^\r\n]*')
+    if ($markers[$markers.Count - 1].Index -ne $records[$records.Count - 1].Index) {
+        throw "The crash's final action must be the log's last marker; found '$($markers[$markers.Count - 1].Value)' after it."
+    }
+}
+
 function Assert-MirrorTimer {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,

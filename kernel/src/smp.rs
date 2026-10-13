@@ -6,10 +6,12 @@
 //! own periodic timer, and any CPU may send another the reschedule IPI,
 //! vector 242 (spec 0051, point 3). Once a slot is ONLINE, its command, timer
 //! and reschedule interrupts and its CPL3 syscalls and exceptions take the
-//! normal trap dispatch; anything else, an earlier trap, or a smoke probe's
-//! armed fault records the slot FAILED (point 4). Serial output from any CPU
-//! goes through its owner-aware lock (spec 0051); only the boot-smoke print
-//! check prints on an AP so far. Shared mapping changes use bounded
+//! normal trap dispatch, and any other trap or a panic takes the crash path
+//! (`crash::enter`, point 10). A trap or panic before ONLINE, or a smoke
+//! probe's armed fault, records the slot FAILED (point 4). Serial output from
+//! any CPU goes through its owner-aware lock (spec 0051); only the boot-smoke
+//! print check and a crash print on an AP so far. Shared mapping changes use
+//! bounded
 //! synchronous shootdowns; retired frames remain owned until every target
 //! ACKs. A user root's changes flush the CPUs in its space's mask with
 //! OP_FLUSH_USER (spec 0051, point 8). User threads still run only on the BSP.
@@ -89,6 +91,19 @@ const PRINT_BARRIER_NS: u64 = WAIT_TICKS * 10_000_000;
 const TICK_PROOF: u64 = 3;
 /// `fail` reason: the AP's periodic LAPIC timer did not start.
 const FAIL_TIMER: u64 = 15;
+/// Run one crash case's AP half (spec 0051, step 4); the argument is the
+/// `CrashTest`. The AP never acknowledges it: it panics, or keeps the
+/// scheduler lock until the crash stops it.
+#[cfg(feature = "boot-smoke")]
+const OP_CRASH_TEST: u32 = 11;
+/// `fail` reason: a crash case's AP half outlived its bound.
+#[cfg(feature = "boot-smoke")]
+const FAIL_CRASH_TEST: u64 = 16;
+/// How long a crash case's AP half waits for the BSP's half, and how long
+/// SchedStall's holder keeps the scheduler lock before it gives up: far past
+/// the lock's 1 s bound and the crash stop's.
+#[cfg(feature = "boot-smoke")]
+const CRASH_TEST_WAIT_NS: u64 = 10_000_000_000;
 
 #[repr(align(64))]
 struct Slot {
@@ -183,6 +198,38 @@ static PRINT_STARTED: AtomicU64 = AtomicU64::new(0);
 /// its request and, if it was set, kicks the BSP back (spec 0051, step 3).
 #[cfg(feature = "boot-smoke")]
 static RESCHEDULE_ECHO: AtomicU64 = AtomicU64::new(0);
+/// Set once slot 1 holds the scheduler lock in ApPanic or SchedStall.
+#[cfg(feature = "boot-smoke")]
+static CRASH_TEST_HELD: AtomicBool = AtomicBool::new(false);
+/// DoublePanic's barrier: the CPUs that wait to panic, the BSP included.
+/// Each panics once every one has arrived, so none has a head start.
+#[cfg(feature = "boot-smoke")]
+static CRASH_TEST_ARRIVED: AtomicUsize = AtomicUsize::new(0);
+/// How many CPUs DoublePanic's barrier waits for; the BSP sets it before it
+/// sends any AP its half.
+#[cfg(feature = "boot-smoke")]
+static CRASH_TEST_CPUS: AtomicUsize = AtomicUsize::new(0);
+
+/// A crash case that needs an AP (spec 0051, step 4), as OP_CRASH_TEST's
+/// argument.
+#[cfg(feature = "boot-smoke")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CrashTest {
+    /// Slot 1 takes the scheduler lock, waits until the BSP spins on it with
+    /// IF clear, and panics; its crash must stop the BSP by NMI.
+    ApPanic = 1,
+    /// Slot 1 takes the scheduler lock and keeps it; the BSP's bounded spin
+    /// panics, and its crash must stop the holder by NMI.
+    SchedStall = 2,
+    /// Every online AP panics at the same moment as the BSP: one crash wins
+    /// and every other CPU stops.
+    DoublePanic = 3,
+}
+
+#[cfg(feature = "boot-smoke")]
+impl CrashTest {
+    const ALL: [Self; 3] = [Self::ApPanic, Self::SchedStall, Self::DoublePanic];
+}
 
 /// The BSP is the sole command producer. Reject reentry instead of spinning:
 /// interrupts are briefly enabled during waits and receivers never take this
@@ -679,7 +726,9 @@ fn fail(index: usize, reason: u64) -> ! {
     arch::halt()
 }
 
-fn initial_apic_id() -> u32 {
+/// This CPU's initial APIC ID from CPUID, which needs neither GS nor the
+/// local APIC mapping: the crash owner's key (spec 0051, point 10).
+pub(crate) fn initial_apic_id() -> u32 {
     // xAPIC discovery rejects IDs >=255, where this 8-bit field would be ambiguous.
     __cpuid(1).ebx >> 24
 }
@@ -717,18 +766,55 @@ pub(crate) fn cpuid_slot() -> Option<usize> {
 /// only once its slot is ONLINE, and not while a smoke probe has armed its
 /// deliberate fault. Otherwise `secondary_fault` records the trap.
 pub(crate) fn ap_traps_dispatch() -> bool {
+    !ap_records_faults()
+}
+
+/// Whether a fatal trap or a panic on this AP keeps the `secondary_fault`
+/// record instead of the crash path (spec 0051, points 4 and 10): before its
+/// slot is ONLINE, or while a smoke probe has armed its deliberate fault.
+/// It reads only atomics, so the panic handler may ask it.
+pub(crate) fn ap_records_faults() -> bool {
     let Some(index) = current_slot() else {
-        return false;
+        return true;
     };
     let slot = &SLOTS[index];
     #[cfg(feature = "boot-smoke")]
     if slot.expect_fault.load(Ordering::Relaxed) {
-        return false;
+        return true;
     }
-    index != 0 && slot.state.load(Ordering::Acquire) == ONLINE
+    index == 0 || slot.state.load(Ordering::Acquire) != ONLINE
 }
 
-/// The AP exception path never touches BSP serial, scheduler or panic state.
+/// This CPU's slot for the crash path, without asserting: its CpuData's,
+/// else its CPUID APIC ID's, else the BSP's before SMP startup published the
+/// slots, when only the BSP runs. `None` only for a CPU outside the slots.
+pub(crate) fn crash_slot() -> Option<usize> {
+    current_slot().or_else(|| (!PUBLISHED.load(Ordering::Acquire)).then_some(0))
+}
+
+/// The ONLINE slots, the BSP's included, with their APIC IDs: the targets of
+/// the crash stop (spec 0051, point 10). Empty before SMP startup published
+/// the slots or when it was skipped. It reads only atomics.
+pub(crate) fn online_cpus() -> impl Iterator<Item = (usize, u32)> {
+    SLOTS[..configured_count()]
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| slot.state.load(Ordering::Acquire) == ONLINE)
+        .map(|(index, slot)| (index, slot.apic_id.load(Ordering::Relaxed)))
+}
+
+/// AP slot `slot`'s stacks as `bottom..top` ranges, guards excluded, for the
+/// crash backtrace (spec 0051, point 11); `None` for the BSP or a slot out
+/// of range. Only an online AP, whose stacks are mapped, walks its own.
+pub(crate) fn slot_stack_ranges(slot: usize) -> Option<[core::ops::Range<u64>; SLOT_STACKS]> {
+    (1..MAX_CPUS)
+        .contains(&slot)
+        .then(|| slot_stacks(slot).map(|(bottom, pages)| bottom..bottom + pages as u64 * PAGE_SIZE))
+}
+
+/// Record a trap or panic on an AP that is not ONLINE, or a smoke probe's
+/// armed fault, in its slot and halt (spec 0051, point 4). This path never
+/// touches serial, scheduler or crash state.
 pub fn secondary_fault(vector: u64, error: u64, rip: u64, address: u64) -> ! {
     arch::disable_interrupts();
     if let Some(index) = current_slot() {
@@ -832,6 +918,10 @@ fn operation_valid(operation: u32, argument: u64, payload: u64, index: usize) ->
                 && argument & 1 != 0
                 && argument & (1 << index) != 0
                 && payload == 0
+        }
+        #[cfg(feature = "boot-smoke")]
+        OP_CRASH_TEST => {
+            index != 0 && CrashTest::ALL.iter().any(|&test| argument == test as u64) && payload == 0
         }
         _ => {
             let _ = index;
@@ -1171,6 +1261,10 @@ pub fn handle_ipi() {
         slot.completed.fetch_add(1, Ordering::Relaxed);
         slot.acknowledgement.store(sequence, Ordering::Release);
         return;
+    }
+    #[cfg(feature = "boot-smoke")]
+    if operation == OP_CRASH_TEST {
+        crash_test_on_ap(index, argument);
     }
     #[cfg(feature = "boot-smoke")]
     if operation == OP_PRINT {
@@ -1802,6 +1896,91 @@ pub(crate) fn arm_user_flush_timeout_for_test() {
     serial::println!("MIRROR_USER_FLUSH_TIMEOUT_ARMED target={}", target);
 }
 
+/// Run a crash case that needs an AP (spec 0051, step 4), at the end of
+/// boot, on the BSP with IF clear: announce the panicking CPU, send each AP
+/// its half, then play the BSP's. It never returns: the case ends in a
+/// crash, whose stop line and exit the run script checks.
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn crash_test(test: CrashTest) -> ! {
+    assert!(!arch::interrupts_enabled() && !is_secondary());
+    let aps = online_aps();
+    assert!(aps & 0b10 != 0, "a crash case requires slot 1 online");
+    let (cpu, targets) = match test {
+        CrashTest::ApPanic => ("1", 0b10),
+        CrashTest::SchedStall => ("0", 0b10),
+        CrashTest::DoublePanic => ("any", aps),
+    };
+    serial::println!("MIRROR_TEST_EXPECT_PANIC cpu={}", cpu);
+    CRASH_TEST_CPUS.store(1 + aps.count_ones() as usize, Ordering::Release);
+    let _guard = CommandGuard::acquire().expect("crash case command transport");
+    for index in (1..configured_count()).filter(|&index| targets & 1 << index != 0) {
+        let sequence = ready_sequence(&SLOTS[index]).expect("crash case target not online");
+        publish_command(index, sequence, OP_CRASH_TEST, test as u64, 0)
+            .expect("crash case delivery failed");
+    }
+    match test {
+        CrashTest::ApPanic | CrashTest::SchedStall => {
+            assert!(
+                wait_until(|| CRASH_TEST_HELD.load(Ordering::Acquire)),
+                "crash case: slot 1 did not take the scheduler lock"
+            );
+            // ApPanic: slot 1 panics once this spin has taken its ticket,
+            // and its crash stops this CPU here by NMI. SchedStall: slot 1
+            // never releases, so this spin panics with "scheduler lock wait
+            // exceeded" and this CPU's crash stops slot 1 by NMI.
+            crate::userspace::wait_for_scheduler_lock_for_test();
+            panic!("crash case: the scheduler lock was released");
+        }
+        CrashTest::DoublePanic => {
+            assert!(crash_test_barrier(), "crash case: an AP did not arrive");
+            panic!("double crash test panic");
+        }
+    }
+}
+
+/// DoublePanic's barrier: arrive, then wait, bounded, until every CPU in
+/// the case has. Returns whether they all did.
+#[cfg(feature = "boot-smoke")]
+fn crash_test_barrier() -> bool {
+    let cpus = CRASH_TEST_CPUS.load(Ordering::Acquire);
+    CRASH_TEST_ARRIVED.fetch_add(1, Ordering::AcqRel);
+    let mut bound = crate::clock::SpinBound::new(CRASH_TEST_WAIT_NS);
+    while CRASH_TEST_ARRIVED.load(Ordering::Acquire) < cpus {
+        if bound.expired() {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    true
+}
+
+/// A crash case's AP half, in this AP's command handler with IF clear. Each
+/// bounded wait that runs out records the slot FAILED, which the run
+/// script's stop check then reports as a CPU that never stopped.
+#[cfg(feature = "boot-smoke")]
+fn crash_test_on_ap(index: usize, argument: u64) -> ! {
+    if argument == CrashTest::DoublePanic as u64 {
+        if !crash_test_barrier() {
+            fail(index, FAIL_CRASH_TEST);
+        }
+        panic!("double crash test panic");
+    }
+    // ApPanic and SchedStall: take the scheduler lock and never release it.
+    let mut bound = crate::clock::SpinBound::new(CRASH_TEST_WAIT_NS);
+    crate::userspace::hold_scheduler_lock_for_test();
+    CRASH_TEST_HELD.store(true, Ordering::Release);
+    let panics = argument == CrashTest::ApPanic as u64;
+    loop {
+        if panics && crate::userspace::scheduler_lock_contended_for_test() {
+            panic!("AP crash test panic");
+        }
+        if bound.expired() {
+            fail(index, FAIL_CRASH_TEST);
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// The configured CPU count once SMP startup has published its slots, else 0.
 fn configured_count() -> usize {
     if PUBLISHED.load(Ordering::Acquire) {
@@ -2162,6 +2341,14 @@ fn self_test() {
         1
     ));
     assert!(!operation_valid(OP_READ_CPU_DATA, 0, 1, 1));
+    for test in CrashTest::ALL {
+        assert!(operation_valid(OP_CRASH_TEST, test as u64, 0, 1));
+        assert!(!operation_valid(OP_CRASH_TEST, test as u64, 0, 0));
+        assert!(!operation_valid(OP_CRASH_TEST, test as u64, 1, 1));
+    }
+    for argument in [0, 4, u64::MAX] {
+        assert!(!operation_valid(OP_CRASH_TEST, argument, 0, 1));
+    }
     assert!(operation_valid(OP_PRINT, 0b11, 0, 1));
     assert!(operation_valid(OP_PRINT, u64::MAX, 0, MAX_CPUS - 1));
     assert!(!operation_valid(OP_PRINT, 0b11, 0, 0));

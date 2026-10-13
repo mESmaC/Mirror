@@ -70,6 +70,7 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
    - CPL0 exceptions and device vectors 32-47 on an AP go to the crash path (point 10).
    - Two cases keep `secondary_fault`: a fault before the slot is ONLINE, and the armed smoke probes `OP_GUARD_FAULT` and `OP_UNMAPPED_FAULT` (smp.rs:968-993). A per-slot `expect_fault` flag marks the probes.
    - 2026-10-12, step 3: until step 4 adds the crash path, CPL0 exceptions and device vectors on an AP keep `secondary_fault` too. An AP's spurious vector 255 still returns uncounted. The AP sets `expect_fault` just before the probe's access.
+   - 2026-10-13, step 4: the same rule decides panics. A panic, a CPL0 exception, a paranoid vector or a device vector on an ONLINE AP outside a probe takes the crash path; before ONLINE, or under a probe, it keeps the `secondary_fault` record (`smp::ap_records_faults`).
 
 5. **What stays on the BSP.**
    - Device IRQs: IOAPIC routes 0, 1 and 12 keep targeting the BSP (apic.rs:36, :505), and PCI interrupts stay off (pci.rs:9).
@@ -117,7 +118,7 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
    - **Join.** A joiner is signalled only after the BSP has freed the exited thread's stack (userspace.rs:2253-2257, :2378-2383). 2026-10-12, step 2: the signal comes at the end of `resume_process`, after the stack free and `on_cpu` cleared; a join that finds its target exited but still on a CPU waits for that signal.
 
 9. **Serial, clock, accounting and session end.**
-   - `serial::print` (serial.rs:64-70) takes an owner-aware spinlock after `cli`. Re-entry on the same CPU prints without waiting. The crash owner bypasses the lock after the stop and starts with `\r\n`. 2026-10-12, step 1: the wait is bounded (at least 2.5 s), after which the CPU prints unlocked, so a CPU stopped mid-print can garble a line but never hang a report.
+   - `serial::print` (serial.rs:64-70) takes an owner-aware spinlock after `cli`. Re-entry on the same CPU prints without waiting. The crash owner bypasses the lock after the stop and starts with `\r\n`. 2026-10-12, step 1: the wait is bounded (at least 2.5 s), after which the CPU prints unlocked, so a CPU stopped mid-print can garble a line but never hang a report. 2026-10-13, step 4: the owner prints every crash line through `serial::print_unlocked`, and its first output is a newline.
    - `clock::snapshot` drops its BSP assert. It loads `LAST_COUNTER` before reading the counter, then asserts the counter did not go backwards, then calls `fetch_max` (clock.rs:314-335).
    - `ServicePolicy::charge` saturates instead of asserting (userspace.rs:301-306).
    - `idle()`'s single-CPU asserts are relaxed (sched.rs:1283-1315).
@@ -131,12 +132,19 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
     - The owner sends an NMI with the new `apic::send_nmi`, which works from any CPU, uses physical destination and has bounded waits. It sends one per ONLINE slot other than itself, never the all-but-self shorthand, because an NMI that reaches an AP before it is ONLINE becomes a #PF (0016a:7). It then waits up to 1 s for each target's bit in a `STOPPED` mask.
     - The first statement of `mirror_paranoid_dispatch` (interrupts.rs:1239) parks a non-owner CPU when vector 2 arrives during a crash. Without a crash, the IST probe (interrupts.rs:1063-1146) and 0016-D4's fatal NMI behave as today.
     - The crash path takes no lock, never allocates and leaves the scheduler alone. The report lives in a static.
+    - 2026-10-13, step 4:
+      - The owner stops the others before it prints anything, so the cause lines (`MIRROR_PANIC:` or `MIRROR_EXCEPTION`) already print without the lock; the STOP line follows them.
+      - The 1 s wait is one window for all targets, timed by the HPET counter's forward deltas (`clock::crash_counter_ns`, any CPU, no assertion), with a poll-count backstop. A target whose NMI send fails counts as not stopped.
+      - A losing CPU sets its own `STOPPED` bit before it halts, so a CPU that panicked at the same time counts as stopped.
+      - The NESTED line is followed by the ACTION line. A third entry by the owner takes the final action without printing.
+      - Until step 6 the final action is `exit` in boot-smoke kernels and `halt` in the others.
 
 11. **Backtrace and crash screen.**
     - Add `-C force-frame-pointers=yes` to `.cargo/config.toml:4-9`. Today only `core`'s functions keep the frame-pointer prologue.
     - Add `.text` start and end symbols to `kernel/linker.ld:23`, and update the "Trap" note in AGENTS.md.
     - The walker follows rbp only inside this CPU's known stacks, requires rbp to increase strictly within each stack, requires return addresses inside `.text`, and stops at 32 frames.
     - At main.rs:227 the boot framebuffer's base and `Layout` are published. After the stop, the owner builds a raw writer (a documented exception to framebuffer.rs:309-347) and draws the reason, the stop line, the frames and the action on `danger_bg` (crates/ui-tokens/src/lib.rs:86-94), using the 5x7 font (framebuffer.rs:875-972).
+    - 2026-10-13, step 4: the walk starts at `crash::enter`'s own frame, so its first return address is in the panic handler or the fatal trap path, and the trap stubs keep the interrupted RBP, so it continues through the interrupted code. A CPU's known stacks are the BSP region's five or an AP slot's four, plus the running thread's kernel stack, found through this CPU's TSS.RSP0 (`kernel_va::stack_below`). `end=user` means a nonzero RBP below 2^47; a misaligned or non-canonical RBP ends the walk with `range`.
 
 12. **Halt or reboot.**
     - `mirror.panic=halt|reboot` is accepted in every flavor (boot.rs:189-195).
@@ -161,6 +169,7 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
       - `MIRROR_USER_FLUSH_TIMEOUT_ARMED target=` and `MIRROR_USER_FLUSH_TIMEOUT_EXPECT root= frame=`, in UserFlushTimeout only;
       - `MIRROR_TEST_EXPECT_PANIC cpu=`;
       - `MIRROR_CRASH_PROBE_OK`, `MIRROR_CRASH_SCREEN_OK`, `MIRROR_CRASH_TESTS_OK`.
+      - 2026-10-13, step 4: `MIRROR_TEST_EXPECT_PANIC cpu=any` for DoublePanic, whose winner varies. `MIRROR_CRASH_TESTS_OK ends=6` prints once in every smoke boot, from the walker's self-test: synthetic chains that end each of the six ways, and the live boot chain, which must end at zero. Step 6 may add the screen's checks to it.
     - No crash marker starts with `MIRROR_PANIC`, so none matches the panic regex at run.ps1:528-531.
     - Default builds still print nothing per input and nothing with user content.
 
@@ -177,7 +186,12 @@ Each step is one commit and must pass its targeted smoke cases.
    - The tick check waits until every online AP has taken three ticks of its own timer. It then requires that `TICKS` advanced by exactly the BSP's own ticks. With the PIT source it requires that no AP ticked.
    - The round trip kicks each AP in turn. The AP, armed by a smoke-only echo mask, takes the request and kicks the BSP back. The BSP then takes its own request, and each side has taken exactly one 242.
    - The marker gains `ticking_aps=<online - 1 with the LAPIC tick, else 0> resched_aps=<online - 1>`.
-4. **NMI stop and backtrace.** Frame pointers, `crash.rs`, `send_nmi`, `STOPPED`, the paranoid hook and the routing. Add the STOP, FRAME, BACKTRACE, ACTION and NESTED markers, `Assert-MirrorCrash`, and the Panic, ApPanic, DoublePanic, NestedPanic and SchedStall cases. This lands before step 5, so that failures on APs in step 5 are visible rather than silent.
+4. **NMI stop and backtrace.** Frame pointers, `crash.rs`, `send_nmi`, `STOPPED`, the paranoid hook and the routing. Add the STOP, FRAME, BACKTRACE, ACTION and NESTED markers, `Assert-MirrorCrash`, and the Panic, ApPanic, DoublePanic, NestedPanic and SchedStall cases. This lands before step 5, so that failures on APs in step 5 are visible rather than silent. 2026-10-13:
+   - The crash cases run at the end of boot, after every self-test and in place of the expected page fault, with the APs idle, and skip the AP guard probe. Step 5 moves Panic into the BSP's pass while battery threads run on the APs.
+   - Panic calls a panicking function through an assembly call whose return address it records, and the backtrace must contain it (`MIRROR_CRASH_PROBE_OK`). NestedPanic panics with a message whose `Display` panics.
+   - ApPanic and SchedStall use slot 1 through the smoke-only command `OP_CRASH_TEST`. In ApPanic the AP panics once the BSP has taken a ticket for the lock it holds. In SchedStall it holds the lock until it is stopped, bounded at 10 s, after which its slot fails.
+   - In DoublePanic every online CPU meets at a barrier and then panics, so the winner varies and the others lose the race.
+   - PROBE_OK and TESTS_OK land in this step. PageFault also runs at 4 CPUs, where the stop leaves out the AP that the guard probe faulted.
 5. **APs run threads.**
    - AP loops join the session; add affinity, the BSP work list, the kicks and the session barrier.
    - Change `userspace_cpus=` together with its assertions at run.ps1:78 and capture.ps1:92.
@@ -230,6 +244,7 @@ The existing init pair stays pinned to the BSP, because its alternation, budget,
 - `targets=` is recomputed from the CPU count, `-LegacyPic` and whether the guard probe ran;
 - `frames=` equals the number of FRAME lines, the indices are contiguous, and each rip is at least 0xffffffff80000000;
 - `drawn=` matches the display switch.
+- 2026-10-13, step 4: outside the crash cases, the one MIRROR_CRASH_ line allowed is `MIRROR_CRASH_TESTS_OK`. Every crash case so far crashes in kernel code, so its backtrace must end with `end=zero`, and its final action must be the log's last `MIRROR_` line. The fatal exception cases and the shootdown timeouts follow the same sequence after their existing diagnostics. SCREEN and its checks come with step 6.
 
 **VMware (G11).** `userspace_cpus=` equals `online=` (roadmap-replan.md:130).
 
@@ -253,4 +268,4 @@ The existing init pair stays pinned to the BSP, because its alternation, budget,
 2. **Deadlock between `SCHED` and IPI ACK waits.** A holder waits for an ACK from a CPU that is spinning at IF=0, for example a heap growth or `kernel_va::trim` shootdown taken under the lock. Detection: the `CpuData` lock-held flag is asserted in `wait_until` and `prepare_kernel_update`. The bounded spin panics and names the owner slot. The heap-growth stress case and `VM_RELEASE` both run while 16 threads trap at `-CpuCount 8`, and SchedStall proves the bound fires.
 3. **Stale user TLB entries, or use of a freed frame.** Causes include a missing flush, freeing frames before the ACK, a mask update raced with `activate`, and pruned tables left in paging-structure caches. Detection: the battery's `stale=0` canary, the read-write to read-only fault requirement on APs, UserFlushTimeout (frames never reach the allocator without the ACK), and exact frame counts at the session barrier.
 4. **Teardown of a root still loaded on another CPU.** This covers `finish`, OOM kill and session close racing threads on APs, which ends in a kernel #PF or triple fault. Detection: `destroy` asserts the mask is 0 and no thread is `on_cpu`. ThreadFault, ThreadProcessExit, ThreadLastExit, UserBudget and IpcPeerExit run at 4 and 8 CPUs. `close` keeps its "no Running thread" assert (userspace.rs:2205), and the reclaim frame-delta asserts stay in every flavor.
-5. **The crash path hangs or prints garbage.** Possible causes: panicking while holding `SCHED` or serial, an NMI reaching a pre-ONLINE or FAILED AP, a panic inside the stop handler, or frame pointers missing in release builds. Detection: ApPanic, SchedStall, DoublePanic and NestedPanic must all exit 35 within the timeout. `Assert-MirrorCrash` is closed-world, and its targets count leaves out the guard-probe slot. `MIRROR_CRASH_PROBE_OK` must appear in the release profile. Disassembling the release `kernel.elf` checks that kernel functions start with `push rbp; mov rbp,rsp`.
+5. **The crash path hangs or prints garbage.** Possible causes: panicking while holding `SCHED` or serial, an NMI reaching a pre-ONLINE or FAILED AP, a panic inside the stop handler, or frame pointers missing in release builds. Detection: ApPanic, SchedStall, DoublePanic and NestedPanic must all exit 35 within the timeout. `Assert-MirrorCrash` is closed-world, and its targets count leaves out the guard-probe slot. `MIRROR_CRASH_PROBE_OK` must appear in the release profile. Disassembling the release `kernel.elf` checks that kernel functions start with `push rbp; mov rbp,rsp`. 2026-10-13, step 4: in the release smoke kernel 764 of 889 functions do; the rest are the entry stubs, leaves without a frame, or functions whose prologue LLVM's shrink-wrapping places after an early return, still before any call, so every call is made inside a frame. Every smoke boot also walks the live boot chain and requires `end=zero` (`MIRROR_CRASH_TESTS_OK`).

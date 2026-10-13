@@ -396,6 +396,21 @@ pub(crate) fn restart_counter_ns() -> Option<u64> {
     Some(nanoseconds(counter, period))
 }
 
+/// The HPET counter in nanoseconds for the crash path (spec 0051, point 10):
+/// any CPU, with no assertion, no regression check and no `LAST_COUNTER`
+/// update, so a crashing CPU never panics here. The crash stop sums forward
+/// deltas, as the restart stopwatch does. `None` without a published clock.
+pub(crate) fn crash_counter_ns() -> Option<u64> {
+    let period = PERIOD_FS.load(Ordering::Acquire);
+    if period == 0 {
+        return None;
+    }
+    // SAFETY: As in restart_counter_ns. Every CPU maps the permanent UC
+    // window, and a main counter read never changes device state.
+    let counter = unsafe { read(COUNTER) };
+    Some(nanoseconds(counter, period))
+}
+
 fn nanoseconds(counter: u64, period: u32) -> u64 {
     (u128::from(counter) * u128::from(period) / FS_PER_NS).min(u128::from(u64::MAX)) as u64
 }

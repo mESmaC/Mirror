@@ -158,6 +158,17 @@ const fn page_address(page: usize) -> u64 {
     BASE + page as u64 * PAGE_SIZE
 }
 
+/// The stack below `top` when `top` can be a thread stack's top in the
+/// window: the crash backtrace's view of the running thread's stack, which
+/// it finds through TSS.RSP0 (spec 0051, point 11). Only the address is
+/// checked; it reads no window state and never panics.
+pub fn stack_below(top: u64) -> Option<core::ops::Range<u64>> {
+    let lowest = page_address(1 + STACK_PAGES);
+    let highest = page_address(PAGES - 1);
+    (top.is_multiple_of(PAGE_SIZE) && (lowest..=highest).contains(&top))
+        .then(|| top - STACK_PAGES as u64 * PAGE_SIZE..top)
+}
+
 struct Window {
     /// One bit per page, set while the page is reserved, guards included.
     used: [u64; WORDS],

@@ -47,6 +47,9 @@ const SVR: u32 = 0xf0;
 const ICR_LOW: u32 = 0x300;
 const ICR_HIGH: u32 = 0x310;
 const SEND_PENDING: u32 = 1 << 12;
+/// ICR low: the asserted level every IPI carries, and NMI delivery mode.
+const ICR_ASSERT: u32 = 1 << 14;
+const ICR_NMI: u32 = 0b100 << 8;
 const ICR_SPINS: usize = 1_000_000;
 const TIMER_LVT: u32 = 0x320;
 const TIMER_INITIAL: u32 = 0x380;
@@ -615,7 +618,18 @@ fn ipi_command(apic_id: u32, vector: u8) -> Result<(u32, u32), &'static str> {
     }
     // Explicit physical destination, fixed delivery, edge trigger, asserted
     // level. Write ICR high first; the low write actually submits the command.
-    Ok((apic_id << 24, (1 << 14) | u32::from(vector)))
+    Ok((apic_id << 24, ICR_ASSERT | u32::from(vector)))
+}
+
+/// The ICR pair for an NMI to one CPU (spec 0051, point 10): physical
+/// destination and NMI delivery, never a destination shorthand, so an AP
+/// that is not ONLINE, whose IST2 stack may not be mapped yet, is never hit
+/// by accident. The vector field is ignored for NMI delivery and stays 0.
+fn nmi_command(apic_id: u32) -> Result<(u32, u32), &'static str> {
+    if apic_id >= 255 {
+        return Err("invalid_ipi_destination");
+    }
+    Ok((apic_id << 24, ICR_ASSERT | ICR_NMI))
 }
 
 fn wait_for_delivery(mut read: impl FnMut() -> u32, spins: usize) -> bool {
@@ -646,7 +660,21 @@ pub(crate) fn send_ipi(apic_id: u32, vector: u8) -> Result<(), &'static str> {
     if !sender_allowed(vector, local_apic_id()? == u32::from(controller.bsp)) {
         return Err("ipi_sender_not_bsp");
     }
-    let local = controller.local;
+    submit(controller.local, high, low)
+}
+
+/// Send an NMI to the CPU whose xAPIC ID is `apic_id`, from any CPU with IF
+/// clear: the crash path's stop (spec 0051, point 10). Like `send_ipi`, both
+/// bounded waits poll only this CPU's ICR. It takes no lock, allocates
+/// nothing and never panics, so a crashing CPU may call it in any state.
+pub(crate) fn send_nmi(apic_id: u32) -> Result<(), &'static str> {
+    let (high, low) = nmi_command(apic_id)?;
+    submit(published_controller()?.local, high, low)
+}
+
+/// Write one ICR pair on this CPU's controller between two bounded waits for
+/// its previous delivery and this one. IF is clear (`published_controller`).
+fn submit(local: Mmio, high: u32, low: u32) -> Result<(), &'static str> {
     if !wait_for_delivery(|| local.read(ICR_LOW), ICR_SPINS) {
         return Err("ipi_previous_delivery_timeout");
     }
@@ -860,6 +888,14 @@ pub fn self_test() {
     }
     for vector in [0, 31, 32, 128, 239, 241, 243, 254, 255] {
         assert_eq!(ipi_command(1, vector), Err("unsupported_ipi_vector"));
+    }
+    // The crash stop's NMI: physical destination, NMI delivery, no
+    // shorthand and no vector (spec 0051, point 10).
+    for id in [0, 1, 127, 254] {
+        assert_eq!(nmi_command(id), Ok((id << 24, 0x4400)));
+    }
+    for id in [255, 256, u32::MAX] {
+        assert_eq!(nmi_command(id), Err("invalid_ipi_destination"));
     }
     // Commands come only from the BSP, a reschedule from any CPU.
     assert!(sender_allowed(240, true) && !sender_allowed(240, false));

@@ -190,6 +190,16 @@ pub enum SmokeMode {
     /// The lifted class limits (0054-D5's values): a normal requester and a
     /// protected process replace the relaunch pair (1024 MiB boot).
     ClassLimits,
+    /// The crash cases (spec 0051, step 4), in place of the expected page
+    /// fault: the BSP panics through a planted call; slot 1 panics holding
+    /// the scheduler lock while the BSP spins on it; every CPU panics at
+    /// once; a panic message's formatting panics; slot 1 keeps the scheduler
+    /// lock until the BSP's bounded spin panics.
+    Panic,
+    ApPanic,
+    DoublePanic,
+    NestedPanic,
+    SchedStall,
     User(u64),
 }
 
@@ -272,6 +282,11 @@ pub fn smoke_mode() -> SmokeMode {
         b"mirror.test=reset-suppressed" => SmokeMode::Reset(ResetTest::Suppressed),
         b"mirror.test=oom-order" => SmokeMode::OomOrder,
         b"mirror.test=class-limits" => SmokeMode::ClassLimits,
+        b"mirror.test=panic" => SmokeMode::Panic,
+        b"mirror.test=ap-panic" => SmokeMode::ApPanic,
+        b"mirror.test=double-panic" => SmokeMode::DoublePanic,
+        b"mirror.test=nested-panic" => SmokeMode::NestedPanic,
+        b"mirror.test=sched-stall" => SmokeMode::SchedStall,
         _ => panic!("unknown smoke-test command line"),
     };
     assert!(tokens.next().is_none(), "multiple smoke-test arguments");
