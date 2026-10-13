@@ -1,6 +1,6 @@
 # 0051: Userspace on all CPUs
 
-Status: implemented on `claude/0051-smp-user` (2026-10-13), steps 1-6; the full `test.ps1` in debug and release gates the merge, after the rebase onto 0054a and 0019a. Open points 1-5 are settled as recommended (team decision under Cameron's 2026-10-12 direction; claude decides), with point 2 subject to kimi's 0054a check. Open point 5's VMware checks are still to do.
+Status: implemented on `claude/0051-smp-user` (2026-10-13), steps 1-6; the full `test.ps1` passed after the rebase onto 0054a and 0019a (218 smoke boots, both profiles' captures, image scans and hygiene probes, 45 min). Open points 1-5 are settled as recommended (team decision under Cameron's 2026-10-12 direction; claude decides), with point 2 subject to kimi's 0054a check. Open point 5's VMware checks are still to do.
 Depends on:
 - 0030a: the process and thread tables, one run queue, wait queues and wakeup preemption (sched.rs:195-211).
 - 0050: per-CPU `CpuData` through GS (cpudata.rs:37-48), per-thread guarded stacks from the kernel VA window (kernel_va.rs:352-420), and RSP0 set per dispatch (userspace.rs:1753).
