@@ -2,3 +2,5 @@
 /build/
 /.tools/
 /tools/mirror-image/target/
+crates/render/golden/actual-*.png
+crates/render/golden/review-*.png

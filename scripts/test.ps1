@@ -91,8 +91,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Rust formatting check failed.' }
     & cargo fmt --all --manifest-path $imageToolManifest -- --check
     if ($LASTEXITCODE -ne 0) { throw 'mirror-image formatting check failed.' }
-    & cargo test --locked -p mirror-desktop-protocol -p mirror-window-protocol -p mirror-vm-protocol -p mirror-thread-protocol -p mirror-clock-protocol -p mirror-perf-protocol -p mirror-sync -p mirror-acpi -p mirror-ui-tokens -p mirror-ext2-layout --target x86_64-pc-windows-msvc
-    if ($LASTEXITCODE -ne 0) { throw 'Native protocol, synchronization, ACPI parser, UI token and ext2 layout tests failed.' }
+    & cargo test --locked -p mirror-desktop-protocol -p mirror-window-protocol -p mirror-vm-protocol -p mirror-thread-protocol -p mirror-clock-protocol -p mirror-perf-protocol -p mirror-sync -p mirror-acpi -p mirror-ui-tokens -p mirror-render -p mirror-ext2-layout --target x86_64-pc-windows-msvc
+    if ($LASTEXITCODE -ne 0) { throw 'Native protocol, synchronization, ACPI parser, UI token, renderer and ext2 layout tests failed.' }
     # Exercise the actual host assertions in the supported inbox PowerShell.
     & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test-perf.ps1')
     if ($LASTEXITCODE -ne 0) { throw 'PowerShell 5.1 perf fixtures failed.' }

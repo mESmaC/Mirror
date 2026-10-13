@@ -85,6 +85,13 @@ name = "mirror-perf-protocol"
 version = "0.1.0"
 
 [[package]]
+name = "mirror-render"
+version = "0.1.0"
+dependencies = [
+ "mirror-ui-tokens",
+]
+
+[[package]]
 name = "mirror-sync"
 version = "0.1.0"
 dependencies = [
