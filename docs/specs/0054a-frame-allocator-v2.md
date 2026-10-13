@@ -1,6 +1,6 @@
 # 0054a: Frame allocator v2 — refcounts, per-process limits
 
-Status: draft (revised after claude's reviews of 8762d0e, 95eafa1 and c5a39eb). Proposed split (C8): it amends RD6 and S18. Until Cameron decides, S18 stands, and 0054a carries the reserve and the OOM order.
+Status: implemented, on `main` @4c05b02 (2026-10-12, kimi), revised after claude's reviews of 8762d0e, 95eafa1 and c5a39eb. C8 was settled on 2026-10-12 without the split: S18 stands, and 0054a carries the reserve and the OOM order (0054-D4 to D6 in the superseded `draft-reserve-oom-order.md`), each open question's recommendation adopted.
 Depends on: 0030a (the process table and its per-entry state, 0030-D1), 0050 (the shared frame-check rule, 0050-D2) and 0059 (the charged-frames counter, 0059-D3). Ordered fifth in Phase 1 (roadmap-replan.md:124), before 0051.
 Ledger: S18 (the class model; the reserve and OOM order are proposed for the follow-up spec, amending RD6 and S18), S6 as amended 2026-10-12 (a vm-protocol limit change; no syscall), I6 as amended 2026-10-12 (multi-GB per-process memory lands in Phase 1 with this spec — as the mechanism, see Non-goals and open question 4). Related: S4, RD6.
 

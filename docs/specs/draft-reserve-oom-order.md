@@ -1,6 +1,6 @@
 # Reserve and OOM order (proposed follow-up to 0054a; unnumbered pending RD24)
 
-Status: draft (proposed split from 0054a per C8; Cameron assigns the number per RD24 — 0054b is taken by pressure notifications, roadmap-replan.md:383, and the review recommends 0054c — and it keeps the family's 0054-Dn IDs, split rule 1). Proposed split (C8): it amends RD6 and S18. Until Cameron decides, S18 stands, and 0054a carries the reserve and the OOM order.
+Status: superseded (2026-10-12), because 0054a carried the reserve and OOM order to `main` @4c05b02 (C8 settled 2026-10-12, S18 stands). Its 0054-D4 to D6 rows remain the reference for that part of 0054a.
 Depends on: 0054a (the refcount allocator and the class model, 0054-D1/D2), 0030a (the process table, wait-queue unlinking, zombie/reap, 0030-D1/D2/D5), 0050 (its stack pool is trimmed before and during victim choice, 0050-D2) and 0059 (0059-D3's charged-frames counter ranks victims).
 Ledger: S18 (the reserve and the OOM order; this split proposes amending it and RD6 until Cameron decides C8), S6 as amended 2026-10-12 (no syscall). Related: S4, G7, I6, RD6.
 

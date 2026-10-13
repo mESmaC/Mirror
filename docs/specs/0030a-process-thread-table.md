@@ -1,6 +1,6 @@
 # 0030a: Process and thread table, run queues and wait queues
 
-Status: confirmed (2026-10-12)
+Status: confirmed (2026-10-12); implemented, on `main` @34f7de0 (2026-10-12, claude). 0050 amended D3 in 61ddc76 (D3's row says how).
 Depends on: 0019a (Phase 1 item 1; RD8 and 0019a's decisions are confirmed first — its perf hooks sit in the session loops this spec deletes, see Interfaces). The code change builds on main after 0019a merges.
 Ledger: S6 as amended 2026-10-11 (Phase 1 adds no syscall and changes only the thread-protocol and vm-protocol limits), decisions.md Phases row 1 (process and thread table), S7/S7a/S7b (marker gating). Related: S4 (the policy work stays in 0052), G7 (input latency).
 

@@ -1,6 +1,6 @@
 # 0059: Kernel heap v2: demand-driven growth, slab caches, per-process frame charging
 
-Status: confirmed (2026-10-12). Numbered 0059 under RD24. Revised after claude's reviews of 58ed8cf.
+Status: confirmed (2026-10-12); implemented, on `main` @561eb30 (2026-10-12, kimi). Numbered 0059 under RD24. Revised after claude's reviews of 58ed8cf.
 Depends on: 0030a (its scheduler loop is a growth safe point, and charging attaches to its process entries, 0030-D1). Ordered after 0050 in Phase 1; no build dependency on 0050 — the heap window's leaf tables are already pinned at init (heap.rs:211, paging.rs:332-358), so growth maps into existing tables and needs no post-seal VA allocation.
 Ledger: none directly (re-plan NEW spec). Related: S18 (the reserve and OOM order land in 0054a on top of this charging), S7/S7a/S7b (marker gating), RS1.
 
