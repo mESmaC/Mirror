@@ -11,6 +11,7 @@ use mirror_thread_protocol::{
     WAIT_FOREVER,
 };
 
+use crate::fpu::{self, Snapshot};
 use crate::{
     EAGAIN, EBADF, EFAULT, EINVAL, KERNEL_BASE, PAGE_SIZE, PROT_NONE, PROT_READ_WRITE, RIGHT_WRITE,
     SYS_BOOT_HANDLE, SYS_CLOSE, SYS_DUP, SYS_PID, SYS_SLEEP, SYS_TICKS, SYS_WRITE, SYS_YIELD, exit,
@@ -54,13 +55,9 @@ const SPIN_TICKS: i64 = 4;
 /// receive deadline.
 const SPIN_LIMIT: i64 = 32;
 
-#[repr(C, align(16))]
-#[derive(Clone, Copy)]
-struct FxState([u8; 512]);
-
-#[repr(C, align(16))]
+#[repr(C, align(64))]
 struct Task {
-    initial: UnsafeCell<FxState>,
+    initial: UnsafeCell<Snapshot>,
     index: AtomicU64,
     stack: AtomicU64,
     fs: AtomicU64,
@@ -80,7 +77,7 @@ unsafe impl Sync for Task {}
 impl Task {
     const fn new() -> Self {
         Self {
-            initial: UnsafeCell::new(FxState([0; 512])),
+            initial: UnsafeCell::new(Snapshot([0; 832])),
             index: AtomicU64::new(0),
             stack: AtomicU64::new(0),
             fs: AtomicU64::new(0),
@@ -110,7 +107,7 @@ static SLEEPER_WOKE: AtomicU64 = AtomicU64::new(0);
 
 unsafe extern "C" {
     fn mirror_thread_entry();
-    fn mirror_thread_fpu(expected: *const FxState, actual: *mut FxState);
+    fn mirror_thread_fpu(expected: *const Snapshot, actual: *mut Snapshot);
 }
 
 fn load(value: &AtomicU64) -> u64 {
@@ -267,11 +264,14 @@ fn check_tls(task: &Task) {
 
 fn check_fresh(task: &Task) {
     // SAFETY: Our assembly entry completed this snapshot before calling Rust.
-    let FxState(bytes) = unsafe { task.initial.get().read() };
+    let Snapshot(bytes) = unsafe { task.initial.get().read() };
     require(bytes[..2] == 0x037f_u16.to_le_bytes(), 510);
     require(bytes[2..5] == [0, 0, 0], 511);
     require(bytes[24..28] == 0x1f80_u32.to_le_bytes(), 512);
     require(bytes[160..416] == [0; 256], 513);
+    if fpu::features() & fpu::AVX != 0 {
+        require(bytes[576..832] == [0; 256], 596);
+    }
     for register in 0..8 {
         require(
             bytes[32 + register * 16..42 + register * 16] == [0; 10],
@@ -281,8 +281,8 @@ fn check_fresh(task: &Task) {
 }
 
 fn check_fpu(tid: u64) {
-    let mut expected = FxState([0; 512]);
-    let mut actual = FxState([0; 512]);
+    let mut expected = Snapshot([0; 832]);
+    let mut actual = Snapshot([0; 832]);
     let rounding = (1 + tid % 2) as u16;
     expected.0[..2].copy_from_slice(&(0x037f_u16 | rounding << 10).to_le_bytes());
     expected.0[24..28].copy_from_slice(&(0x1f80_u32 | u32::from(rounding) << 13).to_le_bytes());
@@ -291,6 +291,10 @@ fn check_fpu(tid: u64) {
         let high = !EXIT_VALUE ^ (tid << 32) ^ register as u64;
         expected.0[160 + register * 16..168 + register * 16].copy_from_slice(&low.to_le_bytes());
         expected.0[168 + register * 16..176 + register * 16].copy_from_slice(&high.to_le_bytes());
+        expected.0[576 + register * 16..584 + register * 16]
+            .copy_from_slice(&(low ^ 0x583b_7021_ee09_a46d).to_le_bytes());
+        expected.0[584 + register * 16..592 + register * 16]
+            .copy_from_slice(&(high ^ 0xf610_296a_84cb_357e).to_le_bytes());
     }
     // Populate all eight physical x87 registers with distinct exact normals.
     expected.0[4] = 0xff;
@@ -306,6 +310,9 @@ fn check_fpu(tid: u64) {
     require(actual.0[..5] == expected.0[..5], 515);
     require(actual.0[24..28] == expected.0[24..28], 516);
     require(actual.0[160..416] == expected.0[160..416], 517);
+    if fpu::features() & fpu::AVX != 0 {
+        require(actual.0[576..832] == expected.0[576..832], 597);
+    }
     for register in 0..8 {
         require(
             actual.0[32 + register * 16..42 + register * 16]

@@ -1,4 +1,4 @@
-# Single-BSP resumable user context, SysV ABI, soft-float kernel Rust.
+# Per-CPU resumable user context, SysV ABI, soft-float kernel Rust.
 # Kernel code runs with this CPU's CpuData in GS (interrupts.S, spec 0050-D1).
 # The original kernel call stack remains mapped but is never used by ring-3
 # interrupts: TSS.RSP0 selects a separate supervisor stack for those entries.
@@ -7,7 +7,7 @@
 .type mirror_resume_user, @function
 mirror_resume_user:
     # Caller guarantees IF=0. Save every SysV callee-saved GPR, original CR0,
-    # and the supervisor-only aligned x87/SIMD image pointer (second argument).
+    # and the supervisor-only aligned extended-state pointer (second argument).
     push rbp
     push rbx
     push r12
@@ -25,10 +25,20 @@ mirror_resume_user:
     # Eager restore before any user execution. FNINIT first clears stale x87
     # pointers on AMD CPUs where FXRSTOR may skip them when incoming FSW.ES=0.
     # Unlike FINIT/FWAIT it never delivers the previous owner's pending #MF.
+    # Every participating CPU uses the immutable BSP format. R8 retains the
+    # source frame and RSI the state address while EDX:EAX holds the XSAVE mask.
     and rax, -9
     mov cr0, rax
     fninit
+    cmp byte ptr [rip + MIRROR_XSAVE_ACTIVE], 0
+    je 1f
+    mov eax, {xstate_mask}
+    xor edx, edx
+    xrstor64 [rsi]
+    jmp 2f
+1:
     fxrstor64 [rsi]
+2:
 
     mov ax, {user_data}
     mov ds, ax
@@ -55,12 +65,23 @@ mirror_resume_kernel:
     # flags. That CPL0 exit left the TLS state alone: the CPL3 entry already
     # nulled both selectors, zeroed the FS base and installed CpuData in GS.
     # Save even faulted/exited processes before clearing their register data.
-    # FXSAVE does not test pending x87 exceptions; FNINIT then FXRSTOR installs
-    # an entirely clean kernel image, including data in empty x87 registers.
-    pop rax
-    fxsave64 [rax]
+    # Neither save tests pending x87 exceptions. FNINIT and a full restore
+    # install a clean image, including empty x87 payloads and YMM upper halves.
+    # Keep the state address in RSI: XSAVE/XRSTOR consume EDX:EAX as a mask.
+    pop rsi
+    cmp byte ptr [rip + MIRROR_XSAVE_ACTIVE], 0
+    je 1f
+    mov eax, {xstate_mask}
+    xor edx, edx
+    xsave64 [rsi]
+    fninit
+    xrstor64 [rip + MIRROR_FPU_CLEAN]
+    jmp 2f
+1:
+    fxsave64 [rsi]
     fninit
     fxrstor64 [rip + MIRROR_FPU_CLEAN]
+2:
     mov ax, {kernel_data}
     mov ds, ax
     mov es, ax

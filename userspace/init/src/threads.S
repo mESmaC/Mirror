@@ -31,7 +31,10 @@ mirror_thread_entry:
     jnz .Lthread_bad_entry
     test r15, r15
     jnz .Lthread_bad_entry
-    fxsave64 [rdi]
+    mov esi, [rip + MIRROR_INIT_FPU_FEATURES]
+    sub rsp, 8
+    call mirror_fpu_snapshot
+    add rsp, 8
     mov rsi, rsp
     jmp mirror_thread_main
 .Lthread_bad_entry:
@@ -50,8 +53,9 @@ mirror_thread_fpu:
     sub rsp, 16
     mov r12, rdi
     mov r13, rsi
-    fxrstor64 [r12]
-    // Different contexts carry different x87/XMM payloads across scheduling.
+    mov esi, [rip + MIRROR_INIT_FPU_FEATURES]
+    call mirror_fpu_restore
+    // Different contexts carry different x87/XMM/YMM payloads across scheduling.
     mov eax, 4
     xor edi, edi
     xor esi, esi
@@ -72,10 +76,27 @@ mirror_thread_fpu:
 .Lthread_busy:
     mov ecx, 4096
 .Lthread_arithmetic:
+    test dword ptr [rip + MIRROR_INIT_FPU_FEATURES], 2
+    jnz .Lthread_arithmetic_avx2
+    test dword ptr [rip + MIRROR_INIT_FPU_FEATURES], 1
+    jnz .Lthread_arithmetic_avx
     pxor xmm0, xmm15
     fchs
     pxor xmm0, xmm15
     fchs
+    jmp .Lthread_arithmetic_next
+.Lthread_arithmetic_avx:
+    vxorps ymm0, ymm0, ymm15
+    fchs
+    vxorps ymm0, ymm0, ymm15
+    fchs
+    jmp .Lthread_arithmetic_next
+.Lthread_arithmetic_avx2:
+    vpaddq ymm0, ymm0, ymm15
+    fchs
+    vpsubq ymm0, ymm0, ymm15
+    fchs
+.Lthread_arithmetic_next:
     dec ecx
     jnz .Lthread_arithmetic
     mov eax, 2
@@ -90,7 +111,9 @@ mirror_thread_fpu:
     int 0x80
     ud2
 .Lthread_snapshot:
-    fxsave64 [r13]
+    mov rdi, r13
+    mov esi, [rip + MIRROR_INIT_FPU_FEATURES]
+    call mirror_fpu_snapshot
     fninit
     mov dword ptr [rsp], 0x1f80
     ldmxcsr [rsp]

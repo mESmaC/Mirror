@@ -50,11 +50,11 @@ function Assert-MirrorKernelImage {
         # Only smoke kernels run the concurrent SMP print check, the user
         # flush self-test and fault, and the SMP battery (0051).
         $required = @('MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=', 'MIRROR_MEM_RESERVE frames=', 'MIRROR_KVA_READY base=', 'MIRROR_CPU_DATA_READY cpus=') + $resetRequired + $crashRequired
-        $forbidden = @('MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_TRACE_ON', 'MIRROR_CONSOLE_COMMAND operation=', 'MIRROR_POINTER_UPDATED', 'MIRROR_POINTER_CLICK', 'MIRROR_SHELL_FRAME', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'Mirror shell: ready', 'MIRROR_USERSPACE_OK', 'Mirror init: VM checks passed', 'fixture data mismatch', 'unexpected budget exhaustion', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROWN phase=auto', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED', 'MIRROR_SMP_PRINT', 'MIRROR_USER_FLUSH', 'MIRROR_SMP_USER_OK', 'Mirror init: SMP') + $resetForbidden + $crashForbidden
+        $forbidden = @('MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_TRACE_ON', 'MIRROR_CONSOLE_COMMAND operation=', 'MIRROR_POINTER_UPDATED', 'MIRROR_POINTER_CLICK', 'MIRROR_SHELL_FRAME', 'MIRROR_DESKTOP_INPUT_TIMEOUT', 'Mirror shell: ready', 'MIRROR_USERSPACE_OK', 'Mirror init: VM checks passed', 'fixture data mismatch', 'unexpected budget exhaustion', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_SMP_XSTATE_OK', 'MIRROR_HEAP_GROWN phase=auto', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED', 'MIRROR_SMP_PRINT', 'MIRROR_USER_FLUSH', 'MIRROR_SMP_USER_OK', 'Mirror init: SMP') + $resetForbidden + $crashForbidden
     }
     else {
         $required = @('MIRROR_TRACE_ON', 'MIRROR_SHELL_FRAME', 'MIRROR_CPU_STACKS', 'MIRROR_STACKS_READY', 'MIRROR_CPU_HARDENING', 'MIRROR_CPU_VULN', 'MIRROR_PS2_INIT elapsed_ms=', 'MIRROR_PS2_TIMEOUT wait=', 'MIRROR_SCHED_READY processes=', 'MIRROR_HEAP_GROWN phase=auto', 'MIRROR_MEM_RESERVE frames=', 'MIRROR_KVA_READY base=', 'MIRROR_CPU_DATA_READY cpus=') + $resetRequired + $crashRequired
-        $forbidden = @('MIRROR_USERSPACE_OK', 'fixture data mismatch', 'MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED', 'MIRROR_SMP_PRINT', 'MIRROR_USER_FLUSH', 'MIRROR_SMP_USER_OK') + $resetForbidden + $crashForbidden
+        $forbidden = @('MIRROR_USERSPACE_OK', 'fixture data mismatch', 'MIRROR_IST_OK', 'MIRROR_ENTRY_AC_OK', 'MIRROR_PS2_INJECTED', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_SMP_XSTATE_OK', 'MIRROR_HEAP_GROW_SKIPPED phase=auto', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED', 'MIRROR_SMP_PRINT', 'MIRROR_USER_FLUSH', 'MIRROR_SMP_USER_OK') + $resetForbidden + $crashForbidden
     }
     foreach ($text in $required) {
         if ($image.IndexOf($text, [StringComparison]::Ordinal) -lt 0) {
@@ -95,7 +95,9 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Native protocol, synchronization, ACPI parser, UI token and ext2 layout tests failed.' }
     # Exercise the actual host assertions in the supported inbox PowerShell.
     & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test-perf.ps1')
-    if ($LASTEXITCODE -ne 0) { throw 'PowerShell 5.1 perf fixtures failed.' }
+    if ($LASTEXITCODE -ne 0) { throw 'Perf host fixtures failed.' }
+    & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test-fpu.ps1')
+    if ($LASTEXITCODE -ne 0) { throw 'FPU host fixtures failed.' }
     & cargo test --locked --target x86_64-pc-windows-msvc --manifest-path $imageToolManifest
     if ($LASTEXITCODE -ne 0) { throw 'mirror-image host tests failed.' }
     & cargo clippy --locked --workspace -- -D warnings
@@ -180,11 +182,11 @@ try {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -Xhci -XhciKeyboard:($case.Device -eq 'Keyboard') -XhciMouse:($case.Device -eq 'Mouse') -XhciPair:($case.Device -eq 'Pair') -XhciFullSpeed:$case.FullSpeed -NoHpet:$case.NoHpet -CpuCount $case.Cpus -Release:$release -Fault $case.Fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
             Save-MirrorSmokeLogs "$profile-Xhci-$($case.Name)"
         }
-        # Expose AVX and FSGSBASE through CPUID as well as exercising the
-        # conservative CPU model. The kernel must keep both features disabled.
+        # Exercise enabled AVX/AVX2 state and keep direct FSGSBASE disabled.
+        # The conservative CPU's UserAvx case still checks unsupported AVX.
         # Only this model reports UMIP, which the kernel enables and the SGDT
         # probe tests (spec 0016b).
-        foreach ($fault in @('None', 'UserAvx', 'UserFsgsbase', 'UserUmip')) {
+        foreach ($fault in @('None', 'UserFsgsbase', 'UserUmip')) {
             & (Join-Path $PSScriptRoot 'run.ps1') -Smoke -NoBuild -ExtendedCpu -Release:$release -Fault $fault -MemoryMiB $memoryMiB -QemuPath $QemuPath -FirmwareCode $FirmwareCode -FirmwareVars $FirmwareVars
             Save-MirrorSmokeLogs "$profile-ExtendedCpu-$fault"
         }
