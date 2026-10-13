@@ -7,7 +7,7 @@
 //! https://docs.amd.com/v/u/en-US/24593_3.44_APM_Vol2
 
 use core::arch::{asm, global_asm};
-use core::mem::{offset_of, size_of};
+use core::mem::{align_of, offset_of, size_of};
 use core::ptr::{addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -33,6 +33,7 @@ global_asm!(
     frame_size = const size_of::<TrapFrame>(),
     frame_words = const size_of::<TrapFrame>() / size_of::<u64>(),
     cpu_user_rsp = const cpudata::USER_KERNEL_RSP_OFFSET,
+    xstate_mask = const fpu::XSTATE_MASK,
 );
 
 const CODE_SELECTOR: u16 = 0x08;
@@ -896,8 +897,10 @@ pub(crate) fn user_frame(entry: u64, stack: u64, argument: u64) -> TrapFrame {
 /// installed a mapped kernel stack. IRQ handlers and scheduling state must be
 /// initialized. No interrupt-disabling guard may span this call: user mode
 /// deliberately sets IF. The saved frame and kernel caller remain mapped.
-/// `extended` must identify this user's aligned, initialized, supervisor-only
-/// State and remain writable/mapped until return. No other reference may access
+/// `extended` must identify this user's 64-byte-aligned, initialized,
+/// supervisor-only State and remain writable/mapped until return. Its legacy
+/// MXCSR and standard XSAVE header must remain kernel-owned and valid for the
+/// BSP's enabled format. No other reference may access
 /// it while assembly restores/saves it. A raw pointer avoids retaining a Rust
 /// field borrow while handlers access the surrounding process independently.
 pub(crate) unsafe fn resume_user(frame: &TrapFrame, extended: *mut fpu::State) {
@@ -906,7 +909,7 @@ pub(crate) unsafe fn resume_user(frame: &TrapFrame, extended: *mut fpu::State) {
     assert!(!arch::interrupts_enabled(), "user entry requires IF=0");
     assert!(!extended.is_null(), "user entry requires extended state");
     assert!(
-        (extended as usize).is_multiple_of(16),
+        (extended as usize).is_multiple_of(align_of::<fpu::State>()),
         "unaligned extended state"
     );
     assert_eq!(frame.cs, u64::from(USER_CODE_SELECTOR), "invalid user CS");
@@ -928,7 +931,8 @@ pub(crate) unsafe fn resume_user(frame: &TrapFrame, extended: *mut fpu::State) {
     // The validated copy has only CPL3 selectors and unprivileged flags. Assembly
     // copies it before restoring registers, preserves kernel callee-saved GPRs,
     // and resumes here only through the trusted return trampoline. The caller
-    // provides a trusted, mapped state image with valid MXCSR reserved bits.
+    // provides a trusted, mapped state image with valid MXCSR and XSAVE header
+    // bits. This CPU validated the BSP's format before running any user code.
     unsafe { mirror_resume_user(&prepared, extended) };
     assert!(!arch::interrupts_enabled(), "user return requires IF=0");
     #[cfg(feature = "boot-smoke")]

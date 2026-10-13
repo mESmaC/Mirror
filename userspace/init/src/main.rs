@@ -73,9 +73,9 @@ global_asm!(
     ".global _start",
     ".type _start,@function",
     "_start:",
-    "fxsave64 [rip + MIRROR_INIT_INITIAL_FX]",
     "xor rbp, rbp",
     "and rsp, -16",
+    "call mirror_fpu_initial",
     "call init_main",
     "ud2",
     ".size _start, .-_start",
@@ -1464,7 +1464,7 @@ extern "C" fn init_main(launch: u64) -> ! {
         // SSE exception unmasked, so DIVSD raises #XM and the kernel ends the process.
         15 => unsafe { fpu::mirror_probe_sse_fault() },
         // SAFETY: This argument-free routine deliberately executes a VEX-encoded
-        // instruction while the kernel leaves OSXSAVE clear, so it raises #UD and
+        // instruction on the fallback CPU without AVX, so it raises #UD and
         // the kernel ends the process.
         16 => unsafe { fpu::mirror_probe_avx_fault() },
         // SAFETY: This argument-free routine deliberately executes WRFSBASE while

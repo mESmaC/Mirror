@@ -23,16 +23,16 @@ use mirror_vm_protocol::{ARENA_START, PROT_READ};
 
 use crate::{
     EAGAIN, ETIMEDOUT, PAGE_SIZE, PROT_READ_WRITE, SYS_BOOT_HANDLE, SYS_RECV_WAIT, SYS_SEND,
-    SYS_TICKS, SYS_VM_PROTECT, SYS_VM_RELEASE, exit, require, syscall, threads, vm_reserve,
-    vm_write, write,
+    SYS_TICKS, SYS_VM_PROTECT, SYS_VM_RELEASE, SYS_YIELD, exit, require, syscall, threads,
+    vm_reserve, vm_write, write,
 };
 
 global_asm!(include_str!("smp.S"));
 
 unsafe extern "C" {
-    /// Make a native call with callee-saved registers and XMM8-12 loaded
-    /// from `canary`, and exit with status 700 unless every one comes back
-    /// unchanged (smp.S).
+    /// Make a native call with callee-saved registers, all x87/XMM/YMM values
+    /// and controls derived from `canary`; exit with status 700 unless every
+    /// one comes back unchanged (smp.S).
     fn mirror_smp_syscall(number: u64, arg0: u64, arg1: u64, arg2: u64, canary: u64) -> i64;
 }
 
@@ -77,8 +77,8 @@ fn canary(index: usize) -> u64 {
 /// A native call through the canary check.
 fn checked(number: u64, arg0: u64, arg1: u64, arg2: u64, index: usize) -> i64 {
     // SAFETY: The assembly makes one native call with these arguments and
-    // restores every callee-saved register; it touches no memory but its
-    // own stack.
+    // restores every callee-saved register and the default FP controls. Its
+    // snapshots live on its own stack; the startup feature word is read-only.
     unsafe { mirror_smp_syscall(number, arg0, arg1, arg2, canary(index)) }
 }
 
@@ -122,6 +122,15 @@ pub(super) fn battery(console: u64, role: u64, probe: u64) -> ! {
         protect(console);
     }
     SPIN_ONLY.store(u32::from(probe == 1), Ordering::Release);
+    if probe == 0 {
+        // The kernel recognizes this exact single-threaded smoke sequence:
+        // BSP -> first AP -> BSP, then restore the ordinary CPU mask. Each
+        // next call acknowledges that the previous call's full state survived.
+        // With one userspace CPU, the same sequence stays on the BSP.
+        for stage in 1..=3 {
+            require(checked(SYS_YIELD, 0x0053_5953, stage, 0, 0) == 0, 752);
+        }
+    }
     for (slot, handle) in [(1, &SEND), (2, &RECEIVE)] {
         let value = syscall(SYS_BOOT_HANDLE, slot, 0, 0);
         require(value > 0, 732);
