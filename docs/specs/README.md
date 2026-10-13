@@ -41,7 +41,7 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 - 0050 Per-CPU data and per-thread kernel stacks. Adds a kernel VA allocator for mappings made after the paging seal. Confirmed (2026-10-12: 0050-D1 to D4; RD21 dropped its SYSCALL rework clause); implemented, on `main` @29b2e2e (2026-10-12, claude)
 - 0059 Kernel heap v2: grows on demand, slab allocator, kernel memory charged to the owning process. Confirmed (2026-10-12: RD24, 0059-D1 to D4); implemented, on `main` @561eb30 (2026-10-12, kimi), as `0059-kernel-heap-v2.md`
 - 0054a (split): frame allocator v2, per-frame refcounts, dynamic per-process limits, and the S18 reserve and OOM order. Implemented, on `main` @4c05b02 (2026-10-12, kimi); C8 settled 2026-10-12 without the split, so its drafted follow-up is superseded and S18 stands
-- 0051 Userspace on all CPUs: locking, user TLB shootdowns; NMI stop of all CPUs on panic (S17). Adds the S17 crash screen
+- 0051 Userspace on all CPUs: locking, user TLB shootdowns; NMI stop of all CPUs on panic (S17). Adds the S17 crash screen. Drafted 2026-10-12 (`0051-userspace-on-all-cpus.md`), implementing on `claude/0051-smp-user`
 - 0052 Scheduler v2: work-conserving, priority classes, accounting (S4)
 - 0053 XSAVE/AVX2 user state (I6)
 - 0055a (split): a TSC time source calibrated against the HPET, catch-all vector handlers, and the x2APIC handoff if it did not move to Phase 0
