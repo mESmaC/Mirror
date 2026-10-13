@@ -744,7 +744,7 @@ function Complete-MirrorCapture {
     else { Assert-MirrorTraceMarker -Serial $serial -Expected (-not $PerfCapture) }
     if ($PerfCapture) {
         if ($perfRuntime.ElapsedMilliseconds -gt 60000) { throw 'PerfCapture exceeded its 60-second process cap.' }
-        foreach ($marker in @('MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_SCHEDULER_OK', 'MIRROR_IPC_OK', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_SCHED_CLASS_TESTS_OK', 'MIRROR_USER_SURFACE_OK', 'MIRROR_USER_SURFACE_CLEANUP_OK', 'MIRROR_USER_CLOCK_OK', 'MIRROR_AHCI_READ_OK', 'MIRROR_HEAP_CHARGE_OK')) {
+        foreach ($marker in @('MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_SCHEDULER_OK', 'MIRROR_IPC_OK', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_SCHED_CLASS_TESTS_OK', 'MIRROR_SCHED_SATURATE_OK', 'MIRROR_SCHED_LATENCY_OK', 'MIRROR_USER_SURFACE_OK', 'MIRROR_USER_SURFACE_CLEANUP_OK', 'MIRROR_USER_CLOCK_OK', 'MIRROR_AHCI_READ_OK', 'MIRROR_HEAP_CHARGE_OK')) {
             if ($serial -match "(?m)^$marker(?:\s|$)") { throw "PerfCapture unexpectedly ran an init/fixture check: $marker." }
         }
         if ([regex]::Matches($serial, '(?m)^MIRROR_BOOT_OK\r?$').Count -ne 1 -or $serial -match '(?m)^user:') { throw 'PerfCapture requires one ordinary boot and no trace userspace output.' }
@@ -872,7 +872,7 @@ try {
         throw "Trace boot unexpectedly reported an OOM kill. See $serialLog."
     }
     # Trace kernels run no init battery and recognize no fixture (spec 0010).
-    foreach ($marker in @('MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_SCHEDULER_OK', 'MIRROR_IPC_OK', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_SCHED_CLASS_TESTS_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_USER_SURFACE_OK', 'MIRROR_USER_SURFACE_CLEANUP_OK', 'MIRROR_USER_CLOCK_OK', 'MIRROR_AHCI_READ_OK', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED')) {
+    foreach ($marker in @('MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_SCHEDULER_OK', 'MIRROR_IPC_OK', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_SCHED_CLASS_TESTS_OK', 'MIRROR_SCHED_SATURATE_OK', 'MIRROR_SCHED_LATENCY_OK', 'MIRROR_KVA_TESTS_OK', 'MIRROR_USER_SURFACE_OK', 'MIRROR_USER_SURFACE_CLEANUP_OK', 'MIRROR_USER_CLOCK_OK', 'MIRROR_AHCI_READ_OK', 'MIRROR_HEAP_CHARGE_OK', 'MIRROR_CPU_DATA_TESTS_OK', 'MIRROR_KSTACK_OK', 'MIRROR_KSTACK_GUARD', 'MIRROR_KVA_DEGRADED')) {
         if ($serial -match "(?m)^$marker(?:\s|$)") { throw "Trace boot unexpectedly reported $marker. See $serialLog." }
     }
     if ($serial -match '(?m)^MIRROR_FRAMEBUFFER_SKIPPED(?:\s|$)') { throw 'Normal boot skipped framebuffer output.' }

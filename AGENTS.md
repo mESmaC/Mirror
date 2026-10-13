@@ -64,6 +64,7 @@ Run commands from the repository root in PowerShell.
 - DMA buffers have no `Drop`. Release them only after the device is reset or quiesced, and quarantine them if that fails. Report cleanup in markers such as `dma_reclaimed=1`.
 - Never add serial output that carries user content (typed text, key codes, file or document data, pointer state), or a per-input marker, to a default build. Gate it behind `test-trace`, which `boot-smoke` implies. The one exception (ledger S7b) is the opt-in timing markers enabled by a valid `mirror.perf=` boot token (spec 0019); they carry no user content. Content-free lifecycle and device markers may print after user actions.
 - Put test batteries and checks on test-fixture data behind `boot-smoke`, so a default build never panics on a test outcome or on disk contents.
+- Every process gets its CPU class at creation (spec 0052): interactive, normal or background. `load_process` starts each one as a normal-class test probe with init's lifetime tick budget, so a process that is not a test probe, such as the shell, an app or 0019d's burn, sets `Process.class` and clears `tick_budget` before it first runs.
 
 ## Serial markers
 - The kernel reports results as single serial lines of the form `MIRROR_<AREA>_<EVENT> key=value ...`. In trace and smoke builds, userspace console output is escaped and prefixed with `user: `, so userspace cannot forge a marker; default builds print none of it.

@@ -9,6 +9,7 @@ use mirror_vm_protocol::{
     SYS_VM_STATS,
 };
 
+mod classes;
 mod clock;
 mod fpu;
 mod smp;
@@ -1223,16 +1224,25 @@ extern "C" fn init_main(launch: u64) -> ! {
     // Roles 0 and 1 are the smoke pair. 0054-D5: roles 2 and 3 are the
     // OomOrder scenario's requester and victim, and roles 4 and 5 the
     // class-limits pair. Roles 6 and 7 are the SMP battery (spec 0051, step
-    // 5), whose probe 1 only spins.
+    // 5), whose probe 1 only spins. Roles 8 and 9 are the class battery's
+    // spinners and timed sleepers (spec 0052), whose probe is their thread
+    // count.
     require(
         match role {
             0 => probe <= 22,
             1..=5 | 7 => probe == 0,
             6 => probe <= 1,
+            8 | 9 => (1..=16).contains(&probe),
             _ => false,
         },
         33,
     );
+    if role == 8 {
+        classes::spinners(probe);
+    }
+    if role == 9 {
+        classes::sleepers(probe);
+    }
     if role == 2 {
         oom_requester();
     }

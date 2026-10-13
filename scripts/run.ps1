@@ -321,6 +321,65 @@ function Assert-MirrorSmpUser {
     }
 }
 
+function Assert-MirrorSchedClasses {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [Parameter(Mandatory = $true)][int]$UserspaceCpus,
+        [string]$FaultMode = 'None'
+    )
+
+    # The class battery (spec 0052) runs only in -Fault None smoke boots,
+    # after the SMP battery and before the first init pair: a saturate
+    # session, then a latency session, each reported once with its full field
+    # list. The relations are recomputed here. A CPU may count a tick's total
+    # just before a window opens and its user charge just after, so user
+    # ticks may exceed the window's ticks by at most one per CPU.
+    $saturateNames = [regex]::Matches($Serial, '(?m)^MIRROR_SCHED_SATURATE_OK(?:\s|$)')
+    $latencyNames = [regex]::Matches($Serial, '(?m)^MIRROR_SCHED_LATENCY_OK(?:\s|$)')
+    if ($FaultMode -ne 'None') {
+        if ($saturateNames.Count -ne 0 -or $latencyNames.Count -ne 0) {
+            throw "Only -Fault None runs the class battery, which -Fault $FaultMode reported."
+        }
+        return
+    }
+    $saturate = [regex]::Matches($Serial, ('(?m)^MIRROR_SCHED_SATURATE_OK cpus={0} window=([0-9]+) ticks=([0-9]+) user=([0-9]+) normal=([0-9]+) background=([0-9]+) background_dispatches=([0-9]+)\r?$' -f $UserspaceCpus))
+    $latency = [regex]::Matches($Serial, ('(?m)^MIRROR_SCHED_LATENCY_OK cpus={0} sleepers=([0-9]+) wakes=([0-9]+) prompt=([0-9]+) worst=([0-9]+) interactive=([0-9]+) background=([0-9]+) user=([0-9]+)\r?$' -f $UserspaceCpus))
+    if ($saturateNames.Count -ne 1 -or $saturate.Count -ne 1 -or $latencyNames.Count -ne 1 -or $latency.Count -ne 1) {
+        throw "A plain smoke boot must report MIRROR_SCHED_SATURATE_OK and MIRROR_SCHED_LATENCY_OK once each, with cpus=$UserspaceCpus and every field."
+    }
+    $smpUser = [regex]::Match($Serial, '(?m)^MIRROR_SMP_USER_OK(?:\s|$)')
+    $degraded = [regex]::Match($Serial, '(?m)^MIRROR_KVA_DEGRADED(?:\s|$)')
+    if (-not $smpUser.Success -or -not $degraded.Success -or $saturate[0].Index -le $smpUser.Index -or
+        $latency[0].Index -le $saturate[0].Index -or $latency[0].Index -ge $degraded.Index) {
+        throw 'The class battery must report its saturate and then its latency session after MIRROR_SMP_USER_OK and before the first init pair.'
+    }
+    $value = { param($match, $group) [uint64]$match.Groups[$group].Value }
+    $window = & $value $saturate[0] 1
+    $ticks = & $value $saturate[0] 2
+    $user = & $value $saturate[0] 3
+    $normal = & $value $saturate[0] 4
+    $background = & $value $saturate[0] 5
+    $dispatches = & $value $saturate[0] 6
+    # Work conservation, normal over background, and the starvation guard.
+    if ($window -lt 80 -or $user -ne $normal + $background -or $user * 4 -lt $ticks * 3 -or
+        $user -gt $ticks + $UserspaceCpus -or $normal * 2 -lt $user -or $background -lt 1 -or $dispatches -lt 2) {
+        throw "The class battery's saturate session broke a relation: window=$window ticks=$ticks user=$user normal=$normal background=$background background_dispatches=$dispatches."
+    }
+    $sleepers = & $value $latency[0] 1
+    $wakes = & $value $latency[0] 2
+    $prompt = & $value $latency[0] 3
+    $worst = & $value $latency[0] 4
+    $interactive = & $value $latency[0] 5
+    $background = & $value $latency[0] 6
+    $user = & $value $latency[0] 7
+    # Every sleeper thread times 12 sleeps; at least 7/8 of the wakes run
+    # within a tick of their deadline, and none waits 40 ticks (2 x AGE).
+    if ($sleepers -ne [Math]::Min($UserspaceCpus, 16) -or $wakes -ne 12 * $sleepers -or $prompt -gt $wakes -or
+        $prompt * 8 -lt $wakes * 7 -or $worst -ge 40 -or $user -ne $interactive + $background) {
+        throw "The class battery's latency session broke a relation: sleepers=$sleepers wakes=$wakes prompt=$prompt worst=$worst interactive=$interactive background=$background user=$user."
+    }
+}
+
 . (Join-Path $PSScriptRoot 'common.ps1')
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $perfToken = $null
@@ -781,8 +840,10 @@ try {
     # its calibration.
     $localTimer = -not $LegacyPic -and -not $PitTimer -and $Fault -ne 'TimerCalibration'
     Assert-MirrorSmpMarkers -Serial $serial -RequestedCpus $CpuCount -UseLegacyPic ([bool]$LegacyPic) -LocalTimer $localTimer -FaultMode $Fault
-    # The SMP battery runs on every CPU that runs userspace (spec 0051, step 5).
+    # The SMP battery runs on every CPU that runs userspace (spec 0051, step 5),
+    # and so does the class battery in plain boots (spec 0052).
     Assert-MirrorSmpUser -Serial $serial -UserspaceCpus $(if ($localTimer) { $CpuCount } else { 1 })
+    Assert-MirrorSchedClasses -Serial $serial -UserspaceCpus $(if ($localTimer) { $CpuCount } else { 1 }) -FaultMode $Fault
     # Every online CPU reports its guarded stacks; -LegacyPic keeps the APs
     # offline, so only the BSP reports (spec 0016a).
     $rsp0Guard = Assert-MirrorStacks -Serial $serial -OnlineCpus $(if ($LegacyPic) { 1 } else { $CpuCount }) -Smoke $true

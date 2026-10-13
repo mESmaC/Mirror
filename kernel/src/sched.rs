@@ -1766,6 +1766,12 @@ pub(super) enum End {
     /// battery thread runs on every AP that runs userspace (Panic).
     #[cfg(feature = "boot-smoke")]
     Battery { process: usize, panic: bool },
+    /// A class battery session (spec 0052) ends once all its processes are
+    /// zombies; the BSP's pass measures it and ends its spinners.
+    #[cfg(feature = "boot-smoke")]
+    Classes {
+        processes: [Option<usize>; super::class_battery::PROCESSES],
+    },
 }
 
 /// Everything one session shares, owned by its seeding function. `run`
@@ -1793,6 +1799,11 @@ impl Session<'_, '_> {
             // SAFETY: As above.
             #[cfg(feature = "boot-smoke")]
             End::Battery { process: slot, .. } => unsafe { process(slot) }.zombie(),
+            #[cfg(feature = "boot-smoke")]
+            End::Classes { processes } => processes.iter().flatten().all(|&slot| {
+                // SAFETY: The scheduler holds no other process reference.
+                unsafe { process(slot) }.zombie()
+            }),
         }
     }
 }
@@ -2025,6 +2036,8 @@ pub(super) fn run(
                     panic_while_aps_run(process);
                 }
             }
+            #[cfg(feature = "boot-smoke")]
+            End::Classes { .. } => super::class_battery::pass(now),
         }
         let selected = select(now);
         kick_work(now);

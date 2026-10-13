@@ -15,6 +15,11 @@
 // A child module, so the scheduler shares these private types (spec 0030a).
 #[path = "sched.rs"]
 mod sched;
+// The scheduler-class battery (spec 0052), a child module for the same
+// reason.
+#[cfg(feature = "boot-smoke")]
+#[path = "class_battery.rs"]
+mod class_battery;
 
 /// The console's `status` lists the last ended processes (spec 0052).
 pub(crate) use sched::ended_processes;
@@ -798,6 +803,11 @@ pub fn run_init(
     // userspace, before the pair, whose first session builds its stacks from
     // the empty pool this leaves.
     run_smp_battery(kernel, frames, bytes, &image, direct_map);
+    // Spec 0052: the class battery, in plain smoke boots only (settled point
+    // 5), also before the pair.
+    if matches!(boot::smoke_mode(), boot::SmokeMode::Normal) {
+        class_battery::run(kernel, frames, bytes, &image, direct_map);
+    }
     // 0059-D1: a session's seeding is a heap safe point.
     sched::unlocked(|| heap::ensure(kernel, frames, direct_map));
     run_pair(
