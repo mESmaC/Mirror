@@ -102,16 +102,18 @@ pub fn wake_u32(word: &AtomicU32, count: usize) -> Result<usize, Error> {
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 fn syscall(number: u64, address: u64, value: u64, timeout: u64) -> i64 {
     let result: i64;
-    // SAFETY: Mirror's native vector preserves all registers except RAX and
-    // restores the caller's stack. Both callers pass a live, aligned AtomicU32;
-    // the kernel validates its mapping again before accessing the word.
+    // SAFETY: Mirror's native vector restores the caller's stack and every
+    // register except RAX, RSI and RDX, which this block declares as outputs
+    // (a successful WAIT_U32 returns its stamps in RSI and RDX). Both callers
+    // pass a live, aligned AtomicU32; the kernel validates its mapping again
+    // before accessing the word.
     unsafe {
         core::arch::asm!(
             "int 0x80",
             inout("rax") number => result,
             in("rdi") address,
-            in("rsi") value,
-            in("rdx") timeout,
+            inout("rsi") value => _,
+            inout("rdx") timeout => _,
             options(nostack),
         );
     }

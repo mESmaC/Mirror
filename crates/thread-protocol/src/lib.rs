@@ -13,6 +13,13 @@ pub const SYS_THREAD_ID: u64 = 32;
 /// a relative timeout. A mismatched value returns EAGAIN before checking a zero
 /// timeout. Otherwise zero polls with ETIMEDOUT, and a nonzero timeout blocks.
 /// Successful wake returns zero; callers must recheck their own condition.
+///
+/// A successful wake also returns two stamps from the process's wait
+/// sequence, which the kernel advances under its scheduler lock and which
+/// only grows: RSI holds the stamp taken as the wait joined its queue, and
+/// RDX the stamp taken as a WAKE_U32 chose it. Every other result leaves RSI
+/// and RDX unchanged, so a caller that may block must treat both as outputs.
+/// The stamps report the kernel's order; they do not promise one.
 pub const SYS_WAIT_U32: u64 = 33;
 /// RDI identifies a readable word in the calling process, RSI bounds the wake
 /// count by MAX_THREADS, and RDX must be zero. Returns the number actually woken.

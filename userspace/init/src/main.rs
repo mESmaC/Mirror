@@ -90,20 +90,23 @@ static mut INITIALIZED: u64 = 0x0123_4567_89ab_cdef;
 static mut ZERO_INITIALIZED: u64 = 0;
 
 /// Ordinary native calls preserve all registers except the result in RAX.
-/// THREAD_JOIN uses a separate wrapper for its additional RDX result.
+/// A successful THREAD_JOIN also returns RDX, and a successful WAIT_U32 RSI
+/// and RDX, so this wrapper treats RSI and RDX as clobbered and serves every
+/// call; JOIN and `sync::wait_stamped` read them through their own wrappers.
 /// Integer addresses let the kernel reject invalid pointers without constructing
 /// invalid Rust references in the application.
 fn syscall(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
     let result: i64;
     // SAFETY: vector 0x80 is the kernel-provided userspace entry. Its handler
-    // restores the user stack and every general-purpose register except RAX.
+    // restores the user stack and every general-purpose register except RAX,
+    // RSI and RDX, which this block declares as outputs.
     unsafe {
         asm!(
             "int 0x80",
             inout("rax") number => result,
             in("rdi") arg0,
-            in("rsi") arg1,
-            in("rdx") arg2,
+            inout("rsi") arg1 => _,
+            inout("rdx") arg2 => _,
             options(nostack),
         );
     }

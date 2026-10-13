@@ -4,9 +4,10 @@
 // The SMP battery's checked native call (spec 0051, risk 1): load RBX and
 // R12-R15, and both halves of XMM8-XMM12, with values derived from the
 // canary, make the call, and require every one back unchanged. The kernel
-// restores all of a thread's registers but RAX, on whichever CPU it resumes,
-// so a context or FPU image restored into the wrong thread exits the process
-// with status 700. R8 carries the canary across the call.
+// restores all of a thread's registers but RAX (and a successful WAIT_U32's
+// RSI and RDX, which carry its stamps), on whichever CPU it resumes, so a
+// context or FPU image restored into the wrong thread exits the process with
+// status 700. R8 carries the canary across the call.
 .global mirror_smp_syscall
 .type mirror_smp_syscall,@function
 mirror_smp_syscall:

@@ -148,8 +148,8 @@ fn id() -> u64 {
 pub(super) fn join(tid: u64) -> (i64, u64) {
     let result: i64;
     let value: u64;
-    // SAFETY: JOIN is the one native call with a second return register. All
-    // other registers are preserved, including across its blocking interval.
+    // SAFETY: JOIN returns its exit value in RDX. All other registers but
+    // RAX are preserved, including across its blocking interval.
     unsafe {
         asm!(
             "int 0x80",
@@ -443,8 +443,8 @@ fn check_validation(start: ThreadStart) {
     require(syscall(SYS_THREAD_EXIT, 0, 1, 0) == EINVAL, 544);
     require(syscall(SYS_THREAD_EXIT, 0, 0, 1) == EINVAL, 545);
     require(syscall(SYS_THREAD_JOIN, 0, 1, 0) == EINVAL, 546);
-    // RDX is an output register on successful JOIN only, so the generic
-    // one-result wrapper remains valid for calls rejected before joining.
+    // RDX is an output register on successful JOIN only; the generic wrapper
+    // treats it as clobbered, so it also serves calls rejected before joining.
     require(syscall(SYS_THREAD_JOIN, 0, 0, 1) == EINVAL, 547);
     require(join(load(&MAIN)).0 == EDEADLK, 548);
     require(join(0).0 == ESRCH && join(u64::MAX).0 == ESRCH, 549);

@@ -629,6 +629,9 @@ struct Signals {
     signaled: [bool; THREAD_SLOTS],
     has_preset: [bool; THREAD_SLOTS],
     preset: [i64; THREAD_SLOTS],
+    /// The wake stamp that an explicit address wake took for each wait
+    /// (WAIT_U32's RDX), or zero for any other signal: stamps start at one.
+    stamp: [u64; THREAD_SLOTS],
     /// The tick of each signal: for a syscall's event, its trap-exit tick,
     /// since no tick is delivered while the handler runs with IF=0.
     at: [u64; THREAD_SLOTS],
@@ -643,6 +646,8 @@ struct Signals {
 pub(super) struct Signal {
     pub(super) slot: u16,
     pub(super) preset: Option<i64>,
+    /// An explicit address wake's stamp, which WAIT_U32 returns in RDX.
+    pub(super) stamp: Option<u64>,
     pub(super) at: u64,
     /// The CPU that signaled it (boot-smoke).
     #[cfg(feature = "boot-smoke")]
@@ -657,6 +662,7 @@ impl Signals {
             signaled: [false; THREAD_SLOTS],
             has_preset: [false; THREAD_SLOTS],
             preset: [0; THREAD_SLOTS],
+            stamp: [0; THREAD_SLOTS],
             at: [0; THREAD_SLOTS],
             #[cfg(feature = "boot-smoke")]
             from: [0; THREAD_SLOTS],
@@ -676,6 +682,7 @@ impl Signals {
         self.signaled[index] = true;
         self.has_preset[index] = preset.is_some();
         self.preset[index] = preset.unwrap_or(0);
+        self.stamp[index] = 0;
         self.at[index] = timer::ticks();
         #[cfg(feature = "boot-smoke")]
         {
@@ -683,6 +690,14 @@ impl Signals {
         }
         self.links.push(&mut self.list, slot);
         cpudata::set_need_resched();
+    }
+
+    /// Signal an explicit address wake: result 0, with the wake stamp it
+    /// took. The caller has checked that the wait is not signaled yet.
+    fn wake(&mut self, slot: u16, stamp: u64) {
+        assert_ne!(stamp, 0, "a wake stamp of zero");
+        self.signal(slot, Some(0));
+        self.stamp[usize::from(slot)] = stamp;
     }
 
     fn take(&mut self, slot: u16) -> Signal {
@@ -693,6 +708,7 @@ impl Signals {
         Signal {
             slot,
             preset: self.has_preset[index].then_some(self.preset[index]),
+            stamp: (self.stamp[index] != 0).then_some(self.stamp[index]),
             at: self.at[index],
             #[cfg(feature = "boot-smoke")]
             from: self.from[index],
@@ -1273,8 +1289,16 @@ pub(super) fn signal_queue(queue: Queue) {
 
 /// Decide an explicit wake of `process`'s waits on `address`, in FIFO order:
 /// up to `count` waits whose deadline has not passed get result 0, and each
-/// passed one gets ETIMEDOUT without counting. Returns (woken, timed out).
-pub(super) fn wake_address(process: u16, address: u64, count: u64, now: u64) -> (u64, u64) {
+/// passed one gets ETIMEDOUT without counting. Each woken wait takes its wake
+/// stamp from `stamp` as it is chosen, so the stamps record this order.
+/// Returns (woken, timed out).
+pub(super) fn wake_address(
+    process: u16,
+    address: u64,
+    count: u64,
+    now: u64,
+    mut stamp: impl FnMut() -> u64,
+) -> (u64, u64) {
     let list = Queue::Futex { process, address }.list();
     WAITS.with(|waits| {
         let Waits {
@@ -1295,7 +1319,7 @@ pub(super) fn wake_address(process: u16, address: u64, count: u64, now: u64) -> 
                 signals.signal(slot, Some(-110));
                 expired += 1;
             } else if woken < count {
-                signals.signal(slot, Some(0));
+                signals.wake(slot, stamp());
                 woken += 1;
             }
         }

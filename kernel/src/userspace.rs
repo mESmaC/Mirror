@@ -350,6 +350,9 @@ struct PendingInput {
 struct PendingWait {
     address: u64,
     deadline: Option<u64>,
+    /// The stamp `park` took from the process's wait sequence as this wait
+    /// joined its queue, which a successful wake returns in RSI.
+    enqueued: u64,
 }
 
 impl PendingWait {
@@ -445,6 +448,10 @@ struct Process {
     /// NO_SLOT. The index is the process-local position that thread
     /// creation fills lowest-first, up to MAX_THREADS.
     members: [u16; thread_abi::MAX_THREADS],
+    /// The last stamp taken from this process's wait sequence: an address
+    /// wait takes one as it joins its queue and another as a wake chooses it,
+    /// both under the scheduler lock (WAIT_U32's RSI and RDX).
+    wait_sequence: u64,
     #[cfg(feature = "boot-smoke")]
     thread_checks: bool,
     #[cfg(feature = "boot-smoke")]
@@ -621,6 +628,16 @@ impl Process {
         let slot = self.current_slot();
         // SAFETY: As in `member_mut`.
         unsafe { &mut *sched::thread_entry(slot) }
+    }
+
+    /// The next stamp from this process's wait sequence. Stamps start at one
+    /// and only grow, so a later stamp is always larger.
+    fn wait_stamp(&mut self) -> u64 {
+        self.wait_sequence = self
+            .wait_sequence
+            .checked_add(1)
+            .expect("wait sequence overflow");
+        self.wait_sequence
     }
 
     fn current_slot(&self) -> u16 {
@@ -1751,6 +1768,7 @@ fn load_process(
         #[cfg(feature = "boot-smoke")]
         copy_faults: 0,
         members: [sched::NO_SLOT; thread_abi::MAX_THREADS],
+        wait_sequence: 0,
         #[cfg(feature = "boot-smoke")]
         thread_checks: false,
         #[cfg(feature = "boot-smoke")]
@@ -3688,6 +3706,15 @@ impl ShellRuntime<'_> {
 /// field, so the scheduler signals that joiner once the exit is complete.
 fn park(process: &mut Process, state: State) {
     let owner = process.thread().process;
+    // An address wait takes its enqueue stamp as it joins its queue, under
+    // the scheduler lock that the wakes hold too (WAIT_U32's RSI).
+    let state = match state {
+        State::Waiting(pending) => State::Waiting(PendingWait {
+            enqueued: process.wait_stamp(),
+            ..pending
+        }),
+        state => state,
+    };
     let (queue, deadline) = match state {
         State::Sleeping(deadline) => (None, Some(deadline)),
         State::Receiving(pending) => (
@@ -3732,7 +3759,11 @@ fn complete_wait(
     now: u64,
 ) {
     let sched::Signal {
-        slot, preset, at, ..
+        slot,
+        preset,
+        stamp,
+        at,
+        ..
     } = signal;
     assert!(!interrupts::user_context_active());
     // A wake that another CPU than the waiter's signaled (spec 0051, step 5).
@@ -3756,20 +3787,37 @@ fn complete_wait(
         preset.is_none() || matches!(state, State::Waiting(_)),
         "preset result for a {state:?} wait"
     );
+    // Only an explicit address wake, which presets 0, takes a wake stamp.
+    assert_eq!(
+        stamp.is_some(),
+        preset == Some(0),
+        "wake stamp without an explicit wake"
+    );
     // The result for RAX, or None to keep the one the syscall saved.
     let result = match state {
         State::Sleeping(deadline) => {
             assert!(deadline_reached(now, deadline), "sleep signaled early");
             None
         }
-        State::Waiting(pending) => Some(preset.unwrap_or_else(|| {
-            assert!(pending.expired(now), "address wait signaled early");
-            #[cfg(feature = "boot-smoke")]
-            {
-                process.sync_timeouts += 1;
+        State::Waiting(pending) => {
+            let result = preset.unwrap_or_else(|| {
+                assert!(pending.expired(now), "address wait signaled early");
+                #[cfg(feature = "boot-smoke")]
+                {
+                    process.sync_timeouts += 1;
+                }
+                -110
+            });
+            // An explicit wake also returns both stamps, which one sequence
+            // ordered under the scheduler lock (WAIT_U32's RSI and RDX).
+            if let Some(woken) = stamp {
+                assert!(woken > pending.enqueued, "woken before it was queued");
+                let frame = &mut process.thread_mut().context.frame;
+                frame.rsi = pending.enqueued;
+                frame.rdx = woken;
             }
-            -110
-        })),
+            Some(result)
+        }
         State::Receiving(pending) => {
             let mut result = receive(
                 process,
@@ -3926,6 +3974,8 @@ fn wait_word(process: &mut Process, frame: &TrapFrame) -> Result<State, i64> {
         address: frame.rdi,
         deadline: (frame.rdx != thread_abi::WAIT_FOREVER)
             .then(|| timer::ticks().wrapping_add(frame.rdx)),
+        // `park` stamps the wait as it joins its queue.
+        enqueued: 0,
     }))
 }
 
@@ -3933,6 +3983,9 @@ fn wait_word(process: &mut Process, frame: &TrapFrame) -> Result<State, i64> {
 /// written: a wake on untouched but readable reserved memory allocates nothing.
 /// Expired waits complete as timeouts and do not consume the caller's count.
 /// Waiters are selected in FIFO order (0030-D6); the scheduler completes them.
+/// Each woken waiter takes its wake stamp from the process's wait sequence
+/// as it is selected: the futex queue is process-private, so the waker's
+/// process is the waiters' own.
 fn wake_word(process: &mut Process, frame: &TrapFrame) -> Result<u64, i64> {
     assert!(!arch::interrupts_enabled());
     if !thread_abi::wake_arguments_valid(frame.rdi, frame.rsi, frame.rdx) {
@@ -3950,12 +4003,10 @@ fn wake_word(process: &mut Process, frame: &TrapFrame) -> Result<u64, i64> {
             false,
         )
         .map_err(|_| -14)?;
-    let (woken, expired) = sched::wake_address(
-        process.thread().process,
-        frame.rdi,
-        frame.rsi,
-        timer::ticks(),
-    );
+    let owner = process.thread().process;
+    let (woken, expired) = sched::wake_address(owner, frame.rdi, frame.rsi, timer::ticks(), || {
+        process.wait_stamp()
+    });
     #[cfg(feature = "boot-smoke")]
     {
         process.sync_wakes += woken;

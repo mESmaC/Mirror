@@ -61,7 +61,10 @@ static GATE: AtomicU32 = AtomicU32::new(0);
 static COUNTER: Mutex<u64> = Mutex::new(0);
 static QUEUE_WORD: AtomicU32 = AtomicU32::new(0);
 static QUEUE_STARTED: AtomicU64 = AtomicU64::new(0);
-static QUEUE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Each queue waiter's two kernel stamps, as its WAIT returned them: when it
+/// joined the queue (RSI) and when the wake chose it (RDX). Zero until then.
+static QUEUE_ENQUEUED: [AtomicU64; QUEUE_WAITERS] = [const { AtomicU64::new(0) }; QUEUE_WAITERS];
+static QUEUE_WOKEN: [AtomicU64; QUEUE_WAITERS] = [const { AtomicU64::new(0) }; QUEUE_WAITERS];
 
 #[repr(align(4))]
 struct ReadonlyWord(u32);
@@ -73,6 +76,29 @@ fn address(word: &AtomicU32) -> u64 {
 
 fn wait(address: u64, expected: u64, timeout: u64) -> i64 {
     syscall(SYS_WAIT_U32, address, expected, timeout)
+}
+
+/// WAIT_U32 with its full result: RAX, then RSI and RDX, which a successful
+/// wake replaces with the wait's enqueue and wake stamps and every other
+/// result leaves as the expected value and timeout.
+fn wait_stamped(address: u64, expected: u64, timeout: u64) -> (i64, u64, u64) {
+    let result: i64;
+    let enqueued: u64;
+    let woken: u64;
+    // SAFETY: WAIT_U32 returns in RAX, RSI and RDX, all declared as outputs,
+    // and preserves every other register and the stack across its blocking
+    // interval. The kernel validates the word's address before reading it.
+    unsafe {
+        asm!(
+            "int 0x80",
+            inout("rax") SYS_WAIT_U32 => result,
+            in("rdi") address,
+            inout("rsi") expected => enqueued,
+            inout("rdx") timeout => woken,
+            options(nostack),
+        );
+    }
+    (result, enqueued, woken)
 }
 
 fn wake(address: u64, count: u64) -> i64 {
@@ -216,8 +242,9 @@ fn check_arguments() {
         require(wait(word, 7, timeout) == EINVAL, 612);
     }
     require(syscall(SYS_WAKE_U32, word, 0, 1) == EINVAL, 613);
-    require(wait(word, 8, 0) == EAGAIN, 614);
-    require(wait(word, 7, 0) == ETIMEDOUT, 615);
+    // A wait that returns without a wake leaves RSI and RDX unchanged.
+    require(wait_stamped(word, 8, 0) == (EAGAIN, 8, 0), 614);
+    require(wait_stamped(word, 7, 0) == (ETIMEDOUT, 7, 0), 615);
     require(
         wake(word, 0) == 0 && wake(word, MAX_THREADS as u64) == 0,
         616,
@@ -397,23 +424,25 @@ extern "C" fn queue_worker(index: u64) -> ! {
     require(index < QUEUE_WAITERS as u64, 658);
     // Counted immediately before the wait; the creator settles afterwards.
     QUEUE_STARTED.fetch_add(1, Ordering::AcqRel);
-    let result = wait(address(&QUEUE_WORD), 0, WAIT_FOREVER);
-    // The ticket comes first, so ticket order is the order in which the
-    // woken waiters ran. A fresh dispatch has a full two-tick quantum, so
-    // no preemption falls between the wait's return and this increment, and
-    // a deadline that displaces this thread first puts it back at the head
-    // of the run queue, still ahead of the waiters woken after it (0030-D3).
-    let ticket = QUEUE_SEQUENCE.fetch_add(1, Ordering::AcqRel);
+    let (result, enqueued, woken) = wait_stamped(address(&QUEUE_WORD), 0, WAIT_FOREVER);
     require(result == 0, 659);
-    syscall(SYS_THREAD_EXIT, ticket, 0, 0);
+    // The kernel took both stamps under its scheduler lock, as it queued
+    // this wait and as the wake chose it, so the order in which the woken
+    // waiters run afterwards cannot change them.
+    let index = index as usize;
+    QUEUE_ENQUEUED[index].store(enqueued, Ordering::Release);
+    QUEUE_WOKEN[index].store(woken, Ordering::Release);
+    syscall(SYS_THREAD_EXIT, index as u64, 0, 0);
     // SAFETY: A successful native thread exit never returns to its entry point.
     unsafe { asm!("ud2", options(noreturn, nostack)) }
 }
 
 /// Acceptance 3 of spec 0030a, run in role 0 only, after its capacity check:
 /// eight threads block on one word, one at a time, and a single wake of
-/// MAX_THREADS releases all of them in the order they blocked, as a shared
-/// sequence counter shows. Each completion also makes the kernel assert that
+/// MAX_THREADS releases all of them in the order they blocked. The kernel is
+/// the oracle: each WAIT returns the stamps the kernel took as it queued the
+/// wait and as the wake chose it, so a preemption after the WAIT returns
+/// cannot reorder them. Each completion also makes the kernel assert that
 /// its blocked thread was charged no ticks. A timed wait that nothing wakes
 /// returns ETIMEDOUT at its deadline. The stacks share one guardless RW
 /// reservation, released before the synchronization checks run.
@@ -424,7 +453,9 @@ pub(super) fn check_wait_queue(console: u64) {
     require(vm_stats().regions == baseline.regions + 1, 660);
     QUEUE_WORD.store(0, Ordering::Release);
     QUEUE_STARTED.store(0, Ordering::Release);
-    QUEUE_SEQUENCE.store(0, Ordering::Release);
+    for stamp in QUEUE_ENQUEUED.iter().chain(&QUEUE_WOKEN) {
+        stamp.store(0, Ordering::Release);
+    }
     let word = address(&QUEUE_WORD);
     let mut tids = [0_u64; QUEUE_WAITERS];
     for (index, tid) in tids.iter_mut().enumerate() {
@@ -444,8 +475,8 @@ pub(super) fn check_wait_queue(console: u64) {
         );
         require(created > 0, 661);
         *tid = created as u64;
-        // Each waiter blocks before the next one starts, which fixes the
-        // order in which they joined the queue.
+        // Each waiter blocks before the next one starts, so they join the
+        // queue one at a time. The enqueue stamps record the order.
         for _ in 0..4096 {
             if QUEUE_STARTED.load(Ordering::Acquire) == index as u64 + 1 {
                 break;
@@ -460,18 +491,45 @@ pub(super) fn check_wait_queue(console: u64) {
     }
     // Let ticks pass while all eight are blocked.
     require(syscall(SYS_SLEEP, 2, 0, 0) == 0, 663);
-    require(QUEUE_SEQUENCE.load(Ordering::Acquire) == 0, 664);
+    require(
+        QUEUE_WOKEN
+            .iter()
+            .all(|stamp| stamp.load(Ordering::Acquire) == 0),
+        664,
+    );
     require(wake(word, MAX_THREADS as u64) == QUEUE_WAITERS as i64, 665);
     for (index, tid) in tids.into_iter().enumerate() {
-        require(join_value(tid) == (0, index as u64), 666);
+        require(join_value(tid) == (0, index as u64), 672);
     }
-    require(
-        QUEUE_SEQUENCE.load(Ordering::Acquire) == QUEUE_WAITERS as u64,
-        667,
-    );
+    let enqueued = QUEUE_ENQUEUED
+        .each_ref()
+        .map(|stamp| stamp.load(Ordering::Acquire));
+    let woken = QUEUE_WOKEN
+        .each_ref()
+        .map(|stamp| stamp.load(Ordering::Acquire));
+    // The waiters in the order the kernel queued them. The enqueue stamps
+    // are distinct and all precede the wake, whose one call took a stamp per
+    // waiter, consecutively, under the scheduler lock. FIFO means the wake
+    // stamps follow the queue order.
+    let mut order: [usize; QUEUE_WAITERS] = core::array::from_fn(|index| index);
+    order.sort_unstable_by_key(|&index| enqueued[index]);
+    let first = woken[order[0]];
+    for (rank, &index) in order.iter().enumerate() {
+        require(
+            enqueued[index] != 0
+                && enqueued[index] < first
+                && (rank == 0 || enqueued[order[rank - 1]] < enqueued[index]),
+            667,
+        );
+        require(woken[index] == first + rank as u64, 666);
+    }
     require(wake(word, MAX_THREADS as u64) == 0, 668);
     let before = syscall(SYS_TICKS, 0, 0, 0);
-    require(wait(word, 0, QUEUE_TIMEOUT) == ETIMEDOUT, 669);
+    // A timed-out wait leaves RSI and RDX unchanged.
+    require(
+        wait_stamped(word, 0, QUEUE_TIMEOUT) == (ETIMEDOUT, 0, QUEUE_TIMEOUT),
+        669,
+    );
     require(
         syscall(SYS_TICKS, 0, 0, 0) - before >= QUEUE_TIMEOUT as i64,
         670,
