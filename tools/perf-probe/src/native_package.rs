@@ -584,6 +584,61 @@ impl NativePackage {
             .map(|s| s.trim().into())
             .map_err(|_| record::invalid("Git returned non-UTF8"))
     }
+    fn require_clean_checkout(&mut self, end: Instant) -> io::Result<()> {
+        // System/global configuration and their filter definitions stay
+        // disabled. Explicitly retain Git for Windows' built-in CRLF text
+        // normalization for the worktree comparison; archive still reads HEAD
+        // bytes and -text attributes continue to require byte equality. A
+        // status-only check can report stale stat differences after changing
+        // normalization, even when an actual content comparison is empty.
+        // Compare the index to HEAD separately, without text normalization, so
+        // a staged edit canceled by the worktree cannot be accepted as clean.
+        self.git(
+            &[
+                "diff",
+                "--cached",
+                "--quiet",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=none",
+                "HEAD",
+                "--",
+            ],
+            end,
+        )?;
+        self.git(
+            &[
+                "-c",
+                "core.autocrlf=true",
+                "diff",
+                "--quiet",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=none",
+                "--",
+            ],
+            end,
+        )?;
+        if !self
+            .git(
+                &[
+                    "ls-files",
+                    "--others",
+                    "--exclude-standard",
+                    "--directory",
+                    "--no-empty-directory",
+                    "-z",
+                ],
+                end,
+            )?
+            .is_empty()
+        {
+            return Err(record::invalid(
+                "lane packaging requires a clean committed checkout",
+            ));
+        }
+        Ok(())
+    }
     fn archive_source(&mut self, end: Instant) -> io::Result<PathBuf> {
         let archive = self.run_dir.join("source.zip");
         let cwd = self.options.checkout.clone();
@@ -961,17 +1016,7 @@ impl Backend for NativePackage {
     fn validate(&mut self, end: Instant) -> io::Result<()> {
         let top = self.git(&["rev-parse", "--show-toplevel"], end)?;
         require_checkout_root(&self.options.checkout, Path::new(&top))?;
-        if !self
-            .git(
-                &["status", "--porcelain=v1", "--untracked-files=normal"],
-                end,
-            )?
-            .is_empty()
-        {
-            return Err(record::invalid(
-                "lane packaging requires a clean committed checkout",
-            ));
-        }
+        self.require_clean_checkout(end)?;
         self.commit = self.git(&["rev-parse", "--verify", "HEAD^{commit}"], end)?;
         self.tree = self.git(&["rev-parse", "--verify", "HEAD^{tree}"], end)?;
         let worktrees = self.git(&["worktree", "list", "--porcelain"], end)?;
@@ -2191,6 +2236,89 @@ mod tests {
                 assert!(!arg.string().unwrap().contains(r"\\?\"));
             }
         }
+        p.prove_no_live_build(false, end()).unwrap();
+        p.lease
+            .as_mut()
+            .unwrap()
+            .publish_release(&utc_now())
+            .unwrap();
+        p.lease.take();
+    }
+    #[test]
+    fn real_git_clean_gate_accepts_crlf_text_and_rejects_content_or_raw_byte_changes() {
+        let f = Fixture::new();
+        let locks = f.dir("locks");
+        let mut p = NativePackage::open_at(f.options(), &locks).unwrap();
+        p.git(&["init", "--quiet", "-b", "fixture"], end()).unwrap();
+        let cwd = p.options.checkout.clone();
+        fs::write(cwd.join(".gitattributes"), b"*.raw -text\n").unwrap();
+        fs::write(cwd.join("source.txt"), b"first line\nsecond line\n").unwrap();
+        fs::write(cwd.join("bytes.raw"), b"unchanged bytes\n").unwrap();
+        p.git(&["-c", "core.autocrlf=false", "add", "--", "."], end())
+            .unwrap();
+        p.git(
+            &[
+                "-c",
+                "user.name=Lane Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "LF source fixture",
+            ],
+            end(),
+        )
+        .unwrap();
+        fs::write(cwd.join("source.txt"), b"first line\r\nsecond line\r\n").unwrap();
+        // This is the pre-fix failure: status with sanitized configuration
+        // treats a normal Windows CRLF checkout as a content modification.
+        assert!(
+            !p.git(&["status", "--porcelain=v1"], end())
+                .unwrap()
+                .is_empty()
+        );
+        p.require_clean_checkout(end()).unwrap();
+        assert_eq!(
+            fs::read(cwd.join("source.txt")).unwrap(),
+            b"first line\r\nsecond line\r\n"
+        );
+        fs::write(cwd.join("source.txt"), b"edited line\r\nsecond line\r\n").unwrap();
+        assert!(p.require_clean_checkout(end()).is_err());
+        fs::write(cwd.join("source.txt"), b"first line\r\nsecond line\r\n").unwrap();
+        p.require_clean_checkout(end()).unwrap();
+        // Normalization is only for the worktree. A CRLF blob newly staged in
+        // place of the committed LF blob must remain a staged modification.
+        p.git(
+            &["-c", "core.autocrlf=false", "add", "--", "source.txt"],
+            end(),
+        )
+        .unwrap();
+        fs::write(cwd.join("source.txt"), b"first line\nsecond line\n").unwrap();
+        assert!(p.require_clean_checkout(end()).is_err());
+        p.git(
+            &["-c", "core.autocrlf=false", "add", "--", "source.txt"],
+            end(),
+        )
+        .unwrap();
+        fs::write(cwd.join("source.txt"), b"first line\r\nsecond line\r\n").unwrap();
+        p.require_clean_checkout(end()).unwrap();
+        fs::write(cwd.join("bytes.raw"), b"unchanged bytes\r\n").unwrap();
+        assert!(p.require_clean_checkout(end()).is_err());
+        fs::write(cwd.join("bytes.raw"), b"unchanged bytes\n").unwrap();
+        p.require_clean_checkout(end()).unwrap();
+        fs::write(cwd.join("untracked.txt"), b"uncommitted\r\n").unwrap();
+        assert!(p.require_clean_checkout(end()).is_err());
+        assert!(
+            p.environment
+                .contains(&("GIT_CONFIG_NOSYSTEM".into(), "1".into()))
+        );
+        assert!(
+            p.environment
+                .contains(&("GIT_CONFIG_GLOBAL".into(), "NUL".into()))
+        );
         p.prove_no_live_build(false, end()).unwrap();
         p.lease
             .as_mut()
