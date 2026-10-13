@@ -500,12 +500,6 @@ function Invoke-MirrorHygieneProbe {
         Start-Sleep -Milliseconds 100
     } while ($true)
     Assert-MirrorTraceMarker -Serial $serial -Expected $false
-    # 0054-D3/D6: the pool and reserve records are checked in every flavor,
-    # and a default boot never kills a victim.
-    Assert-MirrorFramePool -Serial $serial
-    if ($serial -match '(?m)^MIRROR_OOM_KILL(?:\s|$)') {
-        throw "The default kernel unexpectedly killed an OOM victim. See $serialLog."
-    }
     if ([regex]::Matches($serial, '(?m)^MIRROR_AHCI_PROBE_OK fixture=0 reads=1\r?$').Count -ne 1) {
         throw "The default kernel must probe the decoy with one sector-0 read (MIRROR_AHCI_PROBE_OK fixture=0 reads=1). See $serialLog."
     }
@@ -603,6 +597,12 @@ function Assert-MirrorHygieneLog {
         if ($count -ne 0) { throw "The default kernel printed $count line(s) matching '$pattern'. See $serialLog." }
     }
     Assert-MirrorTraceMarker -Serial $Serial -Expected $false
+    # 0054-D3/D6: the final default log still carries exactly one valid pool
+    # and reserve record, and never a victim kill.
+    Assert-MirrorFramePool -Serial $Serial
+    if ($Serial -match '(?m)^MIRROR_OOM_KILL(?:\s|$)') {
+        throw "The default kernel unexpectedly killed an OOM victim. See $serialLog."
+    }
     if ([regex]::Matches($Serial, '(?m)^MIRROR_APP_STARTED(?:\s|$)').Count -ne 1 -or
         [regex]::Matches($Serial, '(?m)^MIRROR_APP_STARTED pid=[1-9][0-9]* kind=0\r?$').Count -ne 1) {
         throw "The hygiene probe must start exactly one Notes application. See $serialLog."
