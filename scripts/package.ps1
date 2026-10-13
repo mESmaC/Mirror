@@ -1,11 +1,48 @@
 [CmdletBinding()]
 param(
     [switch]$Release,
-    [string]$Perf
+    [string]$Perf,
+    [switch]$Lane,
+    [string]$LaneRoot,
+    [string]$LockOwner,
+    [string]$Recover,
+    [string]$CargoHome,
+    [string]$LimineArchive,
+    [ValidateSet('qemu', 'qemu2')][string]$LaneSlot
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
+$laneOptionNames = @('LaneRoot', 'LockOwner', 'Recover', 'CargoHome', 'LimineArchive', 'LaneSlot')
+foreach ($option in $laneOptionNames) {
+    if ($PSBoundParameters.ContainsKey($option) -and [string]::IsNullOrWhiteSpace([string]$PSBoundParameters[$option])) {
+        throw "-$option requires a non-empty value."
+    }
+}
+if ($Lane) {
+    if ($PSBoundParameters.ContainsKey('Perf')) { throw 'Lane packages use the tokenless default flavor.' }
+    if ([string]::IsNullOrWhiteSpace($LaneRoot) -or [string]::IsNullOrWhiteSpace($LockOwner)) {
+        throw 'Lane requires -LaneRoot and -LockOwner nick/task.'
+    }
+    if ($Recover -and $Release) { throw 'Recover cannot select a build profile.' }
+    $laneArguments = @('run', '--locked', '--offline', '--target', 'x86_64-pc-windows-msvc', '--manifest-path', (Join-Path $repositoryRoot 'tools/perf-probe/Cargo.toml'), '--bin', 'perf-probe', '--', 'package', '--checkout', $repositoryRoot, '--lane-root', $LaneRoot, '--owner', $LockOwner)
+    if ($Release) { $laneArguments += '--release' }
+    if ($Recover) { $laneArguments += @('--recover', $Recover) }
+    if ($CargoHome) { $laneArguments += @('--cargo-home', $CargoHome) }
+    if ($LimineArchive) { $laneArguments += @('--limine-archive', $LimineArchive) }
+    if ($LaneSlot) { $laneArguments += @('--slot', $LaneSlot) }
+    # Host-only bootstrap; the Rust controller acquires its own machine lease.
+    Push-Location -LiteralPath $repositoryRoot
+    try {
+        & cargo @laneArguments
+        if ($LASTEXITCODE -ne 0) { throw "Lane package controller exited $LASTEXITCODE; consult the printed LaneRoot record." }
+    }
+    finally { Pop-Location }
+    return
+}
+if (@($laneOptionNames | Where-Object { $PSBoundParameters.ContainsKey($_) }).Count -ne 0) {
+    throw 'Lane options require -Lane.'
+}
 $profile = if ($Release) { 'release' } else { 'debug' }
 $perfToken = if ($PSBoundParameters.ContainsKey('Perf')) { ConvertTo-MirrorPerfToken -Items $Perf } else { $null }
 
@@ -66,6 +103,9 @@ if ($null -ne $perfToken) {
         if ([IO.File]::ReadAllText($dailyConfigPath) -cne $dailyConfig) {
             throw 'The daily Limine config changed during performance packaging.'
         }
+        # Invalidate provenance before replacing either member of this generation.
+        $packageRecord = Join-Path $distDirectory 'mirror.package.json'
+        if (Test-Path -LiteralPath $packageRecord) { Remove-Item -LiteralPath $packageRecord -Force }
         # Both artifacts are already complete and verified on the same volume.
         foreach ($name in @('mirror.img', 'mirror.vmdk')) {
             Move-Item -LiteralPath (Join-Path $stageDirectory $name) -Destination (Join-Path $distDirectory $name) -Force
@@ -89,6 +129,8 @@ if ($null -ne $perfToken) {
     return
 }
 New-Item -ItemType Directory -Path $distDirectory -Force | Out-Null
+$packageRecord = Join-Path $distDirectory 'mirror.package.json'
+if (Test-Path -LiteralPath $packageRecord) { Remove-Item -LiteralPath $packageRecord -Force }
 # Copy the image before the descriptor that names it. Each copy goes to a
 # temporary name first, so a failed copy never leaves a partial artifact.
 foreach ($name in @('mirror.img', 'mirror.vmdk')) {

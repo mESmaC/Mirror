@@ -107,6 +107,16 @@ try {
     & cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc --manifest-path $imageToolManifest -- -D warnings
     if ($LASTEXITCODE -ne 0) { throw 'mirror-image Clippy check failed.' }
 
+    $laneManifest = Join-Path $repositoryRoot 'tools/perf-probe/Cargo.toml'
+    & cargo fmt --all --manifest-path $laneManifest -- --check
+    if ($LASTEXITCODE -ne 0) { throw 'Host lane formatting check failed.' }
+    & cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc --manifest-path $laneManifest -- -D warnings
+    if ($LASTEXITCODE -ne 0) { throw 'Host lane Clippy check failed.' }
+    & cargo test --locked --target x86_64-pc-windows-msvc --manifest-path $laneManifest
+    if ($LASTEXITCODE -ne 0) { throw 'Host lane tests failed.' }
+    & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test-lane.ps1')
+    if ($LASTEXITCODE -ne 0) { throw 'PowerShell 5.1 lane entry fixtures failed.' }
+
     foreach ($release in @($false, $true)) {
         $profile = if ($release) { 'release' } else { 'debug' }
         # Keep firmware and full debug ELF loading out of the kernel memory

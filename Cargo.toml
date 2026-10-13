@@ -1,6 +1,6 @@
 [workspace]
 members = ["kernel", "userspace/init", "userspace/desktop", "userspace/app", "crates/desktop-protocol", "crates/window-protocol", "crates/vm-protocol", "crates/thread-protocol", "crates/clock-protocol", "crates/sync", "crates/acpi", "crates/ui-tokens", "crates/ext2-layout", "crates/perf-protocol"]
-exclude = ["tools/mirror-image"]
+exclude = ["tools/mirror-image", "tools/perf-probe"]
 default-members = ["kernel"]
 resolver = "3"
 

@@ -1,0 +1,19 @@
+# Host-only, std-only controllers (0015c) and reusable transport primitives.
+[workspace]
+resolver = "3"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[package]
+name = "perf-probe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+[lints]
+workspace = true
