@@ -190,6 +190,8 @@ State after the 2026-10-09 gap interview, its write-up and its addendum, the 202
 
 **0058a (2026-10-12):** implemented on `claude/0058a-reboot`, its decisions 0058-D1 to D11 adopted as recommended under Cameron's 2026-10-12 direction (AGENTS.md, Spec process). D3 amends confirmed 0013-D6: discovery also copies the FACP and reads only its header, Flags and reset register, and 0013's row says so. Its VMware checks (tests 7-9) and open questions 3-5 remain.
 
+**0050 (2026-10-12):** implemented on `claude/0050-impl`. Two calls were made while implementing, and each spec's row records it. 0050-D2's thread-stack high-water mark comes from page-table dirty bits instead of a fill pattern. 0030-D3 is amended: an interrupted thread rejoins at the head of the run queue, so a deadline that displaces a just-woken waiter no longer reorders the woken set.
+
 **Decided when their spec comes up** (Cameron, 2026-10-10; none blocks the current M0 work):
 1. Spec 0019's decisions (D1 and D2 confirmed, the rest proposed; D3-D12 unchanged by the gap interview). RD8 (2026-10-12) settled the split: 0019's Phase 1 part opens Phase 1, and 0019b keeps C3 telemetry, after 0062 in Phase 6. RD24 lettered the Phase 1 slices 0019a, 0019c and 0019d; dividing that part into three specs and ordering them before 0030a is 0019-D15, still proposed with the slices' other decisions. codex's 0019a, 0019c and 0019d drafts, in review, carry the Phase 1 decisions, including the new D13-D19; the telemetry decisions (D8-D10) come up with 0019b:
    - 0019-D3: gate every perf line, milestones included, behind a valid `mirror.perf=` token. This narrows confirmed 0018-D9 and changes 0018's marker contract, so it needs re-confirmation together with them.

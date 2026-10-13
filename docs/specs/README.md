@@ -38,7 +38,7 @@ The phases come from the roadmap re-plan (`roadmap-replan.md`), adopted on 2026-
 - 0019c (split): finite input capture, the bounded input-to-present trace. Drafted on `astra/0019a-perf-markers`, its decisions still in review
 - 0019d (split): the `burn` perf item, a CPU load that runs while input response is measured. Drafted on `astra/0019a-perf-markers`, its decisions still in review (0019-D13 proposes a separate process on the boot CPU)
 - 0030a Process and thread table: a global process and thread table, run queues, wait queues instead of polling, wakeup preemption, up to 16 threads per process. Confirmed (2026-10-12: RD24, 0030-D1 to D6); on `main`. The agent-demo build retires when 0030a replaces `run_desktop`, and AGENTS.md drops `test.ps1 -AgentDemo` until Phase 10 brings agents back (RS6)
-- 0050 Per-CPU data and per-thread kernel stacks. Adds a kernel VA allocator for mappings made after the paging seal. Confirmed (2026-10-12: 0050-D1 to D4; RD21 dropped its SYSCALL rework clause); on `main`
+- 0050 Per-CPU data and per-thread kernel stacks. Adds a kernel VA allocator for mappings made after the paging seal. Confirmed (2026-10-12: 0050-D1 to D4; RD21 dropped its SYSCALL rework clause); on `main`, implemented on `claude/0050-impl`
 - 0059 Kernel heap v2: grows on demand, slab allocator, kernel memory charged to the owning process. Confirmed (2026-10-12: RD24, 0059-D1 to D4); on `main` as `0059-kernel-heap-v2.md`
 - 0054a (split): frame allocator v2, per-frame refcounts, dynamic per-process limits, and the S18 reserve and OOM order
 - 0051 Userspace on all CPUs: locking, user TLB shootdowns; NMI stop of all CPUs on panic (S17). Adds the S17 crash screen
