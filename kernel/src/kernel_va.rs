@@ -216,6 +216,8 @@ impl Window {
                     self.mark(start, total, true);
                     self.spans += 1;
                     self.reserved_pages += total;
+                    #[cfg(feature = "boot-smoke")]
+                    SPANS_BUILT.fetch_add(1, Ordering::Relaxed);
                     return Some(start);
                 }
             }
@@ -261,6 +263,10 @@ static BUSY: AtomicBool = AtomicBool::new(false);
 static READY: AtomicBool = AtomicBool::new(false);
 // Only the boot-smoke switch (0050 test 4) sets this.
 static TRANSPORT_WITHHELD: AtomicBool = AtomicBool::new(false);
+/// Spans ever reserved, monotonic (0054-D5's trim points make the live count
+/// non-monotonic; a session's fresh builds read as deltas of this).
+#[cfg(feature = "boot-smoke")]
+static SPANS_BUILT: AtomicUsize = AtomicUsize::new(0);
 /// The frame index at which the next stack build fails (0050 test 5), or
 /// `NO_INJECTION`. One-shot: `allocate_stack` consumes it.
 #[cfg(feature = "boot-smoke")]
@@ -342,6 +348,13 @@ pub unsafe fn init(tables: &mut PageTables, frames: &mut FrameAllocator<'_>) {
 pub fn stats() -> Result<KvaStats, KvaError> {
     let mut guard = WindowGuard::acquire()?;
     Ok(guard.window().stats())
+}
+
+/// Spans ever reserved, monotonic (0054-D5's trim points release spans, so a
+/// session's fresh builds read as deltas of this, never negative).
+#[cfg(feature = "boot-smoke")]
+pub fn spans_built_total() -> usize {
+    SPANS_BUILT.load(Ordering::Relaxed)
 }
 
 /// Take a stack from the reuse pool, newest first, or build one: reserve its

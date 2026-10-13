@@ -1652,6 +1652,7 @@ fn run_limits_pair(
 ) {
     let before = frames.stats().expect("recycling required").allocated_frames;
     let baseline = FrameBaseline::take(frames);
+    let built0 = kernel_va::spans_built_total();
     // Acceptance 4's commit half, in-kernel (no resume cycles): with the
     // normal class's lifted values, commit 256 MiB — past today's cap — then
     // to the 512 MiB bound, and fail one page past it where frames allow (the
@@ -1799,7 +1800,9 @@ fn run_limits_pair(
         zombie.check_charges_zero();
     }
     // The drain trims the stack pool (0050-D2), as run_pair's does.
-    let built = kernel_va::stats().expect("kernel VA stats").spans - baseline.stacks.spans;
+    // 0054-D5's in-loop trims release spans; count this session's fresh
+    // builds by the monotonic counter instead.
+    let built = kernel_va::spans_built_total() - built0;
     // SAFETY: The BSP with IF=0 and the kernel root active; no thread runs.
     let pooled = unsafe { kernel_va::take_pool_high_water(kernel) };
     SESSION_HIGH_WATER.fetch_max(
@@ -1857,6 +1860,7 @@ fn run_oom_pair(
 ) {
     let before = frames.stats().expect("recycling required").allocated_frames;
     let baseline = FrameBaseline::take(frames);
+    let built0 = kernel_va::spans_built_total();
     let requester = create_process(
         kernel,
         frames,
@@ -1954,7 +1958,9 @@ fn run_oom_pair(
         zombie.check_charges_zero();
     }
     // The drain trims the stack pool (0050-D2), as run_pair's does.
-    let built = kernel_va::stats().expect("kernel VA stats").spans - baseline.stacks.spans;
+    // 0054-D5's in-loop trims release spans; count this session's fresh
+    // builds by the monotonic counter instead.
+    let built = kernel_va::spans_built_total() - built0;
     // SAFETY: The BSP with IF=0 and the kernel root active; no thread runs.
     let pooled = unsafe { kernel_va::take_pool_high_water(kernel) };
     SESSION_HIGH_WATER.fetch_max(
@@ -2219,7 +2225,7 @@ fn resume_process(
     // Session pointers remain exclusively borrowed until deferred copy/syscall
     // work completes. No user context or interrupt handler is active here.
     if let State::Memory(request) = process.thread().state {
-        complete_memory(process, frames, ipc, request);
+        complete_memory(kernel, process, frames, ipc, request);
     }
     // A creation deferred through a syscall-buffer page-in completes here,
     // and the creator rejoins the run queue, as after any page-in.
@@ -2347,6 +2353,7 @@ fn kill_oom_victim(slot: usize, frames: &mut FrameAllocator<'_>, ipc: &mut Ipc) 
 /// 0054-D5: a frame-starved materialize kills one lower-class victim per round
 /// and retries, bounded, stopping when no candidate remains.
 fn materialize_or_kill(
+    kernel: &PageTables,
     process: &mut Process,
     frames: &mut FrameAllocator<'_>,
     ipc: &mut Ipc,
@@ -2369,11 +2376,17 @@ fn materialize_or_kill(
         };
         match result {
             Err(vm::VmError::NoFrames) => {
+                // 0050-D2's trim points (0054-D5): reclaim the pooled kernel
+                // stacks before choosing a victim and again after each kill,
+                // before the retry. A withheld shootdown transport just skips
+                // the reclaim.
+                let _ = drain_stacks(kernel, frames);
                 let requester = Some((sched::slot_of(process), process.memory_class));
                 let Some(victim) = sched::select_victim(requester) else {
                     return Err(vm::VmError::NoFrames);
                 };
                 kill_oom_victim(victim, frames, ipc);
+                let _ = drain_stacks(kernel, frames);
             }
             result => return result,
         }
@@ -2383,6 +2396,7 @@ fn materialize_or_kill(
 /// Complete bounded VM work with the kernel root active and no interrupt frames
 /// or published process borrow. Disjoint I/O sessions remain borrowed by resume.
 fn complete_memory(
+    kernel: &PageTables,
     process: &mut Process,
     frames: &mut FrameAllocator<'_>,
     ipc: &mut Ipc,
@@ -2435,7 +2449,8 @@ fn complete_memory(
             process.thread_mut().state = State::Ready;
         }
         MemoryRequest::Fault { address, error } => {
-            let result = materialize_or_kill(process, frames, ipc, address, 1, error & 2 != 0);
+            let result =
+                materialize_or_kill(kernel, process, frames, ipc, address, 1, error & 2 != 0);
             if result.is_ok() {
                 #[cfg(feature = "boot-smoke")]
                 {
@@ -2459,7 +2474,8 @@ fn complete_memory(
             // SAFETY: Complete access validation preceded this deferral; repeat
             // it in materialize before allocating or performing syscall work.
             // 0054-D5: frame starvation kills a lower-class victim and retries.
-            let result = materialize_or_kill(process, frames, ipc, address, length, writable);
+            let result =
+                materialize_or_kill(kernel, process, frames, ipc, address, length, writable);
             if let Err(error) = result {
                 process.thread_mut().context.frame.rax = (if error.errno() == -12 {
                     -12_i64
@@ -3187,6 +3203,17 @@ fn add_thread(
     start: &thread_abi::ThreadStart,
 ) -> Result<u64, i64> {
     let index = vacant_member(process)?;
+    // 0054-D4: a fresh kernel stack preflights its frames on the owner's
+    // class; pooled reuse costs nothing (0050-D2).
+    let fresh = kernel_va::stats().is_ok_and(|stats| stats.pooled == 0);
+    if fresh
+        && !frames.preflight_reserve(
+            kernel_va::STACK_PAGES,
+            process.memory_class.may_draw_reserve(),
+        )
+    {
+        return Err(-12);
+    }
     let kernel_stack = build_stack(kernel, frames, process.direct_map).map_err(|_| -11)?;
     // A running thread's own entry is the process's current member; this
     // insert touches only a vacant slot and the table's occupancy bitmap.
