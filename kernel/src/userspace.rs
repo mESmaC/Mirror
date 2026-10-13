@@ -65,8 +65,10 @@ const QUANTUM_TICKS: u64 = 2;
 // 0030a). Leave headroom for the complete debug workload, including IRQs
 // delivered on syscall return. This finite lifetime allowance is shared by all
 // its threads; it does not change the independent recurring budgets of
-// ordinary services.
-const USER_TICK_BUDGET: u64 = 128;
+// ordinary services. Spec 0051's per-trap scheduler lock and checks raised
+// role 0's debug charge from 53-81 ticks to 60-106 at one and four CPUs, and
+// host load pushed some boots past 128, so the allowance is 192.
+const USER_TICK_BUDGET: u64 = 192;
 /// The SMP battery's lifetime allowance, across all its threads on every CPU
 /// (spec 0051, step 5): far past its bounded phases on eight CPUs, while a
 /// battery stuck in a spin still ends.
