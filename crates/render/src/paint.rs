@@ -93,9 +93,10 @@ const BAYER: [u8; 64] = [
     63, 31, 55, 23, 61, 29, 53, 21,
 ];
 
-/// Interpolate the stops at `t` and quantize with the Bayer perturbation:
-/// each channel is computed in 16.16, then the dither adds up to half an
-/// 8-bit step before truncation.
+/// Interpolate the stops at `t` and quantize with the Bayer threshold:
+/// out = floor(v + threshold) with threshold = (2*cell+1)/128 in (0,1), the
+/// standard ordered-dither quantization. Integer-valued channels (opaque
+/// alpha, equal-color stops) are preserved exactly at every phase.
 fn sample_stops(stops: &[GradientStop], t: u16, dx: u32, dy: u32) -> Rgba {
     if stops.is_empty() {
         return Rgba::TRANSPARENT;
@@ -120,8 +121,8 @@ fn sample_stops(stops: &[GradientStop], t: u16, dx: u32, dy: u32) -> Rgba {
         let cb = (cb as i64) << 16;
         ca + (cb - ca) * f as i64 / span as i64
     };
-    let dither = ((BAYER[(dy as usize % 8) * 8 + (dx as usize % 8)] as i64) - 32) << 10;
-    let quant = |v: i64| -> u8 { ((v + dither).clamp(0, 255 << 16) >> 16) as u8 };
+    let dither = ((BAYER[(dy as usize % 8) * 8 + (dx as usize % 8)] as i64) * 2 + 1) << 9;
+    let quant = |v: i64| -> u8 { ((v + dither) >> 16).clamp(0, 255) as u8 };
     Rgba {
         r: quant(mix(a.color.r, b.color.r)),
         g: quant(mix(a.color.g, b.color.g)),

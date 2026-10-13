@@ -220,6 +220,10 @@ impl PathBuilder {
 /// Squared distance of `p` from the chord `a`-`b`, scaled by the squared
 /// chord length (so the comparison stays in integers): the curve is flat
 /// when cross(p)^2 <= TOLERANCE^2 * len^2.
+/// A control point is flat enough when its perpendicular distance to the
+/// chord is under the tolerance AND its projection along the chord stays
+/// within the chord (plus tolerance) — a collinear control point beyond an
+/// endpoint means a real excursion the chord would discard (review P3).
 fn flat_enough(a: Point, p: Point, b: Point) -> bool {
     let dx = (b.0 - a.0) as i64;
     let dy = (b.1 - a.1) as i64;
@@ -234,7 +238,13 @@ fn flat_enough(a: Point, p: Point, b: Point) -> bool {
     let cross = dx * (p.1 - a.1) as i64 - dy * (p.0 - a.0) as i64;
     // |cross| <= tol * len, avoiding a cross*cross that overflows i64.
     let len = fixed::sqrt32(len2) as i64;
-    cross.abs() <= tol * len
+    if cross.abs() > tol * len {
+        return false;
+    }
+    // The projection must not overshoot the chord: -tol*len <= proj*len
+    // <= len2 + tol*len.
+    let proj = dx * (p.0 - a.0) as i64 + dy * (p.1 - a.1) as i64;
+    (-tol * len..=len2 + tol * len).contains(&proj)
 }
 
 const MAX_DEPTH: u32 = 12;

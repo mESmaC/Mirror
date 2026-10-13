@@ -65,15 +65,18 @@ fn box_radius(blur: u32) -> usize {
 }
 
 /// Blur a mask in place: three separable box passes, edge-clamped windows.
+/// A zero blur is the identity (review P5).
 pub fn blur_mask(mask: &mut Mask, blur: u32, probe: &mut dyn FrameProbe) {
     probe.begin(Span::Blur);
-    let r = box_radius(blur);
-    let (w, h) = (mask.width() as usize, mask.height() as usize);
-    if w > 0 && h > 0 {
-        let mut tmp = alloc::vec![0u8; w * h];
-        for _ in 0..3 {
-            box_pass_h(mask, &mut tmp, r);
-            box_pass_v(&tmp, mask, r);
+    if blur > 0 {
+        let r = box_radius(blur);
+        let (w, h) = (mask.width() as usize, mask.height() as usize);
+        if w > 0 && h > 0 {
+            let mut tmp = alloc::vec![0u8; w * h];
+            for _ in 0..3 {
+                box_pass_h(mask, &mut tmp, r);
+                box_pass_v(&tmp, mask, r);
+            }
         }
     }
     probe.end(Span::Blur);
@@ -127,8 +130,10 @@ fn box_pass_v(src: &[u8], dst: &mut Mask, r: usize) {
     }
 }
 
-/// Draw a path's shadows under the shape: rasterize, blur (cached), and
-/// paint the mask in each shadow's color at its offset.
+/// Draw a path's shadows under the shape: rasterize, pad the mask with
+/// transparent pixels for the blur's support (review P1: without padding a
+/// solid shape's mask is uniform, and the edge-clamped blur cannot spread),
+/// blur (cached), and paint the mask in each shadow's color at its offset.
 pub fn draw_shadow(
     dst: &mut Surface,
     path: &Path,
@@ -144,16 +149,41 @@ pub fn draw_shadow(
     let (mask, origin) = raster::rasterize(path);
     probe.end(Span::Raster);
     for shadow in shadows {
-        let blurred = cache.blurred(&mask, shadow.blur, probe);
+        // Three passes spread coverage up to 3r pixels; pad by that plus
+        // one so the blur tail is fully inside the mask.
+        let pad = if shadow.blur == 0 {
+            0
+        } else {
+            3 * box_radius(shadow.blur) as i32 + 1
+        };
+        let padded = pad_mask(&mask, pad);
+        let blurred = cache.blurred(&padded, shadow.blur, probe);
         let paint = Paint::Solid(shadow.color);
         crate::draw::paint_mask_at(
             dst,
             blurred,
-            (origin.0 + shadow.dx, origin.1 + shadow.dy),
+            (origin.0 + shadow.dx - pad, origin.1 + shadow.dy - pad),
             &paint,
             clip,
         );
     }
+}
+
+/// A mask with `pad` transparent pixels added on every side.
+fn pad_mask(mask: &Mask, pad: i32) -> Mask {
+    if pad <= 0 {
+        return mask.clone();
+    }
+    let mut out = Mask::new(
+        mask.width() + 2 * pad as u32,
+        mask.height() + 2 * pad as u32,
+    );
+    for y in 0..mask.height() as i32 {
+        for x in 0..mask.width() as i32 {
+            out.set(x + pad, y + pad, mask.get(x, y));
+        }
+    }
+    out
 }
 
 /// A bounded LRU cache of blurred shadow masks, keyed by mask content,

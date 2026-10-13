@@ -40,13 +40,26 @@ fn decode(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
     (w, h, bytes[16..].to_vec())
 }
 
+/// Blessing requires exactly `MIRROR_RENDER_BLESS=1` (0027c-D10, review
+/// P7): any other value, or an unset variable, keeps the gate closed.
+fn parse_bless(value: Option<String>) -> bool {
+    value.as_deref() == Some("1")
+}
+
 fn check(name: &str, surface: &Surface) {
+    check_inner(name, surface, parse_bless(std::env::var(BLESS).ok()));
+}
+
+fn check_inner(name: &str, surface: &Surface, bless: bool) {
     let path = golden_dir().join(std::format!("{name}.rgba"));
     let actual = encode(surface);
-    let blessed = std::env::var(BLESS).is_ok();
     match std::fs::read(&path) {
         Ok(expected) if expected == actual => {}
-        Ok(expected) if !blessed => {
+        _ if bless => {
+            std::fs::create_dir_all(golden_dir()).unwrap();
+            std::fs::write(&path, &actual).unwrap();
+        }
+        Ok(expected) => {
             let (w, h, _) = decode(&expected);
             assert_eq!(
                 (w, h),
@@ -65,10 +78,8 @@ fn check(name: &str, surface: &Surface) {
                 dump.display()
             );
         }
-        _ => {
-            std::fs::create_dir_all(golden_dir()).unwrap();
-            std::fs::write(&path, &actual).unwrap();
-            assert!(blessed, "{name}: golden written; rerun tests to verify");
+        Err(e) => {
+            panic!("{name}: golden missing or unreadable ({e}); create it with {BLESS}=1")
         }
     }
 }
@@ -381,6 +392,32 @@ fn dump_scenes_for_review() {
 }
 
 // ---------- PNG dump (test-only, uncompressed zlib) ----------
+
+#[test]
+fn bless_requires_exactly_one() {
+    // P7: only "1" blesses; unset, empty and "0" keep the gate closed.
+    assert!(!parse_bless(None));
+    assert!(!parse_bless(Some(std::string::String::new())));
+    assert!(!parse_bless(Some("0".into())));
+    assert!(!parse_bless(Some(" 1".into())));
+    assert!(parse_bless(Some("1".into())));
+}
+
+#[test]
+#[should_panic(expected = "golden missing or unreadable")]
+fn missing_golden_fails_without_bless() {
+    check_inner("no-such-golden-exists", &Surface::new(2, 2), false);
+}
+
+#[test]
+fn bless_writes_a_missing_golden() {
+    let name = "bless-probe-temp";
+    let path = golden_dir().join(std::format!("{name}.rgba"));
+    let _ = std::fs::remove_file(&path);
+    check_inner(name, &Surface::new(2, 2), true);
+    assert!(path.exists());
+    std::fs::remove_file(&path).unwrap();
+}
 
 fn png(surface: &Surface) -> Vec<u8> {
     let (w, h) = (surface.width(), surface.height());

@@ -111,7 +111,9 @@ impl Wallpaper {
             ],
         };
         let mut paints = vec![base];
-        for &(px_, py_, rx, ry, color) in &self.glows {
+        // CSS backgrounds paint the FIRST listed layer frontmost, so the
+        // glows go on the back-to-front list in reverse (review P6).
+        for &(px_, py_, rx, ry, color) in self.glows.iter().rev() {
             // "color 0%, transparent 55%": the glow fades to nothing.
             let stops = vec![
                 GradientStop { t: 0, color },

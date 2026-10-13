@@ -603,6 +603,199 @@ fn parse_hex(hex: &str) -> mirror_ui_tokens::Rgb {
     }
 }
 
+// ---------- review regressions (0027c-4085cb1) ----------
+
+#[test]
+fn shadow_spreads_beyond_the_shape() {
+    // P1: a solid rect's shadow must extend past the rect's bounds.
+    let mut s = Surface::filled(200, 200, Rgba::opaque(DARK.base));
+    let mut cache = shadow::ShadowCache::new(1 << 20);
+    let mut probe = NoProbe;
+    let rect = rounded(60, 60, 40, 40, 0);
+    shadow::draw_shadow(
+        &mut s,
+        &rect,
+        &[shadow::Shadow {
+            dx: 0,
+            dy: 8,
+            blur: 12,
+            color: Rgba::from_rgba(0, 0, 0, 128),
+        }],
+        &Clip::none(),
+        &mut cache,
+        &mut probe,
+    );
+    // Outside the shape's own bounds (which end at y=100): blurred tail.
+    assert!(s.get(80, 106).a > 0, "shadow tail below the shape");
+    assert!(s.get(56, 80).a > 0, "shadow tail left of the shape");
+}
+
+#[test]
+fn nonzero_winding_does_not_cancel() {
+    // P2: two half-pixel rects, one clockwise and one counterclockwise,
+    // tile one pixel: full coverage, no cancellation.
+    let mut b = PathBuilder::new();
+    let h = fixed::ONE / 2;
+    // Clockwise in y-down over [0, 0.5]x[0, 1].
+    b.move_to(0, 0)
+        .line_to(h, 0)
+        .line_to(h, fixed::ONE)
+        .line_to(0, fixed::ONE)
+        .close();
+    // Counterclockwise over [0.5, 1]x[0, 1].
+    b.move_to(h, 0)
+        .line_to(h, fixed::ONE)
+        .line_to(fixed::ONE, fixed::ONE)
+        .line_to(fixed::ONE, 0)
+        .close();
+    let (mask, _) = raster::rasterize(&b.build());
+    assert_eq!(mask.get(0, 0), 255, "tiled half-rects cover fully");
+
+    // Same-winding identical rects still count once.
+    let mut b = PathBuilder::new();
+    b.rect(0, 0, fixed::ONE, fixed::ONE);
+    b.rect(0, 0, fixed::ONE, fixed::ONE);
+    let (mask, _) = raster::rasterize(&b.build());
+    assert_eq!(mask.get(0, 0), 255, "overlaps do not double-count");
+
+    // A counterclockwise hole inside a clockwise rect stays empty.
+    let mut b = PathBuilder::new();
+    b.rect(0, 0, fixed::px(4), fixed::px(4));
+    b.move_to(fixed::px(1), fixed::px(1))
+        .line_to(fixed::px(1), fixed::px(3))
+        .line_to(fixed::px(3), fixed::px(3))
+        .line_to(fixed::px(3), fixed::px(1))
+        .close();
+    let (mask, _) = raster::rasterize(&b.build());
+    assert_eq!(mask.get(2, 2), 0, "opposite-winding hole stays empty");
+    assert_eq!(mask.get(0, 0), 255);
+}
+
+#[test]
+fn collinear_excursions_survive_flattening() {
+    // P3: a quadratic (0,0)-(20,0)-(10,0) reaches x = 13 1/3 at t = 2/3.
+    let mut b = PathBuilder::new();
+    b.move_to(0, 0).quad_to(fixed::px(20), 0, fixed::px(10), 0);
+    let max_x = b
+        .build()
+        .flatten()
+        .iter()
+        .flat_map(|s| s.points.iter().map(|p| p.0))
+        .max()
+        .unwrap();
+    assert!(
+        max_x > fixed::px(13),
+        "quad excursion kept: {} px",
+        max_x as f64 / 65536.0
+    );
+    // A cubic (0,0)-(20,0)-(20,0)-(10,0) has the same kind of excursion.
+    let mut b = PathBuilder::new();
+    b.move_to(0, 0)
+        .cubic_to(fixed::px(20), 0, fixed::px(20), 0, fixed::px(10), 0);
+    let max_x = b
+        .build()
+        .flatten()
+        .iter()
+        .flat_map(|s| s.points.iter().map(|p| p.0))
+        .max()
+        .unwrap();
+    assert!(
+        max_x > fixed::px(12),
+        "cubic excursion kept: {} px",
+        max_x as f64 / 65536.0
+    );
+}
+
+#[test]
+fn dither_preserves_opaque_alpha_and_constants() {
+    // P4: opaque stops keep alpha 255 at every Bayer phase, and a gradient
+    // between two equal stops is exact everywhere.
+    let opaque = Paint::Linear {
+        x0: 0,
+        y0: 0,
+        x1: fixed::px(64),
+        y1: 0,
+        stops: vec![
+            GradientStop {
+                t: 0,
+                color: Rgba::opaque(DARK.accent),
+            },
+            GradientStop {
+                t: u16::MAX,
+                color: Rgba::opaque(DARK.danger),
+            },
+        ],
+    };
+    for y in 0..8u32 {
+        for x in 0..64u32 {
+            let c = opaque.sample(
+                fixed::px(x as i32) + 32768,
+                fixed::px(y as i32) + 32768,
+                x,
+                y,
+            );
+            assert_eq!(c.a, 255, "opaque gradient alpha at phase ({x},{y})");
+        }
+    }
+    let constant = Paint::Linear {
+        x0: 0,
+        y0: 0,
+        x1: fixed::px(64),
+        y1: 0,
+        stops: vec![
+            GradientStop {
+                t: 0,
+                color: Rgba::from_rgba(10, 100, 200, 90),
+            },
+            GradientStop {
+                t: u16::MAX,
+                color: Rgba::from_rgba(10, 100, 200, 90),
+            },
+        ],
+    };
+    for y in 0..8u32 {
+        for x in 0..64u32 {
+            let c = constant.sample(
+                fixed::px(x as i32) + 32768,
+                fixed::px(y as i32) + 32768,
+                x,
+                y,
+            );
+            assert_eq!(
+                c,
+                Rgba::from_rgba(10, 100, 200, 90),
+                "constant gradient at phase ({x},{y})"
+            );
+        }
+    }
+}
+
+#[test]
+fn zero_blur_is_identity() {
+    // P5: blur 0 changes nothing.
+    let mut mask = Mask::new(3, 1);
+    mask.set(1, 0, 255);
+    let before = mask.clone();
+    let mut probe = NoProbe;
+    shadow::blur_mask(&mut mask, 0, &mut probe);
+    assert_eq!(mask, before);
+}
+
+#[test]
+fn wallpaper_glows_paint_first_listed_on_top() {
+    // P6: paints() is back-to-front, so the second CSS glow comes before
+    // the first: dark glows are (1100, 620) then (950, 640) in the CSS.
+    let rect = clip::Rect::new(0, 0, 300, 100);
+    let paints = WALLPAPER_DARK.paints(rect);
+    assert_eq!(paints.len(), 3);
+    let rx_of = |p: &Paint| match p {
+        Paint::Radial { rx, .. } => *rx,
+        _ => 0,
+    };
+    assert_eq!(rx_of(&paints[1]), fixed::px(950));
+    assert_eq!(rx_of(&paints[2]), fixed::px(1100));
+}
+
 // ---------- golden scenes (0027c-D10) ----------
 
 mod golden;
