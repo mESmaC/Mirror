@@ -843,10 +843,11 @@ pub(super) fn selection_self_test(
     for slot in slots {
         // SAFETY: the process never ran, and nothing references it.
         let process = unsafe { process(slot) };
-        if process.finished() {
-            process.release_threads();
+        if !process.finished() {
+            process.finish(Outcome::Exit(0));
         }
-        // SAFETY: it never ran, finished or not, and nothing references it.
+        process.release_threads();
+        // SAFETY: it never ran and nothing references it.
         let mut process = unsafe { discard(slot) };
         // SAFETY: its root has never been active, and nothing references its
         // tree.

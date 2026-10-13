@@ -433,10 +433,12 @@ impl Vm {
         if self.committed + count * PAGE_SIZE > self.committed_limit {
             return Err(VmError::QuotaExceeded);
         }
-        // 0054-D4: preflight this operation's worst-case frames — the data
-        // pages plus their page-table pages — against the reserve floor. One
-        // check per operation, so no partial operation straddles the floor.
-        let worst_case = count + count / 512 + 2;
+        // 0054-D4: preflight this operation's worst-case frames against the
+        // reserve floor; one check per operation, so no partial operation
+        // straddles the floor. The data pages, plus every page-table page the
+        // span could miss: one P1 table per 512 pages (plus one for boundary
+        // misalignment), one P2 per 262144 pages (plus one), and one P3.
+        let worst_case = count + count / 512 + count / 262144 + 4;
         if !frames.preflight_reserve(worst_case as usize, self.may_draw_reserve) {
             return Err(VmError::NoFrames);
         }

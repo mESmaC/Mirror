@@ -500,6 +500,12 @@ function Invoke-MirrorHygieneProbe {
         Start-Sleep -Milliseconds 100
     } while ($true)
     Assert-MirrorTraceMarker -Serial $serial -Expected $false
+    # 0054-D3/D6: the pool and reserve records are checked in every flavor,
+    # and a default boot never kills a victim.
+    Assert-MirrorFramePool -Serial $serial
+    if ($serial -match '(?m)^MIRROR_OOM_KILL(?:\s|$)') {
+        throw "The default kernel unexpectedly killed an OOM victim. See $serialLog."
+    }
     if ([regex]::Matches($serial, '(?m)^MIRROR_AHCI_PROBE_OK fixture=0 reads=1\r?$').Count -ne 1) {
         throw "The default kernel must probe the decoy with one sector-0 read (MIRROR_AHCI_PROBE_OK fixture=0 reads=1). See $serialLog."
     }
@@ -767,6 +773,10 @@ try {
         if ($serial -notmatch "(?m)^$marker(?:\s|$)") { throw "Normal boot missing $marker. See $serialLog." }
     }
     Assert-MirrorFramePool -Serial $serial
+    # 0054-D6: a trace boot never kills a victim.
+    if ($serial -match '(?m)^MIRROR_OOM_KILL(?:\s|$)') {
+        throw "Trace boot unexpectedly reported an OOM kill. See $serialLog."
+    }
     # Trace kernels run no init battery and recognize no fixture (spec 0010).
     foreach ($marker in @('MIRROR_USERSPACE_OK', 'MIRROR_USER_CLEANUP_OK', 'MIRROR_SCHEDULER_OK', 'MIRROR_IPC_OK', 'MIRROR_PREEMPT_OK', 'MIRROR_SCHED_BOUNDS_OK', 'MIRROR_USER_SURFACE_OK', 'MIRROR_USER_SURFACE_CLEANUP_OK', 'MIRROR_USER_CLOCK_OK', 'MIRROR_AHCI_READ_OK', 'MIRROR_HEAP_CHARGE_OK')) {
         if ($serial -match "(?m)^$marker(?:\s|$)") { throw "Trace boot unexpectedly reported $marker. See $serialLog." }

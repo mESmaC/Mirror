@@ -1032,7 +1032,7 @@ try {
             throw "The OomOrder scenario must kill exactly one background victim before the requester completes. See $serialLog."
         }
     }
-    elseif ($oomKills.Count -ne 0 -or $requesterDone.Count -ne 0) {
+    elseif ([regex]::Matches($serial, '(?m)^MIRROR_OOM_KILL(?:\s|$)').Count -ne 0 -or $requesterDone.Count -ne 0) {
         throw "Mirror unexpectedly ran OOM victim selection. See $serialLog."
     }
     # 0054-D5's lifted class limits, in the 1024 MiB boot: the normal
