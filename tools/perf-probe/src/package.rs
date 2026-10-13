@@ -422,7 +422,7 @@ fn validate_release_proof(proof: &Value, package_id: Option<&str>) -> io::Result
     ];
     match state {
         "owner-record" => {}
-        "detached" => fields.extend(["detached_path", "detached_identity"]),
+        "detached" | "removed" => fields.extend(["detached_path", "detached_identity"]),
         _ => return Err(record::invalid("unknown owner release state")),
     }
     proof.fields(&fields)?;
@@ -455,7 +455,7 @@ fn validate_release_proof(proof: &Value, package_id: Option<&str>) -> io::Result
     {
         return Err(record::invalid("invalid owner release state or slot"));
     }
-    if state == "detached" {
+    if matches!(state, "detached" | "removed") {
         let detached_text = proof.get("detached_path")?.string()?;
         let detached = std::path::Path::new(detached_text);
         let suffix = detached
@@ -546,6 +546,12 @@ pub trait Backend {
     /// Close the released lease; optional identity-checked detach returns the
     /// same base proof with state=detached and its sibling path/identity.
     fn close_released(&mut self) -> io::Result<Option<Value>>;
+    /// Called only after the detached proof is durable in journal and final.
+    /// Remove only the verified sibling generation. Denial retains that proof
+    /// and must not invalidate the package or block a fresh acquisition.
+    fn cleanup_released(&mut self) -> io::Result<bool> {
+        Ok(false)
+    }
 }
 fn phase(b: &mut impl Backend, p: &mut Progress, name: &str) -> io::Result<()> {
     p.phase = name.into();
@@ -687,6 +693,18 @@ fn finalize(b: &mut impl Backend, mut p: Progress) -> io::Result<Progress> {
         // Failure here preserves the earlier valid owner-record final; the
         // adapter also journals detach intent before moving the directory.
         b.persist(&p, true)?;
+        match b.cleanup_released() {
+            Ok(true) => {
+                p.lock_release
+                    .as_mut()
+                    .unwrap()
+                    .set("state", Value::text("removed"))?;
+                Progress::parse(&p.record())?;
+                b.persist(&p, true)?;
+            }
+            Ok(false) => (),
+            Err(error) => eprintln!("detached lease cleanup retained: {error}"),
+        }
     }
     Ok(p)
 }
@@ -704,6 +722,7 @@ mod tests {
         released: bool,
         expire_build: bool,
         detach: bool,
+        remove_detached: bool,
         wrong_detach: bool,
         fail_detached_final: bool,
         durable_final: Option<Value>,
@@ -721,6 +740,7 @@ mod tests {
                 released: false,
                 expire_build: false,
                 detach: false,
+                remove_detached: false,
                 wrong_detach: false,
                 fail_detached_final: false,
                 durable_final: None,
@@ -850,6 +870,21 @@ mod tests {
             } else {
                 Ok(None)
             }
+        }
+        fn cleanup_released(&mut self) -> io::Result<bool> {
+            let durable = Progress::parse(self.durable_final.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                durable
+                    .lock_release
+                    .unwrap()
+                    .get("state")
+                    .unwrap()
+                    .string()
+                    .unwrap(),
+                "detached"
+            );
+            self.step("remove-detached")?;
+            Ok(self.remove_detached)
         }
     }
     fn release_proof() -> Value {
@@ -1070,6 +1105,7 @@ mod tests {
         denied.detach = true;
         denied.fail_detached_final = true;
         assert!(run(&mut denied).is_err());
+        assert!(!denied.calls.iter().any(|s| s == "remove-detached"));
         let retained = Progress::parse(denied.durable_final.as_ref().unwrap()).unwrap();
         assert_eq!(retained.verdict, Verdict::FinalizedValid);
         assert_eq!(
@@ -1092,5 +1128,39 @@ mod tests {
                 .verdict,
             Verdict::FinalizedValid
         );
+    }
+    #[test]
+    fn detached_cleanup_requires_durable_proof_and_denial_preserves_validity() {
+        for fail in [None, Some("remove-detached")] {
+            let mut fake = Fake::new(fail);
+            fake.detach = true;
+            fake.remove_detached = true;
+            let result = run(&mut fake).unwrap();
+            assert_eq!(result.verdict, Verdict::FinalizedValid);
+            assert!(result.first_failure.is_none());
+            let proof = result.lock_release.as_ref().unwrap();
+            assert_eq!(
+                proof.get("state").unwrap().string().unwrap(),
+                if fail.is_none() {
+                    "removed"
+                } else {
+                    "detached"
+                }
+            );
+            assert_eq!(
+                Progress::parse(fake.durable_final.as_ref().unwrap())
+                    .unwrap()
+                    .record(),
+                result.record()
+            );
+            let mut forged = result.clone();
+            forged
+                .lock_release
+                .as_mut()
+                .unwrap()
+                .set("detached_identity", Value::text("wrong"))
+                .unwrap();
+            assert!(Progress::parse(&forged.record()).is_err());
+        }
     }
 }

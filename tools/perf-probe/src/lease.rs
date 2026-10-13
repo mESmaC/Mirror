@@ -44,6 +44,18 @@ mod platform {
             "leases require Windows identity handles",
         ))
     }
+    pub fn cleanup_owner(_: &Path) -> io::Result<File> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "leases require Windows identity handles",
+        ))
+    }
+    pub fn delete(_: &File) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "leases require Windows identity handles",
+        ))
+    }
     pub fn rename(_: &File, _: &Path) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -149,6 +161,118 @@ pub struct ReleaseRecord {
 pub struct Detached {
     pub path: PathBuf,
     pub identity: Identity,
+}
+
+/// Optionally remove the caller's own finalized detached generation. Before
+/// calling, durably persist the final state, release proof and completed detach
+/// outside this directory. Retain that evidence even when cleanup succeeds.
+///
+/// Only a matching lane owner file and its then-empty directory are deleted, by
+/// held identity handles. An unexpected entry or any validation/deletion denial
+/// returns an error; it cannot affect a fresh slot or invalidate the final state.
+/// A failure after owner deletion may leave an empty detached directory, while
+/// the required durable release/detach records still provide its evidence.
+pub fn cleanup_detached(
+    detached: &Detached,
+    release: &ReleaseRecord,
+    owner: &Owner,
+) -> io::Result<()> {
+    owner.validate()?;
+    if detached.identity != release.directory_identity
+        || owner.run != release.run
+        || owner.lease != release.lease
+        || !utc(&release.released)
+        || !release.slot.is_absolute()
+        || !detached.path.is_absolute()
+    {
+        return Err(invalid("detached cleanup does not match release identity"));
+    }
+    let slot_name = release
+        .slot
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| matches!(*name, "qemu" | "qemu2"))
+        .ok_or_else(|| invalid("detached cleanup requires a known slot"))?;
+    let prefix = format!("{slot_name}.released.");
+    let suffix = detached
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(&prefix))
+        .ok_or_else(|| invalid("cleanup path is not a detached slot sibling"))?;
+    let mut parts = suffix.split('-');
+    for _ in 0..3 {
+        if parts
+            .next()
+            .is_none_or(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return Err(invalid("invalid detached generation suffix"));
+        }
+    }
+    if parts.next().is_some() {
+        return Err(invalid("invalid detached generation suffix"));
+    }
+    let parent = crate::paths::canonical_no_reparse(
+        release
+            .slot
+            .parent()
+            .ok_or_else(|| invalid("release slot has no parent"))?,
+    )?;
+    let detached_parent = crate::paths::canonical_no_reparse(
+        detached
+            .path
+            .parent()
+            .ok_or_else(|| invalid("detached path has no parent"))?,
+    )?;
+    if !crate::paths::contains(&parent, &detached_parent)
+        || !crate::paths::contains(&detached_parent, &parent)
+    {
+        return Err(invalid("detached cleanup escaped the slot parent"));
+    }
+    // Deny parent/directory renames throughout path validation and owner locking.
+    // Deletion itself uses only the identity-checked handles, never these paths.
+    let _parent_guard = platform::directory(&parent)?;
+    let path = crate::paths::canonical_no_reparse(&detached.path)?;
+    let directory = platform::directory(&path)?;
+    if platform::identity(&directory)? != release.directory_identity {
+        return Err(invalid("detached directory identity changed"));
+    }
+    let owner_path = path.join("owner.txt");
+    crate::paths::canonical_no_reparse(&owner_path)?;
+    let mut owner_file = platform::cleanup_owner(&owner_path)?;
+    platform::verify_owner(&owner_file, &owner_path)?;
+    if platform::identity(&owner_file)? != release.owner_identity {
+        return Err(invalid("detached owner identity changed"));
+    }
+    let record = read_record(&mut owner_file)?;
+    validate_recovery(owner, &record, None)?;
+    if record.required("lease")? != release.lease
+        || record.required("release_run")? != release.run
+        || record.required("release_lease")? != release.lease
+        || record.required("released_by")? != owner.operator()
+        || record.released.as_deref() != Some(release.released.as_str())
+        || record.required("started")? != owner.started
+        || record.required("worktree")? != path_text(&owner.worktree)?
+    {
+        return Err(invalid(
+            "detached owner does not match the finalized release",
+        ));
+    }
+    // Read at most two entries: only the one regular identity-bound owner file is
+    // eligible. Windows checks emptiness again atomically when deleting the dir.
+    let mut entries = fs::read_dir(&path)?;
+    let entry = entries
+        .next()
+        .ok_or_else(|| invalid("detached owner entry missing"))??;
+    if entry.file_name() != "owner.txt" || entries.next().is_some() {
+        return Err(invalid("detached directory contains unexpected entries"));
+    }
+    drop(entries);
+    platform::delete(&owner_file)?;
+    drop(owner_file);
+    platform::delete(&directory)?;
+    drop(directory);
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,7 +404,10 @@ impl Lease {
             let directory_identity = platform::identity(&directory)?;
             platform::verify_owner(&owner_file, &slot.join("owner.txt"))?;
             let owner_identity = platform::identity(&owner_file)?;
-            let record = read_record(&mut owner_file)?;
+            // An existing record that we cannot fully understand is still an occupied
+            // slot. Never reclaim it, and let a caller try its other permitted slot.
+            let record = read_record(&mut owner_file)
+                .map_err(|error| busy(&format!("unreadable or ambiguous owner record: {error}")))?;
             if record.released.is_some() {
                 if record.values.get("lease") == Some(&owner.lease) {
                     return Err(invalid("a released lease identifier cannot be reused"));
@@ -344,6 +471,9 @@ impl Lease {
     }
     pub fn detached_before_acquire(&self) -> &[Detached] {
         &self.detached_before_acquire
+    }
+    pub fn release_record(&self) -> Option<&ReleaseRecord> {
+        self.released.as_ref()
     }
 
     /// Caller must first durably persist the eligible final state and release intent.
@@ -526,6 +656,10 @@ fn read_record(file: &mut File) -> io::Result<Record> {
             {
                 return Err(invalid("ambiguous manual owner aliases"));
             }
+        }
+        let allowed = ["nick", "task", "worktree", "started", "lease", "released"];
+        if values.keys().any(|key| !allowed.contains(&key.as_str())) {
+            return Err(invalid("unknown manual owner field"));
         }
     }
     for key in ["nick", "task", "worktree", "started"] {
@@ -921,6 +1055,189 @@ mod tests {
         }
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn malformed_and_unknown_manual_owners_are_busy_without_mutation() {
+        let root = root();
+        let slot = root.join("qemu");
+        fs::create_dir(&slot).unwrap();
+        let identity = platform::identity(&platform::directory(&slot).unwrap()).unwrap();
+        let manual =
+            "nick=claude\ntask=manual\nworktree=C:/temporary\nstarted=2026-10-13T03:00:00Z\n";
+        let records = [
+            "nick: claude\ntask: manual\n".as_bytes().to_vec(),
+            format!("\u{feff}{manual}").into_bytes(),
+            format!("{manual}unknown=field\nreleased=2026-10-13T03:01:00Z\n").into_bytes(),
+            format!("{manual}nick=kimi\nreleased=2026-10-13T03:01:00Z\n").into_bytes(),
+            format!("{manual}owner=claude\nreleased=2026-10-13T03:01:00Z\n").into_bytes(),
+            format!("{manual}released=2026-10-13T03:01:00Z\nunknown=field\n").into_bytes(),
+            format!("{manual}released=not-a-time\n").into_bytes(),
+            format!("{manual}released=2026-10-13T03:01:00Z").into_bytes(),
+            b"nick=\xff\n".to_vec(),
+            vec![b'x'; OWNER_CAP + 1],
+        ];
+        for record in records {
+            fs::write(slot.join("owner.txt"), &record).unwrap();
+            let error = Lease::acquire(&slot, owner(&root, "new-lease")).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(fs::read(slot.join("owner.txt")).unwrap(), record);
+            assert_eq!(
+                platform::identity(&platform::directory(&slot).unwrap()).unwrap(),
+                identity
+            );
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        }
+        // The busy classification lets native callers continue to their other slot.
+        let other = Lease::acquire(&root.join("qemu2"), owner(&root, "other-slot")).unwrap();
+        drop(other);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detached_cleanup_deletes_only_finalized_own_generation() {
+        let root = root();
+        let slot = root.join("qemu");
+        let mut lease = Lease::acquire(&slot, owner(&root, "lease-1")).unwrap();
+        let own = lease.owner().clone();
+        let release = lease.publish_release("2026-10-13T03:01:00Z").unwrap();
+        assert_eq!(lease.release_record(), Some(&release));
+        let detached = lease.detach_released().unwrap();
+        let successor = Lease::acquire(&slot, owner(&root, "lease-2")).unwrap();
+        let successor_bytes = fs::read(slot.join("owner.txt")).unwrap();
+        cleanup_detached(&detached, &release, &own).unwrap();
+        assert!(!detached.path.exists());
+        assert_eq!(fs::read(slot.join("owner.txt")).unwrap(), successor_bytes);
+        assert_eq!(successor.owner().lease, "lease-2");
+        drop(successor);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detached_cleanup_rejects_foreign_paths_proofs_and_extra_contents() {
+        let root = root();
+        let slot = root.join("qemu");
+        let mut lease = Lease::acquire(&slot, owner(&root, "lease-1")).unwrap();
+        let own = lease.owner().clone();
+        let release = lease.publish_release("2026-10-13T03:01:00Z").unwrap();
+        let detached = lease.detach_released().unwrap();
+        let original = fs::read(detached.path.join("owner.txt")).unwrap();
+        for field in ["directory", "owner", "run", "lease", "released"] {
+            let mut wrong = release.clone();
+            match field {
+                "directory" => wrong.directory_identity.index ^= 1,
+                "owner" => wrong.owner_identity.index ^= 1,
+                "run" => wrong.run.push_str("-other"),
+                "lease" => wrong.lease.push_str("-other"),
+                "released" => wrong.released = "2026-10-13T03:02:00Z".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                cleanup_detached(&detached, &wrong, &own).is_err(),
+                "{field}"
+            );
+            assert_eq!(fs::read(detached.path.join("owner.txt")).unwrap(), original);
+        }
+        let mut foreign = own.clone();
+        foreign.nick = "kimi".into();
+        assert!(cleanup_detached(&detached, &release, &foreign).is_err());
+        let shared_path = Detached {
+            path: slot.clone(),
+            identity: detached.identity,
+        };
+        assert!(cleanup_detached(&shared_path, &release, &own).is_err());
+        let other_parent = root.join("other");
+        fs::create_dir(&other_parent).unwrap();
+        let mut other_release = release.clone();
+        other_release.slot = other_parent.join("qemu");
+        assert!(cleanup_detached(&detached, &other_release, &own).is_err());
+        fs::write(detached.path.join("foreign.txt"), b"preserve").unwrap();
+        assert!(cleanup_detached(&detached, &release, &own).is_err());
+        assert_eq!(fs::read(detached.path.join("owner.txt")).unwrap(), original);
+        assert_eq!(
+            fs::read(detached.path.join("foreign.txt")).unwrap(),
+            b"preserve"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detached_cleanup_rejects_changed_owner_file_or_release_footer() {
+        let root = root();
+        let slot = root.join("qemu");
+        let mut lease = Lease::acquire(&slot, owner(&root, "lease-1")).unwrap();
+        let own = lease.owner().clone();
+        let release = lease.publish_release("2026-10-13T03:01:00Z").unwrap();
+        let detached = lease.detach_released().unwrap();
+        let owner_path = detached.path.join("owner.txt");
+        let original = fs::read_to_string(&owner_path).unwrap();
+        let changed = original.replace("released=2026-10-13T03:01:00Z", "released=invalid");
+        fs::write(&owner_path, &changed).unwrap();
+        assert!(cleanup_detached(&detached, &release, &own).is_err());
+        assert_eq!(fs::read_to_string(&owner_path).unwrap(), changed);
+        fs::rename(&owner_path, detached.path.join("original-owner.txt")).unwrap();
+        fs::write(&owner_path, original).unwrap();
+        assert!(cleanup_detached(&detached, &release, &own).is_err());
+        assert!(owner_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detached_cleanup_rejects_replaced_directory_and_junction_alias() {
+        use std::os::windows::process::CommandExt;
+        let root = root();
+        let slot = root.join("qemu");
+        let mut lease = Lease::acquire(&slot, owner(&root, "lease-1")).unwrap();
+        let own = lease.owner().clone();
+        let release = lease.publish_release("2026-10-13T03:01:00Z").unwrap();
+        let detached = lease.detach_released().unwrap();
+        let original = fs::read(detached.path.join("owner.txt")).unwrap();
+        let retained = root.join("kept-generation");
+        fs::rename(&detached.path, &retained).unwrap();
+        fs::create_dir(&detached.path).unwrap();
+        fs::write(detached.path.join("owner.txt"), &original).unwrap();
+        assert!(cleanup_detached(&detached, &release, &own).is_err());
+        assert_eq!(fs::read(detached.path.join("owner.txt")).unwrap(), original);
+        fs::remove_file(detached.path.join("owner.txt")).unwrap();
+        fs::remove_dir(&detached.path).unwrap();
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference = 'Stop'; New-Item -ItemType Junction -Path $env:MIRROR_FIXTURE_LINK -Target $env:MIRROR_FIXTURE_TARGET | Out-Null"])
+            .env("MIRROR_FIXTURE_LINK", &detached.path)
+            .env("MIRROR_FIXTURE_TARGET", &retained)
+            .creation_flags(0x0800_0000)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(cleanup_detached(&detached, &release, &own).is_err());
+        assert_eq!(fs::read(retained.join("owner.txt")).unwrap(), original);
+        // Remove only this known fixture junction, never traverse its target.
+        fs::remove_dir(&detached.path).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detached_cleanup_handles_prevent_owner_and_directory_replacement() {
+        let root = root();
+        let slot = root.join("qemu");
+        let mut lease = Lease::acquire(&slot, owner(&root, "lease-1")).unwrap();
+        let own = lease.owner().clone();
+        let release = lease.publish_release("2026-10-13T03:01:00Z").unwrap();
+        let detached = lease.detach_released().unwrap();
+        let directory = platform::directory(&detached.path).unwrap();
+        let owner_path = detached.path.join("owner.txt");
+        let owner_file = platform::cleanup_owner(&owner_path).unwrap();
+        assert!(fs::rename(&detached.path, root.join("replacement")).is_err());
+        assert!(fs::rename(&owner_path, detached.path.join("replaced-owner.txt")).is_err());
+        assert!(fs::write(&owner_path, b"replacement").is_err());
+        drop(owner_file);
+        drop(directory);
+        cleanup_detached(&detached, &release, &own).unwrap();
+        assert!(!detached.path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn manual_final_release_can_be_detached_but_not_adopted() {
         let root = root();
@@ -963,7 +1280,8 @@ mod tests {
         let root = root();
         let slot = root.join("qemu");
         let mut lease = Lease::acquire(&slot, owner(&root, "lease-1")).unwrap();
-        lease.publish_release("2026-10-13T03:01:00Z").unwrap();
+        let own = lease.owner().clone();
+        let release = lease.publish_release("2026-10-13T03:01:00Z").unwrap();
         lease.owner_file.take();
         let collision = root.join("existing-destination");
         fs::create_dir(&collision).unwrap();
@@ -981,12 +1299,12 @@ mod tests {
             .share_mode(1 | 2)
             .open(detached.path.join("owner.txt"))
             .unwrap();
-        assert!(fs::remove_file(detached.path.join("owner.txt")).is_err());
+        assert!(cleanup_detached(&detached, &release, &own).is_err());
+        assert!(detached.path.join("owner.txt").exists());
         assert!(slot.join("owner.txt").exists());
         drop(deny_delete);
-        fs::remove_file(detached.path.join("owner.txt")).unwrap();
-        // Simulate controller death between detached owner-file and directory cleanup.
-        assert!(detached.path.exists());
+        cleanup_detached(&detached, &release, &own).unwrap();
+        assert!(!detached.path.exists());
         assert_eq!(survivor.owner().lease, "lease-2");
         drop(survivor);
         fs::remove_dir_all(root).unwrap();

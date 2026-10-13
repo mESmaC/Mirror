@@ -268,18 +268,50 @@ fn nonzero_exit_is_preserved_and_expired_deadline_terminates_tree() {
 }
 
 #[test]
-fn reused_pid_and_duplicate_job_identity_never_authorize_recovery() {
+fn reused_pid_proves_original_exit_but_recovery_still_requires_job_and_live_checks() {
     let fixture = Fixture::new();
     let job = Job::new(&fixture.name).unwrap();
     assert!(Job::new(&fixture.name).is_err());
     assert_eq!(job.active_processes().unwrap(), 0);
-    let mut reused = current_process_identity().unwrap();
+    let current = current_process_identity().unwrap();
+    let mut reused = current;
     reused.start_time += 1;
-    assert_eq!(process_state(reused).unwrap(), ProcessState::PidReused);
+    // A real live PID with a different creation time is no longer the recorded
+    // controller/worker. Recovery must not reject this unrelated incarnation.
+    assert_eq!(process_state(current).unwrap(), ProcessState::Running);
+    assert_eq!(process_state(reused).unwrap(), ProcessState::Exited);
+    prove_recovery(reused, &[reused], &fixture.name).unwrap();
+    assert_eq!(
+        prove_recovery(current, &[], &fixture.name)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        prove_recovery(reused, &[current], &fixture.name)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let worker = job
+        .spawn(
+            &fixture.spec(vec!["tree".into(), fixture.root.as_os_str().to_owned()]),
+            |_| Ok(()),
+        )
+        .unwrap();
+    wait_for(|| fixture.root.join("leaf.identity").exists());
     assert!(
-        prove_recovery(reused, &[], &fixture.name)
+        prove_recovery(reused, &[reused], &fixture.name)
             .unwrap_err()
             .to_string()
-            .contains("reused")
+            .contains("old job has live descendants")
     );
+    job.terminate().unwrap();
+    job.wait(worker, Instant::now() + Duration::from_secs(10))
+        .unwrap();
+    job.wait_empty(Instant::now() + Duration::from_secs(10))
+        .unwrap();
+    prove_recovery(reused, &[reused], &fixture.name).unwrap();
+    drop(job);
+    prove_recovery(reused, &[reused], &fixture.name).unwrap();
 }

@@ -1,6 +1,6 @@
 //! Windows packaging adapter. All external workers run in the controller's job.
 use crate::{
-    lease::{DetachEvent, DetachPhase, Lease, Owner, Replacement},
+    lease::{self, DetachEvent, DetachPhase, Detached, Lease, Owner, ReleaseRecord, Replacement},
     package::{self, Artifact, Backend, Manifest, Progress, SourceFile},
     paths,
     record::{self, Value},
@@ -70,6 +70,7 @@ pub struct NativePackage {
     command_number: usize,
     prior: Option<Progress>,
     recovery: bool,
+    released_cleanup: Option<(Detached, ReleaseRecord, Owner)>,
 }
 
 pub fn utc_now() -> String {
@@ -485,6 +486,7 @@ impl NativePackage {
             command_number: 0,
             prior,
             recovery,
+            released_cleanup: None,
         })
     }
     pub fn execute(mut self) -> io::Result<Progress> {
@@ -1115,29 +1117,27 @@ impl Backend for NativePackage {
     }
     fn prove_no_live_build(&mut self, recovery: bool, end: Instant) -> io::Result<()> {
         check_time(end)?;
-        let workers = self
-            .journal
-            .get("workers")?
-            .array()?
-            .iter()
-            .map(parse_identity)
-            .collect::<io::Result<Vec<_>>>()?;
         if recovery {
+            let workers = self
+                .journal
+                .get("workers")?
+                .array()?
+                .iter()
+                .map(parse_identity)
+                .collect::<io::Result<Vec<_>>>()?;
             windows_job::prove_recovery(
                 parse_identity(self.journal.get("controller")?)?,
                 &workers,
                 self.journal.get("job")?.string()?,
             )?;
         } else {
+            // Every worker enters this no-breakaway job before it can run.
+            // The retained job handle proves the whole build tree empty;
+            // reopening old PIDs could instead observe unrelated processes.
             self.job
                 .as_ref()
                 .ok_or_else(|| record::invalid("missing worker job"))?
                 .wait_empty(end)?;
-            for worker in workers {
-                if windows_job::process_state(worker)? != windows_job::ProcessState::Exited {
-                    return Err(record::invalid("worker still live or PID reused"));
-                }
-            }
         }
         Ok(())
     }
@@ -1201,7 +1201,12 @@ impl Backend for NativePackage {
             .take()
             .ok_or_else(|| record::invalid("lease already closed"))?;
         let slot = lease.slot().to_owned();
+        let owner = lease.owner().clone();
         let mut proof = self.journal.get("progress")?.get("lock_release")?.clone();
+        let release = lease
+            .release_record()
+            .ok_or_else(|| record::invalid("lease was not released"))?
+            .clone();
         // finalize has already flushed both the owner's release and its final
         // proof. Optional detach never deletes at a shared pathname and failure
         // cannot undo the valid durable release.
@@ -1210,7 +1215,7 @@ impl Backend for NativePackage {
         }) {
             Ok(detached) => {
                 eprintln!(
-                    "lock free for package {}; retained released generation {} identity={}",
+                    "lock free for package {}; detached generation {} identity={}",
                     self.run,
                     detached.path.display(),
                     detached.identity
@@ -1221,6 +1226,7 @@ impl Backend for NativePackage {
                     "detached_identity",
                     Value::text(detached.identity.to_string()),
                 )?;
+                self.released_cleanup = Some((detached, release, owner));
                 return Ok(Some(proof));
             }
             Err(error) => {
@@ -1238,6 +1244,31 @@ impl Backend for NativePackage {
             }
         }
         Ok(None)
+    }
+    fn cleanup_released(&mut self) -> io::Result<bool> {
+        let Some((detached, release, owner)) = self.released_cleanup.take() else {
+            return Ok(false);
+        };
+        match lease::cleanup_detached(&detached, &release, &owner) {
+            Ok(()) => {
+                eprintln!(
+                    "removed own released generation {}",
+                    detached.path.display()
+                );
+                Ok(true)
+            }
+            Err(error) => {
+                let message = format!(
+                    "detached generation {} identity={} retained: {error}",
+                    detached.path.display(),
+                    detached.identity
+                );
+                eprintln!("{message}");
+                self.journal.set("release_cleanup", Value::text(message))?;
+                record::write(&self.run_dir.join("journal.json"), &self.journal)?;
+                Ok(false)
+            }
+        }
     }
 }
 pub fn copy_verified(source: &Path, destination: &Path, end: Instant) -> io::Result<Artifact> {
@@ -1884,6 +1915,14 @@ mod tests {
             .is_err()
         );
         let recovered = NativePackage::open_at(options("replacement/package"), &locks).unwrap();
+        let owner = fs::read_to_string(slot.join("owner.txt")).unwrap();
+        assert!(owner.contains("nick=fixture\n"));
+        assert!(owner.contains("replacement_operator=replacement/package\n"));
+        assert_eq!(
+            owner.matches("replacement_authorization=").count(),
+            1,
+            "replay must not duplicate owner history"
+        );
         let run_dir = recovered.run_dir.clone();
         let result = recovered.execute().unwrap();
         assert_eq!(result.verdict, Verdict::RecoveredInvalid);
@@ -1899,15 +1938,56 @@ mod tests {
         let events = journal.get("release_detach").unwrap().array().unwrap();
         assert_eq!(events.len(), 2);
         let detached = PathBuf::from(events[1].get("path").unwrap().string().unwrap());
-        let owner = fs::read_to_string(detached.join("owner.txt")).unwrap();
-        assert!(owner.contains("nick=fixture\n"));
-        assert!(owner.contains("replacement_operator=replacement/package\n"));
+        assert!(!detached.exists());
         assert_eq!(
-            owner.matches("replacement_authorization=").count(),
-            1,
-            "replay must not duplicate owner history"
+            result
+                .lock_release
+                .unwrap()
+                .get("state")
+                .unwrap()
+                .string()
+                .unwrap(),
+            "removed"
         );
-        assert!(owner.contains("released="));
+    }
+    #[test]
+    fn malformed_manual_slot_is_held_and_other_slot_is_acquired() {
+        for record in [
+            "owner: claude\n",
+            "\u{feff}nick=claude\n",
+            "released=2026-10-13T13:00:00Z\n",
+        ] {
+            let f = Fixture::new();
+            let locks = f.dir("locks");
+            let slot = f.dir("locks/qemu");
+            fs::write(slot.join("owner.txt"), record).unwrap();
+            let mut p = NativePackage::open_at(f.options(), &locks).unwrap();
+            assert_eq!(p.lease.as_ref().unwrap().slot(), locks.join("qemu2"));
+            assert_eq!(fs::read_to_string(slot.join("owner.txt")).unwrap(), record);
+            assert!(
+                p.journal
+                    .get("detached_before_acquire")
+                    .unwrap()
+                    .array()
+                    .unwrap()
+                    .is_empty()
+            );
+            release_fixture(&mut p);
+        }
+    }
+    #[test]
+    fn normal_empty_job_proof_does_not_reopen_old_worker_pids() {
+        let f = Fixture::new();
+        let locks = f.dir("locks");
+        let mut p = NativePackage::open_at(f.options(), &locks).unwrap();
+        let mut reused = windows_job::current_process_identity().unwrap();
+        reused.start_time += 1;
+        p.journal
+            .set("workers", Value::Array(vec![identity(reused)]))
+            .unwrap();
+        p.prove_no_live_build(false, end()).unwrap();
+        p.journal.set("workers", Value::Array(vec![])).unwrap();
+        release_fixture(&mut p);
     }
     #[test]
     fn explicit_slot_never_detaches_another_released_generation() {

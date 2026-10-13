@@ -1,4 +1,5 @@
-//! Canonical, component-based lane paths. Reparse points are never followed.
+//! Canonical, component-based lane paths. Writable paths never follow reparse
+//! points; only the explicit read-only cache resolver permits input aliases.
 
 use std::fs;
 use std::io;
@@ -14,6 +15,18 @@ pub fn canonical_no_reparse(path: &Path) -> io::Result<PathBuf> {
     let absolute = absolute_clean(path)?;
     check_existing_components(&absolute)?;
     fs::canonicalize(absolute)
+}
+
+/// Resolve an existing, input-only cache file, including a shared cache junction.
+/// The resolved file still passes strict path validation, and consumers must
+/// verify its pinned content before use. Never use this for writable lane paths.
+pub fn canonical_readonly_cache_file(path: &Path) -> io::Result<PathBuf> {
+    let resolved = fs::canonicalize(absolute_clean(path)?)?;
+    let resolved = canonical_no_reparse(&resolved)?;
+    if !fs::metadata(&resolved)?.is_file() {
+        return Err(invalid("cached input must be a regular file"));
+    }
+    Ok(resolved)
 }
 
 /// Resolve a future path using its nearest existing ancestor, without aliases.

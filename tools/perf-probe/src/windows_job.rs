@@ -31,10 +31,10 @@ pub struct ProcessIdentity {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessState {
+    /// The recorded process exited, including when its PID now identifies a
+    /// different process with another creation time.
     Exited,
     Running,
-    /// A process with this PID exists, but it is not the recorded process.
-    PidReused,
 }
 
 #[derive(Clone, Debug)]
@@ -367,7 +367,9 @@ pub fn process_state(identity: ProcessIdentity) -> io::Result<ProcessState> {
         return Ok(ProcessState::Exited);
     };
     if process_identity(&handle, identity.pid)?.start_time != identity.start_time {
-        return Ok(ProcessState::PidReused);
+        // The open handle identifies a different process. The original cannot
+        // still be alive while Windows has assigned its PID to this process.
+        return Ok(ProcessState::Exited);
     }
     Ok(if process_exited(&handle)? {
         ProcessState::Exited
@@ -376,32 +378,65 @@ pub fn process_state(identity: ProcessIdentity) -> io::Result<ProcessState> {
     })
 }
 
-/// Fail closed on live identities, PID reuse, inaccessible records, or nonempty
-/// jobs. The caller must additionally verify the durable run/job binding. A
-/// named job disappears only after its last handle and all processes are gone.
+/// Prove the original controller exited and its no-breakaway job is empty or
+/// absent. Matching live identities still block. An inaccessible worker PID may
+/// now belong to an unrelated protected process, so access denial defers to the
+/// job proof; an inaccessible controller still blocks because it is outside the
+/// job. The caller must verify the durable run/job/worker binding. A named job
+/// disappears only after its last handle and all processes are gone.
 pub fn prove_recovery(
     controller: ProcessIdentity,
     workers: &[ProcessIdentity],
     job_name: &str,
 ) -> io::Result<()> {
+    prove_recovery_with(
+        controller,
+        workers,
+        job_name,
+        process_state,
+        prove_job_empty,
+    )
+}
+
+fn prove_recovery_with(
+    controller: ProcessIdentity,
+    workers: &[ProcessIdentity],
+    job_name: &str,
+    mut query_process: impl FnMut(ProcessIdentity) -> io::Result<ProcessState>,
+    prove_job: impl FnOnce(&str) -> io::Result<()>,
+) -> io::Result<()> {
     validate_job_name(job_name)?;
     if workers.len() > 4096 {
         return Err(invalid("too many worker identities"));
     }
-    for identity in std::iter::once(&controller).chain(workers) {
-        match process_state(*identity)? {
-            ProcessState::Exited => (),
-            ProcessState::Running => {
+    // Job emptiness cannot prove controller death: it owns the job handle but
+    // is not a member. Do not apply the worker access-denied fallback here.
+    if query_process(controller)? == ProcessState::Running {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "recorded controller is still running",
+        ));
+    }
+    for identity in workers {
+        match query_process(*identity) {
+            Ok(ProcessState::Exited) => (),
+            Ok(ProcessState::Running) => {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
-                    "recorded controller/worker is still running",
+                    "recorded worker is still running",
                 ));
             }
-            ProcessState::PidReused => {
-                return Err(invalid("recorded PID was reused; identity proof refused"));
-            }
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => (),
+            Err(error) => return Err(error),
         }
     }
+    // Mandatory even if every recorded PID has exited: descendants may not
+    // have an individual journal entry. Workers enter atomically and cannot
+    // break away, so this also resolves an inaccessible historical worker PID.
+    prove_job(job_name)
+}
+
+fn prove_job_empty(job_name: &str) -> io::Result<()> {
     let name = wide(OsStr::new(job_name))?;
     // SAFETY: name is NUL terminated; QUERY is sufficient and no handle is inherited.
     let raw = unsafe { OpenJobObjectW(0x0004, 0, name.as_ptr()) };
@@ -849,4 +884,123 @@ unsafe extern "system" {
     fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
     fn ResumeThread(thread: *mut c_void) -> u32;
     fn TerminateProcess(process: *mut c_void, code: u32) -> i32;
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    const CONTROLLER: ProcessIdentity = ProcessIdentity {
+        pid: 1,
+        start_time: 1,
+    };
+    const WORKER: ProcessIdentity = ProcessIdentity {
+        pid: 2,
+        start_time: 2,
+    };
+
+    fn denied_worker(identity: ProcessIdentity) -> io::Result<ProcessState> {
+        if identity == CONTROLLER {
+            Ok(ProcessState::Exited)
+        } else {
+            assert_eq!(identity, WORKER);
+            // ERROR_ACCESS_DENIED returned when a historical PID now names a
+            // protected process, without modifying any real process ACL.
+            Err(io::Error::from_raw_os_error(5))
+        }
+    }
+
+    #[test]
+    fn worker_access_denial_accepts_real_empty_and_absent_named_job_proof() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let current = current_process_identity().unwrap();
+        let name = format!(
+            "Local\\MirrorLane-recovery-{}-{}-{}",
+            current.pid,
+            current.start_time,
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let job = Job::new(&name).unwrap();
+        prove_recovery_with(CONTROLLER, &[WORKER], &name, denied_worker, prove_job_empty).unwrap();
+        drop(job);
+        prove_recovery_with(CONTROLLER, &[WORKER], &name, denied_worker, prove_job_empty).unwrap();
+    }
+
+    #[test]
+    fn worker_access_denial_never_hides_named_job_failure() {
+        for kind in [
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+        ] {
+            let error = prove_recovery_with(
+                CONTROLLER,
+                &[WORKER],
+                "Local\\MirrorLane-recovery-denied",
+                denied_worker,
+                |_| Err(io::Error::new(kind, "injected named-job proof failure")),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert!(error.to_string().contains("named-job proof failure"));
+        }
+    }
+
+    #[test]
+    fn inaccessible_controller_cannot_use_worker_job_fallback() {
+        let error = prove_recovery_with(
+            CONTROLLER,
+            &[WORKER],
+            "Local\\MirrorLane-recovery-controller-denied",
+            |identity| {
+                assert_eq!(identity, CONTROLLER);
+                Err(io::Error::from_raw_os_error(5))
+            },
+            |_| panic!("an empty job cannot prove controller death"),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(5));
+    }
+
+    #[test]
+    fn matching_live_controller_or_worker_blocks_even_with_job_proof_available() {
+        for live in [CONTROLLER, WORKER] {
+            let error = prove_recovery_with(
+                CONTROLLER,
+                &[WORKER],
+                "Local\\MirrorLane-recovery-live",
+                |identity| {
+                    Ok(if identity == live {
+                        ProcessState::Running
+                    } else {
+                        ProcessState::Exited
+                    })
+                },
+                |_| panic!("job proof must not override a matching live identity"),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        }
+    }
+
+    #[test]
+    fn other_worker_query_errors_do_not_use_access_denied_fallback() {
+        let error = prove_recovery_with(
+            CONTROLLER,
+            &[WORKER],
+            "Local\\MirrorLane-recovery-worker-error",
+            |identity| {
+                if identity == CONTROLLER {
+                    Ok(ProcessState::Exited)
+                } else {
+                    Err(io::Error::other("injected worker query failure"))
+                }
+            },
+            |_| panic!("unexpected query failures must remain fail-closed"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("worker query failure"));
+    }
 }

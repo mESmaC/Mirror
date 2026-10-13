@@ -107,6 +107,44 @@ pub fn owner(path: &Path, create: bool) -> io::Result<File> {
     Ok(file)
 }
 
+/// Lock the exact detached owner against writes and replacement while retaining
+/// DELETE access for identity-bound, non-recursive cleanup.
+pub fn cleanup_owner(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .access_mode(0x8000_0000 | 0x10000) // GENERIC_READ | DELETE
+        .share_mode(1)
+        .custom_flags(0x0020_0000)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "detached owner is not a regular file",
+        ));
+    }
+    identity(&file)?;
+    Ok(file)
+}
+
+/// Delete only this held object on close. For a directory Windows requires it to
+/// be empty; no pathname lookup, recursive traversal or readonly override occurs.
+pub fn delete(file: &File) -> io::Result<()> {
+    let delete_file = 1u8; // FILE_DISPOSITION_INFO's BOOLEAN DeleteFile.
+    // SAFETY: The caller owns a DELETE-capable File handle. FileDispositionInfo=4
+    // takes a one-byte BOOLEAN that remains live for this synchronous call.
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            4,
+            (&delete_file as *const u8).cast(),
+            1,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Verify that the directory guarded after opening the owner still contains that
 /// exact file. This closes the owner-first acquisition/path-replacement interval.
 pub fn verify_owner(file: &File, path: &Path) -> io::Result<()> {
