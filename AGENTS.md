@@ -83,7 +83,7 @@ Guest-side faults exist only in `boot-smoke` kernels. To add one:
 5. Add the case to `scripts\test.ps1`, which runs it in both build profiles, debug and release.
 A passing smoke boot exits QEMU with code 33. An expected fatal fault exits with 35 and an exact diagnostic. A reset case (`-Fault Reset*`) ends in a guest reset, which `-no-reboot` turns into exit code 0 (spec 0058a). Host-side faults are QEMU options in `run.ps1`: blkdebug errors, removed devices, CPU models and CPU counts. The default smoke CPU, in `run.ps1` and `capture.ps1`, is `qemu64,+smep,+smap` (0016-D6).
 
-`-Fault PerfInvalid` is a host-only raw-token test: it injects `mirror.perf=bogus` and the existing unknown-smoke token, expects exactly `MIRROR_PERF_OFF reason=invalid` followed by the existing unknown-smoke panic and exit 35, and rejects public `-Perf`. It adds no `SmokeMode` variant or production fault-injection path.
+`-Fault PerfInvalid` is a host-only raw-token test: it injects only `mirror.perf=bogus`, expects exactly `MIRROR_PERF_OFF reason=invalid` followed by the existing unknown-smoke panic and exit 35, and rejects public `-Perf`. The invalid performance token remains visible to the strict smoke parser and causes that panic; no separate `mirror.test=` token is injected. It adds no `SmokeMode` variant or production fault-injection path.
 
 ## References
 The local reference trees (linux, nt5src, freebsd-src and colibri) are best-practice references only. Read them to learn how others solved a problem. Mirror code is written independently, against Mirror's own interfaces. The trees live on the development machine and their paths vary by machine, so ask Cameron for a tree's location instead of assuming one.
