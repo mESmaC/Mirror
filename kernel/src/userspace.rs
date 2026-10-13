@@ -1947,10 +1947,6 @@ fn complete_memory(
 ) {
     assert!(ACTIVE.load(Ordering::SeqCst).is_null());
     assert!(!arch::interrupts_enabled());
-    // 0054-D5: this function's exclusive `ipc` borrow is fresh; the replay's
-    // with_ipc borrows through the published pointer, so republish it from
-    // this borrow instead of leaving the caller's derivation live.
-    ACTIVE_IPC.store(core::ptr::from_mut(ipc), Ordering::SeqCst);
     match request {
         MemoryRequest::Operation => {
             let frame = process.thread().context.frame;
@@ -2035,6 +2031,10 @@ fn complete_memory(
                 process.copy_faults += 1;
             }
             let mut frame = process.thread().context.frame;
+            // 0054-D5: the replay's with_ipc borrows through the published
+            // pointer; republish it from this function's own exclusive borrow,
+            // after the kill/retry path's mutation through it has ended.
+            ACTIVE_IPC.store(core::ptr::from_mut(ipc), Ordering::SeqCst);
             let outcome = dispatch_syscall(process, &mut frame);
             process.thread_mut().context.frame = frame;
             if !outcome.finished {
