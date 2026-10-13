@@ -51,6 +51,8 @@ pub(crate) const CR4_MCE: u64 = 1 << 6;
 const MAX_CPUS: usize = 64;
 const IPI_VECTOR: usize = 240;
 const LOCAL_TIMER_VECTOR: usize = 241;
+/// The reschedule IPI (spec 0051, point 3).
+const RESCHEDULE_VECTOR: usize = 242;
 const APIC_SPURIOUS_VECTOR: usize = 255;
 
 #[repr(C, packed)]
@@ -231,6 +233,7 @@ unsafe extern "C" {
     fn mirror_exception_128();
     fn mirror_exception_240();
     fn mirror_exception_241();
+    fn mirror_exception_242();
     fn mirror_exception_255();
     fn mirror_resume_user(frame: *const TrapFrame, extended: *mut fpu::State);
     fn mirror_resume_kernel();
@@ -389,6 +392,12 @@ pub fn init() {
         // userspace cannot manufacture scheduler ticks or LAPIC EOIs.
         entries.add(LOCAL_TIMER_VECTOR).write(IdtEntry::interrupt(
             mirror_exception_241 as *const () as u64,
+            0,
+        ));
+        // Another CPU's reschedule IPI may interrupt CPL3, but INT 242 must
+        // remain privileged so userspace cannot fake one or send an EOI.
+        entries.add(RESCHEDULE_VECTOR).write(IdtEntry::interrupt(
+            mirror_exception_242 as *const () as u64,
             0,
         ));
         // Hardware may deliver a spurious LAPIC interrupt at either CPL, but
@@ -1236,22 +1245,24 @@ pub fn arm_expected_page_fault(address: u64) {
 #[unsafe(no_mangle)]
 extern "C" fn mirror_exception_dispatch(frame: &mut TrapFrame) {
     if crate::smp::is_secondary() {
-        // APs have no userspace or device-IRQ responsibilities yet. Keep their
-        // exceptions out of BSP-only tests, scheduler state, logging and locks.
-        if frame.vector == IPI_VECTOR as u64 {
-            crate::smp::handle_ipi();
-            return;
-        }
+        // A spurious LAPIC request needs no EOI, and an AP's never counts
+        // against the BSP's spurious self-test.
         if frame.vector == APIC_SPURIOUS_VECTOR as u64 {
             return;
         }
-        // Secondary local timers stay masked and stopped. An unexpected timer
-        // must fail this CPU instead of entering the BSP's clock or scheduler.
-        let cr2: u64;
-        // SAFETY: Every installed gate enters at CPL0. The failure recorder
-        // uses only atomics before halting this CPU, without serial output.
-        unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
-        crate::smp::secondary_fault(frame.vector, frame.error, frame.rip, cr2);
+        if !ap_dispatches(frame) {
+            // A trap before this AP is ONLINE, a smoke probe's armed fault,
+            // or a vector no AP handles: device IRQs, which the IOAPIC sends
+            // only to the BSP, and kernel exceptions. Keep it out of BSP-only
+            // tests, scheduler state, logging and locks. Step 4 sends the
+            // last two kinds to the crash path (spec 0051, point 4).
+            let cr2: u64;
+            // SAFETY: Every installed gate enters at CPL0. The failure
+            // recorder uses only atomics before halting this CPU, without
+            // serial output.
+            unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
+            crate::smp::secondary_fault(frame.vector, frame.error, frame.rip, cr2);
+        }
     }
     #[cfg(feature = "boot-smoke")]
     assert_kernel_tls_clean();
@@ -1269,6 +1280,20 @@ extern "C" fn mirror_exception_dispatch(frame: &mut TrapFrame) {
     if from_user {
         crate::userspace::end_trap();
     }
+}
+
+/// Whether this AP takes the normal dispatch for `frame` (spec 0051, point
+/// 4): only once its slot is ONLINE and outside an armed smoke probe, and
+/// then for the command IPI, its timer, the reschedule IPI, and a syscall or
+/// exception from CPL3.
+fn ap_dispatches(frame: &TrapFrame) -> bool {
+    let from_user = frame.cs & 3 == 3;
+    let routed = match usize::try_from(frame.vector) {
+        Ok(IPI_VECTOR | LOCAL_TIMER_VECTOR | RESCHEDULE_VECTOR) => true,
+        Ok(vector) => from_user && (vector == 0x80 || vector < 32),
+        Err(_) => false,
+    };
+    routed && crate::smp::ap_traps_dispatch()
 }
 
 /// NMI, #DF and #MC arrive through the paranoid entry (interrupts.S). Its
@@ -1341,8 +1366,21 @@ fn dispatch(frame: &mut TrapFrame) {
     if frame.vector == LOCAL_TIMER_VECTOR as u64 {
         // The timer driver acknowledges before permitting a scheduler tick.
         // Kernel interrupts advance time without charging a suspended user.
+        // On an AP the tick charges the user it interrupted and never
+        // advances the BSP's clock (spec 0051, point 3).
         if timer::handle_local_timer() && frame.cs & 3 == 3 {
             crate::userspace::timer_tick(frame);
+        }
+        return;
+    }
+    if frame.vector == RESCHEDULE_VECTOR as u64 {
+        // Acknowledged first. From CPL3, a reschedule request that another
+        // CPU set returns the interrupted thread to the scheduler; in the
+        // kernel, this CPU's next scheduler pass sees the request and its
+        // new work (spec 0051, point 3).
+        crate::smp::handle_reschedule();
+        if frame.cs & 3 == 3 {
+            crate::userspace::reschedule_interrupt(frame);
         }
         return;
     }

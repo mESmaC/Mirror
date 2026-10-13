@@ -36,6 +36,7 @@ function Assert-MirrorSmpMarkers {
         [Parameter(Mandatory = $true)][string]$Serial,
         [Parameter(Mandatory = $true)][int]$RequestedCpus,
         [bool]$UseLegacyPic,
+        [bool]$LocalTimer,
         [string]$FaultMode = 'None'
     )
 
@@ -46,12 +47,15 @@ function Assert-MirrorSmpMarkers {
     # eight whole lines through the serial lock, and every CPU's last line
     # follows every CPU's first, so they printed at the same time. A line that
     # another CPU's bytes broke fails the whole-line match, and its fragments
-    # no longer pair up.
+    # no longer pair up. Then (step 3) every AP ticks with its own LAPIC timer
+    # when the LAPIC is the tick source, none with the PIT, and every AP
+    # answers a reschedule IPI round trip.
     $printCpus = if ($UseLegacyPic) { 1 } else { $RequestedCpus }
-    $testsOk = [regex]::Matches($Serial, ('(?m)^MIRROR_SMP_TESTS_OK print_cpus={0} print_lines=8\r?$' -f $printCpus))
+    $tickingAps = if ($LocalTimer) { $printCpus - 1 } else { 0 }
+    $testsOk = [regex]::Matches($Serial, ('(?m)^MIRROR_SMP_TESTS_OK print_cpus={0} print_lines=8 ticking_aps={1} resched_aps={2}\r?$' -f $printCpus, $tickingAps, ($printCpus - 1)))
     if ($testsOk.Count -ne 1 -or
         [regex]::Matches($Serial, '(?m)^MIRROR_SMP_TESTS_OK(?:\s|$)').Count -ne 1) {
-        throw 'Mirror must complete the SMP policy, mailbox and print checks exactly once.'
+        throw 'Mirror must complete the SMP policy, mailbox, print, tick and reschedule checks exactly once.'
     }
     $printText = '0123456789abcdefghijklmnopqrstuvwxyz'
     $printLines = [regex]::Matches($Serial, "(?m)^MIRROR_SMP_PRINT cpu=(\d+) line=(\d+) text=$printText\r?$")
@@ -706,7 +710,10 @@ try {
     }
     Assert-MirrorTimer -Serial $serial -Smoke $true -UseLegacyPic ([bool]$LegacyPic) -ForcePit ([bool]$PitTimer) -FaultMode $Fault
     Assert-MirrorClock -Serial $serial -Smoke $true -WithoutHpet ([bool]$NoHpet) -FaultMode $Fault -InitRuns $initRuns
-    Assert-MirrorSmpMarkers -Serial $serial -RequestedCpus $CpuCount -UseLegacyPic ([bool]$LegacyPic) -FaultMode $Fault
+    # The LAPIC is the tick source exactly when Assert-MirrorTimer requires
+    # its calibration.
+    $localTimer = -not $LegacyPic -and -not $PitTimer -and $Fault -ne 'TimerCalibration'
+    Assert-MirrorSmpMarkers -Serial $serial -RequestedCpus $CpuCount -UseLegacyPic ([bool]$LegacyPic) -LocalTimer $localTimer -FaultMode $Fault
     # Every online CPU reports its guarded stacks; -LegacyPic keeps the APs
     # offline, so only the BSP reports (spec 0016a).
     $rsp0Guard = Assert-MirrorStacks -Serial $serial -OnlineCpus $(if ($LegacyPic) { 1 } else { $CpuCount }) -Smoke $true

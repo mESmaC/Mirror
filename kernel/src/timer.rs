@@ -4,7 +4,10 @@
 //! Ticks count delivered IRQs; long interrupt-disabled sections can lose ticks.
 //! The local timer is calibrated against polled PIT channel 2 with IF clear.
 //! IRQ0 stays masked during calibration; ticks count only the selected source.
-//! Secondary timers remain stopped; APs still service only IPIs and faults.
+//! With the LAPIC source each AP starts its own periodic timer with the BSP's
+//! reload (spec 0051, point 3). Only the BSP's ticks advance `TICKS`, the
+//! deadline clock; an AP's tick charges only the user it interrupted. With
+//! the PIT source the APs' timers stay stopped.
 //!
 //! Register definitions: Intel ICH7 datasheet, legacy interrupt/timer chapters:
 //! https://www.intel.com/content/dam/doc/datasheet/i-o-controller-hub-7-datasheet.pdf
@@ -16,9 +19,9 @@
 
 #[cfg(feature = "boot-smoke")]
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use crate::{apic, arch, interrupts, serial};
+use crate::{apic, arch, cpudata, interrupts, serial};
 
 const MASTER_COMMAND: u16 = 0x20;
 const MASTER_DATA: u16 = 0x21;
@@ -46,6 +49,9 @@ const _: () = assert!(PIT_DIVISOR > 0 && PIT_DIVISOR <= u16::MAX as u32);
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static LOCAL_TIMER: AtomicBool = AtomicBool::new(false);
+/// The BSP's calibrated LAPIC reload, which the APs reuse. Stored before
+/// LOCAL_TIMER's release, so it is nonzero whenever LOCAL_TIMER is set.
+static RELOAD: AtomicU32 = AtomicU32::new(0);
 
 /// Select a calibrated local timer when possible, otherwise enable PIT IRQ0.
 /// Runs once on BSP with IF clear and all timer gates installed. Owns PIT0,
@@ -100,6 +106,7 @@ pub fn init() {
     if let Ok(initial) = local {
         // IF remains clear; publish the selected source before a timer interrupt
         // can reach the handler. The unused IRQ0 route has never been unmasked.
+        RELOAD.store(initial, Ordering::Relaxed);
         LOCAL_TIMER.store(true, Ordering::Release);
         serial::println!(
             "MIRROR_TIMER_READY source=lapic irq=local vector=241 hz~{} divide=16 initial={} controller=lapic",
@@ -240,6 +247,33 @@ fn selected_tick(vector: u8, local: bool) -> bool {
 /// is associated with this counter, so relaxed atomic ordering is sufficient.
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
+}
+
+/// Whether the LAPIC timer is the tick source, so every CPU ticks. With the
+/// PIT only the BSP does, and userspace stays on it (spec 0051, point 3).
+pub(crate) fn local_timer() -> bool {
+    LOCAL_TIMER.load(Ordering::Acquire)
+}
+
+/// Start the calling AP's own periodic LAPIC timer with the BSP's reload when
+/// the LAPIC is the tick source, and report whether it started; with the PIT
+/// source its timer stays stopped. Call on an AP with IF=0, after its local
+/// controller is configured and before IF is ever set. No logging.
+pub(crate) fn start_secondary() -> Result<bool, &'static str> {
+    if !local_timer() {
+        return Ok(false);
+    }
+    apic::start_secondary_timer(RELOAD.load(Ordering::Relaxed))?;
+    Ok(true)
+}
+
+/// Stop the calling AP's timer, if `start_secondary` started it, for a slot
+/// that is cancelled before it runs. No logging.
+pub(crate) fn stop_secondary() -> Result<(), &'static str> {
+    if !local_timer() {
+        return Ok(());
+    }
+    apic::stop_secondary_timer()
 }
 
 /// Latch and read PIT channel 0's current count. init programs that channel in
@@ -454,13 +488,25 @@ pub(crate) fn handle_irq(vector: u8) -> bool {
     tick
 }
 
-/// Acknowledge the dedicated BSP local-timer vector before any scheduling.
-/// A stale local request after fallback is retired without advancing time.
+/// Acknowledge the local-timer vector on this CPU before any scheduling, and
+/// return whether it is a tick that may charge an interrupted user. Only the
+/// BSP's tick advances `TICKS`, which stays its deadline clock (spec 0051,
+/// point 3); every CPU counts its own. On the BSP, a stale local request after
+/// fallback is retired without advancing time. An AP's timer starts only with
+/// the LAPIC source, so an AP tick without it is a fatal inconsistency.
 pub(crate) fn handle_local_timer() -> bool {
     assert!(apic::is_enabled(), "local timer interrupt without APIC");
     let tick = selected_tick(LOCAL_VECTOR, LOCAL_TIMER.load(Ordering::Acquire));
+    let bsp = cpudata::current_cpu() == 0;
+    assert!(
+        tick || bsp,
+        "AP timer interrupt without the LAPIC tick source"
+    );
     if tick {
-        TICKS.fetch_add(1, Ordering::Relaxed);
+        if bsp {
+            TICKS.fetch_add(1, Ordering::Relaxed);
+        }
+        cpudata::count_local_tick();
     }
     apic::eoi();
     tick

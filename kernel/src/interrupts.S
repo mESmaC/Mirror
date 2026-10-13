@@ -85,9 +85,15 @@ MIRROR_EXCEPTION 128
 .global mirror_exception_240
 MIRROR_EXCEPTION 240
 
-# BSP local timer uses the same complete register/TLS frame as device IRQs.
+# Every CPU's local timer uses the same complete register/TLS frame as device
+# IRQs.
 .global mirror_exception_241
 MIRROR_EXCEPTION 241
+
+# The reschedule IPI, which any CPU may send, uses a kernel-only gate and the
+# shared full frame too (spec 0051, point 3).
+.global mirror_exception_242
+MIRROR_EXCEPTION 242
 
 # LAPIC spurious interrupts need no EOI and share the full TLS-preserving entry.
 .global mirror_exception_255

@@ -57,12 +57,19 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
      - the CPUs running a killed or flushed process;
      - the BSP, when it hands the BSP work.
    - When the PIT or legacy PIC is the tick source, `userspace_cpus=1` and all userspace stays on the BSP.
+   - 2026-10-12, step 3:
+     - An AP starts its timer in `secondary_main` after its local APIC setup and before its slot goes ONLINE; IF stays clear until its idle loop, so the first tick arrives once traps dispatch. A slot cancelled after that stops its timer. With the PIT source the AP's timer stays stopped, and a 241 on an AP then fails it.
+     - Each CPU counts its own LAPIC ticks and 242s in `CpuData`.
+     - `smp::kick` sets the target's `need_resched` with Release and then sends 242. Vector 240 stays BSP-only, since the BSP alone produces commands. The send waits only for the sender's own ICR, so a `SCHED` holder may kick.
+     - In the kernel, 242 only acknowledges and leaves the request for the next dispatch, which clears it. From CPL3 it displaces only when the request is set.
+     - The senders listed above, the close retry's kick (point 8) and `Process::finish`'s kick come with step 5. Step 5 is the first step that runs threads on APs, so it is the first that can test them.
 
 4. **AP traps.**
    - On an ONLINE AP, these take the normal dispatch instead of `secondary_fault` (interrupts.rs:1203-1221): vector 0x80, CPL3 exceptions, 241, 242, and 240, which can now interrupt CPL3.
    - A CPL3 #PF on an AP goes to `userspace::fault` (userspace.rs:4360-4379).
    - CPL0 exceptions and device vectors 32-47 on an AP go to the crash path (point 10).
    - Two cases keep `secondary_fault`: a fault before the slot is ONLINE, and the armed smoke probes `OP_GUARD_FAULT` and `OP_UNMAPPED_FAULT` (smp.rs:968-993). A per-slot `expect_fault` flag marks the probes.
+   - 2026-10-12, step 3: until step 4 adds the crash path, CPL0 exceptions and device vectors on an AP keep `secondary_fault` too. An AP's spurious vector 255 still returns uncounted. The AP sets `expect_fault` just before the probe's access.
 
 5. **What stays on the BSP.**
    - Device IRQs: IOAPIC routes 0, 1 and 12 keep targeting the BSP (apic.rs:36, :505), and PCI interrupts stay off (pci.rs:9).
@@ -148,7 +155,7 @@ It serves the Phase 1 exit checks at roadmap-replan.md:130-137.
       - `MIRROR_CRASH_ACTION action=<exit|halt|reboot> delay_ms=`;
       - `MIRROR_CRASH_NESTED depth=2`.
     - **Boot-smoke only:**
-      - `MIRROR_SMP_PRINT cpu= line= text=`, eight per printing CPU, then `MIRROR_SMP_TESTS_OK print_cpus=<n> print_lines=8` (step 1);
+      - `MIRROR_SMP_PRINT cpu= line= text=`, eight per printing CPU, then `MIRROR_SMP_TESTS_OK print_cpus=<n> print_lines=8 ticking_aps=<a> resched_aps=<r>` (step 1; 2026-10-12: the AP fields were added in step 3);
       - `MIRROR_SMP_USER_OK cpus= threads=16 ran_on= cross_wakes= flushes= stale=0`;
       - `MIRROR_USER_FLUSH_TESTS_OK cpus= reloaded= skipped=` (2026-10-12: fields added, step 2);
       - `MIRROR_USER_FLUSH_TIMEOUT_ARMED target=` and `MIRROR_USER_FLUSH_TIMEOUT_EXPECT root= frame=`, in UserFlushTimeout only;
@@ -165,7 +172,11 @@ Each step is one commit and must pass its targeted smoke cases.
    - The self-test runs after the kernel VA self-test. Every online AP loads a scratch root with the smoke-only `OP_USER_ENTER` and reads a supervisor-only word through it. A release from that root must make each AP reload CR3, which its answer proves, before the frames return, and each AP then reads the new frame. An AP that left the root (`OP_USER_LEAVE`) only acknowledges a later flush, and `destroy` refuses while the mask is nonzero. The marker is `cpus=<online> reloaded=<online - 1> skipped=<1 with an AP, else 0>`.
    - QEMU's TCG drops an AP's cached translations between two commands even without a flush, so on QEMU a stale read cannot show a missing flush here; the reload proofs do. Step 5's canary checks stale reads with threads running.
    - UserFlushTimeout runs at the end of boot, as SmpTlbTimeout does. The last AP withholds its acknowledgement, and the release panics with "user TLB shootdown acknowledgement timeout" inside its flush, after `MIRROR_USER_FLUSH_TIMEOUT_EXPECT`, so its frames never reach the allocator.
-3. **AP plumbing.** Points 3 and 4: AP timers, vector 242, `send_ipi` from any CPU, and AP trap routing with `expect_fault`. `MIRROR_SMP_TESTS_OK` gains checks that every AP ticks and answers a 242 round trip.
+3. **AP plumbing.** Points 3 and 4: AP timers, vector 242, `send_ipi` from any CPU, and AP trap routing with `expect_fault`. `MIRROR_SMP_TESTS_OK` gains checks that every AP ticks and answers a 242 round trip. 2026-10-12:
+   - Both checks run after the print check.
+   - The tick check waits until every online AP has taken three ticks of its own timer. It then requires that `TICKS` advanced by exactly the BSP's own ticks. With the PIT source it requires that no AP ticked.
+   - The round trip kicks each AP in turn. The AP, armed by a smoke-only echo mask, takes the request and kicks the BSP back. The BSP then takes its own request, and each side has taken exactly one 242.
+   - The marker gains `ticking_aps=<online - 1 with the LAPIC tick, else 0> resched_aps=<online - 1>`.
 4. **NMI stop and backtrace.** Frame pointers, `crash.rs`, `send_nmi`, `STOPPED`, the paranoid hook and the routing. Add the STOP, FRAME, BACKTRACE, ACTION and NESTED markers, `Assert-MirrorCrash`, and the Panic, ApPanic, DoublePanic, NestedPanic and SchedStall cases. This lands before step 5, so that failures on APs in step 5 are visible rather than silent.
 5. **APs run threads.**
    - AP loops join the session; add affinity, the BSP work list, the kicks and the session barrier.

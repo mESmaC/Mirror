@@ -1,13 +1,18 @@
 //! Limine-assisted secondary CPU bring-up and bounded IPI rendezvous.
 //!
 //! APs own guarded kernel stacks, GDT/TSS/IST, local APIC and CPU controls. They
-//! only execute this module and the AP exception path: no allocator, scheduler,
-//! userspace or device queues. Serial output from any CPU goes through its
-//! owner-aware lock (spec 0051); only the boot-smoke print check prints on an
-//! AP so far. Shared mapping changes use bounded synchronous shootdowns;
-//! retired frames remain owned until every target ACKs. A user root's changes
-//! flush the CPUs in its space's mask with OP_FLUSH_USER (spec 0051, point 8).
-//! This establishes CPU ownership and interrupt delivery, not SMP scheduling.
+//! only execute this module and the AP trap path: no allocator, scheduler,
+//! userspace or device queues yet. With the LAPIC tick source each AP runs its
+//! own periodic timer, and any CPU may send another the reschedule IPI,
+//! vector 242 (spec 0051, point 3). Once a slot is ONLINE, its command, timer
+//! and reschedule interrupts and its CPL3 syscalls and exceptions take the
+//! normal trap dispatch; anything else, an earlier trap, or a smoke probe's
+//! armed fault records the slot FAILED (point 4). Serial output from any CPU
+//! goes through its owner-aware lock (spec 0051); only the boot-smoke print
+//! check prints on an AP so far. Shared mapping changes use bounded
+//! synchronous shootdowns; retired frames remain owned until every target
+//! ACKs. A user root's changes flush the CPUs in its space's mask with
+//! OP_FLUSH_USER (spec 0051, point 8). User threads still run only on the BSP.
 //! https://github.com/Limine-Bootloader/limine-protocol/blob/trunk/PROTOCOL.md#mp-multiprocessor-feature
 
 use crate::{
@@ -36,6 +41,8 @@ const SLOT_STACKS: usize = 1 + stacks::IST_COUNT;
 const STACK_STRIDE: u64 =
     stacks::span(STACK_PAGES) + stacks::IST_COUNT as u64 * stacks::span(stacks::IST_PAGES);
 const IPI_VECTOR: u8 = 240;
+/// The reschedule IPI, which any CPU may send (spec 0051, point 3).
+const RESCHEDULE_VECTOR: u8 = 242;
 const WAIT_TICKS: u64 = 500;
 const ABSENT: u32 = 0;
 const STARTING: u32 = 1;
@@ -77,6 +84,11 @@ const PRINT_TEXT: &str = "0123456789abcdefghijklmnopqrstuvwxyz";
 /// own bound (WAIT_TICKS).
 #[cfg(feature = "boot-smoke")]
 const PRINT_BARRIER_NS: u64 = WAIT_TICKS * 10_000_000;
+/// The LAPIC ticks each AP must take in the tick check (spec 0051, step 3).
+#[cfg(feature = "boot-smoke")]
+const TICK_PROOF: u64 = 3;
+/// `fail` reason: the AP's periodic LAPIC timer did not start.
+const FAIL_TIMER: u64 = 15;
 
 #[repr(align(64))]
 struct Slot {
@@ -107,6 +119,11 @@ struct Slot {
     fault_error: AtomicU64,
     fault_rip: AtomicU64,
     fault_address: AtomicU64,
+    /// Set by this AP just before a smoke probe's deliberate fault, so that
+    /// fault keeps the `secondary_fault` record instead of the normal trap
+    /// dispatch or, from step 4, the crash path (spec 0051, point 4).
+    #[cfg(feature = "boot-smoke")]
+    expect_fault: AtomicBool,
 }
 
 impl Slot {
@@ -134,6 +151,8 @@ impl Slot {
             fault_error: AtomicU64::new(0),
             fault_rip: AtomicU64::new(0),
             fault_address: AtomicU64::new(0),
+            #[cfg(feature = "boot-smoke")]
+            expect_fault: AtomicBool::new(false),
         }
     }
 }
@@ -160,6 +179,10 @@ static TIMEOUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// The slots that have printed their first check line.
 #[cfg(feature = "boot-smoke")]
 static PRINT_STARTED: AtomicU64 = AtomicU64::new(0);
+/// The APs whose next reschedule IPI the round-trip check armed: each takes
+/// its request and, if it was set, kicks the BSP back (spec 0051, step 3).
+#[cfg(feature = "boot-smoke")]
+static RESCHEDULE_ECHO: AtomicU64 = AtomicU64::new(0);
 
 /// The BSP is the sole command producer. Reject reentry instead of spinning:
 /// interrupts are briefly enabled during waits and receivers never take this
@@ -284,7 +307,7 @@ pub fn init(
     if !apic::is_enabled() {
         serial::println!("MIRROR_SMP_SKIPPED reason=legacy_pic online=1");
         #[cfg(feature = "boot-smoke")]
-        print_self_test();
+        startup_self_test();
         return;
     }
     let result = prepare(boot, topology, tables, frames);
@@ -293,7 +316,7 @@ pub fn init(
         Err(reason) => {
             serial::println!("MIRROR_SMP_SKIPPED reason={} online=1", reason);
             #[cfg(feature = "boot-smoke")]
-            print_self_test();
+            startup_self_test();
             return;
         }
     };
@@ -342,11 +365,13 @@ pub fn init(
     assert_eq!(online, count, "not every secondary reached kernel idle");
     rendezvous("boot", 8);
     #[cfg(feature = "boot-smoke")]
-    print_self_test();
+    startup_self_test();
 }
 
 /// How many CPUs run user threads. Until spec 0051's step 5 lets the APs run
-/// them, userspace stays on the BSP.
+/// them, userspace stays on the BSP. Step 5 makes it the online count when
+/// every CPU ticks (`timer::local_timer`), and keeps 1 with the PIT or the
+/// legacy PIC as the tick source (point 3).
 pub(crate) fn userspace_cpus() -> usize {
     1
 }
@@ -607,6 +632,12 @@ extern "C" fn secondary_main(index: usize) -> ! {
     if apic::init_secondary(slot.apic_id.load(Ordering::Relaxed), topology).is_err() {
         fail(index, 7);
     }
+    // With the LAPIC tick source this CPU ticks too, with the BSP's reload
+    // (spec 0051, point 3). IF stays clear until the idle loop below, so its
+    // first tick arrives once the slot is ONLINE, when traps dispatch.
+    if timer::start_secondary().is_err() {
+        fail(index, FAIL_TIMER);
+    }
     slot.actual_stack.store(stack, Ordering::Relaxed);
     slot.actual_root.store(root, Ordering::Relaxed);
     slot.actual_cr4.store(cr4, Ordering::Relaxed);
@@ -622,6 +653,9 @@ extern "C" fn secondary_main(index: usize) -> ! {
         .compare_exchange(STARTING, ONLINE, Ordering::Release, Ordering::Acquire)
         .is_err()
     {
+        // IF stays clear, so a running timer could not interrupt the halt;
+        // stop it anyway, so a cancelled CPU keeps nothing running.
+        let _ = timer::stop_secondary();
         arch::halt();
     }
     loop {
@@ -629,8 +663,9 @@ extern "C" fn secondary_main(index: usize) -> ! {
             arch::halt();
         }
         // SAFETY: Private descriptors, validated local APIC and shared mappings
-        // are ready. Only rendezvous/spurious interrupts return on an AP. CLI
-        // closes each idle iteration so no Rust handler/state update nests.
+        // are ready. Only command, timer, reschedule and spurious interrupts
+        // return on an idle AP. CLI closes each idle iteration so no Rust
+        // handler/state update nests.
         unsafe {
             asm!("sti", "hlt", "cli", options(nostack));
         }
@@ -676,6 +711,21 @@ pub(crate) fn cpuid_slot() -> Option<usize> {
     SLOTS[..COUNT.load(Ordering::Relaxed)]
         .iter()
         .position(|slot| slot.apic_id.load(Ordering::Relaxed) == id)
+}
+
+/// Whether this AP's traps may take the normal dispatch (spec 0051, point 4):
+/// only once its slot is ONLINE, and not while a smoke probe has armed its
+/// deliberate fault. Otherwise `secondary_fault` records the trap.
+pub(crate) fn ap_traps_dispatch() -> bool {
+    let Some(index) = current_slot() else {
+        return false;
+    };
+    let slot = &SLOTS[index];
+    #[cfg(feature = "boot-smoke")]
+    if slot.expect_fault.load(Ordering::Relaxed) {
+        return false;
+    }
+    index != 0 && slot.state.load(Ordering::Acquire) == ONLINE
 }
 
 /// The AP exception path never touches BSP serial, scheduler or panic state.
@@ -1059,6 +1109,9 @@ pub fn handle_ipi() {
     #[cfg(feature = "boot-smoke")]
     if operation == OP_GUARD_FAULT {
         let guard = stack_bottom(index) - PAGE_SIZE;
+        // The fault below keeps the secondary_fault record (spec 0051,
+        // point 4). The asm block may access memory, so this store precedes it.
+        slot.expect_fault.store(true, Ordering::Relaxed);
         // SAFETY: This deliberate supervisor write probes an unmapped private
         // stack guard. Assembly avoids constructing an invalid Rust reference;
         // the AP's exception path records the exact #PF and halts this CPU.
@@ -1071,6 +1124,8 @@ pub fn handle_ipi() {
     }
     #[cfg(feature = "boot-smoke")]
     if operation == OP_UNMAPPED_FAULT {
+        // As for OP_GUARD_FAULT; the read-only asm block may read this store.
+        slot.expect_fault.store(true, Ordering::Relaxed);
         // SAFETY: Smoke-only command deliberately reads an absent shared alias.
         // Its ownership and completed unmap are verified by the BSP. A real
         // page fault records this AP's failure without invoking BSP test state.
@@ -1164,6 +1219,60 @@ pub fn handle_ipi() {
     slot.result.store(value, Ordering::Relaxed);
     slot.completed.fetch_add(1, Ordering::Relaxed);
     slot.acknowledgement.store(sequence, Ordering::Release);
+}
+
+/// Ask CPU `slot` to reschedule (spec 0051, point 3): set its request, then
+/// send it vector 242. Any CPU may kick any ONLINE CPU, itself included, with
+/// IF=0, holding the scheduler lock or not: the send waits only for this
+/// CPU's own ICR, never for the target. A delivery failure is fatal.
+#[cfg_attr(
+    not(feature = "boot-smoke"),
+    expect(
+        dead_code,
+        reason = "the scheduler's kicks come with spec 0051's step 5"
+    )
+)]
+pub(crate) fn kick(slot: usize) {
+    assert!(!arch::interrupts_enabled(), "a kick requires IF=0");
+    assert!(
+        slot < configured_count(),
+        "kick target outside the configured CPUs"
+    );
+    let target = &SLOTS[slot];
+    assert_eq!(
+        target.state.load(Ordering::Acquire),
+        ONLINE,
+        "kick target not online"
+    );
+    // send_ipi's fence orders this store before the IPI.
+    cpudata::request_resched(slot);
+    apic::send_ipi(target.apic_id.load(Ordering::Relaxed), RESCHEDULE_VECTOR)
+        .expect("reschedule IPI delivery failed");
+}
+
+/// Called on any CPU by the DPL0 vector 242 gate, with IF=0: acknowledge and
+/// count the reschedule IPI. The trap dispatch then acts on this CPU's
+/// request (spec 0051, point 3).
+pub(crate) fn handle_reschedule() {
+    apic::eoi();
+    cpudata::count_reschedule();
+    #[cfg(feature = "boot-smoke")]
+    echo_reschedule();
+}
+
+/// The round-trip check's AP half (spec 0051, step 3): an AP whose echo the
+/// BSP armed takes the request the BSP set and, only if it was set, kicks the
+/// BSP back. A missing request leaves the BSP to time out.
+#[cfg(feature = "boot-smoke")]
+fn echo_reschedule() {
+    let index = cpudata::current_cpu();
+    let bit = 1_u64 << index;
+    if index == 0 || RESCHEDULE_ECHO.fetch_and(!bit, Ordering::AcqRel) & bit == 0 {
+        return;
+    }
+    if cpudata::take_need_resched() {
+        kick(0);
+    }
 }
 
 /// Whether this CPU, as the armed timeout target, withholds this command's
@@ -1267,16 +1376,34 @@ fn read_cpu_data_self_test() -> usize {
     update.count
 }
 
+/// The SMP checks after startup (spec 0051, steps 1 and 3): the print
+/// check, then the tick check, then the reschedule round trip, after which
+/// `MIRROR_SMP_TESTS_OK` reports the printing CPUs, the APs that ticked and
+/// the APs that answered.
+#[cfg(feature = "boot-smoke")]
+fn startup_self_test() {
+    assert!(!arch::interrupts_enabled() && !is_secondary());
+    let cpus = print_self_test();
+    let ticking = tick_self_test();
+    let rescheduled = reschedule_self_test();
+    serial::println!(
+        "MIRROR_SMP_TESTS_OK print_cpus={} print_lines={} ticking_aps={} resched_aps={}",
+        cpus,
+        PRINT_LINES,
+        ticking,
+        rescheduled
+    );
+}
+
 /// The concurrent print check (spec 0051, step 1): the BSP and every online
 /// AP print `PRINT_LINES` lines each at the same time, through the serial
 /// lock. Each CPU prints its first line, waits until every CPU has printed
 /// its first, then prints the rest, so every CPU's last line follows every
 /// CPU's first. The run script checks that every line is whole and that the
-/// CPUs interleave that way. Without published SMP only the BSP prints. Then
-/// `MIRROR_SMP_TESTS_OK` reports the printing CPUs.
+/// CPUs interleave that way. Without published SMP only the BSP prints.
+/// Returns the printing CPUs.
 #[cfg(feature = "boot-smoke")]
-fn print_self_test() {
-    assert!(!arch::interrupts_enabled() && !is_secondary());
+fn print_self_test() -> usize {
     let update = prepare_kernel_update().expect("print check preflight");
     let cpus = update.count.max(1);
     let participants = u64::MAX >> (64 - cpus);
@@ -1306,11 +1433,89 @@ fn print_self_test() {
             "an AP did not finish its print check"
         );
     }
-    serial::println!(
-        "MIRROR_SMP_TESTS_OK print_cpus={} print_lines={}",
-        cpus,
-        PRINT_LINES
+    cpus
+}
+
+/// The tick check (spec 0051, step 3): with the LAPIC tick source, every
+/// online AP takes `TICK_PROOF` ticks of its own timer, a missing EOI
+/// included, since one stops the next, while `TICKS` advances by exactly the
+/// BSP's own ticks. With the PIT source no AP timer runs. Returns the APs
+/// that ticked.
+#[cfg(feature = "boot-smoke")]
+fn tick_self_test() -> usize {
+    let aps = online_aps();
+    let each = || (1..configured_count()).filter(move |&index| aps & 1 << index != 0);
+    if !timer::local_timer() {
+        for index in each() {
+            assert_eq!(
+                cpudata::local_ticks(index),
+                0,
+                "an AP ticked without the LAPIC tick source"
+            );
+        }
+        return 0;
+    }
+    let mut before = [0; MAX_CPUS];
+    for index in each() {
+        before[index] = cpudata::local_ticks(index);
+    }
+    let clock = timer::ticks();
+    let bsp = cpudata::local_ticks(0);
+    assert!(
+        wait_until(|| each().all(|index| cpudata::local_ticks(index) >= before[index] + TICK_PROOF)),
+        "an AP's local timer did not tick"
     );
+    assert_eq!(
+        timer::ticks() - clock,
+        cpudata::local_ticks(0) - bsp,
+        "an AP's tick advanced the BSP's clock"
+    );
+    aps.count_ones() as usize
+}
+
+/// The reschedule round trip (spec 0051, step 3): the BSP kicks each online
+/// AP in turn, the AP takes the request and kicks the BSP back, and the BSP
+/// takes its own. Each side takes exactly one vector 242. Returns the APs
+/// that answered.
+#[cfg(feature = "boot-smoke")]
+fn reschedule_self_test() -> usize {
+    let aps = online_aps();
+    assert!(
+        !cpudata::take_need_resched(),
+        "the BSP had a reschedule request before the round trip"
+    );
+    for index in (1..configured_count()).filter(|&index| aps & 1 << index != 0) {
+        let (target, bsp) = (cpudata::reschedules(index), cpudata::reschedules(0));
+        assert_eq!(
+            RESCHEDULE_ECHO.fetch_or(1 << index, Ordering::AcqRel),
+            0,
+            "a reschedule echo was already armed"
+        );
+        kick(index);
+        assert!(
+            wait_until(|| cpudata::reschedules(index) > target && cpudata::reschedules(0) > bsp),
+            "reschedule IPI round trip timeout"
+        );
+        assert_eq!(
+            RESCHEDULE_ECHO.load(Ordering::Acquire),
+            0,
+            "an AP did not take its reschedule echo"
+        );
+        assert!(
+            !cpudata::resched_requested(index),
+            "an AP kept the BSP's reschedule request"
+        );
+        assert!(
+            cpudata::take_need_resched(),
+            "an AP's reschedule echo did not set the BSP's request"
+        );
+        assert_eq!(
+            (cpudata::reschedules(index), cpudata::reschedules(0)),
+            (target + 1, bsp + 1),
+            "a reschedule IPI arrived more than once"
+        );
+    }
+    aps.count_ones() as usize
 }
 
 /// Print this CPU's check lines as slot `index`: the first, a bounded wait

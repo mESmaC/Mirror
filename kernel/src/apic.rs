@@ -4,7 +4,8 @@
 //! unsupported platforms keep the legacy PIC path. MMIO mappings
 //! are supervisor-only, NX, PAT3 UC, and precede all private userspace roots.
 //! No AML, SCI, PCI interrupt routing, or x2APIC yet. The timer driver owns
-//! BSP local-timer calibration; secondary local timers remain stopped.
+//! BSP local-timer calibration; each AP starts its own periodic timer with the
+//! BSP's reload when the LAPIC is the tick source (spec 0051, point 3).
 //!
 //! Register contracts: Intel SDM vol. 3A chapter 10 and Intel 82093AA datasheet.
 //! https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html
@@ -34,6 +35,10 @@ const _: () = assert!(
 const APIC_BASE: u32 = 0x1b;
 const MASKED: u32 = 1 << 16;
 const IRQ_LINES: [u8; 3] = [0, 1, 12];
+/// The kernel command IPI (smp.rs), sent only by the BSP, its sole producer.
+const COMMAND_VECTOR: u8 = 240;
+/// The reschedule IPI, which any CPU may send (spec 0051, point 3).
+const RESCHEDULE_VECTOR: u8 = 242;
 const ID: u32 = 0x20;
 const VERSION: u32 = 0x30;
 const TPR: u32 = 0x80;
@@ -399,7 +404,8 @@ fn configure_local(local: Mmio, max_lvt: u32, lint: [u32; 2]) -> Result<(), &'st
             }
         }
     }
-    // This also runs on APs, whose timer must stay stopped throughout runtime.
+    // This also runs on APs, whose timer stays stopped until the AP starts it
+    // itself with the BSP's reload (timer::start_secondary).
     local.write(TIMER_INITIAL, 0);
     if local.read(TIMER_INITIAL) != 0 || local.read(TIMER_CURRENT) != 0 {
         return Err("lapic_timer_stop_readback");
@@ -603,8 +609,8 @@ fn ipi_command(apic_id: u32, vector: u8) -> Result<(u32, u32), &'static str> {
     if apic_id >= 255 {
         return Err("invalid_ipi_destination");
     }
-    // Only the installed SMP rendezvous gate is available at this stage.
-    if vector != 240 {
+    // Only the installed command and reschedule gates take fixed IPIs.
+    if !matches!(vector, COMMAND_VECTOR | RESCHEDULE_VECTOR) {
         return Err("unsupported_ipi_vector");
     }
     // Explicit physical destination, fixed delivery, edge trigger, asserted
@@ -622,21 +628,32 @@ fn wait_for_delivery(mut read: impl FnMut() -> u32, spins: usize) -> bool {
     false
 }
 
-/// Submit a fixed physical IPI from the BSP, including a targeted self-IPI.
-/// The caller must publish any work before this call and await its own target
+/// Whether a CPU may send `vector`: the command IPI only from the BSP, which
+/// alone produces commands, and the reschedule IPI from any CPU.
+fn sender_allowed(vector: u8, from_bsp: bool) -> bool {
+    vector == RESCHEDULE_VECTOR || from_bsp
+}
+
+/// Submit a fixed physical IPI, including a targeted self-IPI: vector 240
+/// from the BSP, vector 242 from any CPU (spec 0051, point 3). The caller
+/// must publish any work before this call and await its own target
 /// acknowledgement: an idle ICR proves submission completion, not execution.
+/// The bounded waits poll only this CPU's ICR, never the target, so a caller
+/// may hold the scheduler lock while the target spins on it with IF clear.
 pub(crate) fn send_ipi(apic_id: u32, vector: u8) -> Result<(), &'static str> {
     let (high, low) = ipi_command(apic_id, vector)?;
     let controller = published_controller()?;
-    if local_apic_id()? != u32::from(controller.bsp) {
+    if !sender_allowed(vector, local_apic_id()? == u32::from(controller.bsp)) {
         return Err("ipi_sender_not_bsp");
     }
     let local = controller.local;
     if !wait_for_delivery(|| local.read(ICR_LOW), ICR_SPINS) {
         return Err("ipi_previous_delivery_timeout");
     }
-    // The fence orders normal-memory mailbox publication before the UC MMIO
-    // notification. IF=0 and BSP-only submission serialize the ICR register pair.
+    // The fence orders normal-memory publication, a mailbox or a reschedule
+    // flag, before the UC MMIO notification. The local APIC page names the
+    // executing CPU's own controller, so each CPU writes only its own ICR
+    // pair, and IF=0 keeps the two writes together.
     fence(Ordering::SeqCst);
     local.write(ICR_HIGH, high);
     local.write(ICR_LOW, low);
@@ -727,7 +744,39 @@ pub(crate) fn start_periodic_timer(count: u32) -> Result<(), &'static str> {
     if count == 0 {
         return Err("lapic_timer_zero_count");
     }
-    let local = bsp_local()?;
+    start_periodic(bsp_local()?, count)
+}
+
+/// The calling AP's own controller, for its own timer. Fails on the BSP.
+fn secondary_local() -> Result<Mmio, &'static str> {
+    let controller = published_controller()?;
+    if local_apic_id()? == u32::from(controller.bsp) {
+        return Err("lapic_timer_is_bsp");
+    }
+    Ok(controller.local)
+}
+
+/// Start the calling AP's divide-by-16 periodic timer on vector241 with the
+/// BSP's calibrated reload (spec 0051, point 3). Call with IF=0, after
+/// `init_secondary` configured this CPU's controller. No logging. After an
+/// error the timer may be half configured: the caller fails this CPU and
+/// never sets IF.
+pub(crate) fn start_secondary_timer(count: u32) -> Result<(), &'static str> {
+    if count == 0 {
+        return Err("lapic_timer_zero_count");
+    }
+    start_periodic(secondary_local()?, count)
+}
+
+/// Mask and stop the calling AP's own timer with IF=0, for a slot that was
+/// cancelled after starting it. No logging.
+pub(crate) fn stop_secondary_timer() -> Result<(), &'static str> {
+    stop_timer(secondary_local()?)
+}
+
+/// Program `local`'s timer: stopped first, then divide-by-16, periodic on
+/// vector241 and unmasked, each step read back, then started by the count.
+fn start_periodic(local: Mmio, count: u32) -> Result<(), &'static str> {
     stop_timer(local)?;
     local.write(TIMER_DIVIDE, TIMER_DIVIDE_16);
     local.write(TIMER_LVT, timer_lvt(true, true));
@@ -803,13 +852,18 @@ pub fn self_test() {
     );
     for id in [0, 1, 127, 254] {
         assert_eq!(ipi_command(id, 240), Ok((id << 24, 0x40f0)));
+        assert_eq!(ipi_command(id, 242), Ok((id << 24, 0x40f2)));
     }
     for id in [255, 256, u32::MAX] {
         assert_eq!(ipi_command(id, 240), Err("invalid_ipi_destination"));
+        assert_eq!(ipi_command(id, 242), Err("invalid_ipi_destination"));
     }
-    for vector in [0, 31, 32, 128, 239, 241, 254, 255] {
+    for vector in [0, 31, 32, 128, 239, 241, 243, 254, 255] {
         assert_eq!(ipi_command(1, vector), Err("unsupported_ipi_vector"));
     }
+    // Commands come only from the BSP, a reschedule from any CPU.
+    assert!(sender_allowed(240, true) && !sender_allowed(240, false));
+    assert!(sender_allowed(242, true) && sender_allowed(242, false));
     assert!(!wait_for_delivery(|| panic!("zero poll budget"), 0));
     assert!(wait_for_delivery(|| 0x40f0, 1));
     let mut polls = 0;
@@ -860,6 +914,7 @@ pub fn self_test() {
     assert_eq!(isr_location(241), (0x170, 1 << 17));
     assert_eq!(isr_location(255), (0x170, 1 << 31));
     assert_eq!(start_periodic_timer(0), Err("lapic_timer_zero_count"));
+    assert_eq!(start_secondary_timer(0), Err("lapic_timer_zero_count"));
 
     assert_eq!(ioapic_inputs(0x10), Ok(1));
     assert_eq!(ioapic_inputs(0x0017_0011), Ok(24));

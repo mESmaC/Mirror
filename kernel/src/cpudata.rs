@@ -52,7 +52,8 @@ pub(crate) struct CpuData {
     /// The process this CPU's scheduler dispatched last, for its switch count.
     last_process: AtomicU32,
     /// Set when an event signals a wait during this CPU's user slice, so the
-    /// syscall that signaled returns to the scheduler (0030-D3).
+    /// syscall that signaled returns to the scheduler (0030-D3), or by
+    /// another CPU before its reschedule IPI (spec 0051, point 3).
     need_resched: AtomicBool,
     /// A user context is entered on this CPU: from user entry until the
     /// suspended scheduler resumes, its trap handlers included.
@@ -67,6 +68,10 @@ pub(crate) struct CpuData {
     /// and timer ticks spent halted.
     switches: AtomicU64,
     idle_ticks: AtomicU64,
+    /// LAPIC timer interrupts this CPU took while the LAPIC is the tick
+    /// source, and reschedule IPIs (vector 242) it took (spec 0051, point 3).
+    local_ticks: AtomicU64,
+    reschedules: AtomicU64,
 }
 
 /// Marks no process or thread slot in a `CpuData` slot field.
@@ -89,6 +94,8 @@ impl CpuData {
             installed: AtomicBool::new(false),
             switches: AtomicU64::new(0),
             idle_ticks: AtomicU64::new(0),
+            local_ticks: AtomicU64::new(0),
+            reschedules: AtomicU64::new(0),
         }
     }
 }
@@ -200,6 +207,8 @@ pub(crate) unsafe fn install(slot: usize) -> bool {
     data.sched_held.store(false, Ordering::Relaxed);
     data.switches.store(0, Ordering::Relaxed);
     data.idle_ticks.store(0, Ordering::Relaxed);
+    data.local_ticks.store(0, Ordering::Relaxed);
+    data.reschedules.store(0, Ordering::Relaxed);
     // SAFETY: CPL0 with IF clear per the caller. The entry is a static and so
     // a canonical kernel address. Nothing reads through GS before this, and
     // the order keeps the D1 invariant at every instruction.
@@ -326,9 +335,56 @@ pub(crate) fn set_need_resched() {
     current().need_resched.store(true, Ordering::Relaxed);
 }
 
+/// Ask CPU `slot`, from any CPU, to reschedule (spec 0051, point 3). The
+/// caller sends it a reschedule IPI next, which this store precedes.
+/// Panics for a slot outside the table or one not installed.
+pub(crate) fn request_resched(slot: usize) {
+    let data = &CPU_DATA[slot];
+    assert!(
+        data.installed.load(Ordering::Acquire),
+        "reschedule request for a CPU without per-CPU data"
+    );
+    data.need_resched.store(true, Ordering::Release);
+}
+
+/// Whether this CPU was asked to reschedule, leaving the request set.
+pub(crate) fn need_resched() -> bool {
+    current().need_resched.load(Ordering::Acquire)
+}
+
 /// Whether this CPU was asked to reschedule since the last take, clearing it.
 pub(crate) fn take_need_resched() -> bool {
-    current().need_resched.swap(false, Ordering::Relaxed)
+    current().need_resched.swap(false, Ordering::AcqRel)
+}
+
+/// Whether CPU `slot` has a reschedule request set (boot-smoke checks).
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn resched_requested(slot: usize) -> bool {
+    CPU_DATA[slot].need_resched.load(Ordering::Acquire)
+}
+
+/// Count a LAPIC timer tick on this CPU.
+pub(crate) fn count_local_tick() {
+    current().local_ticks.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count a reschedule IPI on this CPU.
+pub(crate) fn count_reschedule() {
+    current().reschedules.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The LAPIC timer ticks CPU `slot` has taken since its install, read from
+/// any CPU (boot-smoke checks).
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn local_ticks(slot: usize) -> u64 {
+    CPU_DATA[slot].local_ticks.load(Ordering::Relaxed)
+}
+
+/// The reschedule IPIs CPU `slot` has taken since its install, read from
+/// any CPU (boot-smoke checks).
+#[cfg(feature = "boot-smoke")]
+pub(crate) fn reschedules(slot: usize) -> u64 {
+    CPU_DATA[slot].reschedules.load(Ordering::Relaxed)
 }
 
 /// Set or clear this CPU's user-context flag, returning its previous value.

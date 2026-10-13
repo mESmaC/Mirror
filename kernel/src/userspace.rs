@@ -5200,6 +5200,16 @@ pub(crate) fn input_interrupt(frame: &mut TrapFrame) {
     }
 }
 
+/// A reschedule IPI interrupted CPL3, after its EOI (spec 0051, point 3).
+/// When another CPU asked this one to reschedule, the interrupted thread
+/// returns to the scheduler still ready, with no tick charged and the rest of
+/// its quantum kept, as for a wake (0030-D3). Dispatch clears the request.
+pub(crate) fn reschedule_interrupt(frame: &mut TrapFrame) {
+    if crate::cpudata::need_resched() {
+        displace(frame);
+    }
+}
+
 fn suspend(frame: &mut TrapFrame, state: State) {
     park_current(frame, state, false);
 }
