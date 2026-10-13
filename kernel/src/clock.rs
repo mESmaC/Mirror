@@ -34,6 +34,11 @@ const MAX_PERIOD_FS: u32 = 100_000_000;
 // to wrap. Faster counters require a maintained rollover epoch before use.
 const MIN_PERIOD_FS: u32 = 1_000_000;
 const FS_PER_NS: u128 = 1_000_000;
+/// How far a counter read may trail the highest value already read on any
+/// CPU (spec 0051, point 9). A virtualized HPET computes each read from the
+/// host clock on the thread of the vCPU that reads it, and host cores can
+/// disagree by a tick or two; a larger regression is a counter reset.
+const CROSS_CPU_SKEW_NS: u64 = 1_000_000;
 const PROGRESS_POLLS: usize = 2_000_000;
 const _: () =
     assert!(WINDOW >= crate::heap::HEAP_START + crate::heap::HEAP_MAX_SIZE as u64 + PAGE_SIZE);
@@ -312,8 +317,12 @@ pub fn is_available() -> bool {
 /// (except to `restart_counter_ns`); suspend/resume and extending a full 64-bit rollover are not yet supported.
 /// Any CPU may read it with IF clear (spec 0051, point 9). The highest value
 /// read so far is loaded before the counter: every read it records came
-/// earlier, so a counter below it really went backwards, however reads on
-/// other CPUs interleave. `fetch_max` then keeps the highest.
+/// earlier, so on one coherent counter a read below it really went
+/// backwards, however reads on other CPUs interleave. A virtualized counter
+/// may trail another CPU's read by a little: a read at most
+/// `CROSS_CPU_SKEW_NS` behind reports the highest value read instead, so
+/// snapshots stay monotonic across CPUs, and only a larger regression is
+/// fatal. `fetch_max` then keeps the highest.
 pub fn snapshot() -> Option<ClockSnapshot> {
     assert!(!arch::interrupts_enabled(), "clock read requires IF clear");
     let period = PERIOD_FS.load(Ordering::Acquire);
@@ -325,8 +334,13 @@ pub fn snapshot() -> Option<ClockSnapshot> {
     let last = LAST_COUNTER.load(Ordering::Acquire);
     // SAFETY: Acquire observed the permanent UC mapping and enabled 64-bit
     // counter. Reads do not mutate device state; no later writer is permitted.
-    let counter = unsafe { read(COUNTER) };
-    assert!(counter >= last, "HPET main counter regressed or was reset");
+    let read_value = unsafe { read(COUNTER) };
+    let skew = (u128::from(CROSS_CPU_SKEW_NS) * FS_PER_NS / u128::from(period)) as u64;
+    assert!(
+        read_value.saturating_add(skew) >= last,
+        "HPET main counter regressed or was reset: {read_value:#x} after {last:#x}"
+    );
+    let counter = read_value.max(last);
     // Release keeps the counter read above before the store.
     LAST_COUNTER.fetch_max(counter, Ordering::Release);
     Some(ClockSnapshot {
