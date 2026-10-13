@@ -660,6 +660,22 @@ fn tall_triangle_does_not_overflow() {
 }
 
 #[test]
+fn grazing_intersection_t_does_not_overflow() {
+    // Review: (0,0)->(0,65536)->(1,131072)->(32767,131072)->(32767,0)
+    // produced t = 2147418112, overflowing i32 narrowing in
+    // intersection_y. It must rasterize without panic.
+    let mut b = PathBuilder::new();
+    b.move_to(0, 0)
+        .line_to(0, 65536)
+        .line_to(1, 131072)
+        .line_to(32767, 131072)
+        .line_to(32767, 0)
+        .close();
+    let (mask, _) = raster::rasterize(&b.build());
+    assert!(mask.width() > 0 && mask.data().iter().any(|&v| v > 0));
+}
+
+#[test]
 fn rasterize_into_clears_stale_rows() {
     // Review: an empty-span row must zero a reused mask, not keep it.
     let mut mask = Mask::new(2, 2);

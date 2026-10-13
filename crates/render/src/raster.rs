@@ -223,8 +223,12 @@ fn intersection_y(a: &EdgeSpan, b: &EdgeSpan) -> Option<Fixed> {
         return None;
     }
     let t = (bx0 - ax0) as i64 * den / denom;
-    let y = lo + t as i32;
-    if y > lo && y < hi { Some(y) } else { None }
+    // Only a strict interior crossing matters; reject before narrowing to
+    // i32, where a huge t would overflow (review regression).
+    if t <= 0 || t >= den {
+        return None;
+    }
+    Some(lo + t as i32)
 }
 
 /// x at y along the segment (x0,y0)-(x1,y1), with y0 != y1.
