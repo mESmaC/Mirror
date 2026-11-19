@@ -35,7 +35,7 @@ mirror_thread_entry:
     mov rsi, rsp
     jmp mirror_thread_main
 .Lthread_bad_entry:
-    mov eax, 3
+    mov eax, {sys_exit}
     mov edi, 500
     int 0x80
     ud2
@@ -52,20 +52,20 @@ mirror_thread_fpu:
     mov r13, rsi
     fxrstor64 [r12]
     // Different contexts carry different x87/XMM payloads across scheduling.
-    mov eax, 4
+    mov eax, {sys_yield}
     xor edi, edi
     xor esi, esi
     xor edx, edx
     int 0x80
-    mov eax, 5
+    mov eax, {sys_sleep}
     mov edi, 1
     int 0x80
-    mov eax, 4
+    mov eax, {sys_yield}
     xor edi, edi
     int 0x80
     // A fresh dispatch has a two-tick quantum. Waiting four wall-clock ticks
     // without blocking forces timer preemption while these registers are live.
-    mov eax, 2
+    mov eax, {sys_ticks}
     int 0x80
     mov [rsp + 8], rax
     mov ebx, 1000000
@@ -78,14 +78,14 @@ mirror_thread_fpu:
     fchs
     dec ecx
     jnz .Lthread_arithmetic
-    mov eax, 2
+    mov eax, {sys_ticks}
     int 0x80
     sub rax, [rsp + 8]
     cmp rax, 4
     jae .Lthread_snapshot
     dec ebx
     jnz .Lthread_busy
-    mov eax, 3
+    mov eax, {sys_exit}
     mov edi, 571
     int 0x80
     ud2

@@ -11,14 +11,16 @@
 //! can use nonblocking operations; operations requiring a syscall return
 //! [`Error::Unsupported`].
 
+use mirror_sys as sys;
+
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use mirror_sys::{SYS_WAIT_U32, SYS_WAKE_U32};
 pub use mirror_thread_protocol::{MAX_THREADS, MAX_WAIT_TICKS, WAIT_FOREVER, WAIT_WORD_SIZE};
-use mirror_thread_protocol::{SYS_WAIT_U32, SYS_WAKE_U32};
 
 /// A wait-word operation failed without acquiring a mutex or changing its data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,12 +55,12 @@ impl core::error::Error for Error {}
 
 fn error(result: i64) -> Error {
     match result {
-        -11 => Error::WouldBlock,
-        -110 => Error::TimedOut,
-        -22 => Error::InvalidArgument,
-        -14 => Error::BadAddress,
-        -12 => Error::OutOfMemory,
-        -38 => Error::Unsupported,
+        sys::EAGAIN => Error::WouldBlock,
+        sys::ETIMEDOUT => Error::TimedOut,
+        sys::EINVAL => Error::InvalidArgument,
+        sys::EFAULT => Error::BadAddress,
+        sys::ENOMEM => Error::OutOfMemory,
+        sys::ENOSYS => Error::Unsupported,
         other => Error::Unexpected(other),
     }
 }
@@ -122,7 +124,7 @@ fn syscall(number: u64, address: u64, value: u64, timeout: u64) -> i64 {
 
 #[cfg(not(all(target_arch = "x86_64", target_os = "none")))]
 fn syscall(_number: u64, _address: u64, _value: u64, _timeout: u64) -> i64 {
-    -38
+    sys::ENOSYS
 }
 
 const UNLOCKED: u32 = 0;
@@ -378,12 +380,12 @@ mod tests {
         assert_eq!(wake_u32(&word, 1), Err(Error::Unsupported));
         assert_eq!(word.load(Ordering::Relaxed), 2);
         for (number, expected) in [
-            (-11, Error::WouldBlock),
-            (-110, Error::TimedOut),
-            (-22, Error::InvalidArgument),
-            (-14, Error::BadAddress),
-            (-12, Error::OutOfMemory),
-            (-38, Error::Unsupported),
+            (sys::EAGAIN, Error::WouldBlock),
+            (sys::ETIMEDOUT, Error::TimedOut),
+            (sys::EINVAL, Error::InvalidArgument),
+            (sys::EFAULT, Error::BadAddress),
+            (sys::ENOMEM, Error::OutOfMemory),
+            (sys::ENOSYS, Error::Unsupported),
             (-999, Error::Unexpected(-999)),
             (1, Error::Unexpected(1)),
         ] {

@@ -3,12 +3,12 @@
 //! Native threads, execution-context TLS, and process-private word waits. The
 //! runtime owns every thread's stack and TLS storage, retaining them until join.
 
-pub const SYS_TLS_SET: u64 = 27;
-pub const SYS_TLS_GET: u64 = 28;
-pub const SYS_THREAD_CREATE: u64 = 29;
-pub const SYS_THREAD_EXIT: u64 = 30;
-pub const SYS_THREAD_JOIN: u64 = 31;
-pub const SYS_THREAD_ID: u64 = 32;
+pub use mirror_sys::SYS_THREAD_CREATE;
+pub use mirror_sys::SYS_THREAD_EXIT;
+pub use mirror_sys::SYS_THREAD_ID;
+pub use mirror_sys::SYS_THREAD_JOIN;
+pub use mirror_sys::SYS_TLS_GET;
+pub use mirror_sys::SYS_TLS_SET;
 /// RDI points to an aligned readable u32, RSI is its expected value, and RDX is
 /// a relative timeout. A mismatched value returns EAGAIN before checking a zero
 /// timeout. Otherwise zero polls with ETIMEDOUT, and a nonzero timeout blocks.
@@ -20,11 +20,11 @@ pub const SYS_THREAD_ID: u64 = 32;
 /// RDX the stamp taken as a WAKE_U32 chose it. Every other result leaves RSI
 /// and RDX unchanged, so a caller that may block must treat both as outputs.
 /// The stamps report the kernel's order; they do not promise one.
-pub const SYS_WAIT_U32: u64 = 33;
+pub use mirror_sys::SYS_WAIT_U32;
 /// RDI identifies a readable word in the calling process, RSI bounds the wake
 /// count by MAX_THREADS, and RDX must be zero. Returns the number actually woken.
 /// Does not read, change, or materialize the word; expired waits are not counted.
-pub const SYS_WAKE_U32: u64 = 34;
+pub use mirror_sys::SYS_WAKE_U32;
 pub const TLS_BASES_SIZE: usize = 16;
 pub const THREAD_START_SIZE: usize = 40;
 pub const MAX_THREADS: usize = 16;

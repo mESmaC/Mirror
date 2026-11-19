@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+mirror-sys = { path = "../../crates/sys" }
 mirror-vm-protocol = { path = "../../crates/vm-protocol" }
 mirror-thread-protocol = { path = "../../crates/thread-protocol" }
 mirror-clock-protocol = { path = "../../crates/clock-protocol" }

@@ -1,6 +1,11 @@
 #![no_std]
 #![no_main]
 
+use mirror_sys::{
+    SYS_BOOT_HANDLE, SYS_EXIT, SYS_INPUT_POLL, SYS_SLEEP, SYS_SURFACE_INFO, SYS_SURFACE_PRESENT,
+    SYS_TICKS, SYS_WRITE,
+};
+
 mod font;
 mod render;
 mod shell;
@@ -9,14 +14,6 @@ use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 
 const _: &str = include_str!("../linker.ld");
-const SYS_WRITE: u64 = 1;
-const SYS_TICKS: u64 = 2;
-const SYS_EXIT: u64 = 3;
-const SYS_SLEEP: u64 = 5;
-const SYS_BOOT_HANDLE: u64 = 7;
-const SYS_SURFACE_INFO: u64 = 13;
-const SYS_SURFACE_PRESENT: u64 = 14;
-const SYS_INPUT_POLL: u64 = 16;
 
 global_asm!(
     ".section .text.entry,\"ax\"",

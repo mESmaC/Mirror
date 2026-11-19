@@ -1,6 +1,8 @@
 //! Native thread probes share a process address space and capabilities while
 //! keeping independent stacks, TLS bases, general registers and FPU contexts.
 
+use mirror_sys::{EBUSY, EDEADLK, ESRCH};
+
 use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -17,11 +19,14 @@ use crate::{
     require, syscall, vm_protect, vm_release, vm_reserve, vm_stats, vm_write, write,
 };
 
-global_asm!(include_str!("threads.S"));
+global_asm!(
+    include_str!("threads.S"),
+    sys_exit = const mirror_sys::SYS_EXIT,
+    sys_sleep = const mirror_sys::SYS_SLEEP,
+    sys_ticks = const mirror_sys::SYS_TICKS,
+    sys_yield = const mirror_sys::SYS_YIELD,
+);
 
-const ESRCH: i64 = -3;
-const EBUSY: i64 = -16;
-const EDEADLK: i64 = -35;
 const STACK_PAGES: u64 = 16;
 const STACK_REGION_PAGES: u64 = STACK_PAGES + 2;
 const STACKS: u64 = 0x1_0500_0000;

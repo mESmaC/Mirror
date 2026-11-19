@@ -98,7 +98,7 @@ mirror_smp_syscall:
     pop rbx
     ret
 .Lsmp_bad:
-    mov eax, 3
+    mov eax, {sys_exit}
     mov edi, 700
     int 0x80
     ud2

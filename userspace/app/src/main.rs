@@ -3,6 +3,13 @@
 #![no_std]
 #![no_main]
 
+use mirror_sys as sys;
+
+use mirror_sys::{
+    EAGAIN, ETIMEDOUT, SYS_BOOT_HANDLE, SYS_EXIT, SYS_INPUT_POLL, SYS_INPUT_WAIT, SYS_PID,
+    SYS_SURFACE_INFO, SYS_SURFACE_PRESENT, SYS_TICKS, SYS_WRITE,
+};
+
 mod document;
 mod font;
 mod render;
@@ -12,17 +19,6 @@ use core::panic::PanicInfo;
 use mirror_window_protocol::{Event, SYS_SURFACE_COMMIT};
 
 const _: &str = include_str!("../linker.ld");
-const SYS_WRITE: u64 = 1;
-const SYS_TICKS: u64 = 2;
-const SYS_EXIT: u64 = 3;
-const SYS_PID: u64 = 6;
-const SYS_BOOT_HANDLE: u64 = 7;
-const SYS_SURFACE_INFO: u64 = 13;
-const SYS_SURFACE_PRESENT: u64 = 14;
-const SYS_INPUT_WAIT: u64 = 15;
-const SYS_INPUT_POLL: u64 = 16;
-const EAGAIN: i64 = -11;
-const ETIMEDOUT: i64 = -110;
 
 global_asm!(
     ".section .text.entry,\"ax\"",
@@ -124,12 +120,27 @@ fn next_event(number: u64, input: u64) -> Result<Event, i64> {
 fn check_authority(console: u64, surface: u64, input: u64) {
     let mut buffer = [0xa5u8; 32];
     let address = buffer.as_mut_ptr() as u64;
-    require(syscall(SYS_BOOT_HANDLE, 5, 0, 0) == -9, 10);
-    require(syscall(SYS_SURFACE_INFO, console, address, 24) == -13, 11);
-    require(syscall(SYS_INPUT_POLL, console, address, 32) == -13, 12);
-    require(syscall(SYS_INPUT_POLL, surface, address, 32) == -13, 13);
-    require(syscall(SYS_SURFACE_INFO, input, address, 24) == -13, 14);
-    require(syscall(SYS_SURFACE_COMMIT, console, 0, 0) == -13, 15);
+    require(syscall(SYS_BOOT_HANDLE, 5, 0, 0) == sys::EBADF, 10);
+    require(
+        syscall(SYS_SURFACE_INFO, console, address, 24) == sys::EACCES,
+        11,
+    );
+    require(
+        syscall(SYS_INPUT_POLL, console, address, 32) == sys::EACCES,
+        12,
+    );
+    require(
+        syscall(SYS_INPUT_POLL, surface, address, 32) == sys::EACCES,
+        13,
+    );
+    require(
+        syscall(SYS_SURFACE_INFO, input, address, 24) == sys::EACCES,
+        14,
+    );
+    require(
+        syscall(SYS_SURFACE_COMMIT, console, 0, 0) == sys::EACCES,
+        15,
+    );
     require(buffer == [0xa5; 32], 16);
     require(syscall(SYS_SURFACE_INFO, surface, address, 24) == 24, 17);
     let mut words = [0u32; 6];

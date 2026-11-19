@@ -75,7 +75,7 @@ mirror_probe_fpu:
 
     // An ordinary syscall must preserve the entire extended context too.
     mov ebx, 2
-    mov eax, 6
+    mov eax, {sys_pid}
     int 0x80
     cmp rax, r15
     jne .Lfpu_fail
@@ -86,7 +86,7 @@ mirror_probe_fpu:
     mov qword ptr [rsp + 8], 4
 .Lfpu_switches:
     mov ebx, 3
-    mov eax, 4
+    mov eax, {sys_yield}
     int 0x80
     test rax, rax
     jnz .Lfpu_fail
@@ -94,7 +94,7 @@ mirror_probe_fpu:
     test eax, eax
     jnz .Lfpu_fail
     mov ebx, 4
-    mov eax, 5
+    mov eax, {sys_sleep}
     mov edi, 2
     int 0x80
     test rax, rax
@@ -115,7 +115,7 @@ mirror_probe_fpu:
     test eax, eax
     jnz .Lfpu_fail
     mov ebx, 6
-    mov eax, 26
+    mov eax, {sys_vm_stats}
     lea rdi, [r13 + 4096]
     mov esi, 48
     xor edx, edx
@@ -129,14 +129,14 @@ mirror_probe_fpu:
     // The kernel records its preemption count at this marker and requires that
     // it increase before the success marker. This interval never yields/sleeps.
     mov ebx, 7
-    mov eax, 1
+    mov eax, {sys_write}
     lea rdi, [rip + .Lfpu_preemption_marker]
     mov esi, {preemption_marker_len}
     mov rdx, r14
     int 0x80
     cmp rax, {preemption_marker_len}
     jne .Lfpu_fail
-    mov eax, 2
+    mov eax, {sys_ticks}
     int 0x80
     test rax, rax
     js .Lfpu_fail
@@ -158,7 +158,7 @@ mirror_probe_fpu:
     call .Lfpu_compare
     test eax, eax
     jnz .Lfpu_fail
-    mov eax, 2
+    mov eax, {sys_ticks}
     int 0x80
     cmp rax, [rsp + 24]
     jl .Lfpu_fail

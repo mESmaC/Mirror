@@ -7,6 +7,8 @@
 //! absent paging subtrees. Resident work remains bounded by 8192 pages per
 //! process.
 
+use mirror_sys::{EACCES, EEXIST, EFAULT, EINVAL, ENOMEM};
+
 use crate::{
     memory::{FrameAllocator, PAGE_SIZE},
     paging::{
@@ -20,11 +22,6 @@ const RESIDENT_BITMAP_WORDS: usize = (RESERVED_LIMIT / PAGE_SIZE / 64) as usize;
 const USER_END: u64 = 1 << 47;
 const READ: u64 = 1;
 const READ_WRITE: u64 = 3;
-const EINVAL: i64 = -22;
-const ENOMEM: i64 = -12;
-const EACCES: i64 = -13;
-const EFAULT: i64 = -14;
-const EEXIST: i64 = -17;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Region {

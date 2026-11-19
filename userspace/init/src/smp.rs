@@ -27,7 +27,10 @@ use crate::{
     vm_write, write,
 };
 
-global_asm!(include_str!("smp.S"));
+global_asm!(
+    include_str!("smp.S"),
+    sys_exit = const mirror_sys::SYS_EXIT,
+);
 
 unsafe extern "C" {
     /// Make a native call with callee-saved registers and XMM8-12 loaded

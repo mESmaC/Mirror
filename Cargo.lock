@@ -31,6 +31,7 @@ version = "0.1.0"
 name = "mirror-app"
 version = "0.1.0"
 dependencies = [
+ "mirror-sys",
  "mirror-ui-tokens",
  "mirror-window-protocol",
 ]
@@ -38,11 +39,15 @@ dependencies = [
 [[package]]
 name = "mirror-clock-protocol"
 version = "0.1.0"
+dependencies = [
+ "mirror-sys",
+]
 
 [[package]]
 name = "mirror-desktop"
 version = "0.1.0"
 dependencies = [
+ "mirror-sys",
  "mirror-ui-tokens",
  "mirror-window-protocol",
 ]
@@ -61,6 +66,7 @@ version = "0.1.0"
 dependencies = [
  "mirror-clock-protocol",
  "mirror-sync",
+ "mirror-sys",
  "mirror-thread-protocol",
  "mirror-vm-protocol",
 ]
@@ -74,6 +80,7 @@ dependencies = [
  "mirror-acpi",
  "mirror-clock-protocol",
  "mirror-perf-protocol",
+ "mirror-sys",
  "mirror-thread-protocol",
  "mirror-ui-tokens",
  "mirror-vm-protocol",
@@ -95,12 +102,20 @@ dependencies = [
 name = "mirror-sync"
 version = "0.1.0"
 dependencies = [
+ "mirror-sys",
  "mirror-thread-protocol",
 ]
 
 [[package]]
+name = "mirror-sys"
+version = "0.1.0"
+
+[[package]]
 name = "mirror-thread-protocol"
 version = "0.1.0"
+dependencies = [
+ "mirror-sys",
+]
 
 [[package]]
 name = "mirror-ui-tokens"
@@ -109,7 +124,13 @@ version = "0.1.0"
 [[package]]
 name = "mirror-vm-protocol"
 version = "0.1.0"
+dependencies = [
+ "mirror-sys",
+]
 
 [[package]]
 name = "mirror-window-protocol"
 version = "0.1.0"
+dependencies = [
+ "mirror-sys",
+]

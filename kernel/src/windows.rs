@@ -1,6 +1,8 @@
 //! Bounded application surfaces and routed input, independent of window policy.
 //! Pixel pages are kernel-owned, never user-mapped, and explicitly reclaimed.
 
+use mirror_sys as sys;
+
 use crate::memory::{FrameAllocator, PAGE_SIZE};
 use mirror_window_protocol as protocol;
 
@@ -44,7 +46,7 @@ impl Pixels {
             let Some(frame) = frames.allocate() else {
                 // SAFETY: These unexposed pages have no aliases except the HHDM.
                 unsafe { pixels.destroy(frames) };
-                return Err(-12);
+                return Err(sys::ENOMEM);
             };
             pixels.frames[index] = frame;
             pixels.count += 1;
@@ -54,7 +56,7 @@ impl Pixels {
             else {
                 // SAFETY: No owned page has been exposed to users or devices.
                 unsafe { pixels.destroy(frames) };
-                return Err(-12);
+                return Err(sys::ENOMEM);
             };
             // SAFETY: This freshly allocated page is exclusively owned, fully
             // mapped by the caller's HHDM and checked against address overflow.
@@ -200,10 +202,10 @@ impl Application {
 
     pub fn present(&mut self, packet: &[u8]) -> Result<(), i64> {
         if self.state != 1 {
-            return Err(-32);
+            return Err(sys::EPIPE);
         }
         if packet.len() != TILE_PACKET {
-            return Err(-22);
+            return Err(sys::EINVAL);
         }
         let x = word(packet, 0) as usize;
         let y = word(packet, 4) as usize;
@@ -214,7 +216,7 @@ impl Application {
             || x > WIDTH - EDGE
             || y > HEIGHT - EDGE
         {
-            return Err(-22);
+            return Err(sys::EINVAL);
         }
         for row in 0..EDGE {
             self.back.write(
@@ -233,16 +235,16 @@ impl Application {
 
     pub fn commit(&mut self) -> Result<u64, i64> {
         if self.state != 1 {
-            return Err(-32);
+            return Err(sys::EPIPE);
         }
         if self.covered != TILES {
-            return Err(-11);
+            return Err(sys::EAGAIN);
         }
         let revision = self
             .revision
             .checked_add(1)
             .filter(|value| *value <= i64::MAX as u64)
-            .ok_or(-75)?;
+            .ok_or(sys::EOVERFLOW)?;
         core::mem::swap(&mut self.front, &mut self.back);
         self.revision = revision;
         self.coverage.fill(0);
@@ -252,7 +254,7 @@ impl Application {
 
     pub fn read(&self, packet: &mut [u8]) -> Result<(), i64> {
         if !(28..=READ_PACKET).contains(&packet.len()) {
-            return Err(-22);
+            return Err(sys::EINVAL);
         }
         let revision = u64::from_le_bytes(packet[..8].try_into().unwrap());
         let x = word(packet, 8) as usize;
@@ -265,10 +267,10 @@ impl Application {
             || y > HEIGHT - height
             || packet.len() != 24 + width * height * 4
         {
-            return Err(-22);
+            return Err(sys::EINVAL);
         }
         if revision != self.revision {
-            return Err(-11);
+            return Err(sys::EAGAIN);
         }
         for row in 0..height {
             self.front.read(
@@ -286,7 +288,7 @@ impl Application {
     /// another adds nothing, so a pointer loss never costs a key (0017a-D3).
     pub fn enqueue(&mut self, event: [u8; EVENT_SIZE]) -> Result<(), i64> {
         if self.state != 1 {
-            return Err(-32);
+            return Err(sys::EPIPE);
         }
         if protocol::Event::decode(&event) == Ok(protocol::Event::Reset) {
             if self.length == 0 || self.events[self.tail()] != reset_event() {
@@ -295,7 +297,7 @@ impl Application {
             return Ok(());
         }
         if self.real == QUEUE_EVENTS {
-            return Err(-11);
+            return Err(sys::EAGAIN);
         }
         self.push(event);
         self.real += 1;
@@ -372,7 +374,7 @@ impl Session {
             .iter()
             .flatten()
             .find(|application| application.pid == pid)
-            .ok_or(-9)
+            .ok_or(sys::EBADF)
     }
 
     pub fn get_mut(&mut self, pid: u64) -> Result<&mut Application, i64> {
@@ -380,7 +382,7 @@ impl Session {
             .iter_mut()
             .flatten()
             .find(|application| application.pid == pid)
-            .ok_or(-9)
+            .ok_or(sys::EBADF)
     }
 
     /// The window index of the app with this PID.
@@ -392,7 +394,7 @@ impl Session {
                     .as_ref()
                     .is_some_and(|application| application.pid == pid)
             })
-            .ok_or(-9)
+            .ok_or(sys::EBADF)
     }
 }
 
@@ -405,14 +407,14 @@ fn reset_event() -> [u8; EVENT_SIZE] {
 }
 
 pub fn validate_event(event: &[u8; EVENT_SIZE], smoke: bool) -> Result<(), i64> {
-    let event = protocol::Event::decode(event).map_err(|_| -22)?;
+    let event = protocol::Event::decode(event).map_err(|_| sys::EINVAL)?;
     if !smoke
         && matches!(
             event,
             protocol::Event::TestFault | protocol::Event::TestBusy
         )
     {
-        Err(-22)
+        Err(sys::EINVAL)
     } else {
         Ok(())
     }
@@ -428,7 +430,7 @@ pub fn self_test(frames: &mut FrameAllocator<'_>, direct_map: u64) {
         frames.stats().unwrap().allocated_frames,
         before + SURFACE_PAGES
     );
-    assert_eq!(application.commit(), Err(-11));
+    assert_eq!(application.commit(), Err(sys::EAGAIN));
     let mut tile = [9; TILE_PACKET];
     tile[..8].fill(0);
     tile[8..12].copy_from_slice(&(EDGE as u32).to_le_bytes());
@@ -455,12 +457,16 @@ pub fn self_test(frames: &mut FrameAllocator<'_>, direct_map: u64) {
     }
     assert_eq!(application.commit(), Ok(1));
     let stale = read;
-    assert_eq!(application.read(&mut read), Err(-11));
+    assert_eq!(application.read(&mut read), Err(sys::EAGAIN));
     assert_eq!(read, stale, "stale read modified packet");
     read[..8].copy_from_slice(&1_u64.to_le_bytes());
     application.read(&mut read).unwrap();
     assert_eq!(&read[24..], &[9; 4]);
-    assert_eq!(application.commit(), Err(-11), "coverage survived commit");
+    assert_eq!(
+        application.commit(),
+        Err(sys::EAGAIN),
+        "coverage survived commit"
+    );
     tile[..8].fill(0);
     tile[16..].fill(22);
     application.present(&tile).unwrap();
@@ -471,9 +477,9 @@ pub fn self_test(frames: &mut FrameAllocator<'_>, direct_map: u64) {
         "partial next frame changed front buffer"
     );
     tile[..4].copy_from_slice(&1_u32.to_le_bytes());
-    assert_eq!(application.present(&tile), Err(-22));
+    assert_eq!(application.present(&tile), Err(sys::EINVAL));
     tile[..4].copy_from_slice(&u32::MAX.to_le_bytes());
-    assert_eq!(application.present(&tile), Err(-22));
+    assert_eq!(application.present(&tile), Err(sys::EINVAL));
     assert_eq!(application.covered, 1);
     while application.peek().is_some() {
         application.consume();
@@ -498,12 +504,12 @@ pub fn self_test(frames: &mut FrameAllocator<'_>, direct_map: u64) {
     application.enqueue(reset_event()).unwrap();
     application.enqueue(reset_event()).unwrap();
     assert_eq!(application.length, QUEUE_SLOTS);
-    assert_eq!(application.enqueue(key(b'z')), Err(-11));
+    assert_eq!(application.enqueue(key(b'z')), Err(sys::EAGAIN));
     for index in 0..QUEUE_EVENTS as u8 {
         assert_eq!(application.peek(), Some(reset_event()), "lost a Reset");
         application.consume();
         if index == 0 {
-            assert_eq!(application.enqueue(key(b'z')), Err(-11));
+            assert_eq!(application.enqueue(key(b'z')), Err(sys::EAGAIN));
         }
         assert_eq!(application.peek(), Some(key(b'A' + index)), "lost a key");
         application.consume();
@@ -519,13 +525,13 @@ pub fn self_test(frames: &mut FrameAllocator<'_>, direct_map: u64) {
     let key = key(b'x');
     let mut invalid = key;
     invalid[16] = 1;
-    assert_eq!(validate_event(&invalid, true), Err(-22));
+    assert_eq!(validate_event(&invalid, true), Err(sys::EINVAL));
     assert_eq!(
         validate_event(&protocol::Event::TestFault.encode().unwrap(), false),
-        Err(-22)
+        Err(sys::EINVAL)
     );
     application.finish(3, 6);
-    assert_eq!(application.enqueue(key), Err(-32));
+    assert_eq!(application.enqueue(key), Err(sys::EPIPE));
     // SAFETY: The test never published this object or user-mapped its pages.
     unsafe { application.destroy(frames) };
     assert_eq!(frames.stats().unwrap().allocated_frames, before);

@@ -8,7 +8,7 @@
 /// first. An unavailable clock returns ENODEV without inspecting or touching
 /// the output range; otherwise an invalid output range returns EFAULT.
 /// Success writes one complete record and returns CLOCK_SNAPSHOT_SIZE.
-pub const SYS_CLOCK_GET: u64 = 35;
+pub use mirror_sys::SYS_CLOCK_GET;
 pub const CLOCK_SNAPSHOT_SIZE: usize = 24;
 pub const CLOCK_VERSION: u32 = 1;
 

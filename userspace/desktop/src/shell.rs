@@ -1,6 +1,8 @@
 //! Native window management and composition. Applications own their content;
 //! this process owns only window geometry, decoration, focus and scanout.
 
+use mirror_sys as sys;
+
 use crate::render::{self, Rect, Renderer, WindowView};
 use crate::{
     Event as HardwareEvent, SYS_INPUT_POLL, SYS_SLEEP, SYS_TICKS, boot_handle, exit, next_input,
@@ -653,7 +655,7 @@ impl Shell {
                     bytes.len() as u64,
                 ) {
                     0 => window.pending.pop(),
-                    -11 => break,
+                    sys::EAGAIN => break,
                     _ => {
                         window.pending = Pending::new();
                         break;
@@ -1081,7 +1083,7 @@ pub fn run(smoke: bool) -> ! {
                         exit(0);
                     }
                 }
-                Err(-11) => break,
+                Err(sys::EAGAIN) => break,
                 Err(_) => exit(144),
             }
         }

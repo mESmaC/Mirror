@@ -3,10 +3,10 @@
 //! Anonymous virtual-memory ABI. Addresses and lengths are page aligned;
 //! reservation does not commit physical pages. Protection never permits execute.
 
-pub const SYS_VM_RESERVE: u64 = 23;
-pub const SYS_VM_RELEASE: u64 = 24;
-pub const SYS_VM_PROTECT: u64 = 25;
-pub const SYS_VM_STATS: u64 = 26;
+pub use mirror_sys::SYS_VM_PROTECT;
+pub use mirror_sys::SYS_VM_RELEASE;
+pub use mirror_sys::SYS_VM_RESERVE;
+pub use mirror_sys::SYS_VM_STATS;
 pub const PAGE_SIZE: u64 = 4096;
 pub const PROT_NONE: u64 = 0;
 pub const PROT_READ: u64 = 1;

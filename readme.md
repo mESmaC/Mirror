@@ -506,6 +506,13 @@ Input records are eight little-endian `u32` words: version `1`, event kind, flag
 
 Routed application input uses the separate [window protocol](crates/window-protocol/src/lib.rs): 32-byte key records preserve flags/kind/printable ASCII, pointer records carry unsigned local coordinates and button levels, and reset/focus records establish interaction state. The shell owns physical-to-local translation. The hardware delta format above applies to the shell/console input lease. `APP_READ` has a 24-byte header: little-endian `u64` revision followed by `u32` x, y, width, height, then exactly `4 * width * height` output bytes. Tiles are at most 16 by 16. App uploads cover complete aligned 16 by 16 tiles before commit; front/back swapping resets coverage for the next frame.
 
+The shared [`mirror-sys`](crates/sys/src/lib.rs) crate owns syscall numbers and
+negative errors for the kernel, native programs and protocol crates (spec 0020).
+All live numbers remain unchanged. Calls 36 (`REALTIME_GET`) and 37
+(`RANDOM_BYTES`) are reserved; both return `ENOSYS` without accessing user memory.
+ABI strings use a byte count and complete UTF-8 validation, including bytes after
+an embedded NUL. Binary protocol records keep their own byte-array formats.
+
 Capability operations resolve the caller's handle and required rights before accessing the resource. Native error results are:
 
 | Result | Meaning |

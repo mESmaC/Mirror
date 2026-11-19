@@ -1,6 +1,12 @@
 #![no_std]
 #![no_main]
 
+use mirror_sys::{
+    EACCES, EAGAIN, EBADF, EEXIST, EFAULT, EINVAL, EMFILE, EMSGSIZE, ENOMEM, ENOSYS, EPIPE,
+    ETIMEDOUT, SYS_BOOT_HANDLE, SYS_CLOSE, SYS_DUP, SYS_EXIT, SYS_PID, SYS_RECV, SYS_RECV_WAIT,
+    SYS_SEND, SYS_SLEEP, SYS_SURFACE_INFO, SYS_SURFACE_PRESENT, SYS_TICKS, SYS_WRITE, SYS_YIELD,
+};
+
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 use mirror_vm_protocol::{
@@ -9,6 +15,7 @@ use mirror_vm_protocol::{
     SYS_VM_STATS,
 };
 
+mod abi;
 mod clock;
 mod fpu;
 mod smp;
@@ -19,35 +26,9 @@ mod tls;
 // Relink when the package-specific script changes, without a host build script.
 const _: &str = include_str!("../linker.ld");
 
-const SYS_WRITE: u64 = 1;
-const SYS_TICKS: u64 = 2;
-const SYS_EXIT: u64 = 3;
-const SYS_YIELD: u64 = 4;
-const SYS_SLEEP: u64 = 5;
-const SYS_PID: u64 = 6;
-const SYS_BOOT_HANDLE: u64 = 7;
-const SYS_SEND: u64 = 8;
-const SYS_RECV: u64 = 9;
-const SYS_RECV_WAIT: u64 = 10;
-const SYS_CLOSE: u64 = 11;
-const SYS_DUP: u64 = 12;
-const SYS_SURFACE_INFO: u64 = 13;
-const SYS_SURFACE_PRESENT: u64 = 14;
 const RIGHT_SEND: u64 = 1;
 const RIGHT_RECEIVE: u64 = 2;
 const RIGHT_WRITE: u64 = 4;
-const EBADF: i64 = -9;
-const EAGAIN: i64 = -11;
-const ENOMEM: i64 = -12;
-const EACCES: i64 = -13;
-const EFAULT: i64 = -14;
-const EEXIST: i64 = -17;
-const EINVAL: i64 = -22;
-const EMFILE: i64 = -24;
-const EPIPE: i64 = -32;
-const ENOSYS: i64 = -38;
-const EMSGSIZE: i64 = -90;
-const ETIMEDOUT: i64 = -110;
 const KERNEL_BASE: u64 = 0xffff_ffff_8000_0000;
 const CODE_BASE: u64 = 0x0040_0000;
 const STACK_GUARD: u64 = 0x7ffe_f000;
@@ -1326,6 +1307,7 @@ extern "C" fn init_main(launch: u64) -> ! {
         23,
     );
     require(syscall(u64::MAX, 0, 0, 0) == ENOSYS, 24);
+    abi::check(console);
     require(syscall(SYS_WRITE, 0, 0, console) == 0, 29);
     require(syscall(SYS_WRITE, CODE_BASE, 257, console) == EINVAL, 32);
     check_syscall_registers(pid);

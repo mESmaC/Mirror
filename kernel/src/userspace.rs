@@ -12,6 +12,8 @@
 //! the frame allocator, the heap or the kernel VA window: an AP hands such a
 //! thread to the BSP's work list.
 
+use mirror_sys as sys;
+
 // A child module, so the scheduler shares these private types (spec 0030a).
 #[path = "sched.rs"]
 mod sched;
@@ -1299,7 +1301,7 @@ fn test_create_rollback(
         kernel_va::arm_frame_failure(index);
         assert_eq!(
             add_thread(kernel, frames, process, slot, &start),
-            Err(-11),
+            Err(sys::EAGAIN),
             "a failed stack build must refuse the thread"
         );
         let now = FrameBaseline::take(frames);
@@ -1404,14 +1406,14 @@ fn table_bounds_self_test(
     );
     assert_eq!(
         refused.map_err(|error| error.errno()),
-        Err(-11),
+        Err(sys::EAGAIN),
         "a full process table took a process"
     );
     // SAFETY: An occupied slot that nothing else references.
     let process = unsafe { sched::process(slots[0]) };
     assert_eq!(
         add_thread(kernel, frames, process, slots[0], &start),
-        Err(-11),
+        Err(sys::EAGAIN),
         "a full thread table took a thread"
     );
     assert_eq!(allocated(frames), full, "a refused create allocated frames");
@@ -1439,7 +1441,7 @@ fn table_bounds_self_test(
     );
     assert_eq!(
         refused.map_err(|error| error.errno()),
-        Err(-11),
+        Err(sys::EAGAIN),
         "a table of zombies took a process"
     );
     for &slot in &slots {
@@ -1474,7 +1476,7 @@ fn table_bounds_self_test(
         }
         assert_eq!(
             add_thread(kernel, frames, process, *slot, &start),
-            Err(-11),
+            Err(sys::EAGAIN),
             "a full process took a thread"
         );
     }
@@ -1495,7 +1497,7 @@ fn table_bounds_self_test(
     );
     assert_eq!(
         refused.map_err(|error| error.errno()),
-        Err(-11),
+        Err(sys::EAGAIN),
         "a full thread table took a process"
     );
     assert_eq!(allocated(frames), full, "a refused create allocated frames");
@@ -1664,8 +1666,8 @@ impl CreateError {
     /// The error a launch returns to its caller.
     fn errno(&self) -> i64 {
         match self {
-            Self::TableFull => -11,
-            Self::Paging(_) | Self::Stack(_) => -12,
+            Self::TableFull => sys::EAGAIN,
+            Self::Paging(_) | Self::Stack(_) => sys::ENOMEM,
         }
     }
 }
@@ -3133,12 +3135,12 @@ fn complete_memory(
     let frame = unsafe { sched::process(owner) }.thread().context.frame;
     let result = match frame.rax {
         // SAFETY: As above.
-        vm_abi::SYS_VM_RESERVE => unsafe { sched::process(owner) }
+        sys::SYS_VM_RESERVE => unsafe { sched::process(owner) }
             .vm
             .reserve(frame.rdi, frame.rsi, frame.rdx)
             .map(|address| address as i64),
-        vm_abi::SYS_VM_RELEASE if frame.rdx != 0 => Err(-22),
-        vm_abi::SYS_VM_RELEASE => {
+        sys::SYS_VM_RELEASE if frame.rdx != 0 => Err(sys::EINVAL),
+        sys::SYS_VM_RELEASE => {
             // The SMP battery's release of its written page keeps that page's
             // frame for the stale-write canary (spec 0051, step 5).
             #[cfg(feature = "boot-smoke")]
@@ -3155,7 +3157,7 @@ fn complete_memory(
             canary::disarm();
             result
         }
-        vm_abi::SYS_VM_PROTECT => complete_removal(owner, frames, |process| {
+        sys::SYS_VM_PROTECT => complete_removal(owner, frames, |process| {
             process
                 .vm
                 .begin_protect(&process.space, frame.rdi, frame.rsi, frame.rdx)
@@ -3169,7 +3171,7 @@ fn complete_memory(
     if process.finished() {
         return;
     }
-    if result.is_ok() && frame.rax != vm_abi::SYS_VM_RESERVE {
+    if result.is_ok() && frame.rax != sys::SYS_VM_RESERVE {
         // Cancel the old wait keys before this thread runs again. The ledger
         // changed first, so no sibling began a wait in the interval since.
         // Failed transactional changes leave waiters untouched. No backing
@@ -3178,7 +3180,7 @@ fn complete_memory(
             process,
             frame.rdi,
             frame.rsi,
-            frame.rax == vm_abi::SYS_VM_RELEASE || frame.rdx == vm_abi::PROT_NONE,
+            frame.rax == sys::SYS_VM_RELEASE || frame.rdx == vm_abi::PROT_NONE,
         );
     }
     process.thread_mut().context.frame.rax = result.unwrap_or_else(|error| error) as u64;
@@ -3327,10 +3329,10 @@ fn complete_page_in(
                 return;
             }
             if let Err(error) = result {
-                process.thread_mut().context.frame.rax = (if error.errno() == -12 {
-                    -12_i64
+                process.thread_mut().context.frame.rax = (if error.errno() == sys::ENOMEM {
+                    sys::ENOMEM
                 } else {
-                    -14_i64
+                    sys::EFAULT
                 }) as u64;
                 process.thread_mut().state = State::Ready;
                 return;
@@ -3373,62 +3375,68 @@ fn syscall_buffer(process: &Process, frame: &TrapFrame) -> Option<(u64, usize, b
         )
     };
     let range = match frame.rax {
-        1 if frame.rsi <= MAX_WRITE as u64
-            && require(frame.rdx, capability::WRITE) == Some(Object::Console) =>
+        sys::SYS_WRITE
+            if frame.rsi <= MAX_WRITE as u64
+                && require(frame.rdx, capability::WRITE) == Some(Object::Console) =>
         {
             (frame.rdi, frame.rsi, false)
         }
-        8 if (1..=MESSAGE_SIZE as u64).contains(&frame.rdx)
-            && channel_for(process, frame.rdi, capability::SEND).is_ok() =>
+        sys::SYS_SEND
+            if (1..=MESSAGE_SIZE as u64).contains(&frame.rdx)
+                && channel_for(process, frame.rdi, capability::SEND).is_ok() =>
         {
             (frame.rsi, frame.rdx, false)
         }
-        9 | 10
+        sys::SYS_RECV | sys::SYS_RECV_WAIT
             if (1..=MESSAGE_SIZE as u64).contains(&frame.rdx)
                 && channel_for(process, frame.rdi, capability::RECEIVE).is_ok() =>
         {
             (frame.rsi, frame.rdx, true)
         }
-        13 if frame.rdx == 24 && surface(frame.rdi) => (frame.rsi, frame.rdx, true),
-        14 if (16..=windows::TILE_PACKET as u64).contains(&frame.rdx) && surface(frame.rdi) => {
+        sys::SYS_SURFACE_INFO if frame.rdx == 24 && surface(frame.rdi) => {
+            (frame.rsi, frame.rdx, true)
+        }
+        sys::SYS_SURFACE_PRESENT
+            if (16..=windows::TILE_PACKET as u64).contains(&frame.rdx) && surface(frame.rdi) =>
+        {
             (frame.rsi, frame.rdx, false)
         }
-        15 | 16
+        sys::SYS_INPUT_WAIT | sys::SYS_INPUT_POLL
             if frame.rdx == input::EVENT_SIZE as u64
                 && (require(frame.rdi, capability::RECEIVE) == Some(Object::Input)
                     || matches!(require(frame.rdi, capability::RECEIVE), Some(Object::AppInput(pid)) if pid == process.pid)) =>
         {
             (frame.rsi, frame.rdx, true)
         }
-        18 if frame.rdx == windows::INFO_SIZE as u64 && app(frame.rdi) => {
+        sys::SYS_APP_INFO if frame.rdx == windows::INFO_SIZE as u64 && app(frame.rdi) => {
             (frame.rsi, frame.rdx, true)
         }
-        19 if frame.rdx == windows::EVENT_SIZE as u64 && app(frame.rdi) => {
+        sys::SYS_APP_EVENT if frame.rdx == windows::EVENT_SIZE as u64 && app(frame.rdi) => {
             (frame.rsi, frame.rdx, false)
         }
-        20 if (28..=windows::READ_PACKET as u64).contains(&frame.rdx) && app(frame.rdi) => {
+        sys::SYS_APP_READ
+            if (28..=windows::READ_PACKET as u64).contains(&frame.rdx) && app(frame.rdi) =>
+        {
             (frame.rsi, frame.rdx, true)
         }
-        vm_abi::SYS_VM_STATS if frame.rsi == vm_abi::STATS_SIZE as u64 && frame.rdx == 0 => {
+        sys::SYS_VM_STATS if frame.rsi == vm_abi::STATS_SIZE as u64 && frame.rdx == 0 => {
             (frame.rdi, frame.rsi, true)
         }
-        thread_abi::SYS_TLS_GET
-            if frame.rsi == thread_abi::TLS_BASES_SIZE as u64 && frame.rdx == 0 =>
-        {
+        sys::SYS_TLS_GET if frame.rsi == thread_abi::TLS_BASES_SIZE as u64 && frame.rdx == 0 => {
             (frame.rdi, frame.rsi, true)
         }
-        clock_abi::SYS_CLOCK_GET
+        sys::SYS_CLOCK_GET
             if clock_abi::clock_arguments_valid(frame.rsi, frame.rdx)
                 && crate::clock::is_available() =>
         {
             (frame.rdi, frame.rsi, true)
         }
-        thread_abi::SYS_THREAD_CREATE
+        sys::SYS_THREAD_CREATE
             if frame.rsi == thread_abi::THREAD_START_SIZE as u64 && frame.rdx == 0 =>
         {
             (frame.rdi, frame.rsi, false)
         }
-        thread_abi::SYS_WAIT_U32
+        sys::SYS_WAIT_U32
             if thread_abi::wait_arguments_valid(frame.rdi, frame.rsi, frame.rdx)
                 && thread_abi::wait_word_address_valid(frame.rdi) =>
         {
@@ -3489,7 +3497,7 @@ impl ShellRuntime<'_> {
             .applications
             .iter()
             .position(Option::is_none)
-            .ok_or(-11)?;
+            .ok_or(sys::EAGAIN)?;
         assert!(self.children[index].is_none());
         let baseline = FrameBaseline::take(frames);
         let slot = create_process(
@@ -3521,7 +3529,7 @@ impl ShellRuntime<'_> {
                 windows::SURFACE_PAGES,
                 MemoryClass::Normal.may_draw_reserve(),
             ) {
-                return Err(-12);
+                return Err(sys::ENOMEM);
             }
             // SAFETY: The kernel root is active on the sole BSP with IF=0.
             // The unique allocator and persistent HHDM own all acquired pages.
@@ -3655,7 +3663,7 @@ impl ShellRuntime<'_> {
                 .is_some_and(|application| application.pid == pid)
         });
         let Some(index) = index else {
-            return Some(Err(-9));
+            return Some(Err(sys::EBADF));
         };
         if let Some(slot) = self.children[index] {
             // SAFETY: The child's slot is distinct from the shell's, and this
@@ -3806,7 +3814,7 @@ fn complete_wait(
                 {
                     process.sync_timeouts += 1;
                 }
-                -110
+                sys::ETIMEDOUT
             });
             // An explicit wake also returns both stamps, which one sequence
             // ordered under the scheduler lock (WAIT_U32's RSI and RDX).
@@ -3826,18 +3834,18 @@ fn complete_wait(
                 pending.address,
                 pending.capacity,
             );
-            if result == -11 && deadline_reached(now, pending.deadline) {
-                result = -110;
+            if result == sys::EAGAIN && deadline_reached(now, pending.deadline) {
+                result = sys::ETIMEDOUT;
                 #[cfg(feature = "boot-smoke")]
                 {
                     process.ipc_timeouts += 1;
                 }
             }
-            if result == -11 {
+            if result == sys::EAGAIN {
                 return;
             }
             #[cfg(feature = "boot-smoke")]
-            if result == -32 {
+            if result == sys::EPIPE {
                 process.ipc_closed_wakes += 1;
             }
             Some(result)
@@ -3862,15 +3870,15 @@ fn complete_wait(
                         pending.address,
                         windows::EVENT_SIZE as u64,
                     ),
-                    _ => -13,
+                    _ => sys::EACCES,
                 },
                 Err(error) => cap_error(error),
             };
-            if result == -11 && deadline_reached(now, pending.deadline) {
-                result = -110;
+            if result == sys::EAGAIN && deadline_reached(now, pending.deadline) {
+                result = sys::ETIMEDOUT;
                 process.input_timeouts += 1;
             }
-            if result == -11 {
+            if result == sys::EAGAIN {
                 return;
             }
             Some(result)
@@ -3941,10 +3949,10 @@ fn signal_handle_waits(process: &Process, handle: Option<u64>) {
 fn wait_word(process: &mut Process, frame: &TrapFrame) -> Result<State, i64> {
     assert!(!arch::interrupts_enabled());
     if !thread_abi::wait_arguments_valid(frame.rdi, frame.rsi, frame.rdx) {
-        return Err(-22);
+        return Err(sys::EINVAL);
     }
     if !thread_abi::wait_word_address_valid(frame.rdi) {
-        return Err(-14);
+        return Err(sys::EFAULT);
     }
     // Check ledger permissions too: PROT_NONE may retain physical backing.
     process
@@ -3955,16 +3963,16 @@ fn wait_word(process: &mut Process, frame: &TrapFrame) -> Result<State, i64> {
             thread_abi::WAIT_WORD_SIZE as usize,
             false,
         )
-        .map_err(|_| -14)?;
+        .map_err(|_| sys::EFAULT)?;
     // SAFETY: Only the BSP edits the tables, under the lock this handler
     // holds. Siblings may write the word from other CPUs, so it is read with
     // one atomic load (spec 0051, point 7); the lock orders it against wakes.
-    let word = unsafe { process.space.read_word(frame.rdi) }.map_err(|_| -14)?;
+    let word = unsafe { process.space.read_word(frame.rdi) }.map_err(|_| sys::EFAULT)?;
     if u64::from(word) != frame.rsi {
-        return Err(-11);
+        return Err(sys::EAGAIN);
     }
     if frame.rdx == 0 {
-        return Err(-110);
+        return Err(sys::ETIMEDOUT);
     }
     #[cfg(feature = "boot-smoke")]
     {
@@ -3989,10 +3997,10 @@ fn wait_word(process: &mut Process, frame: &TrapFrame) -> Result<State, i64> {
 fn wake_word(process: &mut Process, frame: &TrapFrame) -> Result<u64, i64> {
     assert!(!arch::interrupts_enabled());
     if !thread_abi::wake_arguments_valid(frame.rdi, frame.rsi, frame.rdx) {
-        return Err(-22);
+        return Err(sys::EINVAL);
     }
     if !thread_abi::wait_word_address_valid(frame.rdi) {
-        return Err(-14);
+        return Err(sys::EFAULT);
     }
     process
         .vm
@@ -4002,7 +4010,7 @@ fn wake_word(process: &mut Process, frame: &TrapFrame) -> Result<u64, i64> {
             thread_abi::WAIT_WORD_SIZE as usize,
             false,
         )
-        .map_err(|_| -14)?;
+        .map_err(|_| sys::EFAULT)?;
     let owner = process.thread().process;
     let (woken, expired) = sched::wake_address(owner, frame.rdi, frame.rsi, timer::ticks(), || {
         process.wait_stamp()
@@ -4048,25 +4056,25 @@ fn member_by_id(process: &Process, tid: u64) -> Option<usize> {
 /// continuation, which builds the thread (0050-D2).
 fn create_thread(process: &mut Process, frame: &TrapFrame) -> Result<thread_abi::ThreadStart, i64> {
     if frame.rsi != thread_abi::THREAD_START_SIZE as u64 || frame.rdx != 0 {
-        return Err(-22);
+        return Err(sys::EINVAL);
     }
     let mut bytes = [0; thread_abi::THREAD_START_SIZE];
     // SAFETY: All threads are stopped on this BSP; copy checks the entire
     // descriptor before touching the local destination. Lazy pages were
     // resolved by the normal deferred syscall-buffer path.
-    unsafe { process.space.copy_from_user(frame.rdi, &mut bytes) }.map_err(|_| -14)?;
-    let start = thread_abi::ThreadStart::decode(&bytes).ok_or(-22)?;
+    unsafe { process.space.copy_from_user(frame.rdi, &mut bytes) }.map_err(|_| sys::EFAULT)?;
+    let start = thread_abi::ThreadStart::decode(&bytes).ok_or(sys::EINVAL)?;
     if !process
         .space
         .translate(start.entry)
-        .map_err(|_| -14)?
+        .map_err(|_| sys::EFAULT)?
         .is_some_and(|translation| translation.executable)
         || process
             .vm
             .preflight(&process.space, start.stack, 8, true)
             .is_err()
     {
-        return Err(-14);
+        return Err(sys::EFAULT);
     }
     vacant_member(process)?;
     Ok(start)
@@ -4080,9 +4088,9 @@ fn vacant_member(process: &Process) -> Result<usize, i64> {
         .members
         .iter()
         .position(|&member| member == sched::NO_SLOT)
-        .ok_or(-11)?;
+        .ok_or(sys::EAGAIN)?;
     if !sched::has_room(0, 1) {
-        return Err(-11);
+        return Err(sys::EAGAIN);
     }
     Ok(index)
 }
@@ -4127,9 +4135,9 @@ fn add_thread(
             process.memory_class.may_draw_reserve(),
         )
     {
-        return Err(-12);
+        return Err(sys::ENOMEM);
     }
-    let kernel_stack = build_stack(kernel, frames, process.direct_map).map_err(|_| -11)?;
+    let kernel_stack = build_stack(kernel, frames, process.direct_map).map_err(|_| sys::EAGAIN)?;
     // A running thread's own entry is the process's current member; this
     // insert touches only a vacant slot and the table's occupancy bitmap.
     let slot = sched::insert_thread(|slot| {
@@ -4164,16 +4172,16 @@ fn add_thread(
 
 fn join_thread(process: &mut Process, frame: &mut TrapFrame) -> Result<Option<State>, i64> {
     if frame.rsi != 0 || frame.rdx != 0 {
-        return Err(-22);
+        return Err(sys::EINVAL);
     }
     let current = process.thread().id;
     if frame.rdi == current {
-        return Err(-35);
+        return Err(sys::EDEADLK);
     }
-    let index = member_by_id(process, frame.rdi).ok_or(-3)?;
+    let index = member_by_id(process, frame.rdi).ok_or(sys::ESRCH)?;
     let target = process.member(index).expect("join target");
     if target.joiner.is_some() {
-        return Err(-16);
+        return Err(sys::EBUSY);
     }
     // An exited thread still on its CPU, or handed to the BSP, keeps its
     // stack until the BSP frees it; the join then waits for the signal that
@@ -4198,7 +4206,7 @@ fn join_thread(process: &mut Process, frame: &mut TrapFrame) -> Result<Option<St
             break;
         };
         if tid == current {
-            return Err(-35);
+            return Err(sys::EDEADLK);
         }
         state = process
             .threads()
@@ -4434,7 +4442,7 @@ fn app_load_rollback_test<'a>(
     // with -12 and the frame and window baselines are exact. It runs first:
     // a later launch would reuse the stack the next one pools.
     kernel_va::arm_frame_failure(kernel_va::STACK_PAGES / 2);
-    assert_eq!(runtime.launch(frames, desktop, 0), Err(-12));
+    assert_eq!(runtime.launch(frames, desktop, 0), Err(sys::ENOMEM));
     let failed = FrameBaseline::take(frames);
     assert_eq!(
         (failed.allocated, failed.stacks),
@@ -4443,7 +4451,7 @@ fn app_load_rollback_test<'a>(
     );
     // The child's stack is built before the handle insert fails, and the
     // rollback pools it: D2's rule holds with a pool delta of 16 frames.
-    assert_eq!(runtime.launch(frames, desktop, 0), Err(-24));
+    assert_eq!(runtime.launch(frames, desktop, 0), Err(sys::EMFILE));
     baseline.assert_kept(frames, "application-load rollback leaked");
     assert_eq!(
         kernel_va::stats().expect("kernel VA stats").pooled,
@@ -4618,7 +4626,7 @@ fn validate_process(process: &Process, scenario: u64) {
         process.outcome
     );
     assert_eq!(process.bad_pointers, 4);
-    assert_eq!(process.unknown_calls, 1);
+    assert_eq!(process.unknown_calls, 2);
     assert!(process.dispatches > 1, "context did not resume");
     assert!(process.yields >= 5, "yield checks did not complete");
     assert!(process.sleeps >= 4, "sleep checks did not complete");
@@ -4937,18 +4945,18 @@ fn with_windows<T>(access: Access, operation: impl FnOnce(&mut windows::Session)
 
 fn cap_error(error: CapError) -> i64 {
     match error {
-        CapError::BadHandle => -9,
-        CapError::Denied => -13,
-        CapError::InvalidRights => -22,
-        CapError::TableFull | CapError::IdsExhausted => -24,
+        CapError::BadHandle => sys::EBADF,
+        CapError::Denied => sys::EACCES,
+        CapError::InvalidRights => sys::EINVAL,
+        CapError::TableFull | CapError::IdsExhausted => sys::EMFILE,
     }
 }
 
 fn ipc_error(error: IpcError) -> i64 {
     match error {
-        IpcError::WouldBlock => -11,
-        IpcError::Closed => -32,
-        IpcError::MessageSize => -90,
+        IpcError::WouldBlock => sys::EAGAIN,
+        IpcError::Closed => sys::EPIPE,
+        IpcError::MessageSize => sys::EMSGSIZE,
     }
 }
 
@@ -4956,7 +4964,7 @@ fn channel_for(process: &Process, handle: u64, rights: u64) -> Result<usize, i64
     let capability = process.handles.require(handle, rights).map_err(cap_error)?;
     match capability.object {
         Object::Channel(index) => Ok(index),
-        _ => Err(-13),
+        _ => Err(sys::EACCES),
     }
 }
 
@@ -4969,11 +4977,11 @@ fn receive_input(
 ) -> i64 {
     match process.handles.require(handle, capability::RECEIVE) {
         Ok(capability) if capability.object == Object::Input => {}
-        Ok(_) => return -13,
+        Ok(_) => return sys::EACCES,
         Err(error) => return cap_error(error),
     }
     if length != input::EVENT_SIZE as u64 {
-        return -22;
+        return sys::EINVAL;
     }
     // Validate before even peeking/staging an event, and repeat this on wake.
     // A failed copy must not consume input or expose a partial wire record.
@@ -4982,17 +4990,17 @@ fn receive_input(
         .validate_writable(address, input::EVENT_SIZE)
         .is_err()
     {
-        return -14;
+        return sys::EFAULT;
     }
     // A checked physical Input poll counts even when its queue is empty.
     crate::perf::input_poll(process.pid);
     let Some(event) = session.peek() else {
-        return -11;
+        return sys::EAGAIN;
     };
     // SAFETY: The user is suspended with immutable mappings on the BSP. This
     // owned encoded snapshot cannot alias the checked destination user pages.
     if unsafe { process.space.copy_to_user(address, &event) }.is_err() {
-        return -14;
+        return sys::EFAULT;
     }
     session.consume();
     let kind = u32::from_le_bytes(event[4..8].try_into().unwrap());
@@ -5101,7 +5109,7 @@ fn require_surface(process: &Process, handle: u64) -> Result<Option<u64>, i64> {
             object: Object::AppSurface(pid),
             ..
         }) if pid == process.pid => Ok(Some(pid)),
-        Ok(_) => Err(-13),
+        Ok(_) => Err(sys::EACCES),
         Err(error) => Err(cap_error(error)),
     }
 }
@@ -5125,7 +5133,7 @@ fn surface_info(process: &mut Process, handle: u64, address: u64, length: u64) -
         }
     };
     if length != surface::INFO_SIZE as u64 {
-        return -22;
+        return sys::EINVAL;
     }
     let bytes = if let Some(pid) = application {
         match with_windows(process.access, |session| {
@@ -5143,7 +5151,7 @@ fn surface_info(process: &mut Process, handle: u64, address: u64, length: u64) -
     // and the complete fixed-size destination is checked before any write.
     // The owned kernel info bytes cannot alias an owned user physical page.
     if unsafe { process.space.copy_to_user(address, &bytes) }.is_err() {
-        return -14;
+        return sys::EFAULT;
     }
     #[cfg(feature = "boot-smoke")]
     {
@@ -5162,7 +5170,7 @@ fn surface_present(process: &mut Process, handle: u64, address: u64, length: u64
         }
     };
     if !(16..=surface::MAX_PACKET as u64).contains(&length) {
-        return -22;
+        return sys::EINVAL;
     }
     let length = length as usize;
     let mut packet = [0_u8; surface::MAX_PACKET];
@@ -5170,7 +5178,7 @@ fn surface_present(process: &mut Process, handle: u64, address: u64, length: u64
     // disjoint fixed-size kernel buffer is the sole source passed to the driver;
     // no user pointer or partial packet can survive into framebuffer mutation.
     if unsafe { process.space.copy_from_user(address, &mut packet[..length]) }.is_err() {
-        return -14;
+        return sys::EFAULT;
     }
     if let Some(pid) = application {
         return match with_windows(process.access, |session| {
@@ -5189,7 +5197,7 @@ fn surface_present(process: &mut Process, handle: u64, address: u64, length: u64
             }
             length as i64
         }
-        Err(_) => -22,
+        Err(_) => sys::EINVAL,
     }
 }
 
@@ -5203,7 +5211,7 @@ fn application_pid(process: &Process, handle: u64) -> Result<u64, i64> {
             object: Object::Application(pid),
             ..
         } => Ok(pid),
-        _ => Err(-13),
+        _ => Err(sys::EACCES),
     }
 }
 
@@ -5213,7 +5221,7 @@ fn application_info(process: &mut Process, handle: u64, address: u64, length: u6
         Err(error) => return error,
     };
     if length != windows::INFO_SIZE as u64 {
-        return -22;
+        return sys::EINVAL;
     }
     let info = match with_windows(process.access, |session| {
         session.get(pid).map(windows::Application::info)
@@ -5224,7 +5232,7 @@ fn application_info(process: &mut Process, handle: u64, address: u64, length: u6
     // SAFETY: The user is suspended with immutable private mappings; the API
     // validates all destination pages before copying this distinct stack record.
     if unsafe { process.space.copy_to_user(address, &info) }.is_err() {
-        -14
+        sys::EFAULT
     } else {
         length as i64
     }
@@ -5236,13 +5244,13 @@ fn application_event(process: &mut Process, handle: u64, address: u64, length: u
         Err(error) => return error,
     };
     if length != windows::EVENT_SIZE as u64 {
-        return -22;
+        return sys::EINVAL;
     }
     let mut event = [0; windows::EVENT_SIZE];
     // SAFETY: The entire checked user record is snapshotted into kernel memory
     // before interpreting it; no retained user pointer can race event delivery.
     if unsafe { process.space.copy_from_user(address, &mut event) }.is_err() {
-        return -14;
+        return sys::EFAULT;
     }
     match with_windows(process.access, |session| {
         windows::validate_event(&event, session.smoke && cfg!(feature = "boot-smoke"))?;
@@ -5263,18 +5271,18 @@ fn application_read(process: &mut Process, handle: u64, address: u64, length: u6
         Err(error) => return error,
     };
     if !(28..=windows::READ_PACKET as u64).contains(&length) {
-        return -22;
+        return sys::EINVAL;
     }
     let length = length as usize;
     // Validate the complete in/out destination before even snapshotting its
     // header. Revision or geometry failures leave every user byte unchanged.
     if process.space.validate_writable(address, length).is_err() {
-        return -14;
+        return sys::EFAULT;
     }
     let mut packet = [0; windows::READ_PACKET];
     // SAFETY: Immutable user mappings, full range checked above, distinct packet.
     if unsafe { process.space.copy_from_user(address, &mut packet[..24]) }.is_err() {
-        return -14;
+        return sys::EFAULT;
     }
     if let Err(error) = with_windows(process.access, |session| {
         session.get(pid)?.read(&mut packet[..length])
@@ -5284,7 +5292,7 @@ fn application_read(process: &mut Process, handle: u64, address: u64, length: u6
     // SAFETY: The same immutable range was fully validated before the read;
     // only kernel-owned front-buffer bytes and the original header are copied.
     if unsafe { process.space.copy_to_user(address, &packet[..length]) }.is_err() {
-        -14
+        sys::EFAULT
     } else {
         length as i64
     }
@@ -5302,30 +5310,30 @@ fn receive_app_input(
             object: Object::AppInput(pid),
             ..
         }) if pid == process.pid => pid,
-        Ok(_) => return -13,
+        Ok(_) => return sys::EACCES,
         Err(error) => return cap_error(error),
     };
     if length != windows::EVENT_SIZE as u64 {
-        return -22;
+        return sys::EINVAL;
     }
     if process
         .space
         .validate_writable(address, windows::EVENT_SIZE)
         .is_err()
     {
-        return -14;
+        return sys::EFAULT;
     }
     let application = match session.get_mut(pid) {
         Ok(application) => application,
         Err(error) => return error,
     };
     let Some(event) = application.peek() else {
-        return -11;
+        return sys::EAGAIN;
     };
     // SAFETY: The destination has been fully checked and no task can mutate its
     // mappings during this copy; only a successfully copied event is consumed.
     if unsafe { process.space.copy_to_user(address, &event) }.is_err() {
-        return -14;
+        return sys::EFAULT;
     }
     application.consume();
     process.input_events += 1;
@@ -5341,7 +5349,7 @@ fn send(process: &mut Process, ipc: &mut Ipc, handle: u64, address: u64, length:
         Err(error) => return error,
     };
     if !(1..=MESSAGE_SIZE as u64).contains(&length) {
-        return -90;
+        return sys::EMSGSIZE;
     }
     let mut buffer = [0_u8; MESSAGE_SIZE];
     // SAFETY: The sole CPU suspended this user, its mappings are immutable,
@@ -5354,7 +5362,7 @@ fn send(process: &mut Process, ipc: &mut Ipc, handle: u64, address: u64, length:
     }
     .is_err()
     {
-        return -14;
+        return sys::EFAULT;
     }
     match ipc.send(channel, &buffer[..length as usize]) {
         Ok(length) => {
@@ -5378,20 +5386,20 @@ fn receive(
         Err(error) => return error,
     };
     if !(1..=MESSAGE_SIZE).contains(&capacity) {
-        return -90;
+        return sys::EMSGSIZE;
     }
     // Check the caller's entire advertised buffer even when the queue is empty,
     // before blocking or consuming anything. Repeat on wake to avoid retaining
     // authority or trusting an old validation across a scheduling boundary.
     if process.space.validate_writable(address, capacity).is_err() {
-        return -14;
+        return sys::EFAULT;
     }
     let message = match ipc.peek(channel) {
         Ok(message) => message,
         Err(error) => return ipc_error(error),
     };
     if message.length > capacity {
-        return -90;
+        return sys::EMSGSIZE;
     }
     // SAFETY: User execution is suspended, mappings cannot race on the BSP,
     // and this kernel-owned message copy cannot alias destination user pages.
@@ -5403,7 +5411,7 @@ fn receive(
     }
     .is_err()
     {
-        return -14;
+        return sys::EFAULT;
     }
     ipc.consume(channel);
     process.ipc_received += 1;
@@ -5420,7 +5428,7 @@ pub(crate) fn syscall(frame: &mut TrapFrame) {
         return;
     }
     // Reserve/protect/release always run after handler frames have unwound.
-    if (vm_abi::SYS_VM_RESERVE..=vm_abi::SYS_VM_PROTECT).contains(&frame.rax) {
+    if (sys::SYS_VM_RESERVE..=sys::SYS_VM_PROTECT).contains(&frame.rax) {
         suspend(frame, State::Memory(MemoryRequest::Operation));
         return;
     }
@@ -5464,16 +5472,16 @@ pub(crate) fn syscall(frame: &mut TrapFrame) {
 }
 
 fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResult {
-    let mut result = -38_i64;
+    let mut result = sys::ENOSYS;
     let mut finished = false;
     let mut suspension = None;
     (|| {
         match frame.rax {
-            1 => {
+            sys::SYS_WRITE => {
                 match process.handles.require(frame.rdx, capability::WRITE) {
                     Ok(capability) if capability.object == Object::Console => {}
                     Ok(_) => {
-                        result = -13;
+                        result = sys::EACCES;
                         return;
                     }
                     Err(error) => {
@@ -5482,7 +5490,7 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                     }
                 }
                 if frame.rsi > MAX_WRITE as u64 {
-                    result = -22;
+                    result = sys::EINVAL;
                     return;
                 }
                 let length = frame.rsi as usize;
@@ -5505,7 +5513,7 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                     {
                         process.bad_pointers += 1;
                     }
-                    result = -14;
+                    result = sys::EFAULT;
                     return;
                 }
                 // The diagnostic console ABI accepts UTF-8 only. Trace kernels
@@ -5514,7 +5522,7 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                 // the test oracles. Default kernels keep every check and the
                 // result but print and match nothing: their serial output
                 // never carries user content (spec 0010-D4).
-                result = match core::str::from_utf8(&buffer[..length]) {
+                result = match sys::decode_utf8(&buffer[..length]) {
                     #[cfg(feature = "test-trace")]
                     Ok(message) => {
                         serial::println!("user: {}", message.escape_debug());
@@ -5525,13 +5533,13 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                     }
                     #[cfg(not(feature = "test-trace"))]
                     Ok(_) => length as i64,
-                    Err(_) => -22,
+                    Err(error) => error,
                 };
             }
-            2 => result = timer::ticks() as i64,
-            clock_abi::SYS_CLOCK_GET => {
+            sys::SYS_TICKS => result = timer::ticks() as i64,
+            sys::SYS_CLOCK_GET => {
                 if !clock_abi::clock_arguments_valid(frame.rsi, frame.rdx) {
-                    result = -22;
+                    result = sys::EINVAL;
                 } else if let Some(snapshot) = crate::clock::snapshot() {
                     let bytes = snapshot.encode();
                     // SAFETY: The suspended process owns its mappings. The full
@@ -5539,18 +5547,18 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                     // demand-zero destinations were materialized by the scheduler.
                     result = match unsafe { process.space.copy_to_user(frame.rdi, &bytes) } {
                         Ok(()) => bytes.len() as i64,
-                        Err(_) => -14,
+                        Err(_) => sys::EFAULT,
                     };
                 } else {
                     // Source availability is checked before touching user memory.
-                    result = -19;
+                    result = sys::ENODEV;
                 }
             }
-            3 => {
+            sys::SYS_EXIT => {
                 process.finish(Outcome::Exit(frame.rdi));
                 finished = true;
             }
-            4 => {
+            sys::SYS_YIELD => {
                 result = 0;
                 #[cfg(feature = "boot-smoke")]
                 {
@@ -5558,9 +5566,9 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                 }
                 suspension = Some(State::Ready);
             }
-            5 => {
+            sys::SYS_SLEEP => {
                 if frame.rdi > MAX_SLEEP_TICKS {
-                    result = -22;
+                    result = sys::EINVAL;
                 } else {
                     result = 0;
                     if frame.rdi == 0 {
@@ -5578,21 +5586,23 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                     }
                 }
             }
-            6 => result = process.pid as i64,
-            7 => {
+            sys::SYS_PID => result = process.pid as i64,
+            sys::SYS_BOOT_HANDLE => {
                 result = match process.boot_handles.get(frame.rdi as usize) {
                     Some(&handle) => match process.handles.get(handle) {
                         Ok(_) => handle as i64,
                         Err(error) => cap_error(error),
                     },
-                    None => -9,
+                    None => sys::EBADF,
                 };
             }
-            8 => result = with_ipc(|ipc| send(process, ipc, frame.rdi, frame.rsi, frame.rdx)),
-            9 | 10 => {
+            sys::SYS_SEND => {
+                result = with_ipc(|ipc| send(process, ipc, frame.rdi, frame.rsi, frame.rdx))
+            }
+            sys::SYS_RECV | sys::SYS_RECV_WAIT => {
                 result =
                     with_ipc(|ipc| receive(process, ipc, frame.rdi, frame.rsi, frame.rdx as usize));
-                if frame.rax == 10 && result == -11 {
+                if frame.rax == sys::SYS_RECV_WAIT && result == sys::EAGAIN {
                     #[cfg(feature = "boot-smoke")]
                     {
                         process.ipc_waits += 1;
@@ -5610,7 +5620,7 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                     }));
                 }
             }
-            11 => {
+            sys::SYS_CLOSE => {
                 result = match process.handles.close(frame.rdi) {
                     Ok(capability) => {
                         with_ipc(|ipc| ipc.release(capability));
@@ -5621,7 +5631,7 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                     Err(error) => cap_error(error),
                 };
             }
-            12 => {
+            sys::SYS_DUP => {
                 result = match process.handles.duplicate(frame.rdi, frame.rsi) {
                     Ok((handle, capability)) => {
                         with_ipc(|ipc| ipc.grant(capability));
@@ -5630,9 +5640,13 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                     Err(error) => cap_error(error),
                 };
             }
-            13 => result = surface_info(process, frame.rdi, frame.rsi, frame.rdx),
-            14 => result = surface_present(process, frame.rdi, frame.rsi, frame.rdx),
-            15 | 16 => {
+            sys::SYS_SURFACE_INFO => {
+                result = surface_info(process, frame.rdi, frame.rsi, frame.rdx)
+            }
+            sys::SYS_SURFACE_PRESENT => {
+                result = surface_present(process, frame.rdi, frame.rsi, frame.rdx)
+            }
+            sys::SYS_INPUT_WAIT | sys::SYS_INPUT_POLL => {
                 // Reject ungranted/wrong objects before entering the optional
                 // session: finite init has no input session or grant.
                 let routed = match process.handles.require(frame.rdi, capability::RECEIVE) {
@@ -5642,7 +5656,7 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                         ..
                     }) if pid == process.pid => true,
                     Ok(_) => {
-                        result = -13;
+                        result = sys::EACCES;
                         return;
                     }
                     Err(error) => {
@@ -5660,7 +5674,7 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                         receive_input(process, session, frame.rdi, frame.rsi, frame.rdx)
                     })
                 };
-                if frame.rax == 15 && result == -11 {
+                if frame.rax == sys::SYS_INPUT_WAIT && result == sys::EAGAIN {
                     process.input_waits += 1;
                     // An empty routed queue implies the app's window exists.
                     let queue = if routed {
@@ -5679,11 +5693,11 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                     }));
                 }
             }
-            17 => {
+            sys::SYS_APP_LAUNCH => {
                 match process.handles.require(frame.rdi, capability::WRITE) {
                     Ok(capability) if capability.object == Object::Supervisor => {}
                     Ok(_) => {
-                        result = -13;
+                        result = sys::EACCES;
                         return;
                     }
                     Err(error) => {
@@ -5692,45 +5706,51 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                     }
                 }
                 if frame.rsi > 1 || frame.rdx != 0 {
-                    result = -22;
+                    result = sys::EINVAL;
                 } else {
                     result = 0;
                     suspension = Some(State::Launching(frame.rsi));
                 }
             }
-            18 => result = application_info(process, frame.rdi, frame.rsi, frame.rdx),
-            19 => result = application_event(process, frame.rdi, frame.rsi, frame.rdx),
-            20 => result = application_read(process, frame.rdi, frame.rsi, frame.rdx),
-            21 => {
+            sys::SYS_APP_INFO => {
+                result = application_info(process, frame.rdi, frame.rsi, frame.rdx)
+            }
+            sys::SYS_APP_EVENT => {
+                result = application_event(process, frame.rdi, frame.rsi, frame.rdx)
+            }
+            sys::SYS_APP_READ => {
+                result = application_read(process, frame.rdi, frame.rsi, frame.rdx)
+            }
+            sys::SYS_APP_CLOSE => {
                 result = match application_pid(process, frame.rdi) {
                     Ok(pid) if frame.rsi == 0 && frame.rdx == 0 => {
                         suspension = Some(State::Closing(pid));
                         0
                     }
-                    Ok(_) => -22,
+                    Ok(_) => sys::EINVAL,
                     Err(error) => error,
                 };
             }
-            22 => {
+            sys::SYS_SURFACE_COMMIT => {
                 result = match process.handles.require(frame.rdi, capability::WRITE) {
                     Ok(Capability {
                         object: Object::AppSurface(pid),
                         ..
                     }) if pid == process.pid => {
                         if frame.rsi != 0 || frame.rdx != 0 {
-                            -22
+                            sys::EINVAL
                         } else {
                             with_windows(process.access, |session| session.get_mut(pid)?.commit())
                                 .map_or_else(|error| error, |_| 0)
                         }
                     }
-                    Ok(_) => -13,
+                    Ok(_) => sys::EACCES,
                     Err(error) => cap_error(error),
                 };
             }
-            vm_abi::SYS_VM_STATS => {
+            sys::SYS_VM_STATS => {
                 if frame.rsi != vm_abi::STATS_SIZE as u64 || frame.rdx != 0 {
-                    result = -22;
+                    result = sys::EINVAL;
                 } else {
                     let stats = process.vm.stats();
                     let bytes = vm_abi::VmStats {
@@ -5746,17 +5766,17 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                     // destination; no other user or device can change mappings.
                     result = match unsafe { process.space.copy_to_user(frame.rdi, &bytes) } {
                         Ok(()) => bytes.len() as i64,
-                        Err(_) => -14,
+                        Err(_) => sys::EFAULT,
                     };
                 }
             }
-            thread_abi::SYS_TLS_SET => {
+            sys::SYS_TLS_SET => {
                 let bases = thread_abi::TlsBases {
                     fs: frame.rdi,
                     gs: frame.rsi,
                 };
                 if frame.rdx != 0 || !bases.is_valid() {
-                    result = -22;
+                    result = sys::EINVAL;
                 } else {
                     // Validate both before changing either. Assembly restores
                     // these values only after Rust and return checks unwind.
@@ -5767,9 +5787,9 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                     result = 0;
                 }
             }
-            thread_abi::SYS_TLS_GET => {
+            sys::SYS_TLS_GET => {
                 if frame.rsi != thread_abi::TLS_BASES_SIZE as u64 || frame.rdx != 0 {
-                    result = -22;
+                    result = sys::EINVAL;
                 } else {
                     // The current trap captured actual hardware bases, which
                     // can change through user selector loads between syscalls.
@@ -5782,22 +5802,22 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                     // cannot race mappings and leaves invalid output untouched.
                     result = match unsafe { process.space.copy_to_user(frame.rdi, &bytes) } {
                         Ok(()) => bytes.len() as i64,
-                        Err(_) => -14,
+                        Err(_) => sys::EFAULT,
                     };
                 }
             }
             // The scheduler builds the thread once this handler unwinds
             // (0050-D2); validation and room failures return at once.
-            thread_abi::SYS_THREAD_CREATE => match create_thread(process, frame) {
+            sys::SYS_THREAD_CREATE => match create_thread(process, frame) {
                 Ok(start) => {
                     result = 0;
                     suspension = Some(State::Creating(start));
                 }
                 Err(error) => result = error,
             },
-            thread_abi::SYS_THREAD_EXIT => {
+            sys::SYS_THREAD_EXIT => {
                 if frame.rsi != 0 || frame.rdx != 0 {
-                    result = -22;
+                    result = sys::EINVAL;
                 } else {
                     #[cfg(feature = "boot-smoke")]
                     {
@@ -5818,30 +5838,32 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                     }
                 }
             }
-            thread_abi::SYS_THREAD_JOIN => match join_thread(process, frame) {
+            sys::SYS_THREAD_JOIN => match join_thread(process, frame) {
                 Ok(state) => {
                     result = 0;
                     suspension = state;
                 }
                 Err(error) => result = error,
             },
-            thread_abi::SYS_THREAD_ID => {
+            sys::SYS_THREAD_ID => {
                 result = if frame.rdi == 0 && frame.rsi == 0 && frame.rdx == 0 {
                     process.thread().id as i64
                 } else {
-                    -22
+                    sys::EINVAL
                 };
             }
-            thread_abi::SYS_WAIT_U32 => match wait_word(process, frame) {
+            sys::SYS_WAIT_U32 => match wait_word(process, frame) {
                 Ok(state) => {
                     result = 0;
                     suspension = Some(state);
                 }
                 Err(error) => result = error,
             },
-            thread_abi::SYS_WAKE_U32 => {
+            sys::SYS_WAKE_U32 => {
                 result = wake_word(process, frame).map_or_else(|error| error, |count| count as i64);
             }
+            // Recognized reservations have no argument or memory access yet.
+            sys::SYS_REALTIME_GET | sys::SYS_RANDOM_BYTES => {}
             _ => {
                 #[cfg(feature = "boot-smoke")]
                 {

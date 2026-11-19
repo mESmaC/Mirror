@@ -1,6 +1,8 @@
 //! Clock ABI and checked-copy probes. The IRQ tick and sleep ABIs retain their
 //! existing meaning whether or not an independent elapsed clock is available.
 
+use mirror_sys::ENODEV;
+
 use mirror_clock_protocol::{CLOCK_SNAPSHOT_SIZE, ClockSnapshot, SYS_CLOCK_GET};
 use mirror_thread_protocol::USER_ADDRESS_END;
 
@@ -9,7 +11,6 @@ use crate::{
     require, syscall, vm_protect, vm_release, vm_reserve, vm_stats, write,
 };
 
-const ENODEV: i64 = -19;
 const MEMORY: u64 = 0x1_0900_0000;
 const SENTINEL: u8 = 0xa5;
 static READONLY: [u8; CLOCK_SNAPSHOT_SIZE] = [0x5a; CLOCK_SNAPSHOT_SIZE];

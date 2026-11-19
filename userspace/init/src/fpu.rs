@@ -8,6 +8,12 @@ use crate::{PROT_READ_WRITE, require, vm_release, vm_reserve, write};
 
 global_asm!(
     include_str!("fpu.S"),
+    sys_pid = const mirror_sys::SYS_PID,
+    sys_sleep = const mirror_sys::SYS_SLEEP,
+    sys_ticks = const mirror_sys::SYS_TICKS,
+    sys_vm_stats = const mirror_sys::SYS_VM_STATS,
+    sys_write = const mirror_sys::SYS_WRITE,
+    sys_yield = const mirror_sys::SYS_YIELD,
     preemption_marker_len = const b"Mirror init: FPU preemption begin\n".len(),
 );
 
