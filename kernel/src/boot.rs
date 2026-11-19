@@ -245,6 +245,9 @@ pub enum SmokeMode {
     UserFlushTimeout,
     TimerCalibration,
     ClockActivation,
+    /// Each AP adds 10 ms to its measured TSC skew, so the TSC is rejected
+    /// and the HPET stays the clock source (spec 0055a, D3).
+    TscSkew,
     Ps2BatTimeout,
     Ps2StaleScancode,
     VmmouseError,
@@ -342,6 +345,7 @@ pub fn smoke_mode() -> SmokeMode {
         b"mirror.test=user-flush-timeout" => SmokeMode::UserFlushTimeout,
         b"mirror.test=timer-calibration" => SmokeMode::TimerCalibration,
         b"mirror.test=clock-activation" => SmokeMode::ClockActivation,
+        b"mirror.test=tsc-skew" => SmokeMode::TscSkew,
         b"mirror.test=ps2-bat-timeout" => SmokeMode::Ps2BatTimeout,
         b"mirror.test=ps2-stale-scancode" => SmokeMode::Ps2StaleScancode,
         b"mirror.test=vmmouse-error" => SmokeMode::VmmouseError,
