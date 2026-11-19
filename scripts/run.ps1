@@ -32,6 +32,33 @@ param(
     [ValidateRange(128, 32768)][int]$MemoryMiB = 256
 )
 
+function Assert-MirrorFpuMarkers {
+    param(
+        [Parameter(Mandatory = $true)][string]$Serial,
+        [bool]$Extended,
+        [int]$InitRuns
+    )
+
+    $ready = if ($Extended) {
+        'MIRROR_FPU_READY format=xsave64 bytes=832 xmm=16 eager=1 avx=1 avx2=1 cpuid_avx=1 osxsave=1 mask=7'
+    } else {
+        'MIRROR_FPU_READY format=fxsave64 bytes=512 xmm=16 eager=1 avx=0 avx2=0 cpuid_avx=0 osxsave=0 mask=0'
+    }
+    if ([regex]::Matches($Serial, '(?m)^MIRROR_FPU_READY(?:\s|$)').Count -ne 1 -or
+        [regex]::Matches($Serial, ('(?m)^{0}\r?$' -f [regex]::Escape($ready))).Count -ne 1) {
+        throw 'The FPU format, enabled mask and capabilities must exactly match the requested CPU model.'
+    }
+    $expected = if ($Extended) { $InitRuns } else { 0 }
+    foreach ($kind in @('AVX', 'AVX2')) {
+        $prefix = '(?m)^user: Mirror init: {0} checks passed' -f $kind
+        $exact = $prefix + '\\n\r?$'
+        if ([regex]::Matches($Serial, $prefix).Count -ne $expected -or
+            [regex]::Matches($Serial, $exact).Count -ne $expected) {
+            throw "Each enabled native process must complete its $kind register-state checks; fallback CPUs must not report them."
+        }
+    }
+}
+
 function Assert-MirrorSmpMarkers {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,
@@ -295,7 +322,8 @@ function Assert-MirrorSmpMarkers {
 function Assert-MirrorSmpUser {
     param(
         [Parameter(Mandatory = $true)][string]$Serial,
-        [Parameter(Mandatory = $true)][int]$UserspaceCpus
+        [Parameter(Mandatory = $true)][int]$UserspaceCpus,
+        [bool]$Extended
     )
 
     # The SMP battery (spec 0051, step 5) runs once in every smoke boot,
@@ -318,6 +346,12 @@ function Assert-MirrorSmpUser {
     if (-not $bounds.Success -or -not $degraded.Success -or
         $records[0].Index -le $bounds.Index -or $records[0].Index -ge $degraded.Index) {
         throw 'MIRROR_SMP_USER_OK must follow the table-bounds test and precede the first init-pair session.'
+    }
+    $migrations = if ($UserspaceCpus -gt 1) { 2 } else { 0 }
+    $xstate = [regex]::Matches($Serial, ('(?m)^MIRROR_SMP_XSTATE_OK cpus={0} migrations={1} avx={2}\r?$' -f $UserspaceCpus, $migrations, [int]$Extended))
+    if ([regex]::Matches($Serial, '(?m)^MIRROR_SMP_XSTATE_OK(?:\s|$)').Count -ne 1 -or
+        $xstate.Count -ne 1 -or $xstate[0].Index -le $records[0].Index -or $xstate[0].Index -ge $degraded.Index) {
+        throw 'The register canary must complete BSP-to-AP-to-BSP migration exactly once, or remain on the sole userspace CPU.'
     }
 }
 
@@ -396,6 +430,9 @@ if ($Fault -eq 'VmmouseError' -and $NoVmport) {
 # Without them the kernel probes panic and SGDT succeeds (spec 0016b).
 if ($ExtendedCpu -and $BaselineCpu) {
     throw '-ExtendedCpu and -BaselineCpu select different CPU models; pass at most one.'
+}
+if ($ExtendedCpu -and $Fault -eq 'UserAvx') {
+    throw '-Fault UserAvx checks unsupported AVX and requires the default or -BaselineCpu model; -ExtendedCpu enables AVX (0053).'
 }
 if ($Fault -in @('KernelSmep', 'KernelSmap') -and $BaselineCpu) {
     throw "-Fault $Fault requires SMEP and SMAP, which -BaselineCpu's CPU model does not report."
@@ -782,7 +819,7 @@ try {
     $localTimer = -not $LegacyPic -and -not $PitTimer -and $Fault -ne 'TimerCalibration'
     Assert-MirrorSmpMarkers -Serial $serial -RequestedCpus $CpuCount -UseLegacyPic ([bool]$LegacyPic) -LocalTimer $localTimer -FaultMode $Fault
     # The SMP battery runs on every CPU that runs userspace (spec 0051, step 5).
-    Assert-MirrorSmpUser -Serial $serial -UserspaceCpus $(if ($localTimer) { $CpuCount } else { 1 })
+    Assert-MirrorSmpUser -Serial $serial -UserspaceCpus $(if ($localTimer) { $CpuCount } else { 1 }) -Extended ([bool]$ExtendedCpu)
     # Every online CPU reports its guarded stacks; -LegacyPic keeps the APs
     # offline, so only the BSP reports (spec 0016a).
     $rsp0Guard = Assert-MirrorStacks -Serial $serial -OnlineCpus $(if ($LegacyPic) { 1 } else { $CpuCount }) -Smoke $true
@@ -911,12 +948,7 @@ try {
             throw 'Both native process runs must validate shared resources and independent thread contexts.'
         }
     }
-    if ($serial -notmatch '(?m)^MIRROR_FPU_READY .*osxsave=0(?:\s|$)') {
-        throw 'Mirror must keep unmanaged XSAVE state disabled.'
-    }
-    if ($ExtendedCpu -and $serial -notmatch '(?m)^MIRROR_FPU_READY .*cpuid_avx=1(?:\s|$)') {
-        throw 'The extended CPU regression requires guest-visible AVX support.'
-    }
+    Assert-MirrorFpuMarkers -Serial $serial -Extended ([bool]$ExtendedCpu) -InitRuns $initRuns
     if (@([regex]::Matches($serial, '(?m)^user: Mirror init: FPU checks passed\\n\r?$')).Count -ne $initRuns) {
         throw 'Both native processes must complete their FPU checks before and after teardown/relaunch.'
     }

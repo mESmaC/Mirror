@@ -438,6 +438,13 @@ struct Process {
     /// The SMP battery's console oracles seen, one bit each.
     #[cfg(feature = "boot-smoke")]
     battery_checks: u8,
+    /// The release battery's checked-yield migration prelude, enabled only
+    /// before the ordinary battery starts its worker threads.
+    #[cfg(feature = "boot-smoke")]
+    battery_xstate_stage: Option<u8>,
+    /// Completed canary checks after a forced change of CPU in that prelude.
+    #[cfg(feature = "boot-smoke")]
+    battery_xstate_migrations: u8,
     #[cfg(feature = "boot-smoke")]
     vm_checks: bool,
     #[cfg(feature = "boot-smoke")]
@@ -872,6 +879,11 @@ impl Battery {
 #[cfg(feature = "boot-smoke")]
 const BATTERY_PAGE: u64 = vm_abi::ARENA_START + 0x0300_0000;
 
+/// Only the smoke release battery interprets this otherwise unused yield
+/// argument. Init checks its live register canaries before each next stage.
+#[cfg(feature = "boot-smoke")]
+const BATTERY_XSTATE_TAG: u64 = 0x0053_5953;
+
 /// What one battery session measured.
 #[cfg(feature = "boot-smoke")]
 struct BatteryReport {
@@ -879,6 +891,8 @@ struct BatteryReport {
     cross_wakes: u64,
     flushes: u64,
     stale: usize,
+    xstate_stage: Option<u8>,
+    xstate_migrations: u8,
 }
 
 /// Spec 0051, step 5: run the release battery, then the protect battery,
@@ -931,6 +945,15 @@ fn run_smp_battery(
         release.cross_wakes,
         release.flushes + protect.flushes,
         release.stale
+    );
+    assert_eq!(release.xstate_stage, Some(3));
+    assert_eq!(protect.xstate_stage, None);
+    assert_eq!(protect.xstate_migrations, 0);
+    serial::println!(
+        "MIRROR_SMP_XSTATE_OK cpus={} migrations={} avx={}",
+        cpus.count_ones(),
+        release.xstate_migrations,
+        u8::from(crate::fpu::avx_enabled())
     );
 }
 
@@ -1009,6 +1032,10 @@ fn run_battery(
         }
         process.battery = Some(battery);
         process.tick_budget = BATTERY_TICK_BUDGET;
+        if battery == Battery::Release && !panic {
+            process.cpus = BSP_ONLY;
+            process.battery_xstate_stage = Some(0);
+        }
     }
     let mut session = sched::Session {
         ipc,
@@ -1096,12 +1123,67 @@ fn validate_battery(process: &Process, battery: Battery) -> BatteryReport {
         battery.threads(),
         "the {battery:?} battery created the wrong number of threads"
     );
+    let expected_stage = (battery == Battery::Release).then_some(3);
+    let expected_migrations =
+        u8::from(battery == Battery::Release && crate::smp::userspace_mask().count_ones() > 1) * 2;
+    assert_eq!(
+        process.battery_xstate_stage, expected_stage,
+        "the {battery:?} battery did not complete its xstate prelude"
+    );
+    assert_eq!(
+        process.battery_xstate_migrations, expected_migrations,
+        "the {battery:?} battery did not check both xstate migrations"
+    );
     BatteryReport {
         ran_on: process.ran_on,
         cross_wakes: process.cross_wakes,
         flushes: process.flushes,
         stale: 0,
+        xstate_stage: process.battery_xstate_stage,
+        xstate_migrations: process.battery_xstate_migrations,
     }
+}
+
+/// Force the sole release-battery thread through BSP -> AP -> BSP. Each
+/// tagged yield comes through init's assembly canary check, so stage two
+/// acknowledges the first migrated restore and stage three the second.
+/// The ordinary yield result and suspension are unchanged; the scheduler's
+/// existing process mask selects the next CPU, with no scheduler test path.
+#[cfg(feature = "boot-smoke")]
+fn battery_xstate_yield(process: &mut Process, frame: &TrapFrame) {
+    if process.battery != Some(Battery::Release) || frame.rdi != BATTERY_XSTATE_TAG {
+        return;
+    }
+    let Some(previous) = process.battery_xstate_stage else {
+        return;
+    };
+    assert!((1..=3).contains(&frame.rsi), "invalid xstate prelude stage");
+    assert_eq!(frame.rdx, 0, "invalid xstate prelude argument");
+    let stage = frame.rsi as u8;
+    assert_eq!(stage, previous + 1, "repeated or out-of-order xstate stage");
+    assert_eq!(process.threads_created, 1, "xstate prelude has workers");
+    let aps = crate::smp::userspace_mask() & !BSP_ONLY;
+    let target = if aps == 0 {
+        0
+    } else {
+        aps.trailing_zeros() as usize
+    };
+    let expected_cpu = if stage == 2 { target } else { 0 };
+    assert_eq!(
+        crate::cpudata::current_cpu(),
+        expected_cpu,
+        "xstate prelude resumed on the wrong CPU"
+    );
+    if stage > 1 && target != 0 {
+        process.battery_xstate_migrations += 1;
+    }
+    process.cpus = match stage {
+        1 => 1 << target,
+        2 => BSP_ONLY,
+        3 => ANY_CPU,
+        _ => unreachable!("validated xstate stage"),
+    };
+    process.battery_xstate_stage = Some(stage);
 }
 
 /// The release battery's stale-write canary (spec 0051, step 5). When the
@@ -1761,6 +1843,10 @@ fn load_process(
         flushes: 0,
         #[cfg(feature = "boot-smoke")]
         battery_checks: 0,
+        #[cfg(feature = "boot-smoke")]
+        battery_xstate_stage: None,
+        #[cfg(feature = "boot-smoke")]
+        battery_xstate_migrations: 0,
         #[cfg(feature = "boot-smoke")]
         vm_checks: false,
         #[cfg(feature = "boot-smoke")]
@@ -5555,6 +5641,7 @@ fn dispatch_syscall(process: &mut Process, frame: &mut TrapFrame) -> SyscallResu
                 #[cfg(feature = "boot-smoke")]
                 {
                     process.yields += 1;
+                    battery_xstate_yield(process, frame);
                 }
                 suspension = Some(State::Ready);
             }
